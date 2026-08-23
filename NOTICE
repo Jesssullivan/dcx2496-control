@@ -39,3 +39,12 @@ hardware evidence. The 115200-first/one-38400-fallback sequence is a bounded
 Legalab probe policy combining the official line-rate documentation with a
 legacy behavioral hypothesis. All hardware claims remain unverified pending a
 separately reviewed, query-only named-device receipt.
+
+The transport boundary's 500 ms per-attempt timeout and 26-byte input ceiling
+are fail-closed Legalab engineering limits, not vendor timing claims. The
+boundary is injected and has no serial-port implementation: it does not
+enumerate, open, configure, read, or write any device.
+It is not the reviewed macOS carrier and does not authorize a live Search. A
+future carrier must separately prove current-boot private-path binding,
+single-write/no-internal-retry behavior, the declared byte and time ceilings,
+and restoration of prior termios and control-line state.

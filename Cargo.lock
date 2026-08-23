@@ -108,6 +108,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcx-transport"
+version = "0.1.0"
+dependencies = [
+ "dcx-core",
+ "thiserror",
+]
+
+[[package]]
 name = "dcxctl"
 version = "0.1.0"
 dependencies = [

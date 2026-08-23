@@ -11,5 +11,9 @@ bazel-check: repo::bazel-check
 
 nix-check: repo::nix-check
 
+security: repo::security
+
+transport-check: repo::transport-check
+
 dcxctl *args:
     cargo run --quiet --package dcxctl -- {{args}}
