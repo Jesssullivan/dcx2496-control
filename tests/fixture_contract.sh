@@ -11,7 +11,17 @@ digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 "${dcxctl}" decode --file "${protocol_fixture}" >/dev/null
 "${dcxctl}" decode --file "${search_fixture}" | grep -q '"kind": "search_response"'
-"${dcxctl}" discovery plan --expected-device 0 | grep -q '"transport_opened": false'
+plan_output=$("${dcxctl}" discovery plan --expected-device 0)
+grep -q '"kind": "primary"' <<<"${plan_output}"
+grep -q '"baud": 115200' <<<"${plan_output}"
+grep -q '"kind": "single_fallback"' <<<"${plan_output}"
+grep -q '"baud": 38400' <<<"${plan_output}"
+grep -q '"query_hex": "F0002032200E40F7"' <<<"${plan_output}"
+grep -q '"transport_opened": false' <<<"${plan_output}"
+if [[ $(grep -c '"baud":' <<<"${plan_output}") -ne 2 ]]; then
+  echo "discovery plan exposed an unexpected attempt count" >&2
+  exit 1
+fi
 "${dcxctl}" discovery validate-response "${search_fixture}" --expected-device 0 >/dev/null
 "${dcxctl}" profile validate "${safe_profile}" >/dev/null
 "${dcxctl}" profile diff "${safe_profile}" "${desired_profile}" >/dev/null

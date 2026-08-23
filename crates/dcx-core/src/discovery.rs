@@ -289,6 +289,11 @@ mod tests {
         let fallback = discovery.current_attempt().unwrap();
         assert_eq!(fallback.kind(), DiscoveryAttemptKind::SingleFallback);
         assert_eq!(fallback.settings().baud(), FALLBACK_BAUD);
+        assert_eq!(fallback.settings().data_bits(), 8);
+        assert_eq!(fallback.settings().stop_bits(), 1);
+        assert_eq!(fallback.settings().parity(), SerialParity::None);
+        assert_eq!(fallback.settings().flow_control(), SerialFlowControl::None);
+        assert_eq!(fallback.query(), Query::Search);
         assert_eq!(
             discovery.timeout_current().unwrap(),
             DiscoveryState::Exhausted
