@@ -1,0 +1,36 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "dcx_core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "dcx_core",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    size = "small",
+    crate = ":dcx_core",
+)
+
+rust_test(
+    name = "robustness",
+    size = "small",
+    srcs = ["tests/robustness.rs"],
+    compile_data = ["//:safe_profile_fixture"],
+    edition = "2024",
+    deps = [":dcx_core"],
+)
+
+test_suite(
+    name = "all_tests",
+    tests = [
+        ":robustness",
+        ":unit_tests",
+    ],
+)

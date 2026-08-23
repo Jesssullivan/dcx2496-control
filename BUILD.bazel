@@ -1,0 +1,50 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "LICENSE",
+    "LICENSE-APACHE",
+    "NOTICE",
+    "third_party/duinodcx/LICENSE",
+])
+
+alias(
+    name = "dcxctl",
+    actual = "//crates/dcxctl",
+)
+
+filegroup(
+    name = "safe_profile_fixture",
+    srcs = ["fixtures/profiles/safe-muted-v1.json"],
+)
+
+test_suite(
+    name = "check",
+    tests = [
+        ":fixture_contract",
+        "//crates/dcx-core:all_tests",
+    ],
+)
+
+sh_test(
+    name = "fixture_contract",
+    size = "small",
+    srcs = ["tests/fixture_contract.sh"],
+    args = [
+        "$(location //crates/dcxctl:dcxctl)",
+        "$(location fixtures/protocol/SYNTHETIC-direct-parameter.hex)",
+        "$(location fixtures/profiles/safe-muted-v1.json)",
+        "$(location fixtures/profiles/SYNTHETIC-control-room-v1.json)",
+        "$(location fixtures/rew/SYNTHETIC-cut-only.txt)",
+    ],
+    data = [
+        "fixtures/profiles/SYNTHETIC-control-room-v1.json",
+        "fixtures/profiles/safe-muted-v1.json",
+        "fixtures/protocol/SYNTHETIC-direct-parameter.hex",
+        "fixtures/rew/SYNTHETIC-cut-only.txt",
+        "//crates/dcxctl",
+    ],
+)

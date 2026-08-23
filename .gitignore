@@ -1,0 +1,14 @@
+/target/
+/bazel-*
+/.direnv/
+/.env
+/.env.*
+!.env.example
+/result
+/result-*
+*.local.md
+/.notes/
+/captures/
+/artifacts/
+/fuzz/corpus/
+/fuzz/artifacts/

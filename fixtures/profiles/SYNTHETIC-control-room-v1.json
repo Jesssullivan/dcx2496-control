@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "profile_id": "tinyland-legalab-pzm-dcx2496",
+  "profile_revision": 1,
+  "device_manufacturer": "Behringer",
+  "device_model": "DCX2496",
+  "device_id": 0,
+  "input_c": {
+    "mode": "line",
+    "auto_align_enabled": false,
+    "auto_eq_enabled": false,
+    "phantom_15v_enabled": false
+  },
+  "outputs": [
+    {
+      "output": 1,
+      "role": "monitor_left",
+      "label": "JBL left",
+      "sink_manufacturer": "JBL",
+      "sink_model": "306P MkII",
+      "model_verified": true,
+      "source": "a",
+      "muted": false,
+      "gain_db": -12.0,
+      "filters": [],
+      "limiter": {"enabled": true, "threshold_db": -12.0, "release_ms": 100.0}
+    },
+    {
+      "output": 2,
+      "role": "monitor_right",
+      "label": "JBL right",
+      "sink_manufacturer": "JBL",
+      "sink_model": "306P MkII",
+      "model_verified": true,
+      "source": "b",
+      "muted": false,
+      "gain_db": -12.0,
+      "filters": [],
+      "limiter": {"enabled": true, "threshold_db": -12.0, "release_ms": 100.0}
+    },
+    {
+      "output": 3,
+      "role": "subwoofer",
+      "label": "JBL sub exact model unverified",
+      "sink_manufacturer": "JBL",
+      "sink_model": null,
+      "model_verified": false,
+      "source": "sum",
+      "muted": true,
+      "gain_db": -15.0,
+      "filters": [],
+      "limiter": {"enabled": true, "threshold_db": -18.0, "release_ms": 120.0}
+    },
+    {
+      "output": 4,
+      "role": "pa",
+      "label": "Alto PA exact model unverified",
+      "sink_manufacturer": "Alto Professional",
+      "sink_model": null,
+      "model_verified": false,
+      "source": null,
+      "muted": true,
+      "gain_db": -15.0,
+      "filters": [],
+      "limiter": null
+    },
+    {
+      "output": 5,
+      "role": "unused",
+      "label": "unused and blocked",
+      "sink_manufacturer": null,
+      "sink_model": null,
+      "model_verified": false,
+      "source": null,
+      "muted": true,
+      "gain_db": -15.0,
+      "filters": [],
+      "limiter": null
+    },
+    {
+      "output": 6,
+      "role": "unused",
+      "label": "unused and blocked",
+      "sink_manufacturer": null,
+      "sink_model": null,
+      "model_verified": false,
+      "source": null,
+      "muted": true,
+      "gain_db": -15.0,
+      "filters": [],
+      "limiter": null
+    }
+  ]
+}
