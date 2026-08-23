@@ -22,7 +22,10 @@ rust_test(
     name = "robustness",
     size = "small",
     srcs = ["tests/robustness.rs"],
-    compile_data = ["//:safe_profile_fixture"],
+    compile_data = [
+        "//:safe_profile_fixture",
+        "//:synthetic_search_fixture",
+    ],
     edition = "2024",
     deps = [":dcx_core"],
 )

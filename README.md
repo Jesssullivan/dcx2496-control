@@ -5,12 +5,19 @@ DCX2496 control in Tinyland's Legacy Audio Lab.
 
 This foundation is deliberately **offline only**. `dcxctl` can decode fixture
 bytes, construct known read-only query frames, validate/diff complete profiles,
-and quantize Room EQ Wizard Generic EQ text. It has no serial dependency, no
-network server, and no command that can write to a device.
+plan and validate query-only discovery, and quantize Room EQ Wizard Generic EQ
+text. It has no serial dependency, no network server, and no command that can
+write to a device.
 
 ## Safety boundary
 
 - A valid frame is not proof of a connected or compatible device.
+- Discovery accepts exactly one complete 26-byte search response with the
+  expected device address. Partial, ambiguous, wrong-manufacturer, wrong-model,
+  wrong-function, and wrong-address evidence fails closed; its 18-byte payload
+  remains opaque.
+- The pure discovery plan is exactly 115200 8N1 followed by one 38400 8N1
+  fallback after an explicit timeout. It does not open or name a transport.
 - Synthetic fixtures are named `SYNTHETIC-*` and are never hardware evidence.
 - Profiles bind the exact Behringer DCX2496 identity, profile ID/revision, and
   all six physical outputs. Omitted or role-swapped outputs fail validation.
@@ -26,7 +33,10 @@ network server, and no command that can write to a device.
   deserialized.
 
 The later hardware milestone must add query-only serial probing behind a new,
-reviewed I/O boundary. It must not weaken these pure contracts.
+reviewed I/O boundary. This slice does not enumerate ports, open devices, set
+line state, send bytes, or retry. The 38400 fallback remains an explicitly
+bounded compatibility hypothesis, not a claim that the vendor documents it for
+RS-232. A future I/O boundary must not weaken these pure contracts.
 
 ## Entrypoints
 
@@ -42,6 +52,9 @@ Offline examples:
 
 ```sh
 just dcxctl query search
+just dcxctl discovery plan --expected-device 0
+just dcxctl discovery validate-response \
+  fixtures/protocol/SYNTHETIC-search-response-26.hex --expected-device 0
 just dcxctl decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex
 just dcxctl profile validate fixtures/profiles/safe-muted-v1.json
 just dcxctl profile diff \
