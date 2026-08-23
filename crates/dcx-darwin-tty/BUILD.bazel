@@ -1,0 +1,41 @@
+load("@crates//:defs.bzl", "all_crate_deps", "crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "dcx_darwin_tty",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "dcx_darwin_tty",
+    edition = "2024",
+    deps = [
+        "//crates/dcx-core:dcx_core",
+        "//crates/dcx-transport:dcx_transport",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    size = "small",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "dcx_darwin_tty_test",
+    edition = "2024",
+    # Keep unit tests pure and platform-independent. The rust_library above
+    # still compiles the native backend; Cargo's macOS suite also links and
+    # exercises its injected syscall boundary without opening a tty.
+    rustc_flags = ["--cfg=bazel_test_no_native"],
+    deps = [
+        "//crates/dcx-core:dcx_core",
+        "//crates/dcx-transport:dcx_transport",
+    ] + crate_deps([
+        "serde",
+        "serde_json",
+        "sha2",
+        "thiserror",
+    ]),
+)
+
+test_suite(
+    name = "all_tests",
+    tests = [":unit_tests"],
+)
