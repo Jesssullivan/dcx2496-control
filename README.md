@@ -6,9 +6,10 @@ DCX2496 control in Tinyland's Legacy Audio Lab.
 `dcxctl` remains deliberately **offline only**. It can decode fixture bytes,
 construct known read-only query frames, validate/diff complete profiles, plan
 and validate query-only discovery, and quantize Room EQ Wizard Generic EQ text.
-The separate `dcx-transport` crate adds an injected Search-only boundary, but
-there is still no serial-port dependency, port enumeration, live CLI, network
-server, or command that can open or write to a device.
+The separate `dcx-transport` crate adds an injected Search-only boundary.
+`dcx-darwin-tty` binds that boundary to one private, digest-checked macOS
+callout node. There is no port enumeration, live CLI, network server, or
+generic byte-write surface.
 
 ## Safety boundary
 
@@ -23,6 +24,11 @@ server, or command that can open or write to a device.
   attempt has a 500 ms total adapter deadline and a 26-byte input ceiling; the
   sole fallback is eligible only after an empty primary timeout. Partial input,
   malformed or wrong identity, and transport errors stop without fallback.
+- The Darwin carrier reserves 25 ms of that monotonic budget for mandatory
+  termios/control-line restoration and close. It opens nonblocking with
+  `O_NOCTTY`, obtains `TIOCEXCL`, performs one write syscall, and uses
+  `FIONREAD` to detect overflow without consuming byte 27. It never calls
+  `tcflush` or toggles DTR/RTS.
 - Synthetic fixtures are named `SYNTHETIC-*` and are never hardware evidence.
 - Profiles bind the exact Behringer DCX2496 identity, profile ID/revision, and
   all six physical outputs. Omitted or role-swapped outputs fail validation.
@@ -37,17 +43,15 @@ server, or command that can open or write to a device.
   activation tokens are required; its privileged state cannot be cloned or
   deserialized.
 
-The later hardware milestone must bind this injected contract to a separately
-reviewed serial adapter. This slice does not enumerate ports, open devices, set
-line state, send bytes, or expose a live CLI. The 38400 fallback remains an
-explicitly bounded compatibility hypothesis, not a claim that the vendor
-documents it for RS-232. A concrete adapter must enforce the supplied line,
-byte, and time limits without weakening the pure contracts. In particular, it
-must bind an approved private TTY path from the current boot, preserve and
-restore termios/control-line state, perform one exact eight-byte write per
-attempt, read at most 26 bytes, return within the 500 ms total attempt deadline,
-and never retry internally. Merging the injected executor does not authorize a
-live Search.
+The carrier is a programmatic primitive, not an operator command or permission
+to probe. Its raw path exists only in a non-cloneable, redacted in-memory
+binding and must match an independently observed `sha256/...` digest immediately
+before open. Only `/dev/cu.usbserial-*` is in scope. Sanitized receipts contain
+the path digest, byte counts, response digest, deadline, and cleanup outcome;
+they never retain a raw path or response. A live Search still requires exact
+current-boot adapter/device evidence and Legalab's explicit attended WORD gate.
+The 38400 fallback remains a bounded compatibility hypothesis, not a vendor
+claim for direct RS-232.
 
 ## Entrypoints
 
@@ -57,6 +61,7 @@ Use the pinned Nix environment and Just recipes:
 nix develop
 just check
 just transport-check
+just darwin-carrier-check
 just bazel-check
 ```
 
@@ -75,12 +80,12 @@ just dcxctl profile diff \
 just dcxctl rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3
 ```
 
-The Bazel graph exposes `//:dcxctl`, `//:check`, and
-`//crates/dcx-transport:all_tests`. Cargo remains the source of Rust dependency
-truth; Bzlmod's crate-universe derives its external graph from the committed
-`Cargo.lock`. CI also requires committed `MODULE.bazel.lock` and `flake.lock`;
-the supply-chain gate denies the malicious August 2026 crate releases and
-typosquats by name.
+The Bazel graph exposes `//:dcxctl`, `//:check`,
+`//crates/dcx-transport:all_tests`, and
+`//crates/dcx-darwin-tty:all_tests`. The carrier target runs only fake syscalls;
+CI never opens a tty. Cargo remains the source of Rust dependency truth;
+Bzlmod's crate-universe derives its external graph from the committed
+`Cargo.lock`. CI also requires committed `MODULE.bazel.lock` and `flake.lock`.
 
 ## Protocol status
 
