@@ -10,11 +10,23 @@ implementation hypotheses from public behavioral descriptions. They are not
 observed device facts, compatibility proof, or authorization to send bytes.
 Useful behavioral references reviewed for this offline foundation include:
 
-- Behringer ULTRADRIVE PRO DCX2496 manual, Music Tribe.
+- Behringer ULTRADRIVE PRO DCX2496/ULTRADRIVE DCX2496LE User Manual,
+  Music Tribe, resolved 2026-08-23:
+  https://mediadl.musictribe.com/media/sys_master/h84/h96/8849440243742.pdf
+  The Serial Interface specification on manual page 31 documents RS-232 as
+  115200 baud 8N1 and RS-485 as 38400 baud 8N1. It does not document the
+  discovery frame or authorize treating 38400 as a proven RS-232 setting.
 - DuinoDCX by Lasse Lukkari, MIT license, revision
   00b9d70d6192e993f31ec94ff0bc20e6e2265b2c (behavioral reference only,
-  resolved 2026-08-22): https://github.com/lasselukkari/DuinoDCX
-  Its license is reproduced in third_party/duinodcx/LICENSE.
+  resolved 2026-08-23):
+  https://github.com/lasselukkari/DuinoDCX/tree/00b9d70d6192e993f31ec94ff0bc20e6e2265b2c
+  The pinned Ultradrive.h defines a 26-byte search response, and the pinned
+  DuinoDCX.ino initializes its serial paths at 38400 baud:
+  https://github.com/lasselukkari/DuinoDCX/blob/00b9d70d6192e993f31ec94ff0bc20e6e2265b2c/DuinoDCX/Ultradrive.h#L24
+  https://github.com/lasselukkari/DuinoDCX/blob/00b9d70d6192e993f31ec94ff0bc20e6e2265b2c/DuinoDCX/DuinoDCX.ino#L381-L384
+  This source does not define the 18-byte response payload semantics or
+  establish behavior on Legalab's named unit. Its license is reproduced in
+  third_party/duinodcx/LICENSE.
 - UltradrivePi protocol notes by geftactics; no repository license was present
   when reviewed on 2026-08-22, so it is an incompatible/uncertain-license
   behavioral reference only and no source code or prose was copied. Revision
@@ -23,5 +35,7 @@ Useful behavioral references reviewed for this offline foundation include:
 
 Synthetic fixtures in fixtures/ are original test data. They are clearly
 marked and establish deterministic behavior only; they must not be cited as
-hardware evidence. All hardware claims remain unverified pending a separately
-reviewed, query-only named-device receipt.
+hardware evidence. The 115200-first/one-38400-fallback sequence is a bounded
+Legalab probe policy combining the official line-rate documentation with a
+legacy behavioral hypothesis. All hardware claims remain unverified pending a
+separately reviewed, query-only named-device receipt.

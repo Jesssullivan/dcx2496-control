@@ -10,6 +10,7 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use dcx_core::{
     LabProfileV1,
+    discovery::QueryOnlyDiscovery,
     protocol::{self, DeviceId, DumpPart, MAX_FRAME_LEN, Query},
     rew::{self, MAX_REW_BYTES},
 };
@@ -32,6 +33,11 @@ enum Command {
     Query {
         #[command(subcommand)]
         command: QueryCommand,
+    },
+    /// Inspect or validate the pure query-only discovery plan.
+    Discovery {
+        #[command(subcommand)]
+        command: DiscoveryCommand,
     },
     /// Validate or compare strict versioned profiles.
     Profile {
@@ -66,6 +72,23 @@ enum QueryCommand {
         device: u8,
         #[arg(value_enum)]
         part: PartArg,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiscoveryCommand {
+    /// Print the exact offline 115200-then-38400 search plan.
+    Plan {
+        /// Reviewed DCX profile device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+    },
+    /// Validate one offline 26-byte response against an expected address.
+    ValidateResponse {
+        file: PathBuf,
+        /// Reviewed DCX profile device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
     },
 }
 
@@ -105,8 +128,55 @@ fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Command::Decode(args) => decode(args)?,
         Command::Query { command } => query(command)?,
+        Command::Discovery { command } => discovery(command)?,
         Command::Profile { command } => profile(command)?,
         Command::Rew { command } => rew(command)?,
+    }
+    Ok(())
+}
+
+fn discovery(command: DiscoveryCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        DiscoveryCommand::Plan { expected_device } => {
+            let expected_device = DeviceId::new(expected_device)?;
+            let mut discovery = QueryOnlyDiscovery::new(expected_device);
+            let primary = discovery.current_attempt().expect("new plan has primary");
+            discovery.timeout_current()?;
+            let fallback = discovery
+                .current_attempt()
+                .expect("primary timeout has one fallback");
+            let receipt = serde_json::json!({
+                "mode": "offline_query_only",
+                "expected_device": expected_device,
+                "attempts": [
+                    {
+                        "kind": primary.kind(),
+                        "settings": primary.settings(),
+                        "query_hex": hex::encode_upper(primary.query().encode()?),
+                    },
+                    {
+                        "kind": fallback.kind(),
+                        "settings": fallback.settings(),
+                        "query_hex": hex::encode_upper(fallback.query().encode()?),
+                    },
+                ],
+                "transport_opened": false,
+            });
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        DiscoveryCommand::ValidateResponse {
+            file,
+            expected_device,
+        } => {
+            let bytes = decode_fixture(&read_bounded(
+                &file,
+                MAX_DECODE_FILE_BYTES,
+                "search response fixture",
+            )?)?;
+            let mut discovery = QueryOnlyDiscovery::new(DeviceId::new(expected_device)?);
+            let response = discovery.accept_candidates(&[&bytes])?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
     }
     Ok(())
 }

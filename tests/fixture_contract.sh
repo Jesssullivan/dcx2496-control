@@ -3,12 +3,16 @@ set -euo pipefail
 
 dcxctl=$1
 protocol_fixture=$2
-safe_profile=$3
-desired_profile=$4
-rew_fixture=$5
+search_fixture=$3
+safe_profile=$4
+desired_profile=$5
+rew_fixture=$6
 digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 "${dcxctl}" decode --file "${protocol_fixture}" >/dev/null
+"${dcxctl}" decode --file "${search_fixture}" | grep -q '"kind": "search_response"'
+"${dcxctl}" discovery plan --expected-device 0 | grep -q '"transport_opened": false'
+"${dcxctl}" discovery validate-response "${search_fixture}" --expected-device 0 >/dev/null
 "${dcxctl}" profile validate "${safe_profile}" >/dev/null
 "${dcxctl}" profile diff "${safe_profile}" "${desired_profile}" >/dev/null
 "${dcxctl}" rew import "${rew_fixture}" --target-output 3 >/dev/null
