@@ -18,6 +18,10 @@ lint:
 test:
     cargo test --workspace --all-targets --all-features
 
+# Exercise only the injected, no-device Search transport contract.
+transport-check:
+    cargo test --locked --package dcx-transport --all-targets --all-features
+
 fixtures:
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null

@@ -3,11 +3,12 @@
 Typed, fail-closed building blocks for restoring Behringer ULTRADRIVE PRO
 DCX2496 control in Tinyland's Legacy Audio Lab.
 
-This foundation is deliberately **offline only**. `dcxctl` can decode fixture
-bytes, construct known read-only query frames, validate/diff complete profiles,
-plan and validate query-only discovery, and quantize Room EQ Wizard Generic EQ
-text. It has no serial dependency, no network server, and no command that can
-write to a device.
+`dcxctl` remains deliberately **offline only**. It can decode fixture bytes,
+construct known read-only query frames, validate/diff complete profiles, plan
+and validate query-only discovery, and quantize Room EQ Wizard Generic EQ text.
+The separate `dcx-transport` crate adds an injected Search-only boundary, but
+there is still no serial-port dependency, port enumeration, live CLI, network
+server, or command that can open or write to a device.
 
 ## Safety boundary
 
@@ -18,6 +19,10 @@ write to a device.
   remains opaque.
 - The pure discovery plan is exactly 115200 8N1 followed by one 38400 8N1
   fallback after an explicit timeout. It does not open or name a transport.
+- The injected executor supplies only the exact eight-byte Search request. Each
+  attempt has a 500 ms total adapter deadline and a 26-byte input ceiling; the
+  sole fallback is eligible only after an empty primary timeout. Partial input,
+  malformed or wrong identity, and transport errors stop without fallback.
 - Synthetic fixtures are named `SYNTHETIC-*` and are never hardware evidence.
 - Profiles bind the exact Behringer DCX2496 identity, profile ID/revision, and
   all six physical outputs. Omitted or role-swapped outputs fail validation.
@@ -32,11 +37,17 @@ write to a device.
   activation tokens are required; its privileged state cannot be cloned or
   deserialized.
 
-The later hardware milestone must add query-only serial probing behind a new,
-reviewed I/O boundary. This slice does not enumerate ports, open devices, set
-line state, send bytes, or retry. The 38400 fallback remains an explicitly
-bounded compatibility hypothesis, not a claim that the vendor documents it for
-RS-232. A future I/O boundary must not weaken these pure contracts.
+The later hardware milestone must bind this injected contract to a separately
+reviewed serial adapter. This slice does not enumerate ports, open devices, set
+line state, send bytes, or expose a live CLI. The 38400 fallback remains an
+explicitly bounded compatibility hypothesis, not a claim that the vendor
+documents it for RS-232. A concrete adapter must enforce the supplied line,
+byte, and time limits without weakening the pure contracts. In particular, it
+must bind an approved private TTY path from the current boot, preserve and
+restore termios/control-line state, perform one exact eight-byte write per
+attempt, read at most 26 bytes, return within the 500 ms total attempt deadline,
+and never retry internally. Merging the injected executor does not authorize a
+live Search.
 
 ## Entrypoints
 
@@ -45,6 +56,7 @@ Use the pinned Nix environment and Just recipes:
 ```sh
 nix develop
 just check
+just transport-check
 just bazel-check
 ```
 
@@ -63,11 +75,12 @@ just dcxctl profile diff \
 just dcxctl rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3
 ```
 
-The Bazel graph exposes `//:dcxctl` and `//:check`. Cargo remains the source of
-Rust dependency truth; Bzlmod's crate-universe derives its external graph from
-the committed `Cargo.lock`. CI also requires committed `MODULE.bazel.lock` and
-`flake.lock`; the supply-chain gate denies the malicious August 2026 crate
-releases and typosquats by name.
+The Bazel graph exposes `//:dcxctl`, `//:check`, and
+`//crates/dcx-transport:all_tests`. Cargo remains the source of Rust dependency
+truth; Bzlmod's crate-universe derives its external graph from the committed
+`Cargo.lock`. CI also requires committed `MODULE.bazel.lock` and `flake.lock`;
+the supply-chain gate denies the malicious August 2026 crate releases and
+typosquats by name.
 
 ## Protocol status
 

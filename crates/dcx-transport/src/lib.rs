@@ -1,0 +1,575 @@
+//! Injected, bounded transport contract for DCX2496 discovery.
+//!
+//! This crate does not enumerate or open ports and has no operating-system
+//! serial dependency. It exposes one operation: the exact broadcast Search
+//! request. A separately reviewed adapter may implement [`SearchTransport`]
+//! after satisfying Legalab's hardware gate.
+
+use std::{error::Error as StdError, fmt, time::Duration};
+
+use dcx_core::{
+    discovery::{
+        DiscoveryAttempt, DiscoveryAttemptKind, DiscoveryError, DiscoveryState, QueryOnlyDiscovery,
+        SerialSettings,
+    },
+    protocol::{DeviceId, SEARCH_RESPONSE_LEN, SearchResponse26},
+};
+use thiserror::Error;
+
+/// Exact outbound byte count for the only operation this boundary exposes.
+pub const SEARCH_REQUEST_LEN: usize = 8;
+/// Maximum inbound byte count for one Search attempt.
+pub const SEARCH_RESPONSE_LIMIT: usize = SEARCH_RESPONSE_LEN;
+/// Total deadline an adapter must enforce for one configure/write/read attempt.
+pub const SEARCH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Maximum number of attempts represented by the executor.
+pub const MAX_SEARCH_ATTEMPTS: usize = 2;
+/// Nominal sum of the two per-attempt deadlines, excluding immediate errors.
+pub const SEARCH_DISCOVERY_BUDGET: Duration = Duration::from_millis(1_000);
+
+const SEARCH_REQUEST_BYTES: [u8; SEARCH_REQUEST_LEN] =
+    [0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7];
+
+/// The sole outbound request available to a transport implementation.
+///
+/// Fields are private and there is no public constructor. Callers cannot use
+/// this boundary to supply arbitrary protocol or configuration bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchRequest([u8; SEARCH_REQUEST_LEN]);
+
+impl SearchRequest {
+    const fn new() -> Self {
+        Self(SEARCH_REQUEST_BYTES)
+    }
+
+    /// Return the exact eight Search bytes.
+    pub const fn as_bytes(&self) -> &[u8; SEARCH_REQUEST_LEN] {
+        &self.0
+    }
+}
+
+/// One immutable operation issued by [`execute_search`].
+///
+/// The timeout covers the complete adapter attempt: serial configuration,
+/// writing all eight Search bytes, and reading no more than 26 bytes. The
+/// future adapter is responsible for enforcing that deadline; this injected
+/// executor deliberately owns no clock, thread, file descriptor, or TTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOperation {
+    attempt: DiscoveryAttemptKind,
+    settings: SerialSettings,
+    expected_device: DeviceId,
+}
+
+impl SearchOperation {
+    const fn new(attempt: DiscoveryAttempt, expected_device: DeviceId) -> Self {
+        Self {
+            attempt: attempt.kind(),
+            settings: attempt.settings(),
+            expected_device,
+        }
+    }
+
+    /// Return whether this is the primary or sole fallback attempt.
+    pub const fn attempt(self) -> DiscoveryAttemptKind {
+        self.attempt
+    }
+
+    /// Return exact line settings for this attempt.
+    pub const fn settings(self) -> SerialSettings {
+        self.settings
+    }
+
+    /// Return the expected unit address bound by the caller.
+    pub const fn expected_device(self) -> DeviceId {
+        self.expected_device
+    }
+
+    /// Return the only outbound request exposed by this crate.
+    pub const fn request(self) -> SearchRequest {
+        SearchRequest::new()
+    }
+
+    /// Return the total deadline the adapter must enforce for this attempt.
+    pub const fn timeout(self) -> Duration {
+        SEARCH_ATTEMPT_TIMEOUT
+    }
+
+    /// Return the hard input ceiling for this attempt.
+    pub const fn response_limit(self) -> usize {
+        SEARCH_RESPONSE_LIMIT
+    }
+}
+
+/// How one bounded adapter read ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReadEnd {
+    /// Exactly 26 bytes were received before the deadline.
+    Complete,
+    /// The 500 ms deadline elapsed with fewer than 26 bytes.
+    TimedOut,
+}
+
+/// Bounded response bytes returned by a transport implementation.
+///
+/// The raw bytes are intentionally omitted from `Debug`; captures and opaque
+/// identity payloads must remain outside Git. Construction enforces that a
+/// complete read is exactly 26 bytes and that a timeout contains at most 25.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SearchRead {
+    end: SearchReadEnd,
+    bytes: [u8; SEARCH_RESPONSE_LIMIT],
+    received: usize,
+}
+
+impl SearchRead {
+    /// Construct an exact-length completed read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchReadError::CompleteLength`] unless `bytes` has exactly
+    /// 26 elements.
+    pub fn complete(bytes: &[u8]) -> Result<Self, SearchReadError> {
+        if bytes.len() != SEARCH_RESPONSE_LIMIT {
+            return Err(SearchReadError::CompleteLength(bytes.len()));
+        }
+        let mut bounded = [0; SEARCH_RESPONSE_LIMIT];
+        bounded.copy_from_slice(bytes);
+        Ok(Self {
+            end: SearchReadEnd::Complete,
+            bytes: bounded,
+            received: SEARCH_RESPONSE_LIMIT,
+        })
+    }
+
+    /// Construct a deadline result carrying any partial bytes already read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchReadError::TimeoutLength`] for 26 or more bytes. A full
+    /// response must be returned through [`Self::complete`].
+    pub fn timed_out(bytes: &[u8]) -> Result<Self, SearchReadError> {
+        if bytes.len() >= SEARCH_RESPONSE_LIMIT {
+            return Err(SearchReadError::TimeoutLength(bytes.len()));
+        }
+        let mut bounded = [0; SEARCH_RESPONSE_LIMIT];
+        bounded[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            end: SearchReadEnd::TimedOut,
+            bytes: bounded,
+            received: bytes.len(),
+        })
+    }
+
+    /// Return how the bounded read ended.
+    pub const fn end(&self) -> SearchReadEnd {
+        self.end
+    }
+
+    /// Return the number of bytes read, without exposing their contents.
+    pub const fn received_len(&self) -> usize {
+        self.received
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.received_len()]
+    }
+}
+
+impl fmt::Debug for SearchRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchRead")
+            .field("end", &self.end)
+            .field("received", &self.received)
+            .field("bytes", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Invalid adapter result construction.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReadError {
+    /// A completed read was not the exact response size.
+    #[error("complete Search read has {0} bytes; expected exactly 26")]
+    CompleteLength(usize),
+    /// A timeout incorrectly contained a complete or oversized response.
+    #[error("timed-out Search read has {0} bytes; expected at most 25")]
+    TimeoutLength(usize),
+}
+
+/// Injected boundary implemented later by a separately reviewed serial adapter.
+///
+/// An implementation must configure the supplied settings, write only
+/// [`SearchOperation::request`], read at most
+/// [`SearchOperation::response_limit`] bytes, and return by
+/// [`SearchOperation::timeout`]. It must not enumerate ports, retry internally,
+/// issue another query type, or retain raw response bytes. The executor owns
+/// attempt ordering and fallback policy.
+pub trait SearchTransport {
+    /// Adapter-specific error. Errors always stop discovery without fallback.
+    type Error: StdError + Send + Sync + 'static;
+
+    /// Execute exactly one supplied Search operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter-specific failure. The executor stops immediately
+    /// and does not expose the fallback after any adapter error.
+    fn search(&mut self, operation: SearchOperation) -> Result<SearchRead, Self::Error>;
+}
+
+/// Successful exact identity returned by the executor.
+pub struct IdentifiedSearch {
+    attempt: DiscoveryAttemptKind,
+    response: SearchResponse26,
+}
+
+impl IdentifiedSearch {
+    /// Return the attempt that produced the validated identity.
+    pub const fn attempt(&self) -> DiscoveryAttemptKind {
+        self.attempt
+    }
+
+    /// Return the validated expected unit address.
+    pub const fn device(&self) -> DeviceId {
+        self.response.device()
+    }
+
+    /// Borrow the typed exact response for bounded local evidence handling.
+    ///
+    /// The opaque payload may contain device-specific material. Do not log or
+    /// commit it; durable receipts should store only a digest and byte count.
+    pub const fn response(&self) -> &SearchResponse26 {
+        &self.response
+    }
+}
+
+impl fmt::Debug for IdentifiedSearch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentifiedSearch")
+            .field("attempt", &self.attempt)
+            .field("device", &self.device())
+            .field("response_bytes", &SEARCH_RESPONSE_LIMIT)
+            .field("response", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Terminal result from the exact two-attempt policy.
+#[derive(Debug)]
+pub enum SearchOutcome {
+    /// One exact response matched the caller-bound unit address.
+    Identified(IdentifiedSearch),
+    /// Both attempts reached their deadline without receiving any bytes.
+    Exhausted,
+}
+
+/// Fail-closed execution errors. None permit the fallback except an empty
+/// primary timeout, which is represented internally rather than as an error.
+#[derive(Debug, Error)]
+pub enum SearchExecutionError<E: StdError + Send + Sync + 'static> {
+    /// The injected adapter failed; no later attempt is eligible.
+    #[error("Search transport failed during {attempt:?} attempt")]
+    Transport {
+        /// Attempt on which the adapter failed.
+        attempt: DiscoveryAttemptKind,
+        /// Adapter-specific cause.
+        #[source]
+        source: E,
+    },
+    /// A deadline arrived after a partial response; changing baud is unsafe.
+    #[error("Search timed out with {received} partial bytes during {attempt:?} attempt")]
+    PartialTimeout {
+        /// Attempt on which partial input was received.
+        attempt: DiscoveryAttemptKind,
+        /// Bounded number of bytes received before the deadline.
+        received: usize,
+    },
+    /// Exact response validation or pure state progression failed.
+    #[error("Search validation failed during {attempt:?} attempt: {source}")]
+    Validation {
+        /// Attempt on which validation failed.
+        attempt: DiscoveryAttemptKind,
+        /// Pure discovery failure.
+        #[source]
+        source: DiscoveryError,
+    },
+}
+
+/// Execute the exact Search-only discovery policy through an injected adapter.
+///
+/// Attempt one is 115200 8N1/no-flow. Exactly one 38400 8N1/no-flow fallback
+/// is issued only when attempt one reaches 500 ms with zero input bytes. Any
+/// partial timeout, transport error, malformed frame, or wrong identity stops
+/// immediately. The executor supplies no arbitrary bytes and performs no I/O
+/// except through [`SearchTransport::search`].
+///
+/// # Errors
+///
+/// Returns [`SearchExecutionError`] for transport, partial-timeout, protocol,
+/// identity, or impossible state errors.
+pub fn execute_search<T: SearchTransport>(
+    transport: &mut T,
+    expected_device: DeviceId,
+) -> Result<SearchOutcome, SearchExecutionError<T::Error>> {
+    let mut discovery = QueryOnlyDiscovery::new(expected_device);
+
+    loop {
+        let attempt =
+            discovery
+                .current_attempt()
+                .ok_or_else(|| SearchExecutionError::Validation {
+                    attempt: DiscoveryAttemptKind::SingleFallback,
+                    source: DiscoveryError::NoPendingAttempt,
+                })?;
+        let kind = attempt.kind();
+        let read = transport
+            .search(SearchOperation::new(attempt, expected_device))
+            .map_err(|source| SearchExecutionError::Transport {
+                attempt: kind,
+                source,
+            })?;
+
+        match read.end() {
+            SearchReadEnd::Complete => {
+                let response = discovery
+                    .accept_candidates(&[read.bytes()])
+                    .map_err(|source| SearchExecutionError::Validation {
+                        attempt: kind,
+                        source,
+                    })?;
+                return Ok(SearchOutcome::Identified(IdentifiedSearch {
+                    attempt: kind,
+                    response,
+                }));
+            }
+            SearchReadEnd::TimedOut if read.received_len() != 0 => {
+                return Err(SearchExecutionError::PartialTimeout {
+                    attempt: kind,
+                    received: read.received_len(),
+                });
+            }
+            SearchReadEnd::TimedOut => {
+                let state = discovery.timeout_current().map_err(|source| {
+                    SearchExecutionError::Validation {
+                        attempt: kind,
+                        source,
+                    }
+                })?;
+                if state == DiscoveryState::Exhausted {
+                    return Ok(SearchOutcome::Exhausted);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use dcx_core::{
+        discovery::{FALLBACK_BAUD, PRIMARY_BAUD, SerialFlowControl, SerialParity},
+        protocol::{ProtocolError, Query},
+    };
+
+    use super::*;
+
+    #[derive(Debug, Error)]
+    #[error("synthetic transport failure")]
+    struct FakeError;
+
+    enum Step {
+        Read(SearchRead),
+        Fail,
+    }
+
+    #[derive(Default)]
+    struct FakeTransport {
+        steps: VecDeque<Step>,
+        operations: Vec<SearchOperation>,
+    }
+
+    impl FakeTransport {
+        fn new(steps: impl IntoIterator<Item = Step>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                operations: Vec::new(),
+            }
+        }
+    }
+
+    impl SearchTransport for FakeTransport {
+        type Error = FakeError;
+
+        fn search(&mut self, operation: SearchOperation) -> Result<SearchRead, Self::Error> {
+            self.operations.push(operation);
+            match self.steps.pop_front().expect("test supplied a step") {
+                Step::Read(read) => Ok(read),
+                Step::Fail => Err(FakeError),
+            }
+        }
+    }
+
+    fn synthetic_response(device: u8) -> [u8; SEARCH_RESPONSE_LIMIT] {
+        let mut frame = [0; SEARCH_RESPONSE_LIMIT];
+        frame[..7].copy_from_slice(&[0xf0, 0x00, 0x20, 0x32, device, 0x0e, 0x00]);
+        frame[7..25].copy_from_slice(b"SYNTHETIC-IDENTITY");
+        frame[25] = 0xf7;
+        frame
+    }
+
+    fn assert_operation(operation: SearchOperation, kind: DiscoveryAttemptKind, baud: u32) {
+        assert_eq!(operation.attempt(), kind);
+        assert_eq!(operation.expected_device(), DeviceId::new(0).unwrap());
+        assert_eq!(operation.settings().baud(), baud);
+        assert_eq!(operation.settings().data_bits(), 8);
+        assert_eq!(operation.settings().stop_bits(), 1);
+        assert_eq!(operation.settings().parity(), SerialParity::None);
+        assert_eq!(operation.settings().flow_control(), SerialFlowControl::None);
+        assert_eq!(operation.request().as_bytes(), &SEARCH_REQUEST_BYTES);
+        assert_eq!(operation.timeout(), Duration::from_millis(500));
+        assert_eq!(operation.response_limit(), 26);
+    }
+
+    #[test]
+    fn exact_search_request_cannot_drift_from_the_pure_typed_query() {
+        assert_eq!(
+            Query::Search.encode().unwrap().as_slice(),
+            SEARCH_REQUEST_BYTES
+        );
+    }
+
+    #[test]
+    fn exact_primary_identity_stops_after_one_attempt() {
+        let frame = synthetic_response(0);
+        let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
+
+        let outcome = execute_search(&mut transport, DeviceId::new(0).unwrap()).unwrap();
+        let SearchOutcome::Identified(identity) = outcome else {
+            panic!("expected exact identity")
+        };
+        assert_eq!(identity.attempt(), DiscoveryAttemptKind::Primary);
+        assert_eq!(identity.device(), DeviceId::new(0).unwrap());
+        assert_eq!(identity.response().opaque_payload(), b"SYNTHETIC-IDENTITY");
+        assert_eq!(transport.operations.len(), 1);
+        assert_operation(
+            transport.operations[0],
+            DiscoveryAttemptKind::Primary,
+            PRIMARY_BAUD,
+        );
+    }
+
+    #[test]
+    fn one_empty_primary_timeout_unlocks_exactly_one_fallback() {
+        let frame = synthetic_response(0);
+        let mut transport = FakeTransport::new([
+            Step::Read(SearchRead::timed_out(&[]).unwrap()),
+            Step::Read(SearchRead::complete(&frame).unwrap()),
+        ]);
+
+        let outcome = execute_search(&mut transport, DeviceId::new(0).unwrap()).unwrap();
+        let SearchOutcome::Identified(identity) = outcome else {
+            panic!("expected fallback identity")
+        };
+        assert_eq!(identity.attempt(), DiscoveryAttemptKind::SingleFallback);
+        assert_eq!(transport.operations.len(), MAX_SEARCH_ATTEMPTS);
+        assert_operation(
+            transport.operations[0],
+            DiscoveryAttemptKind::Primary,
+            PRIMARY_BAUD,
+        );
+        assert_operation(
+            transport.operations[1],
+            DiscoveryAttemptKind::SingleFallback,
+            FALLBACK_BAUD,
+        );
+    }
+
+    #[test]
+    fn two_empty_timeouts_exhaust_without_a_third_attempt() {
+        let mut transport = FakeTransport::new([
+            Step::Read(SearchRead::timed_out(&[]).unwrap()),
+            Step::Read(SearchRead::timed_out(&[]).unwrap()),
+        ]);
+
+        assert!(matches!(
+            execute_search(&mut transport, DeviceId::new(0).unwrap()).unwrap(),
+            SearchOutcome::Exhausted
+        ));
+        assert_eq!(transport.operations.len(), MAX_SEARCH_ATTEMPTS);
+    }
+
+    #[test]
+    fn partial_timeout_stops_without_fallback() {
+        let mut transport =
+            FakeTransport::new([Step::Read(SearchRead::timed_out(&[0xf0, 0x00]).unwrap())]);
+
+        assert!(matches!(
+            execute_search(&mut transport, DeviceId::new(0).unwrap()),
+            Err(SearchExecutionError::PartialTimeout {
+                attempt: DiscoveryAttemptKind::Primary,
+                received: 2,
+            })
+        ));
+        assert_eq!(transport.operations.len(), 1);
+    }
+
+    #[test]
+    fn invalid_identity_stops_without_fallback() {
+        let frame = synthetic_response(1);
+        let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
+
+        assert!(matches!(
+            execute_search(&mut transport, DeviceId::new(0).unwrap()),
+            Err(SearchExecutionError::Validation {
+                attempt: DiscoveryAttemptKind::Primary,
+                source: DiscoveryError::UnexpectedDevice {
+                    expected: 0,
+                    actual: 1,
+                },
+            })
+        ));
+        assert_eq!(transport.operations.len(), 1);
+    }
+
+    #[test]
+    fn transport_error_stops_without_fallback() {
+        let mut transport = FakeTransport::new([Step::Fail]);
+
+        assert!(matches!(
+            execute_search(&mut transport, DeviceId::new(0).unwrap()),
+            Err(SearchExecutionError::Transport {
+                attempt: DiscoveryAttemptKind::Primary,
+                ..
+            })
+        ));
+        assert_eq!(transport.operations.len(), 1);
+    }
+
+    #[test]
+    fn malformed_exact_length_frame_stops_without_fallback() {
+        let mut frame = synthetic_response(0);
+        frame[5] = 0x0f;
+        let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
+
+        assert!(matches!(
+            execute_search(&mut transport, DeviceId::new(0).unwrap()),
+            Err(SearchExecutionError::Validation {
+                source: DiscoveryError::Protocol(ProtocolError::WrongModel(0x0f)),
+                ..
+            })
+        ));
+        assert_eq!(transport.operations.len(), 1);
+    }
+
+    #[test]
+    fn read_debug_output_redacts_raw_identity_bytes() {
+        let frame = synthetic_response(0);
+        let debug = format!("{:?}", SearchRead::complete(&frame).unwrap());
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("SYNTHETIC"));
+    }
+}
