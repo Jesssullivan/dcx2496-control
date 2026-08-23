@@ -22,6 +22,10 @@ test:
 transport-check:
     cargo test --locked --package dcx-transport --all-targets --all-features
 
+# Exercise the Darwin carrier only through its injected fake syscall boundary.
+darwin-carrier-check:
+    cargo test --locked --package dcx-darwin-tty --all-targets --all-features
+
 fixtures:
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
@@ -44,7 +48,7 @@ check: fmt-check lint test fixtures lockfiles
 
 bazel-check:
     bazelisk test //:check
-    bazelisk build //:dcxctl
+    bazelisk build //:dcxctl //crates/dcx-darwin-tty:dcx_darwin_tty
 
 nix-check:
     nix flake check
