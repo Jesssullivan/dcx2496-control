@@ -1,0 +1,12 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_binary(
+    name = "dcxctl",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = ["//crates/dcx-core:dcx_core"] + all_crate_deps(normal = True),
+)

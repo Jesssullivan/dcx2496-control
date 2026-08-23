@@ -1,0 +1,27 @@
+DCX2496 Control
+Copyright 2026 Jess Sullivan
+
+The repository began as the private Jesssullivan/dcx-server repository. Its
+original README and MIT license are preserved in Git history; the original MIT
+license remains in LICENSE. New work is available under MIT OR Apache-2.0.
+
+Protocol constants and quantization mappings in this foundation are inferred
+implementation hypotheses from public behavioral descriptions. They are not
+observed device facts, compatibility proof, or authorization to send bytes.
+Useful behavioral references reviewed for this offline foundation include:
+
+- Behringer ULTRADRIVE PRO DCX2496 manual, Music Tribe.
+- DuinoDCX by Lasse Lukkari, MIT license, revision
+  00b9d70d6192e993f31ec94ff0bc20e6e2265b2c (behavioral reference only,
+  resolved 2026-08-22): https://github.com/lasselukkari/DuinoDCX
+  Its license is reproduced in third_party/duinodcx/LICENSE.
+- UltradrivePi protocol notes by geftactics; no repository license was present
+  when reviewed on 2026-08-22, so it is an incompatible/uncertain-license
+  behavioral reference only and no source code or prose was copied. Revision
+  259fa83f6555be6c5707b437dfdcafc90bb19de5 was resolved 2026-08-22:
+  https://github.com/geftactics/UltradrivePi
+
+Synthetic fixtures in fixtures/ are original test data. They are clearly
+marked and establish deterministic behavior only; they must not be cited as
+hardware evidence. All hardware claims remain unverified pending a separately
+reviewed, query-only named-device receipt.

@@ -1,0 +1,4 @@
+Equaliser: Generic
+Filter 1: ON PK Fc 63.0 Hz Gain -3.2 dB Q 4.00
+Filter 2: ON PK Fc 125.0 Hz Gain -1.5 dB Q 2.00
+Filter 3: OFF PK Fc 250.0 Hz Gain 1.0 dB Q 1.00
