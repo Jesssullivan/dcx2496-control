@@ -195,6 +195,8 @@ pub enum CarrierStage {
     SnapshotControlLines,
     /// Apply exact raw 8N1/no-flow settings.
     Configure,
+    /// Check queued input before configuration or the sole outbound write.
+    CheckPreexistingInput,
     /// Perform the sole eight-byte write syscall.
     Write,
     /// Query queued input without consuming bytes.
@@ -223,6 +225,8 @@ pub enum CarrierFailureKind {
     System,
     /// The sole write did not accept exactly eight bytes.
     ShortWrite,
+    /// Input was already queued before the Search write.
+    PreexistingInput,
     /// More than 26 input bytes were pending.
     Overflow,
     /// The tty reached end-of-file.
@@ -256,6 +260,12 @@ pub enum DarwinCarrierError {
     ShortWrite {
         /// Number accepted by the single syscall.
         written: usize,
+    },
+    /// Input was queued before configuration or the Search write.
+    #[error("Search blocked because {queued} pre-existing input bytes were queued")]
+    PreexistingInput {
+        /// Bytes observed without consuming or flushing them.
+        queued: usize,
     },
     /// More bytes were queued than the exact response budget permits.
     #[error("Search response overflow: {received} received and {queued} additional queued")]
@@ -295,6 +305,7 @@ impl DarwinCarrierError {
             Self::Deadline { .. } => CarrierFailureKind::Deadline,
             Self::System { .. } | Self::Cleanup { .. } => CarrierFailureKind::System,
             Self::ShortWrite { .. } => CarrierFailureKind::ShortWrite,
+            Self::PreexistingInput { .. } => CarrierFailureKind::PreexistingInput,
             Self::Overflow { .. } => CarrierFailureKind::Overflow,
             Self::EndOfFile { .. } => CarrierFailureKind::EndOfFile,
             Self::ReadInvariant(_) => CarrierFailureKind::ReadInvariant,
@@ -330,6 +341,8 @@ pub enum SanitizedAttemptOutcome {
     DeadlineExceeded,
     /// The sole write was short.
     ShortWrite,
+    /// Input was already queued before any Search byte was transmitted.
+    PreexistingInput,
     /// Additional input was detected without crossing the 26-byte ceiling.
     Overflow,
     /// The tty reached EOF.
@@ -531,19 +544,18 @@ impl<B: SerialBackend> SearchTransport for Carrier<B> {
     }
 }
 
+type AttemptResult = (
+    Result<SearchRead, DarwinCarrierError>,
+    SanitizedAttemptReceipt,
+);
+
 fn run_attempt<B: SerialBackend>(
     binding: &PrivateTtyBinding,
     backend: &mut B,
     operation: SearchOperation,
-) -> (
-    Result<SearchRead, DarwinCarrierError>,
-    SanitizedAttemptReceipt,
-) {
+) -> AttemptResult {
     let start = backend.monotonic_now();
-    let whole_attempt_deadline = start
-        .checked_add(operation.timeout())
-        .unwrap_or(Duration::MAX);
-    let active_io_deadline = whole_attempt_deadline.saturating_sub(SEARCH_CLEANUP_RESERVE);
+    let active_io_deadline = active_io_deadline(start, operation.timeout());
     let mut receipt = ReceiptBuilder::new(binding, operation);
     let mut opened = false;
     let mut configuration_attempted = false;
@@ -574,11 +586,13 @@ fn run_attempt<B: SerialBackend>(
                 .map_err(|fault| system_error(CarrierStage::SnapshotControlLines, fault))?,
         );
 
+        reject_preexisting_input(backend, active_io_deadline)?;
         ensure_before_deadline(backend, active_io_deadline, CarrierStage::Configure)?;
         configuration_attempted = true;
         backend
             .configure(&snapshot, operation.settings().baud())
             .map_err(|fault| system_error(CarrierStage::Configure, fault))?;
+        reject_preexisting_input(backend, active_io_deadline)?;
         ensure_before_deadline(backend, active_io_deadline, CarrierStage::Write)?;
 
         let written = backend
@@ -648,6 +662,26 @@ fn run_attempt<B: SerialBackend>(
     }
     let outcome = classify_outcome(&result);
     (result, receipt.finish(elapsed, outcome))
+}
+
+fn active_io_deadline(start: Duration, timeout: Duration) -> Duration {
+    let whole = start.checked_add(timeout).unwrap_or(Duration::MAX);
+    whole.saturating_sub(SEARCH_CLEANUP_RESERVE)
+}
+
+fn reject_preexisting_input<B: SerialBackend>(
+    backend: &mut B,
+    deadline: Duration,
+) -> Result<(), DarwinCarrierError> {
+    ensure_before_deadline(backend, deadline, CarrierStage::CheckPreexistingInput)?;
+    let queued = backend
+        .bytes_available()
+        .map_err(|fault| system_error(CarrierStage::CheckPreexistingInput, fault))?;
+    if queued == 0 {
+        Ok(())
+    } else {
+        Err(DarwinCarrierError::PreexistingInput { queued })
+    }
 }
 
 fn ensure_before_deadline<B: SerialBackend>(
@@ -746,6 +780,9 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         Err(DarwinCarrierError::System { .. }) => SanitizedAttemptOutcome::SystemError,
         Err(DarwinCarrierError::Deadline { .. }) => SanitizedAttemptOutcome::DeadlineExceeded,
         Err(DarwinCarrierError::ShortWrite { .. }) => SanitizedAttemptOutcome::ShortWrite,
+        Err(DarwinCarrierError::PreexistingInput { .. }) => {
+            SanitizedAttemptOutcome::PreexistingInput
+        }
         Err(DarwinCarrierError::Overflow { .. }) => SanitizedAttemptOutcome::Overflow,
         Err(DarwinCarrierError::EndOfFile { .. }) => SanitizedAttemptOutcome::EndOfFile,
         Err(DarwinCarrierError::ReadInvariant(_)) => SanitizedAttemptOutcome::ReadInvariant,

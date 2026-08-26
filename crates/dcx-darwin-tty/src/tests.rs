@@ -35,6 +35,9 @@ struct FakeBackend {
     fail_at: Option<CarrierStage>,
     advance_at: Option<(CarrierStage, Duration)>,
     opened: bool,
+    written: bool,
+    preexisting_input: usize,
+    preexisting_script: VecDeque<usize>,
 }
 
 impl FakeBackend {
@@ -49,6 +52,9 @@ impl FakeBackend {
             fail_at: None,
             advance_at: None,
             opened: false,
+            written: false,
+            preexisting_input: 0,
+            preexisting_script: VecDeque::new(),
         }
     }
 
@@ -104,11 +110,24 @@ impl SerialBackend for FakeBackend {
     fn write_once(&mut self, bytes: &[u8]) -> Result<usize, SystemFault> {
         self.step(CarrierStage::Write, Call::Write(bytes.len()))?;
         assert_eq!(bytes, &[0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7]);
-        Ok(self.short_write.unwrap_or(bytes.len()))
+        let written = self.short_write.unwrap_or(bytes.len());
+        self.written = true;
+        Ok(written)
     }
 
     fn bytes_available(&mut self) -> Result<usize, SystemFault> {
-        self.step(CarrierStage::BytesAvailable, Call::BytesAvailable)?;
+        let stage = if self.written {
+            CarrierStage::BytesAvailable
+        } else {
+            CarrierStage::CheckPreexistingInput
+        };
+        self.step(stage, Call::BytesAvailable)?;
+        if !self.written {
+            return Ok(self
+                .preexisting_script
+                .pop_front()
+                .unwrap_or(self.preexisting_input));
+        }
         Ok(self
             .available_script
             .pop_front()
@@ -147,6 +166,7 @@ impl SerialBackend for FakeBackend {
     fn close(&mut self) {
         self.calls.push(Call::Close);
         self.opened = false;
+        self.written = false;
     }
 }
 
@@ -183,7 +203,9 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
             Call::Open,
             Call::SnapshotTermios,
             Call::SnapshotControlLines,
+            Call::BytesAvailable,
             Call::Configure(115_200),
+            Call::BytesAvailable,
             Call::Write(8),
             Call::BytesAvailable,
             Call::Read(26),
@@ -202,6 +224,74 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
     assert_eq!(receipt.cleanup_reserve_millis, 25);
     assert_eq!(receipt.rx_digest, Some(Sha256Digest::of_bytes(&response)));
     assert_eq!(receipt.outcome, SanitizedAttemptOutcome::Complete);
+    assert_eq!(receipt.termios_cleanup, CleanupDisposition::Restored);
+    assert_eq!(receipt.control_lines_cleanup, CleanupDisposition::Restored);
+    assert!(receipt.closed);
+}
+
+#[test]
+fn preexisting_input_blocks_write_without_consuming_and_restores() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.preexisting_input = 3;
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(matches!(
+        execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+        Err(SearchExecutionError::Transport {
+            source: DarwinCarrierError::PreexistingInput { queued: 3 },
+            ..
+        })
+    ));
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Write(_)))
+    );
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Configure(_)))
+    );
+    let receipt = &carrier.receipts()[0];
+    assert_eq!(receipt.tx_bytes, 0);
+    assert_eq!(receipt.rx_bytes, 0);
+    assert_eq!(receipt.outcome, SanitizedAttemptOutcome::PreexistingInput);
+    assert_eq!(receipt.termios_cleanup, CleanupDisposition::NotRequired);
+    assert_eq!(
+        receipt.control_lines_cleanup,
+        CleanupDisposition::NotRequired
+    );
+    assert!(receipt.closed);
+}
+
+#[test]
+fn input_arriving_during_configuration_blocks_write_and_restores() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.preexisting_script = [0, 3].into_iter().collect();
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(matches!(
+        execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+        Err(SearchExecutionError::Transport {
+            source: DarwinCarrierError::PreexistingInput { queued: 3 },
+            ..
+        })
+    ));
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Write(_)))
+    );
+    let receipt = &carrier.receipts()[0];
+    assert_eq!(receipt.tx_bytes, 0);
+    assert_eq!(receipt.rx_bytes, 0);
+    assert_eq!(receipt.outcome, SanitizedAttemptOutcome::PreexistingInput);
     assert_eq!(receipt.termios_cleanup, CleanupDisposition::Restored);
     assert_eq!(receipt.control_lines_cleanup, CleanupDisposition::Restored);
     assert!(receipt.closed);
@@ -324,7 +414,7 @@ fn a_short_write_is_never_retried_and_always_restores() {
 }
 
 #[test]
-fn deadline_includes_configuration_and_blocks_the_write_at_500_ms() {
+fn deadline_after_configuration_blocks_the_write_at_preexisting_input_check() {
     let mut backend = FakeBackend::with_inbound([]);
     backend.advance_at = Some((CarrierStage::Configure, Duration::from_millis(500)));
     let mut carrier = Carrier::new(binding(), backend);
@@ -333,7 +423,7 @@ fn deadline_includes_configuration_and_blocks_the_write_at_500_ms() {
         execute_search(&mut carrier, DeviceId::new(0).unwrap()),
         Err(SearchExecutionError::Transport {
             source: DarwinCarrierError::Deadline {
-                stage: CarrierStage::Write,
+                stage: CarrierStage::CheckPreexistingInput,
             },
             ..
         })

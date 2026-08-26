@@ -3,13 +3,15 @@
 Typed, fail-closed building blocks for restoring Behringer ULTRADRIVE PRO
 DCX2496 control in Tinyland's Legacy Audio Lab.
 
-`dcxctl` remains deliberately **offline only**. It can decode fixture bytes,
+`dcxctl` remains deliberately **offline by default**. It can decode fixture bytes,
 construct known read-only query frames, validate/diff complete profiles, plan
 and validate query-only discovery, and quantize Room EQ Wizard Generic EQ text.
 The separate `dcx-transport` crate adds an injected Search-only boundary.
 `dcx-darwin-tty` binds that boundary to one private, digest-checked macOS
-callout node. There is no port enumeration, live CLI, network server, or
-generic byte-write surface.
+callout node. An explicit macOS-only `live-discovery` build adds `discovery
+prepare`, `live`, and `repeat`; the default binary contains none of them. There
+is no port enumeration, network server, arbitrary-frame input, or generic
+byte-write surface.
 
 ## Safety boundary
 
@@ -29,6 +31,9 @@ generic byte-write surface.
   `O_NOCTTY`, obtains `TIOCEXCL`, performs one write syscall, and uses
   `FIONREAD` to detect overflow without consuming byte 27. It never calls
   `tcflush` or toggles DTR/RTS.
+- The carrier checks `FIONREAD` before configuration and again after raw 8N1
+  configuration. Any queued input blocks the write; it is never flushed or
+  consumed as if it were a Search response.
 - Synthetic fixtures are named `SYNTHETIC-*` and are never hardware evidence.
 - Profiles bind the exact Behringer DCX2496 identity, profile ID/revision, and
   all six physical outputs. Omitted or role-swapped outputs fail validation.
@@ -43,15 +48,29 @@ generic byte-write surface.
   activation tokens are required; its privileged state cannot be cloned or
   deserialized.
 
-The carrier is a programmatic primitive, not an operator command or permission
-to probe. Its raw path exists only in a non-cloneable, redacted in-memory
+The carrier is not permission to probe. The feature-gated CLI reads a strict,
+16 KiB maximum envelope only from redirected stdin; interactive stdin is
+rejected. The raw path exists only in a non-cloneable, redacted in-memory
 binding and must match an independently observed `sha256/...` digest immediately
-before open. Only `/dev/cu.usbserial-*` is in scope. Sanitized receipts contain
-the path digest, byte counts, response digest, deadline, and cleanup outcome;
-they never retain a raw path or response. A live Search still requires exact
-current-boot adapter/device evidence and Legalab's explicit attended WORD gate.
-The 38400 fallback remains a bounded compatibility hypothesis, not a vendor
-claim for direct RS-232.
+before open. Only `/dev/cu.usbserial-*` is in scope. The authorization packet
+binds the current LocalHostName, hardware/OS, boot, executable digest, physical
+declarations, evidence revisions, and fixed I/O limits. Sanitized receipts
+contain digests, byte counts, deadlines, cleanup, and an independently
+recomputable `receiptBodyDigest`; they never retain the path, WORD, or raw
+response. A WORD is replayable until its maximum 15-minute expiry, so a fresh
+packet remains required after reboot, binary/profile/source/physical drift, or
+binding change. The 38400 fallback remains a bounded compatibility hypothesis,
+not a vendor claim for direct RS-232.
+
+`discovery repeat` accepts only the complete canonical packet and successful
+receipt body from the first Search, verifies both digests and all bindings, and
+then issues exactly nine Searches at the successful baud. Each trial is spaced
+by at least 500 ms, the session is capped at ten seconds, and the first timeout,
+identity, transport, pacing, or cleanup failure stops the run.
+
+The exact private-envelope fields, prepare/live/repeat workflow, receipt
+mapping, exit behavior, and exact immutable Nix-store transfer are documented in
+[`docs/live-discovery.md`](docs/live-discovery.md).
 
 ## Entrypoints
 
@@ -62,6 +81,7 @@ nix develop
 just check
 just transport-check
 just darwin-carrier-check
+just live-discovery-check
 just bazel-check
 ```
 
@@ -80,7 +100,8 @@ just dcxctl profile diff \
 just dcxctl rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3
 ```
 
-The Bazel graph exposes `//:dcxctl`, `//:check`,
+The Bazel graph exposes feature-free `//:dcxctl`, macOS-only
+`//:dcxctl_live_discovery`, `//:check`,
 `//crates/dcx-transport:all_tests`, and
 `//crates/dcx-darwin-tty:all_tests`. The carrier target runs only fake syscalls;
 CI never opens a tty. Cargo remains the source of Rust dependency truth;

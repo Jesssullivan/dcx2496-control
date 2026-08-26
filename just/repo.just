@@ -26,6 +26,10 @@ transport-check:
 darwin-carrier-check:
     cargo test --locked --package dcx-darwin-tty --all-targets --all-features
 
+# Compile and test the explicit macOS-only live discovery surface without I/O.
+live-discovery-check:
+    cargo test --locked --package dcxctl --features live-discovery
+
 fixtures:
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
@@ -48,10 +52,14 @@ check: fmt-check lint test fixtures lockfiles
 
 bazel-check:
     bazelisk test //:check
-    bazelisk build //:dcxctl //crates/dcx-darwin-tty:dcx_darwin_tty
+    bazelisk build //:dcxctl //:dcxctl_live_discovery //crates/dcx-darwin-tty:dcx_darwin_tty
 
 nix-check:
     nix flake check
+
+# Materialize the exact aarch64-darwin live binary without profile activation.
+live-package:
+    nix build .#dcxctl-live --no-link
 
 security:
     cargo deny check

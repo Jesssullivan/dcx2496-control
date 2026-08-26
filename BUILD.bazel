@@ -16,6 +16,11 @@ alias(
     actual = "//crates/dcxctl",
 )
 
+alias(
+    name = "dcxctl_live_discovery",
+    actual = "//crates/dcxctl:dcxctl_live_discovery",
+)
+
 filegroup(
     name = "safe_profile_fixture",
     srcs = ["fixtures/profiles/safe-muted-v1.json"],
@@ -33,6 +38,7 @@ test_suite(
         "//crates/dcx-core:all_tests",
         "//crates/dcx-darwin-tty:all_tests",
         "//crates/dcx-transport:all_tests",
+        "//crates/dcxctl:live_discovery_unit_tests",
     ],
 )
 

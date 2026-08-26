@@ -1,4 +1,8 @@
-//! Offline-only operator CLI. There is intentionally no serial dependency.
+//! Offline-by-default operator CLI. The explicit Darwin `live-discovery`
+//! feature is the sole serial-capable build.
+
+#[cfg(all(feature = "live-discovery", target_os = "macos"))]
+mod live_discovery;
 
 use std::{
     error::Error,
@@ -90,6 +94,15 @@ enum DiscoveryCommand {
         #[arg(long)]
         expected_device: u8,
     },
+    /// Prepare an exact sanitized WORD packet from a private stdin envelope.
+    #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+    Prepare,
+    /// Run one exact WORD-authorized primary/fallback Search policy.
+    #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+    Live,
+    /// Run exactly nine separately authorized Searches at the proven baud.
+    #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+    Repeat,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -177,6 +190,12 @@ fn discovery(command: DiscoveryCommand) -> Result<(), Box<dyn Error>> {
             let response = discovery.accept_candidates(&[&bytes])?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
+        #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+        DiscoveryCommand::Prepare => live_discovery::run(live_discovery::LiveCommand::Prepare)?,
+        #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+        DiscoveryCommand::Live => live_discovery::run(live_discovery::LiveCommand::Live)?,
+        #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+        DiscoveryCommand::Repeat => live_discovery::run(live_discovery::LiveCommand::Repeat)?,
     }
     Ok(())
 }

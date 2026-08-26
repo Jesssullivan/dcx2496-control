@@ -9,8 +9,8 @@ use std::{error::Error as StdError, fmt, time::Duration};
 
 use dcx_core::{
     discovery::{
-        DiscoveryAttempt, DiscoveryAttemptKind, DiscoveryError, DiscoveryState, QueryOnlyDiscovery,
-        SerialSettings,
+        DiscoveryAttempt, DiscoveryAttemptKind, DiscoveryError, DiscoveryState, FALLBACK_BAUD,
+        PRIMARY_BAUD, QueryOnlyDiscovery, SerialSettings,
     },
     protocol::{DeviceId, SEARCH_RESPONSE_LEN, SearchResponse26},
 };
@@ -26,6 +26,12 @@ pub const SEARCH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MAX_SEARCH_ATTEMPTS: usize = 2;
 /// Nominal sum of the two per-attempt deadlines, excluding immediate errors.
 pub const SEARCH_DISCOVERY_BUDGET: Duration = Duration::from_millis(1_000);
+/// Number of same-baud Search trials authorized after the first identity.
+pub const REPEAT_SEARCH_COUNT: usize = 9;
+/// Minimum delay before every separately authorized repeat Search.
+pub const REPEAT_SEARCH_GAP: Duration = Duration::from_millis(500);
+/// Whole nominal budget for the fixed nine-trial repeat session.
+pub const REPEAT_SEARCH_BUDGET: Duration = Duration::from_secs(10);
 
 const SEARCH_REQUEST_BYTES: [u8; SEARCH_REQUEST_LEN] =
     [0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7];
@@ -99,6 +105,20 @@ impl SearchOperation {
     pub const fn response_limit(self) -> usize {
         SEARCH_RESPONSE_LIMIT
     }
+}
+
+fn operation_for_attempt(
+    attempt: DiscoveryAttemptKind,
+    expected_device: DeviceId,
+) -> Result<SearchOperation, DiscoveryError> {
+    let mut discovery = QueryOnlyDiscovery::new(expected_device);
+    if attempt == DiscoveryAttemptKind::SingleFallback {
+        discovery.timeout_current()?;
+    }
+    discovery
+        .current_attempt()
+        .map(|planned| SearchOperation::new(planned, expected_device))
+        .ok_or(DiscoveryError::NoPendingAttempt)
 }
 
 /// How one bounded adapter read ended.
@@ -217,6 +237,220 @@ pub trait SearchTransport {
     /// Returns an adapter-specific failure. The executor stops immediately
     /// and does not expose the fallback after any adapter error.
     fn search(&mut self, operation: SearchOperation) -> Result<SearchRead, Self::Error>;
+}
+
+/// Injected monotonic clock and delay boundary for an exact repeat session.
+///
+/// Implementations must wait for at least the supplied duration. Keeping this
+/// boundary separate from [`SearchTransport`] leaves ordinary discovery free
+/// of retry or sleep behavior and makes the nine-trial policy testable without
+/// wall-clock delays.
+pub trait RepeatPacer {
+    /// Pacer-specific failure.
+    type Error: StdError + Send + Sync + 'static;
+
+    /// Return monotonic elapsed time from an implementation-owned epoch.
+    fn elapsed(&mut self) -> Duration;
+
+    /// Wait for at least the supplied minimum interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific failure without issuing a Search.
+    fn wait(&mut self, minimum: Duration) -> Result<(), Self::Error>;
+}
+
+/// Reviewed successful baud carried from the first sanitized Search receipt.
+///
+/// This value can represent only the two settings already present in the
+/// immutable discovery policy. It cannot introduce an arbitrary line rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatSearchBinding {
+    expected_device: DeviceId,
+    successful_attempt: DiscoveryAttemptKind,
+}
+
+impl RepeatSearchBinding {
+    /// Bind a separately authorized repeat session to the first successful
+    /// Search baud and expected device address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepeatBindingError::UnsupportedBaud`] for any rate outside
+    /// the fixed primary/fallback policy.
+    pub fn from_successful_baud(
+        expected_device: DeviceId,
+        successful_baud: u32,
+    ) -> Result<Self, RepeatBindingError> {
+        let successful_attempt = match successful_baud {
+            PRIMARY_BAUD => DiscoveryAttemptKind::Primary,
+            FALLBACK_BAUD => DiscoveryAttemptKind::SingleFallback,
+            baud => return Err(RepeatBindingError::UnsupportedBaud(baud)),
+        };
+        Ok(Self {
+            expected_device,
+            successful_attempt,
+        })
+    }
+
+    /// Expected device address from the first successful receipt.
+    pub const fn expected_device(self) -> DeviceId {
+        self.expected_device
+    }
+
+    /// Successful first-attempt baud pinned for all nine trials.
+    pub const fn successful_baud(self) -> u32 {
+        match self.successful_attempt {
+            DiscoveryAttemptKind::Primary => PRIMARY_BAUD,
+            DiscoveryAttemptKind::SingleFallback => FALLBACK_BAUD,
+        }
+    }
+}
+
+/// Invalid first-success evidence for a repeat session.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatBindingError {
+    /// Only the primary and sole fallback baud rates can be repeated.
+    #[error("successful Search baud {0} is outside the fixed discovery policy")]
+    UnsupportedBaud(u32),
+}
+
+/// Sanitized success summary for all nine same-baud trials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatedSearch {
+    expected_device: DeviceId,
+    successful_baud: u32,
+    valid_response_count: usize,
+}
+
+impl RepeatedSearch {
+    /// Expected and observed device address for every response.
+    pub const fn device(self) -> DeviceId {
+        self.expected_device
+    }
+
+    /// Baud rate reused from the first successful Search.
+    pub const fn baud(self) -> u32 {
+        self.successful_baud
+    }
+
+    /// Number of valid responses, always nine for a returned value.
+    pub const fn valid_response_count(self) -> usize {
+        self.valid_response_count
+    }
+}
+
+/// Terminal failure from the fixed repeat executor.
+#[derive(Debug, Error)]
+pub enum RepeatSearchError<T: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>
+{
+    /// The injected pacer failed before the named trial.
+    #[error("repeat pacing failed before trial {trial}")]
+    Pacing {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Pacer-specific cause.
+        #[source]
+        source: P,
+    },
+    /// The ten-second whole-session budget was exceeded.
+    #[error("repeat session exceeded its 10 second budget at trial {trial}")]
+    BudgetExceeded {
+        /// One-based repeat trial number.
+        trial: usize,
+    },
+    /// The injected carrier failed; no later trial is eligible.
+    #[error("repeat Search transport failed during trial {trial}")]
+    Transport {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Carrier-specific cause.
+        #[source]
+        source: T,
+    },
+    /// A repeat timed out, including an empty timeout; no fallback is allowed.
+    #[error("repeat Search timed out with {received} bytes during trial {trial}")]
+    Timeout {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Bounded bytes received before the deadline.
+        received: usize,
+    },
+    /// Exact response or expected-device validation failed.
+    #[error("repeat Search validation failed during trial {trial}: {source}")]
+    Validation {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Pure discovery failure.
+        #[source]
+        source: DiscoveryError,
+    },
+}
+
+/// Execute exactly nine same-baud Searches from reviewed first-success evidence.
+///
+/// Every trial is preceded by at least 500 ms of injected pacing. The baud is
+/// pinned to the successful primary or fallback rate; a repeat never restarts
+/// discovery and therefore can never change baud. Any timeout, invalid response,
+/// transport error, pacing error, or whole-session budget overrun stops without
+/// issuing a later trial. Opaque response payloads are validated but neither
+/// retained nor compared for equality.
+///
+/// # Errors
+///
+/// Returns [`RepeatSearchError`] on the first terminal failure.
+pub fn execute_search_repeat<T: SearchTransport, P: RepeatPacer>(
+    transport: &mut T,
+    pacer: &mut P,
+    binding: RepeatSearchBinding,
+) -> Result<RepeatedSearch, RepeatSearchError<T::Error, P::Error>> {
+    let start = pacer.elapsed();
+    let operation = operation_for_attempt(binding.successful_attempt, binding.expected_device)
+        .map_err(|source| RepeatSearchError::Validation { trial: 1, source })?;
+
+    for index in 0..REPEAT_SEARCH_COUNT {
+        let trial = index + 1;
+        pacer
+            .wait(REPEAT_SEARCH_GAP)
+            .map_err(|source| RepeatSearchError::Pacing { trial, source })?;
+        let elapsed = pacer.elapsed().saturating_sub(start);
+        if elapsed > REPEAT_SEARCH_BUDGET.saturating_sub(operation.timeout()) {
+            return Err(RepeatSearchError::BudgetExceeded { trial });
+        }
+
+        let read = transport
+            .search(operation)
+            .map_err(|source| RepeatSearchError::Transport { trial, source })?;
+        if pacer.elapsed().saturating_sub(start) > REPEAT_SEARCH_BUDGET {
+            return Err(RepeatSearchError::BudgetExceeded { trial });
+        }
+
+        match read.end() {
+            SearchReadEnd::Complete => {
+                let mut discovery = QueryOnlyDiscovery::new(binding.expected_device);
+                if binding.successful_attempt == DiscoveryAttemptKind::SingleFallback {
+                    discovery
+                        .timeout_current()
+                        .map_err(|source| RepeatSearchError::Validation { trial, source })?;
+                }
+                discovery
+                    .accept_candidates(&[read.bytes()])
+                    .map_err(|source| RepeatSearchError::Validation { trial, source })?;
+            }
+            SearchReadEnd::TimedOut => {
+                return Err(RepeatSearchError::Timeout {
+                    trial,
+                    received: read.received_len(),
+                });
+            }
+        }
+    }
+
+    Ok(RepeatedSearch {
+        expected_device: binding.expected_device,
+        successful_baud: binding.successful_baud(),
+        valid_response_count: REPEAT_SEARCH_COUNT,
+    })
 }
 
 /// Successful exact identity returned by the executor.
@@ -392,6 +626,35 @@ mod tests {
         operations: Vec<SearchOperation>,
     }
 
+    #[derive(Debug, Error)]
+    #[error("synthetic pacing failure")]
+    struct FakePacingError;
+
+    #[derive(Default)]
+    struct FakePacer {
+        now: Duration,
+        waits: Vec<Duration>,
+        next_wait: Option<Duration>,
+        fail: bool,
+    }
+
+    impl RepeatPacer for FakePacer {
+        type Error = FakePacingError;
+
+        fn elapsed(&mut self) -> Duration {
+            self.now
+        }
+
+        fn wait(&mut self, minimum: Duration) -> Result<(), Self::Error> {
+            self.waits.push(minimum);
+            if self.fail {
+                return Err(FakePacingError);
+            }
+            self.now += self.next_wait.take().unwrap_or(minimum);
+            Ok(())
+        }
+    }
+
     impl FakeTransport {
         fn new(steps: impl IntoIterator<Item = Step>) -> Self {
             Self {
@@ -563,6 +826,81 @@ mod tests {
             })
         ));
         assert_eq!(transport.operations.len(), 1);
+    }
+
+    #[test]
+    fn repeat_executes_exactly_nine_primary_searches_with_fixed_pacing() {
+        let frame = synthetic_response(0);
+        let steps =
+            (0..REPEAT_SEARCH_COUNT).map(|_| Step::Read(SearchRead::complete(&frame).unwrap()));
+        let mut transport = FakeTransport::new(steps);
+        let mut pacer = FakePacer::default();
+        let binding =
+            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), PRIMARY_BAUD)
+                .unwrap();
+
+        let repeated = execute_search_repeat(&mut transport, &mut pacer, binding).unwrap();
+        assert_eq!(repeated.device(), DeviceId::new(0).unwrap());
+        assert_eq!(repeated.baud(), PRIMARY_BAUD);
+        assert_eq!(repeated.valid_response_count(), REPEAT_SEARCH_COUNT);
+        assert_eq!(transport.operations.len(), REPEAT_SEARCH_COUNT);
+        assert!(transport.operations.iter().all(|operation| {
+            operation.attempt() == DiscoveryAttemptKind::Primary
+                && operation.settings().baud() == PRIMARY_BAUD
+        }));
+        assert_eq!(pacer.waits, [REPEAT_SEARCH_GAP; REPEAT_SEARCH_COUNT]);
+    }
+
+    #[test]
+    fn repeat_pins_fallback_baud_and_stops_on_first_timeout() {
+        let frame = synthetic_response(0);
+        let mut transport = FakeTransport::new([
+            Step::Read(SearchRead::complete(&frame).unwrap()),
+            Step::Read(SearchRead::timed_out(&[]).unwrap()),
+            Step::Read(SearchRead::complete(&frame).unwrap()),
+        ]);
+        let mut pacer = FakePacer::default();
+        let binding =
+            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), FALLBACK_BAUD)
+                .unwrap();
+
+        assert!(matches!(
+            execute_search_repeat(&mut transport, &mut pacer, binding),
+            Err(RepeatSearchError::Timeout {
+                trial: 2,
+                received: 0,
+            })
+        ));
+        assert_eq!(transport.operations.len(), 2);
+        assert!(transport.operations.iter().all(|operation| {
+            operation.attempt() == DiscoveryAttemptKind::SingleFallback
+                && operation.settings().baud() == FALLBACK_BAUD
+        }));
+        assert_eq!(pacer.waits.len(), 2);
+    }
+
+    #[test]
+    fn repeat_rejects_unknown_baud_and_insufficient_remaining_budget() {
+        assert_eq!(
+            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), 9_600),
+            Err(RepeatBindingError::UnsupportedBaud(9_600))
+        );
+
+        let frame = synthetic_response(0);
+        let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
+        let mut pacer = FakePacer {
+            next_wait: Some(Duration::from_millis(9_501)),
+            ..FakePacer::default()
+        };
+        let binding =
+            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), PRIMARY_BAUD)
+                .unwrap();
+
+        assert!(matches!(
+            execute_search_repeat(&mut transport, &mut pacer, binding),
+            Err(RepeatSearchError::BudgetExceeded { trial: 1 })
+        ));
+        assert!(transport.operations.is_empty());
     }
 
     #[test]
