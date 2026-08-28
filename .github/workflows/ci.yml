@@ -57,8 +57,17 @@ jobs:
             > "$artifact/flake-lock.sha256"
           printf 'sha256/%s\n' "$(shasum -a 256 "$LIVE_STORE/bin/dcxctl" | awk '{print $1}')" \
             > "$artifact/binary.sha256"
-          nix path-info --json --recursive "$LIVE_STORE" \
-            | jq -S 'sort_by(.path)' > "$artifact/closure-path-info.json"
+          nix path-info --json --json-format 1 --recursive "$LIVE_STORE" \
+            | jq -S '
+                if type == "object" then
+                  to_entries | map(.value + {path: .key})
+                elif type == "array" then
+                  .
+                else
+                  error("unexpected nix path-info JSON shape")
+                end
+                | sort_by(.path)
+              ' > "$artifact/closure-path-info.json"
 
           jq -e --arg store "$LIVE_STORE" '
             type == "array" and length > 0 and
