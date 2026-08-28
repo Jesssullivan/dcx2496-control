@@ -2,8 +2,8 @@
 //!
 //! This crate does not enumerate or open ports and has no operating-system
 //! serial dependency. It exposes one operation: the exact broadcast Search
-//! request. A separately reviewed adapter may implement [`SearchTransport`]
-//! after satisfying Legalab's hardware gate.
+//! request. A platform adapter may implement [`SearchTransport`]; Legalab owns
+//! the external hardware and operator preconditions for invoking it.
 
 use std::{error::Error as StdError, fmt, time::Duration};
 
@@ -26,9 +26,9 @@ pub const SEARCH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MAX_SEARCH_ATTEMPTS: usize = 2;
 /// Nominal sum of the two per-attempt deadlines, excluding immediate errors.
 pub const SEARCH_DISCOVERY_BUDGET: Duration = Duration::from_millis(1_000);
-/// Number of same-baud Search trials authorized after the first identity.
+/// Number of same-baud Search trials after the first identity.
 pub const REPEAT_SEARCH_COUNT: usize = 9;
-/// Minimum delay before every separately authorized repeat Search.
+/// Minimum delay before every repeat Search.
 pub const REPEAT_SEARCH_GAP: Duration = Duration::from_millis(500);
 /// Whole nominal budget for the fixed nine-trial repeat session.
 pub const REPEAT_SEARCH_BUDGET: Duration = Duration::from_secs(10);
@@ -260,10 +260,7 @@ pub trait RepeatPacer {
     fn wait(&mut self, minimum: Duration) -> Result<(), Self::Error>;
 }
 
-/// Reviewed successful baud carried from the first sanitized Search receipt.
-///
-/// This value can represent only the two settings already present in the
-/// immutable discovery policy. It cannot introduce an arbitrary line rate.
+/// Successful attempt derived directly from the first validated Search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepeatSearchBinding {
     expected_device: DeviceId,
@@ -271,26 +268,12 @@ pub struct RepeatSearchBinding {
 }
 
 impl RepeatSearchBinding {
-    /// Bind a separately authorized repeat session to the first successful
-    /// Search baud and expected device address.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RepeatBindingError::UnsupportedBaud`] for any rate outside
-    /// the fixed primary/fallback policy.
-    pub fn from_successful_baud(
-        expected_device: DeviceId,
-        successful_baud: u32,
-    ) -> Result<Self, RepeatBindingError> {
-        let successful_attempt = match successful_baud {
-            PRIMARY_BAUD => DiscoveryAttemptKind::Primary,
-            FALLBACK_BAUD => DiscoveryAttemptKind::SingleFallback,
-            baud => return Err(RepeatBindingError::UnsupportedBaud(baud)),
-        };
-        Ok(Self {
-            expected_device,
-            successful_attempt,
-        })
+    /// Derive the repeat session from the successful typed Search result.
+    pub const fn from_identified(search: &IdentifiedSearch) -> Self {
+        Self {
+            expected_device: search.device(),
+            successful_attempt: search.attempt(),
+        }
     }
 
     /// Expected device address from the first successful receipt.
@@ -305,14 +288,6 @@ impl RepeatSearchBinding {
             DiscoveryAttemptKind::SingleFallback => FALLBACK_BAUD,
         }
     }
-}
-
-/// Invalid first-success evidence for a repeat session.
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum RepeatBindingError {
-    /// Only the primary and sole fallback baud rates can be repeated.
-    #[error("successful Search baud {0} is outside the fixed discovery policy")]
-    UnsupportedBaud(u32),
 }
 
 /// Sanitized success summary for all nine same-baud trials.
@@ -697,6 +672,13 @@ mod tests {
         assert_eq!(operation.response_limit(), 26);
     }
 
+    fn identified(attempt: DiscoveryAttemptKind, device: u8) -> IdentifiedSearch {
+        IdentifiedSearch {
+            attempt,
+            response: SearchResponse26::parse(&synthetic_response(device)).unwrap(),
+        }
+    }
+
     #[test]
     fn exact_search_request_cannot_drift_from_the_pure_typed_query() {
         assert_eq!(
@@ -830,14 +812,14 @@ mod tests {
 
     #[test]
     fn repeat_executes_exactly_nine_primary_searches_with_fixed_pacing() {
+        assert_eq!(REPEAT_SEARCH_COUNT, 9);
         let frame = synthetic_response(0);
         let steps =
             (0..REPEAT_SEARCH_COUNT).map(|_| Step::Read(SearchRead::complete(&frame).unwrap()));
         let mut transport = FakeTransport::new(steps);
         let mut pacer = FakePacer::default();
-        let binding =
-            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), PRIMARY_BAUD)
-                .unwrap();
+        let first = identified(DiscoveryAttemptKind::Primary, 0);
+        let binding = RepeatSearchBinding::from_identified(&first);
 
         let repeated = execute_search_repeat(&mut transport, &mut pacer, binding).unwrap();
         assert_eq!(repeated.device(), DeviceId::new(0).unwrap());
@@ -860,9 +842,8 @@ mod tests {
             Step::Read(SearchRead::complete(&frame).unwrap()),
         ]);
         let mut pacer = FakePacer::default();
-        let binding =
-            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), FALLBACK_BAUD)
-                .unwrap();
+        let first = identified(DiscoveryAttemptKind::SingleFallback, 0);
+        let binding = RepeatSearchBinding::from_identified(&first);
 
         assert!(matches!(
             execute_search_repeat(&mut transport, &mut pacer, binding),
@@ -880,21 +861,15 @@ mod tests {
     }
 
     #[test]
-    fn repeat_rejects_unknown_baud_and_insufficient_remaining_budget() {
-        assert_eq!(
-            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), 9_600),
-            Err(RepeatBindingError::UnsupportedBaud(9_600))
-        );
-
+    fn repeat_rejects_insufficient_remaining_budget() {
         let frame = synthetic_response(0);
         let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
         let mut pacer = FakePacer {
             next_wait: Some(Duration::from_millis(9_501)),
             ..FakePacer::default()
         };
-        let binding =
-            RepeatSearchBinding::from_successful_baud(DeviceId::new(0).unwrap(), PRIMARY_BAUD)
-                .unwrap();
+        let first = identified(DiscoveryAttemptKind::Primary, 0);
+        let binding = RepeatSearchBinding::from_identified(&first);
 
         assert!(matches!(
             execute_search_repeat(&mut transport, &mut pacer, binding),

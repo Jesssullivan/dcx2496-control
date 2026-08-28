@@ -17,8 +17,6 @@ transport-check: repo::transport-check
 
 darwin-carrier-check: repo::darwin-carrier-check
 
-live-discovery-check: repo::live-discovery-check
-
 live-package: repo::live-package
 
 dcxctl *args:

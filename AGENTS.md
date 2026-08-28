@@ -5,11 +5,13 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
 
 - Use `just` as the operator entrypoint and Bazel labels as the build graph.
 - `dcxctl` is offline-only by default. Its sole exception is the explicit
-  macOS-only `live-discovery` feature, which accepts one bounded private stdin
-  envelope and can invoke only the review-gated Search carrier in
-  `dcx-darwin-tty`. Live use still requires Legalab's exact attended WORD gate;
-  no enumeration, arbitrary frame, generic write, or configuration command is
-  allowed.
+  macOS-only `live-discovery` feature, whose `discovery live-search` command
+  accepts one named callout path, sends only the typed Search query, and runs
+  exactly nine repeats at the discovered baud. It never enumerates ports or
+  exposes arbitrary frames, generic writes, or configuration commands.
+- Legalab owns physical/operator readiness before invoking live Search. Do not
+  duplicate Legalab decisions, evidence schemas, or authorization ceremonies in
+  this device repository.
 - Unknown identity, state, route, or value is an error. Never infer that an
   output is safe or muted.
 - Tests use synthetic or explicitly sanitized fixtures. Never commit captures,

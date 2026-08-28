@@ -1,7 +1,7 @@
 //! Darwin-only, Search-only tty carrier for the DCX2496 discovery boundary.
 //!
-//! The public carrier exists only on macOS. It accepts one private, in-memory
-//! callout-device binding and implements only [`SearchTransport`]. There is no
+//! The public carrier exists only on macOS. It accepts one explicit, validated
+//! callout-device path and implements only [`SearchTransport`]. There is no
 //! port enumeration, CLI, generic byte-write method, retry loop, or retained
 //! raw capture. Tests exercise the same state machine through injected fake
 //! syscalls without opening any device.
@@ -23,7 +23,6 @@ use thiserror::Error;
 
 const PRIVATE_CALLOUT_PREFIX: &[u8] = b"/dev/cu.usbserial-";
 const SHA256_PREFIX: &str = "sha256/";
-const SHA256_HEX_LEN: usize = 64;
 /// Portion of the 500 ms whole-attempt budget reserved for restoration/close.
 pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
 
@@ -32,32 +31,6 @@ pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
 pub struct Sha256Digest([u8; 32]);
 
 impl Sha256Digest {
-    /// Parse the exact `sha256/<64 lower-case hex>` receipt form.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BindingError::InvalidDigest`] for any other representation.
-    pub fn parse(value: &str) -> Result<Self, BindingError> {
-        let Some(hex) = value.strip_prefix(SHA256_PREFIX) else {
-            return Err(BindingError::InvalidDigest);
-        };
-        if hex.len() != SHA256_HEX_LEN
-            || !hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(BindingError::InvalidDigest);
-        }
-
-        let mut bytes = [0_u8; 32];
-        let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
-        debug_assert!(remainder.is_empty());
-        for (index, pair) in pairs.iter().enumerate() {
-            bytes[index] = (decode_hex(pair[0]) << 4) | decode_hex(pair[1]);
-        }
-        Ok(Self(bytes))
-    }
-
     fn of_bytes(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
     }
@@ -85,59 +58,35 @@ impl Serialize for Sha256Digest {
     }
 }
 
-const fn decode_hex(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => 0,
-    }
-}
-
-/// A private callout path paired with an independently observed path digest.
+/// One explicit Darwin callout path for the Search-only carrier.
 ///
-/// The raw path is intentionally not cloneable, serializable, displayable, or
-/// accessible after construction. Callers must obtain it through a private
-/// in-process channel; command-line and environment-variable transport are not
-/// provided. The digest is recomputed immediately before every open.
+/// The path is validated at construction and again immediately before every
+/// open. It is intentionally omitted from `Debug` and carrier receipts.
 pub struct PrivateTtyBinding {
     path: PathBuf,
-    expected_digest: Sha256Digest,
+    digest: Sha256Digest,
 }
 
 impl PrivateTtyBinding {
-    /// Bind one exact FTDI-style Darwin callout path to an independent digest.
+    /// Bind one exact FTDI-style Darwin callout path.
     ///
     /// # Errors
     ///
     /// Returns [`BindingError`] when the path is outside the narrow
-    /// `/dev/cu.usbserial-*` envelope, the digest is malformed, or the supplied
-    /// path does not match it.
-    pub fn new(path: PathBuf, expected_digest: &str) -> Result<Self, BindingError> {
+    /// `/dev/cu.usbserial-*` callout namespace.
+    pub fn new(path: PathBuf) -> Result<Self, BindingError> {
         validate_private_path(&path)?;
-        let expected_digest = Sha256Digest::parse(expected_digest)?;
-        let binding = Self {
-            path,
-            expected_digest,
-        };
-        binding.verify()?;
-        Ok(binding)
+        let digest = Sha256Digest::of_bytes(path.as_os_str().as_bytes());
+        Ok(Self { path, digest })
     }
 
     /// Return only the sanitized path digest.
     pub const fn digest(&self) -> Sha256Digest {
-        self.expected_digest
+        self.digest
     }
 
     fn verify(&self) -> Result<(), BindingError> {
-        validate_private_path(&self.path)?;
-        let actual = Sha256Digest::of_bytes(self.path.as_os_str().as_bytes());
-        if actual != self.expected_digest {
-            return Err(BindingError::DigestMismatch {
-                expected: self.expected_digest,
-                actual,
-            });
-        }
-        Ok(())
+        validate_private_path(&self.path)
     }
 }
 
@@ -146,7 +95,7 @@ impl fmt::Debug for PrivateTtyBinding {
         formatter
             .debug_struct("PrivateTtyBinding")
             .field("path", &"[redacted]")
-            .field("digest", &self.expected_digest)
+            .field("digest", &self.digest)
             .finish()
     }
 }
@@ -162,30 +111,19 @@ fn validate_private_path(path: &Path) -> Result<(), BindingError> {
     Ok(())
 }
 
-/// Fail-closed private-binding validation failures.
+/// Fail-closed callout-path validation failures.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum BindingError {
-    /// Digest syntax was not the canonical lower-case SHA-256 form.
-    #[error("binding digest is not canonical sha256/<64 lower-case hex>")]
-    InvalidDigest,
     /// The path was not one exact FTDI-style Darwin callout node.
-    #[error("private tty binding is outside the approved Darwin callout envelope")]
+    #[error("tty path is outside the supported Darwin callout namespace")]
     UnsupportedPrivatePath,
-    /// The in-memory path did not match the independently supplied digest.
-    #[error("private tty binding digest mismatch (expected {expected}, observed {actual})")]
-    DigestMismatch {
-        /// Independently observed digest.
-        expected: Sha256Digest,
-        /// Digest recomputed from the private path.
-        actual: Sha256Digest,
-    },
 }
 
 /// A named carrier operation suitable for sanitized failure receipts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CarrierStage {
-    /// Revalidate the private path digest.
+    /// Revalidate the explicit callout path.
     VerifyBinding,
     /// Open the callout with the declared nonblocking/no-controlling-tty policy.
     OpenExclusive,
@@ -242,7 +180,7 @@ pub enum CarrierFailureKind {
 /// Error from one Darwin Search attempt.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DarwinCarrierError {
-    /// Exact private binding failed before any open.
+    /// Exact callout-path validation failed before any open.
     #[error(transparent)]
     Binding(#[from] BindingError),
     /// The monotonic 500 ms attempt deadline expired.
@@ -382,7 +320,7 @@ impl From<SearchOperation> for SanitizedAttemptKind {
 pub struct SanitizedAttemptReceipt {
     /// Primary or sole fallback attempt.
     pub attempt: SanitizedAttemptKind,
-    /// Independently supplied private-path digest.
+    /// Digest of the validated callout path; the path itself is never emitted.
     pub binding_digest: Sha256Digest,
     /// Requested line rate.
     pub baud: u32,
@@ -805,12 +743,11 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
     }
 }
 
-/// Review-gated macOS implementation of the typed Search-only transport.
+/// macOS implementation of the typed Search-only transport.
 ///
 /// Construction does not open a descriptor. Each `search` call revalidates the
-/// private binding, opens one descriptor, performs one bounded attempt, restores
-/// prior state, and closes. A live call still requires Legalab's attended
-/// hardware WORD gate; this type does not represent authorization.
+/// callout path, opens one descriptor, performs one bounded attempt, restores
+/// prior state, and closes. Legalab owns any external operator authorization.
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
 pub struct DarwinSearchTransport {
     inner: Carrier<macos::MacOsBackend>,
@@ -818,7 +755,7 @@ pub struct DarwinSearchTransport {
 
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
 impl DarwinSearchTransport {
-    /// Create an inert carrier for one already validated private binding.
+    /// Create an inert carrier for one already validated callout path.
     pub fn new(binding: PrivateTtyBinding) -> Self {
         Self {
             inner: Carrier::new(binding, macos::MacOsBackend::new()),

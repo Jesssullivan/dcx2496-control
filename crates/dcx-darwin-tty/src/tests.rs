@@ -204,9 +204,7 @@ fn synthetic_response(device: u8) -> [u8; SEARCH_RESPONSE_LIMIT] {
 }
 
 fn binding() -> PrivateTtyBinding {
-    let path = PathBuf::from(SYNTHETIC_PATH);
-    let digest = Sha256Digest::of_bytes(path.as_os_str().as_bytes()).to_string();
-    PrivateTtyBinding::new(path, &digest).unwrap()
+    PrivateTtyBinding::new(PathBuf::from(SYNTHETIC_PATH)).unwrap()
 }
 
 #[test]
@@ -632,7 +630,7 @@ fn generated_read_partitions_never_cross_the_26_byte_ceiling() {
 }
 
 #[test]
-fn binding_and_receipt_debug_output_never_expose_the_private_path_or_payload() {
+fn binding_and_receipt_debug_output_never_expose_the_path_or_payload() {
     let binding = binding();
     let debug = format!("{binding:?}");
     assert!(!debug.contains(SYNTHETIC_PATH));
@@ -648,27 +646,11 @@ fn binding_and_receipt_debug_output_never_expose_the_private_path_or_payload() {
 }
 
 #[test]
-fn private_binding_rejects_noncanonical_digest_and_non_callout_paths() {
+fn explicit_binding_rejects_non_callout_paths() {
     assert!(matches!(
-        PrivateTtyBinding::new(PathBuf::from(SYNTHETIC_PATH), "SHA256/not-canonical"),
-        Err(BindingError::InvalidDigest)
-    ));
-    let digest = Sha256Digest::of_bytes(b"not-a-callout").to_string();
-    assert!(matches!(
-        PrivateTtyBinding::new(PathBuf::from("not-a-callout"), &digest),
+        PrivateTtyBinding::new(PathBuf::from("not-a-callout")),
         Err(BindingError::UnsupportedPrivatePath)
     ));
-}
-
-#[test]
-fn binding_digest_mismatch_is_sanitized_and_prevents_construction() {
-    let expected = Sha256Digest::of_bytes(b"different-private-binding");
-    let error =
-        PrivateTtyBinding::new(PathBuf::from(SYNTHETIC_PATH), &expected.to_string()).unwrap_err();
-    assert!(matches!(error, BindingError::DigestMismatch { .. }));
-    let message = error.to_string();
-    assert!(!message.contains(SYNTHETIC_PATH));
-    assert!(message.contains("digest mismatch"));
 }
 
 #[test]

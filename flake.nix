@@ -1,5 +1,5 @@
 {
-  description = "Offline-first DCX2496 control and gated Darwin discovery";
+  description = "Offline-first DCX2496 control with explicit Darwin live Search";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

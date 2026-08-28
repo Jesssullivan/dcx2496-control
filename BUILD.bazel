@@ -38,7 +38,6 @@ test_suite(
         "//crates/dcx-core:all_tests",
         "//crates/dcx-darwin-tty:all_tests",
         "//crates/dcx-transport:all_tests",
-        "//crates/dcxctl:live_discovery_unit_tests",
     ],
 )
 

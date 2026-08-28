@@ -3,99 +3,56 @@
 Typed, fail-closed building blocks for restoring Behringer ULTRADRIVE PRO
 DCX2496 control in Tinyland's Legacy Audio Lab.
 
-`dcxctl` remains deliberately **offline by default**. It can decode fixture bytes,
-construct known read-only query frames, validate/diff complete profiles, plan
-and validate query-only discovery, and quantize Room EQ Wizard Generic EQ text.
-The separate `dcx-transport` crate adds an injected Search-only boundary.
-`dcx-darwin-tty` binds that boundary to one private, digest-checked macOS
-callout node. An explicit macOS-only `live-discovery` build adds `discovery
-prepare`, `live`, and `repeat`; the default binary contains none of them. There
-is no port enumeration, network server, arbitrary-frame input, or generic
-byte-write surface.
+`dcxctl` is offline by default. It decodes fixture bytes, constructs known
+read-only query frames, validates and diffs complete profiles, plans discovery,
+and quantizes Room EQ Wizard Generic EQ text. The macOS-only `live-discovery`
+feature adds one hardware command: a typed Search followed by exactly nine
+same-baud repeats.
 
-## Safety boundary
+There is no port enumeration, server, arbitrary-frame input, generic byte-write
+surface, or configuration command.
 
-- A valid frame is not proof of a connected or compatible device.
-- Discovery accepts exactly one complete 26-byte search response with the
-  expected device address. Partial, ambiguous, wrong-manufacturer, wrong-model,
-  wrong-function, and wrong-address evidence fails closed; its 18-byte payload
-  remains opaque.
-- The pure discovery plan is exactly 115200 8N1 followed by one 38400 8N1
-  fallback after an explicit timeout. It does not open or name a transport.
-- The injected executor supplies only the exact eight-byte Search request. Each
-  attempt has a 500 ms total adapter deadline and a 26-byte input ceiling; the
-  sole fallback is eligible only after an empty primary timeout. Partial input,
-  malformed or wrong identity, and transport errors stop without fallback.
-- The Darwin carrier reserves 25 ms of that monotonic budget for mandatory
-  termios/control-line restoration and close. It opens nonblocking with
-  `O_NOCTTY`, obtains `TIOCEXCL`, performs one write syscall, and uses
-  `FIONREAD` to detect overflow without consuming byte 27. It never calls
-  `tcflush` or toggles DTR/RTS.
-- The carrier checks `FIONREAD` before configuration and again after raw 8N1
-  configuration. Any queued input blocks the write; it is never flushed or
-  consumed as if it were a Search response.
-- Synthetic fixtures are named `SYNTHETIC-*` and are never hardware evidence.
-- Profiles bind the exact Behringer DCX2496 identity, profile ID/revision, and
-  all six physical outputs. Omitted or role-swapped outputs fail validation.
-- Input C is line mode with Auto Align, Auto EQ, and +15 V disabled. O5/O6 are
-  always unused, unrouted, at -15 dB, and muted.
-- Exact subwoofer and Alto PA models remain unverified in the fixtures, so the
-  explicit apply-readiness gate blocks them even though offline diffing works.
-- An unmuted output requires an explicit source and enabled limiter.
-- REW imports are strictly bounded and cut-only; there is no boost option.
-- The pure state machine treats panic as unverified/faulted, not as confirmed
-  mute. Exact device/plan/profile readback and distinct expiring apply and
-  activation tokens are required; its privileged state cannot be cloned or
-  deserialized.
+## Live Search
 
-The carrier is not permission to probe. The feature-gated CLI reads a strict,
-16 KiB maximum envelope only from redirected stdin; interactive stdin is
-rejected. One fixed, non-growing parse buffer and a Deserialize-only envelope
-briefly hold the raw input. Normal, error, and drop paths explicitly clear the
-buffer, and the path is then moved into a non-cloneable, redacted binding before
-open; production code cannot clone or serialize the envelope, and neither form
-is emitted or persisted. This clearing is bounded in-process hygiene, not a
-claim of compiler-guaranteed zeroization: serde-owned path/authorization
-allocations remain process-private until consumed and dropped. The path must
-match an independently observed `sha256/...` digest immediately before open.
-Only `/dev/cu.usbserial-*` is in scope. The
-authorization packet binds the current LocalHostName, hardware/OS, boot,
-executable digest, physical declarations, closed Legalab decision/claim/review
-references, distinct DCX safe-muted and Legalab integration profile digests,
-and fixed I/O limits. The sanitized `prepare` response exposes only the
-semantic action and packet digest; Legalab derives the WORD transiently at its
-attended surface. Native receipts contain digests, byte counts, deadlines,
-verified-restoration cleanup, and an independently recomputable
-`receiptBodyDigest`; they never retain the path, WORD, or raw response. A WORD
-is replayable until its maximum 15-minute expiry, so a fresh packet remains
-required after reboot, binary/profile/source/physical drift, or binding change.
-The 38400 fallback remains a bounded compatibility hypothesis, not a vendor
-claim for direct RS-232.
-
-`discovery repeat` accepts only the complete canonical packet and successful
-receipt body from the first Search, verifies both digests and all bindings, and
-then issues exactly nine Searches at the successful baud. Each trial is spaced
-by at least 500 ms, the session is capped at ten seconds, and the first timeout,
-identity, transport, pacing, or cleanup failure stops the run.
-
-The exact private-envelope contract, prepare/live/repeat behavior, receipt
-mapping, blocked future artifact contract, and Legalab-owned execution boundary
-are documented in [`docs/live-discovery.md`](docs/live-discovery.md).
-
-## Entrypoints
-
-Use the pinned Nix environment and Just recipes:
+The live command accepts one explicit FTDI callout node:
 
 ```sh
-nix develop
-just check
-just transport-check
-just darwin-carrier-check
-just live-discovery-check
-just bazel-check
+dcxctl discovery live-search \
+  --tty /dev/cu.usbserial-EXACT_DEVICE \
+  --expected-device 0
 ```
 
-Offline examples:
+One invocation performs the complete discovery milestone:
+
+1. Open the named callout exclusively and try the fixed Search query at 115200
+   baud, 8N1.
+2. Try 38400 only after an empty primary timeout.
+3. Validate the exact 26-byte Behringer/DCX response and expected device
+   address.
+4. Derive the successful baud from that typed response path and issue exactly
+   nine more Searches at the same baud.
+5. Print structured JSON with the parsed identity, selected baud, valid-response
+   count, and carrier diagnostics.
+
+The caller cannot choose a repeat baud, repeat count, request bytes, timeout, or
+fallback policy. Legalab owns physical readiness and operator authorization
+before this command is invoked; this repository does not mirror those records.
+
+## Serial boundary
+
+- The only outbound frame is the eight-byte Search request.
+- Every attempt has a 500 ms total deadline and 26-byte input ceiling.
+- Fallback is allowed only after zero bytes at 115200. Partial input, invalid
+  identity, overflow, or transport failure stops immediately.
+- The Darwin carrier opens nonblocking with `O_NOCTTY`, obtains `TIOCEXCL`, and
+  performs one write syscall per attempt.
+- Existing queued input blocks a write; it is never flushed or consumed as a
+  response.
+- Termios and modem control lines are snapshotted, restored, read back exactly,
+  and the descriptor is closed on every opened path.
+- Raw callout paths and response payloads are omitted from diagnostic output.
+
+## Offline commands
 
 ```sh
 just dcxctl query search
@@ -110,28 +67,28 @@ just dcxctl profile diff \
 just dcxctl rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3
 ```
 
-The Bazel graph exposes feature-free `//:dcxctl`, macOS-only
-`//:dcxctl_live_discovery`, `//:check`,
-`//crates/dcx-transport:all_tests`, and
-`//crates/dcx-darwin-tty:all_tests`. The carrier target runs only fake syscalls;
-CI never opens a tty. Cargo remains the source of Rust dependency truth;
-Bzlmod's crate-universe derives its external graph from the committed
-`Cargo.lock`. CI also requires committed `MODULE.bazel.lock` and `flake.lock`.
+## Build and validation
 
-## Protocol status
+`just` is the operator front door and Bazel is the build graph:
 
-The envelope and parameter encodings are research hypotheses until checked
-against a safely commissioned DCX. See `NOTICE` for sources and provenance.
-Unsupported functions remain typed as unknown; the parser does not speculate
-about payload meaning. Arbitrary parsed messages cannot be constructed or
-encoded through the public API: only typed, read-only queries can emit bytes.
+```sh
+nix develop
+just check
+just bazel-check
+just live-package
+```
 
-The repository was initialized as `dcx-server` with the goal of a complete
-Linux/web/mobile stack. That historical README and its MIT license remain in
-Git history. Legalab's current epoch narrows this repository to a portable,
-testable control core without a network service.
+The Bazel graph exposes the default `//:dcxctl`, the macOS-only
+`//:dcxctl_live_discovery`, and the transport/carrier test suites. Tests use
+injected transports and synthetic fixtures; they never open a device. The live
+Nix package is available only for `aarch64-darwin`.
 
-## License
+## Scope
 
-New work is licensed under either Apache-2.0 or MIT, at your option. The
-original MIT text remains in `LICENSE`; Apache-2.0 is in `LICENSE-APACHE`.
+A valid Search response establishes protocol identity and address only. The
+remaining response payload stays opaque until observed behavior supports a
+typed interpretation. Snapshot, semantic diff, apply/readback, and rollback are
+the next product phases; no blind write is implemented here.
+
+New work is licensed under either Apache-2.0 or MIT, at your option. See
+`NOTICE`, `LICENSE`, and `LICENSE-APACHE`.

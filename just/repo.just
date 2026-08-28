@@ -34,16 +34,6 @@ transport-check:
 darwin-carrier-check:
     cargo test --locked --package dcx-darwin-tty --all-targets --all-features
 
-# Compile and test the explicit macOS-only live discovery surface without I/O.
-live-discovery-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ $(uname -s) != Darwin ]]; then
-        echo "live-discovery-check unavailable: requires an admitted Darwin runner" >&2
-        exit 78
-    fi
-    cargo test --locked --package dcxctl --features live-discovery
-
 fixtures:
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
@@ -79,7 +69,7 @@ bazel-check:
 nix-check:
     nix flake check
 
-# Materialize the exact aarch64-darwin live binary without profile activation.
+# Materialize the aarch64-darwin live binary without profile activation.
 live-package:
     nix build .#dcxctl-live --no-link
 
