@@ -17,12 +17,11 @@ The command performs one uninterrupted Search-and-repeat transaction:
 
 1. Validate the explicit `/dev/cu.usbserial-*` callout path and expected DCX
    address.
-2. Search at 115200 baud, 8N1, with a 500 ms whole-attempt deadline.
-3. Search once at 38400 only if the primary attempt times out with zero bytes.
-4. Require one exact 26-byte Behringer/DCX Search response at the expected
+2. Search at the MVP golden-path 38400 baud binding, 8N1, with a 500 ms
+   whole-attempt deadline.
+3. Require one exact 26-byte Behringer/DCX Search response at the expected
    address.
-5. Derive the successful baud from the validated attempt.
-6. Wait at least five seconds before each of exactly nine same-baud repeats,
+4. Wait at least five seconds before each of exactly nine same-baud repeats,
    matching the cadence of the pinned behavioral reference and stopping on the
    first timeout, identity failure, carrier failure, or 60-second repeat budget
    overrun.
@@ -40,7 +39,7 @@ the fixed eight-byte Search frame, reads at most 26 bytes, restores and verifies
 the original state, and closes the descriptor. A failed restoration is a failed
 operation even if the response itself was valid.
 
-The command has no options for request bytes, retry count, fallback rate,
+The command has no options for request bytes, retry count, baud rate,
 timeout, serial format, or arbitrary output. The feature-free `dcxctl` binary
 contains no serial-capable command.
 

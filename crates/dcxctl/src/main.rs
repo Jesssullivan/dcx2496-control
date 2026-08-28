@@ -94,7 +94,7 @@ enum DiscoveryCommand {
         #[arg(long)]
         expected_device: u8,
     },
-    /// Run one DCX Search and nine repeats at the discovered baud.
+    /// Run one DCX Search and nine repeats at the MVP 38400 binding.
     #[cfg(all(feature = "live-discovery", target_os = "macos"))]
     LiveSearch {
         /// Exact Darwin FTDI callout node; ports are never enumerated.

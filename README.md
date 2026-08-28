@@ -24,26 +24,24 @@ dcxctl discovery live-search \
 
 One invocation performs the complete discovery milestone:
 
-1. Open the named callout exclusively and try the fixed Search query at 115200
-   baud, 8N1.
-2. Try 38400 only after an empty primary timeout.
-3. Validate the exact 26-byte Behringer/DCX response and expected device
+1. Open the named callout exclusively and issue the fixed Search query at the
+   MVP golden-path 38400 baud binding, 8N1.
+2. Validate the exact 26-byte Behringer/DCX response and expected device
    address.
-4. Derive the successful baud from that typed response path and issue exactly
-   nine more Searches at the same baud, paced five seconds apart.
-5. Print structured JSON with the parsed identity, selected baud, valid-response
+3. Issue exactly nine more Searches at the same baud, paced five seconds apart.
+4. Print structured JSON with the parsed identity, selected baud, valid-response
    count, and carrier diagnostics.
 
 The caller cannot choose a repeat baud, repeat count, request bytes, timeout, or
-fallback policy. Legalab owns physical readiness and operator authorization
+initial-baud policy. Legalab owns physical readiness and operator authorization
 before this command is invoked; this repository does not mirror those records.
 
 ## Serial boundary
 
 - The only outbound frame is the eight-byte Search request.
 - Every attempt has a 500 ms total deadline and 26-byte input ceiling.
-- Fallback is allowed only after zero bytes at 115200. Partial input, invalid
-  identity, overflow, or transport failure stops immediately.
+- Partial input, invalid identity, overflow, timeout, or transport failure stops
+  immediately.
 - The Darwin carrier opens nonblocking with `O_NOCTTY`, obtains `TIOCEXCL`, and
   performs one write syscall per attempt.
 - Existing queued input blocks a write; it is never flushed or consumed as a

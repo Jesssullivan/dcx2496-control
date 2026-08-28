@@ -1,4 +1,4 @@
-//! Thin macOS runner for one DCX Search followed by nine pinned-baud repeats.
+//! Thin macOS runner for one known-38400 Search and nine repeats.
 
 use std::{
     convert::Infallible,
@@ -9,14 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dcx_core::{
-    discovery::{DiscoveryAttemptKind, FALLBACK_BAUD, PRIMARY_BAUD},
-    protocol::DeviceId,
-};
+use dcx_core::protocol::DeviceId;
 use dcx_darwin_tty::{DarwinSearchTransport, PrivateTtyBinding};
 use dcx_transport::{
-    REPEAT_SEARCH_COUNT, RepeatPacer, RepeatSearchBinding, SEARCH_RESPONSE_LIMIT, SearchOutcome,
-    execute_search, execute_search_repeat,
+    Known38400SearchOutcome, REPEAT_SEARCH_COUNT, RepeatPacer, RepeatSearchBinding,
+    SEARCH_RESPONSE_LIMIT, execute_known_38400_search, execute_search_repeat,
 };
 
 const RESULT_SCHEMA: &str = "dcx.live-search-result/v1";
@@ -69,16 +66,17 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
     let binding = PrivateTtyBinding::new(tty)?;
     let mut transport = DarwinSearchTransport::new(binding);
 
-    let first = match execute_search(&mut transport, expected) {
-        Ok(SearchOutcome::Identified(identity)) => identity,
-        Ok(SearchOutcome::Exhausted) => {
+    let first = match execute_known_38400_search(&mut transport, expected) {
+        Ok(Known38400SearchOutcome::Identified(identity)) => identity,
+        Ok(Known38400SearchOutcome::TimedOut) => {
             let attempts = transport.take_receipts();
             return fail(
                 "initial_search",
-                "no response at 115200 or 38400 baud",
+                "no response at the MVP 38400 baud binding",
                 serde_json::json!({
                     "schemaVersion": RESULT_SCHEMA,
                     "status": "not_found",
+                    "searchBinding": "known_38400",
                     "expectedDevice": expected_device,
                     "attempts": attempts,
                 }),
@@ -94,6 +92,7 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
                     "schemaVersion": RESULT_SCHEMA,
                     "status": "failed",
                     "phase": "initial_search",
+                    "searchBinding": "known_38400",
                     "expectedDevice": expected_device,
                     "error": &detail,
                     "attempts": attempts,
@@ -102,11 +101,8 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let selected_baud = match first.attempt() {
-        DiscoveryAttemptKind::Primary => PRIMARY_BAUD,
-        DiscoveryAttemptKind::SingleFallback => FALLBACK_BAUD,
-    };
     let repeat_binding = RepeatSearchBinding::from_identified(&first);
+    let selected_baud = repeat_binding.successful_baud();
     let mut pacer = SystemPacer::new();
 
     match execute_search_repeat(&mut transport, &mut pacer, repeat_binding) {
@@ -116,6 +112,7 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
             emit(&serde_json::json!({
                 "schemaVersion": RESULT_SCHEMA,
                 "status": "identified",
+                "searchBinding": "known_38400",
                 "protocolIdentity": {
                     "manufacturer": "Behringer",
                     "model": "DCX2496",
@@ -142,6 +139,7 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
                     "schemaVersion": RESULT_SCHEMA,
                     "status": "failed",
                     "phase": "repeat_search",
+                    "searchBinding": "known_38400",
                     "protocolIdentity": {
                         "manufacturer": "Behringer",
                         "model": "DCX2496",

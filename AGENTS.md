@@ -7,7 +7,7 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
 - `dcxctl` is offline-only by default. Its sole exception is the explicit
   macOS-only `live-discovery` feature, whose `discovery live-search` command
   accepts one named callout path, sends only the typed Search query, and runs
-  exactly nine repeats at the discovered baud. It never enumerates ports or
+  exactly nine repeats at the MVP 38400 binding. It never enumerates ports or
   exposes arbitrary frames, generic writes, or configuration commands.
 - Legalab owns physical/operator readiness before invoking live Search. Do not
   duplicate Legalab decisions, evidence schemas, or authorization ceremonies in

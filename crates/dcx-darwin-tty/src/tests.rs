@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, path::PathBuf, time::Duration};
 
-use dcx_core::{discovery::DiscoveryAttemptKind, protocol::DeviceId};
-use dcx_transport::{SearchExecutionError, SearchOutcome, execute_search};
+use dcx_core::protocol::DeviceId;
+use dcx_transport::{SearchExecutionError, SearchOperationKind, SearchOutcome, execute_search};
 
 use super::*;
 
@@ -218,7 +218,7 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
     else {
         panic!("expected exact identity")
     };
-    assert_eq!(identity.attempt(), DiscoveryAttemptKind::Primary);
+    assert_eq!(identity.kind(), SearchOperationKind::Primary);
     assert_eq!(carrier.backend.inbound.len(), 0);
     assert_eq!(
         carrier.backend.calls,

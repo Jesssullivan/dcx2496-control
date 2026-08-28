@@ -14,8 +14,8 @@ use std::{
 };
 
 use dcx_transport::{
-    SEARCH_RESPONSE_LIMIT, SearchOperation, SearchRead, SearchReadEnd, SearchReadError,
-    SearchTransport,
+    SEARCH_RESPONSE_LIMIT, SearchOperation, SearchOperationKind, SearchRead, SearchReadEnd,
+    SearchReadError, SearchTransport,
 };
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -295,7 +295,7 @@ pub enum SanitizedAttemptOutcome {
     CleanupFailed,
 }
 
-/// Primary or sole fallback attempt represented in a sanitized receipt.
+/// Closed Search operation kind represented in a sanitized receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SanitizedAttemptKind {
@@ -303,13 +303,16 @@ pub enum SanitizedAttemptKind {
     Primary,
     /// One 38400 baud compatibility fallback.
     SingleFallback,
+    /// Direct 38400 operation for the observed MVP binding.
+    Known38400,
 }
 
 impl From<SearchOperation> for SanitizedAttemptKind {
     fn from(operation: SearchOperation) -> Self {
-        match operation.attempt() {
-            dcx_core::discovery::DiscoveryAttemptKind::Primary => Self::Primary,
-            dcx_core::discovery::DiscoveryAttemptKind::SingleFallback => Self::SingleFallback,
+        match operation.kind() {
+            SearchOperationKind::Primary => Self::Primary,
+            SearchOperationKind::SingleFallback => Self::SingleFallback,
+            SearchOperationKind::Known38400 => Self::Known38400,
         }
     }
 }
@@ -318,7 +321,7 @@ impl From<SearchOperation> for SanitizedAttemptKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SanitizedAttemptReceipt {
-    /// Primary or sole fallback attempt.
+    /// Closed Search operation kind.
     pub attempt: SanitizedAttemptKind,
     /// Digest of the validated callout path; the path itself is never emitted.
     pub binding_digest: Sha256Digest,
