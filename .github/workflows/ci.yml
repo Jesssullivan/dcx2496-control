@@ -23,6 +23,80 @@ jobs:
       - name: Validate Bazel graph
         run: nix develop --command just bazel-check
       - name: Materialize gated Darwin discovery binary
-        run: nix build .#dcxctl-live --no-link
+        id: live-build
+        run: |
+          set -euo pipefail
+          live_store=$(nix build .#dcxctl-live --no-link --print-out-paths)
+          if [[ ! $live_store =~ ^/nix/store/[a-z0-9]{32}-dcxctl-live-0\.1\.0$ ]]; then
+            printf 'unexpected live package path: %q\n' "$live_store" >&2
+            exit 1
+          fi
+          test -x "$live_store/bin/dcxctl"
+          printf 'store-path=%s\n' "$live_store" >> "$GITHUB_OUTPUT"
       - name: Supply-chain policy
         run: nix develop --command just repo::security
+      - name: Export provenance-bound live discovery cache
+        id: live-export
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          LIVE_STORE: ${{ steps.live-build.outputs.store-path }}
+        run: |
+          set -euo pipefail
+          artifact="$RUNNER_TEMP/dcxctl-live-artifact"
+          mkdir -p "$artifact/nix-cache"
+
+          test -x "$LIVE_STORE/bin/dcxctl"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_tree=$(git show -s --format=%T "$GITHUB_SHA")
+
+          nix copy --to "file://$artifact/nix-cache" "$LIVE_STORE"
+          printf '%s\n' "$LIVE_STORE" > "$artifact/out-path.txt"
+          printf '%s\n' "$GITHUB_SHA" > "$artifact/source-revision.txt"
+          printf '%s\n' "$source_tree" > "$artifact/source-tree.txt"
+          printf 'sha256/%s\n' "$(shasum -a 256 flake.lock | awk '{print $1}')" \
+            > "$artifact/flake-lock.sha256"
+          printf 'sha256/%s\n' "$(shasum -a 256 "$LIVE_STORE/bin/dcxctl" | awk '{print $1}')" \
+            > "$artifact/binary.sha256"
+          nix path-info --json --recursive "$LIVE_STORE" \
+            | jq -S 'sort_by(.path)' > "$artifact/closure-path-info.json"
+
+          jq -e --arg store "$LIVE_STORE" '
+            type == "array" and length > 0 and
+            all(.[];
+              (.path | type == "string") and
+              (.narHash | type == "string") and
+              (.narSize | type == "number") and
+              (.references | type == "array")
+            ) and
+            any(.[]; .path == $store)
+          ' "$artifact/closure-path-info.json" >/dev/null
+          test -s "$artifact/nix-cache/nix-cache-info"
+          printf 'artifact-directory=%s\n' "$artifact" >> "$GITHUB_OUTPUT"
+      - name: Upload merged live discovery cache
+        id: live-upload
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dcxctl-live-${{ github.sha }}
+          path: ${{ steps.live-export.outputs.artifact-directory }}/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+          retention-days: 14
+      - name: Record merged artifact identity
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          ARTIFACT_DIGEST: ${{ steps.live-upload.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.live-upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.live-upload.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          {
+            printf '## Gated Darwin discovery artifact\n\n'
+            printf -- '- Source revision: %s\n' "$GITHUB_SHA"
+            printf -- '- Run ID: %s\n' "$GITHUB_RUN_ID"
+            printf -- '- Artifact ID: %s\n' "$ARTIFACT_ID"
+            printf -- '- Artifact digest: sha256/%s\n' "$ARTIFACT_DIGEST"
+            printf -- '- Artifact URL: %s\n' "$ARTIFACT_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

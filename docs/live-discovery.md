@@ -2,176 +2,136 @@
 
 The live surface is present only in the `dcxctl-live` Nix package and the
 Cargo/Bazel `live-discovery` feature. It can send only the fixed eight-byte
-Search request. Keep envelopes, WORD values, native receipts, and the raw tty
-path in an operator-private location outside Git.
+Search request. The default `dcxctl` package and `//:dcxctl` Bazel target remain
+offline-only and contain no live subcommands.
 
-## Build and transfer
+This repository owns the typed carrier and its receipt contract. Legalab owns
+hardware authorization, PZM evidence, exact artifact delivery, private input,
+and execution. Do not substitute a direct shell session, raw SSH command, local
+developer build, port enumeration, or hand-authored envelope for the Legalab
+ceremony.
+
+## Immutable artifact contract
+
+Every pull request compiles and tests the gated package. Only a successful
+`push` workflow for merged `main` exports a runnable artifact named
+`dcxctl-live-<40-hex-merge-sha>`. The artifact contains:
+
+```text
+binary.sha256
+closure-path-info.json
+flake-lock.sha256
+nix-cache/
+out-path.txt
+source-revision.txt
+source-tree.txt
+```
+
+`nix-cache/` is a file-backed Nix binary cache containing the exact recursive
+closure. `closure-path-info.json` records every store path's `narHash`,
+`narSize`, and references. The remaining files bind the output path, executable,
+flake lock, merge revision, and Git tree. The workflow summary records the
+GitHub run ID, artifact ID, artifact URL, and GitHub-computed artifact digest.
+
+The cache is intentionally not a generally trusted substituter. Legalab must
+select the exact successful merged-main run, verify the GitHub artifact digest,
+verify all manifest files and recursive path metadata, then copy that exact
+closure without activating a profile. A local `nix build`, a pull-request
+artifact, a differently named artifact, or an artifact from a non-main event is
+not admissible hardware evidence.
+
+The following commands are build/validation operations only; neither opens a
+TTY:
 
 ```sh
-live_store=$(nix build --no-link --print-out-paths .#dcxctl-live)
-nix copy --to \
-  'ssh-ng://pzm?remote-program=/nix/var/nix/profiles/default/bin/nix-daemon' \
-  "$live_store"
-printf 'Exact copied path: %s\n' "$live_store"
-ssh -t pzm
+nix develop --command just live-discovery-check
+nix develop --command just bazel-check
+nix build .#dcxctl-live --no-link
 ```
 
-This materializes and copies the exact immutable Nix store closure, verified by
-its NAR hash; it does not activate a profile or open a tty. `just live-package`
-performs the local build. After `ssh -t pzm`, set `live_store` inside that PZM
-shell to the exact printed `/nix/store/...` path:
+## Typed execution policy
+
+The feature-gated executable exposes three native subcommands under
+`discovery`: `prepare`, `live`, and `repeat`. They accept one strict JSON object
+from redirected stdin, reject interactive stdin and unknown fields, and cap
+input at 16 KiB. They do not enumerate or accept arbitrary ports, frames,
+queries, baud rates, retry counts, or timeouts.
+
+The Legalab-owned envelope binds all of the following:
+
+- current PZM LocalHostName, hardware model, OS build, boot digest, and exact
+  executable digest;
+- one private `/dev/cu.usbserial-*` callout digest, with the raw path retained
+  only in process memory;
+- the supported standard non-LE DCX2496, firmware 1.17, rear RS-232 connection,
+  verified RS-232 electrical mode, disconnected speakers, and desired device ID
+  0 from the exact safe profile;
+- fresh passive receipt, adapter electrical evidence, profile digest, source
+  revision and tree, issue time, and an expiry no more than 15 minutes later;
+- the exact Search-only byte, baud, deadline, fallback, repeat, and response
+  ceilings.
+
+`prepare` observes and validates the current runtime, constructs the canonical
+packet, and returns the exact required WORD without opening the TTY. Legalab
+keeps the private path and WORD in remote process memory and immediately passes
+the otherwise identical authorized envelope to `live` or `repeat`. A reboot,
+expiry, binding change, executable change, profile/evidence change, source
+change, or physical-declaration change invalidates authorization.
+
+`live` performs one Search policy:
+
+1. attempt 115200 baud, 8N1, no flow control, with a 500 ms whole-attempt
+   deadline;
+2. try 38400 exactly once only if the primary attempt reached its deadline with
+   zero received bytes;
+3. stop on any partial response, identity failure, transport failure, overflow,
+   cleanup failure, or other non-empty primary outcome.
+
+Every attempt opens only the pre-bound callout with `O_NOCTTY`, nonblocking,
+`O_NOFOLLOW`, and `TIOCEXCL`; rejects queued input before and after raw serial
+configuration; performs one write syscall containing
+`F0002032200E40F7`; reads at most 26 bytes; restores termios and control-line
+state; and closes. It never flushes input or toggles DTR/RTS.
+
+`repeat` requires the complete canonical packet and successful receipt body
+from `live`, rehashes both, and checks every runtime, evidence, physical, and
+response binding. It then performs exactly nine Searches at the already proven
+baud, waits at least 500 ms before each trial, and caps the session at ten
+seconds. It never restarts fallback discovery. The first timeout, identity,
+transport, pacing, budget, or cleanup failure ends the session.
+
+## Receipt and failure contract
+
+Native receipts are sanitized JSON. They include the canonical public packet,
+packet and body digests, selected baud, observed device ID, per-attempt byte
+counts and response digests, monotonic elapsed time, cleanup results, and an
+explicit effects record. They never include the raw path, WORD, or raw response.
+Failures emit one sanitized receipt to stdout and exit nonzero.
+
+A successful first receipt proves one valid 26-byte identity response. A
+successful repeat receipt proves nine additional valid responses at the pinned
+baud. Together they are the required 10/10 native observation. The receipts
+explicitly report zero configuration writes and no audio-routing, sound, clock,
+driver, system-extension, SIP, or persistent-host changes.
+
+## Legalab operator entrypoint
+
+Live execution is performed only from the Legalab repository through its
+hardware gate and the lab-owned status-preserving remote wrapper. The owning
+entrypoint is:
 
 ```sh
-live_store=/nix/store/<exact-path-printed-on-the-build-mac>
+scripts/dcx_native_discovery.sh SANITIZED_MANIFEST [PZM_ALIAS]
 ```
 
-Run every remaining command in this document inside that PZM shell. In
-particular, prompt for the private callout path only on PZM; never place it in
-an SSH command, argument, environment variable, local-build-host variable, or
-file. Do not run the copied binary on the build Mac because LocalHostName is
-part of the gate.
+The sanitized manifest binds the verified merged-main artifact, recursive Nix
+closure, fresh current-boot passive evidence, operator-ratified electrical and
+physical evidence, host identity, and safe profile. The remote runner derives
+the one rooted FTDI callout on PZM, retains the raw callout and WORDs only in
+memory, runs `prepare` plus `live` plus a separately prepared `repeat`, and emits
+only the combined sanitized session receipt.
 
-## First Search
-
-Create a sanitized public-field template outside Git, omitting
-`privateTtyPath` and `authorization`. Replace every synthetic value with fresh
-current-boot evidence and Unix timestamps. Digests use exact lower-case
-`sha256/<64 hex>` form; revisions and trees use 40 lower-case Git hex. The
-following full object documents the strict shape, but never persist a version
-containing the real raw path or WORD.
-
-```json
-{
-  "schemaVersion": "dcx.live-discovery-envelope/v1",
-  "action": "search",
-  "privateTtyPath": "/dev/cu.usbserial-SYNTHETIC",
-  "bindingDigest": "sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "expectedHost": {
-    "role": "petting-zoo-mini",
-    "hardwareModel": "Mac16,10",
-    "osBuild": "25G220"
-  },
-  "expectedDeviceId": 0,
-  "physical": {
-    "powered": true,
-    "edition": "standard-non-le",
-    "firmwareVersion": "1.17",
-    "portMode": "RS-232",
-    "rearRs232Connected": true,
-    "adapterRs232ElectricalVerified": true,
-    "speakersDisconnected": true
-  },
-  "evidence": {
-    "passiveReceiptDigest": "sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "passiveCapturedAtUnixSeconds": 1787520000,
-    "adapterElectricalEvidenceDigest": "sha256/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "profileDigest": "sha256/177836a70709a1a12c9bbf52d9a359c691d91c6dcfabe729a1e16b546cf60b0d",
-    "sourceRevision": "PLACEHOLDER-40-HEX-GIT-COMMIT",
-    "sourceTree": "PLACEHOLDER-40-HEX-GIT-TREE"
-  },
-  "issuedAtUnixSeconds": 1787520000,
-  "expiresAtUnixSeconds": 1787520900,
-  "priorSearch": null,
-  "authorization": null
-}
-```
-
-`expectedDeviceId: 0` is the desired address declared by the
-`tinyland-legalab-pzm-dcx2496` safe profile and bound by the exact current
-`profileDigest` above; it is not presented as a front-panel observation. The
-packet labels that basis `desired_profile_declared`. A successful Search proves
-the address from the wire, and an unexpected response emits the sanitized
-observed ID before stopping. Prepare performs host, boot, executable, binding, time,
-declaration, and digest validation without opening the tty. Read the raw callout into a non-exported
-shell variable, inject it through `jq` stdin, and pipe the completed envelope
-directly to the remote process:
-
-```sh
-read -r -s -p 'Private tty callout: ' tty_path; printf '\n' >&2
-prepared_search=$(printf '%s\n' "$tty_path" |
-  jq -Rn --slurpfile base search-public.json \
-    'input as $tty | $base[0] + {privateTtyPath: $tty, authorization: null}' |
-  "$live_store/bin/dcxctl" discovery prepare)
-unset tty_path
-printf '%s\n' "$prepared_search" | jq 'del(.requiredWord)' > prepared-search-sanitized.json
-```
-
-Review the emitted packet and exact `requiredWord`. Put that exact WORD string
-in the otherwise unchanged envelope's `authorization` field, then execute:
-
-```sh
-word=$(printf '%s\n' "$prepared_search" | jq -r .requiredWord)
-read -r -s -p 'Private tty callout: ' tty_path; printf '\n' >&2
-{ printf '%s\n' "$tty_path"; printf '%s\n' "$word"; } |
-  jq -Rn --slurpfile base search-public.json \
-    '[inputs] as $private | $base[0] + {privateTtyPath: $private[0], authorization: $private[1]}' |
-  "$live_store/bin/dcxctl" discovery live > first-search-receipt.json
-unset tty_path word prepared_search
-```
-
-Success exits zero and records one wire-observed device ID. Exhaustion or any
-gate, carrier, identity, deadline, overflow, or cleanup failure emits one
-sanitized JSON receipt to stdout and exits nonzero. The raw path, WORD, and raw
-response never appear in packet or receipt output.
-
-## Nine-trial repeat
-
-The repeat envelope has the same outer fields, `action` is `repeat`, and
-`priorSearch` is required. Populate it only from the exact successful Search
-receipt:
-
-```json
-{
-  "firstPacket": { "copy": "the complete receipt.packet object" },
-  "firstPacketDigest": "copy receipt.packetDigest",
-  "firstReceiptBody": { "copy": "the complete receipt except receiptBodyDigest" },
-  "firstReceiptBodyDigest": "copy receipt.receiptBodyDigest",
-  "firstResponseDigest": "copy the sole receipt.rxDigests value",
-  "bindingDigest": "copy receipt.packet.bindingDigest",
-  "expectedDeviceId": 0,
-  "successfulBaud": 115200,
-  "firstHostIdentityDigest": "copy receipt.packet.host.hostIdentityDigest",
-  "firstBootDigest": "copy receipt.packet.host.bootDigest",
-  "firstExecutableDigest": "copy receipt.packet.host.executableDigest",
-  "firstProfileDigest": "copy receipt.packet.operatorDeclaredEvidence.profileDigest",
-  "firstPassiveReceiptDigest": "copy receipt.packet.operatorDeclaredEvidence.passiveReceiptDigest",
-  "firstAdapterElectricalEvidenceDigest": "copy receipt.packet.operatorDeclaredEvidence.adapterElectricalEvidenceDigest",
-  "firstSourceRevision": "copy receipt.packet.operatorDeclaredEvidence.sourceRevision",
-  "firstSourceTree": "copy receipt.packet.operatorDeclaredEvidence.sourceTree",
-  "firstPhysicalDigest": "copy receipt.packet.operatorDeclaredPhysicalDigest"
-}
-```
-
-`firstPacket` and `firstReceiptBody` above are whole JSON objects, not the
-illustrative `{ "copy": ... }` placeholders. The CLI canonicalizes and rehashes
-both objects, validates the exact primary-only or empty-primary-plus-fallback
-history, and rejects host/boot/executable/profile/source/evidence/physical drift.
-The passive capture timestamp embedded in `firstPacket` must equal the current
-repeat template's `evidence.passiveCapturedAtUnixSeconds`.
-
-```sh
-read -r -s -p 'Private tty callout: ' tty_path; printf '\n' >&2
-prepared_repeat=$(printf '%s\n' "$tty_path" |
-  jq -Rn --slurpfile base repeat-public.json \
-    'input as $tty | $base[0] + {privateTtyPath: $tty, authorization: null}' |
-  "$live_store/bin/dcxctl" discovery prepare)
-unset tty_path
-printf '%s\n' "$prepared_repeat" | jq 'del(.requiredWord)' > prepared-repeat-sanitized.json
-
-word=$(printf '%s\n' "$prepared_repeat" | jq -r .requiredWord)
-read -r -s -p 'Private tty callout: ' tty_path; printf '\n' >&2
-{ printf '%s\n' "$tty_path"; printf '%s\n' "$word"; } |
-  jq -Rn --slurpfile base repeat-public.json \
-    '[inputs] as $private | $base[0] + {privateTtyPath: $private[0], authorization: $private[1]}' |
-  "$live_store/bin/dcxctl" discovery repeat > repeat-receipt.json
-unset tty_path word prepared_repeat
-```
-
-Repeat is fixed at nine same-baud trials, at least 500 ms apart and within ten
-seconds. A WORD is stateless and can be replayed until its maximum 15-minute
-expiry; the binary does not claim one-use consumption. Reboot or any bound
-runtime/evidence change invalidates the packet digest.
-
-Only sanitized prepared/native stdout may be retained, and it remains outside
-Git until Legalab ingests a reviewed receipt. Never persist, log, or add shell
-tracing around the completed raw envelope, callout path, or WORD.
+Do not invoke `dcxctl discovery live` or `repeat` directly for a Legalab proof.
+Do not place a raw callout or WORD in an argument, environment variable, file,
+log, terminal transcript, or workflow artifact. No direct invocation may widen
+the Search-only authority or satisfy the cross-repository evidence gate.

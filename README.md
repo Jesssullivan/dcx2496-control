@@ -68,9 +68,9 @@ then issues exactly nine Searches at the successful baud. Each trial is spaced
 by at least 500 ms, the session is capped at ten seconds, and the first timeout,
 identity, transport, pacing, or cleanup failure stops the run.
 
-The exact private-envelope fields, prepare/live/repeat workflow, receipt
-mapping, exit behavior, and exact immutable Nix-store transfer are documented in
-[`docs/live-discovery.md`](docs/live-discovery.md).
+The exact private-envelope contract, prepare/live/repeat behavior, receipt
+mapping, merged-main artifact layout, and Legalab-owned execution boundary are
+documented in [`docs/live-discovery.md`](docs/live-discovery.md).
 
 ## Entrypoints
 

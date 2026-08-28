@@ -51,8 +51,14 @@ lockfiles:
 check: fmt-check lint test fixtures lockfiles
 
 bazel-check:
-    bazelisk test //:check
-    bazelisk build //:dcxctl //:dcxctl_live_discovery //crates/dcx-darwin-tty:dcx_darwin_tty
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repo_env=()
+    if [[ $(uname -s) == Darwin ]]; then
+        repo_env=(--repo_env=CC=/usr/bin/clang --repo_env=CXX=/usr/bin/clang++)
+    fi
+    bazelisk test "${repo_env[@]}" //:check
+    bazelisk build "${repo_env[@]}" //:dcxctl //:dcxctl_live_discovery //crates/dcx-darwin-tty:dcx_darwin_tty
 
 nix-check:
     nix flake check
