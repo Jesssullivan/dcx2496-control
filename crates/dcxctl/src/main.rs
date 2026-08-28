@@ -94,7 +94,7 @@ enum DiscoveryCommand {
         #[arg(long)]
         expected_device: u8,
     },
-    /// Prepare an exact sanitized WORD packet from a private stdin envelope.
+    /// Print a sanitized packet-digest response from a private stdin envelope.
     #[cfg(all(feature = "live-discovery", target_os = "macos"))]
     Prepare,
     /// Run one exact WORD-authorized primary/fallback Search policy.

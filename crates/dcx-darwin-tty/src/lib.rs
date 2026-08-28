@@ -207,8 +207,12 @@ pub enum CarrierStage {
     Read,
     /// Restore the saved termios structure.
     RestoreTermios,
+    /// Read termios back and compare every represented field with the snapshot.
+    VerifyTermiosRestore,
     /// Restore the saved modem control-line bits.
     RestoreControlLines,
+    /// Read modem control-line bits back and compare them with the snapshot.
+    VerifyControlLinesRestore,
     /// Close the owned descriptor after all restoration attempts.
     Close,
 }
@@ -319,8 +323,8 @@ impl DarwinCarrierError {
 pub enum CleanupDisposition {
     /// No carrier setting had been applied.
     NotRequired,
-    /// The original state was restored.
-    Restored,
+    /// The restore write succeeded and exact post-restore readback matched.
+    VerifiedRestored,
     /// Restoration was attempted and failed closed.
     Failed,
 }
@@ -437,7 +441,12 @@ trait SerialBackend {
     fn wait_readable(&mut self, remaining: Duration) -> Result<bool, SystemFault>;
     fn read_once(&mut self, bytes: &mut [u8]) -> Result<ReadProgress, SystemFault>;
     fn restore_termios(&mut self, snapshot: &Self::TermiosSnapshot) -> Result<(), SystemFault>;
+    fn verify_termios_restore(
+        &mut self,
+        snapshot: &Self::TermiosSnapshot,
+    ) -> Result<bool, SystemFault>;
     fn restore_control_lines(&mut self, state: i32) -> Result<(), SystemFault>;
+    fn verify_control_lines_restore(&mut self, state: i32) -> Result<bool, SystemFault>;
     fn close(&mut self);
 }
 
@@ -618,8 +627,11 @@ fn run_attempt<B: SerialBackend>(
 
     if configuration_attempted {
         receipt.termios_cleanup = match termios_snapshot.as_ref() {
-            Some(snapshot) if backend.restore_termios(snapshot).is_ok() => {
-                CleanupDisposition::Restored
+            Some(snapshot)
+                if backend.restore_termios(snapshot).is_ok()
+                    && backend.verify_termios_restore(snapshot) == Ok(true) =>
+            {
+                CleanupDisposition::VerifiedRestored
             }
             Some(_) => {
                 termios_failed = true;
@@ -628,8 +640,11 @@ fn run_attempt<B: SerialBackend>(
             None => CleanupDisposition::NotRequired,
         };
         receipt.control_lines_cleanup = match control_lines_snapshot {
-            Some(state) if backend.restore_control_lines(state).is_ok() => {
-                CleanupDisposition::Restored
+            Some(state)
+                if backend.restore_control_lines(state).is_ok()
+                    && backend.verify_control_lines_restore(state) == Ok(true) =>
+            {
+                CleanupDisposition::VerifiedRestored
             }
             Some(_) => {
                 control_lines_failed = true;
@@ -992,14 +1007,33 @@ mod macos {
 
         fn restore_termios(&mut self, snapshot: &Self::TermiosSnapshot) -> Result<(), SystemFault> {
             termios::tcsetattr(self.fd()?, OptionalActions::Now, snapshot).map_err(fault)?;
-            self.saved_termios = None;
             Ok(())
+        }
+
+        fn verify_termios_restore(
+            &mut self,
+            snapshot: &Self::TermiosSnapshot,
+        ) -> Result<bool, SystemFault> {
+            let observed = termios::tcgetattr(self.fd()?).map_err(fault)?;
+            let matches = termios_matches(snapshot, &observed);
+            if matches {
+                self.saved_termios = None;
+            }
+            Ok(matches)
         }
 
         fn restore_control_lines(&mut self, state: i32) -> Result<(), SystemFault> {
             abi::set_control_lines(self.fd()?.as_raw_fd(), state)?;
-            self.saved_control_lines = None;
             Ok(())
+        }
+
+        fn verify_control_lines_restore(&mut self, state: i32) -> Result<bool, SystemFault> {
+            let observed = abi::get_control_lines(self.fd()?.as_raw_fd())?;
+            let matches = observed == state;
+            if matches {
+                self.saved_control_lines = None;
+            }
+            Ok(matches)
         }
 
         fn close(&mut self) {
@@ -1011,6 +1045,19 @@ mod macos {
 
     fn fault(error: Errno) -> SystemFault {
         SystemFault::new(error.raw_os_error())
+    }
+
+    fn termios_matches(expected: &Termios, observed: &Termios) -> bool {
+        expected.input_modes == observed.input_modes
+            && expected.output_modes == observed.output_modes
+            && expected.control_modes == observed.control_modes
+            && expected.local_modes == observed.local_modes
+            && expected.input_speed() == observed.input_speed()
+            && expected.output_speed() == observed.output_speed()
+            // `SpecialCodes` intentionally has no `PartialEq`; its pinned Debug
+            // implementation enumerates every c_cc slot and value.
+            && format!("{:?}", expected.special_codes)
+                == format!("{:?}", observed.special_codes)
     }
 
     mod abi {

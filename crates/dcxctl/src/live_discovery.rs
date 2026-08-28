@@ -14,8 +14,8 @@ use std::{
 
 use dcx_core::{discovery::DiscoveryError, protocol::DeviceId};
 use dcx_darwin_tty::{
-    DarwinCarrierError, DarwinSearchTransport, PrivateTtyBinding, SanitizedAttemptReceipt,
-    Sha256Digest,
+    CleanupDisposition, DarwinCarrierError, DarwinSearchTransport, PrivateTtyBinding,
+    SanitizedAttemptKind, SanitizedAttemptOutcome, SanitizedAttemptReceipt, Sha256Digest,
 };
 use dcx_transport::{
     REPEAT_SEARCH_BUDGET, REPEAT_SEARCH_COUNT, REPEAT_SEARCH_GAP, RepeatPacer, RepeatSearchBinding,
@@ -34,9 +34,13 @@ const TARGET_HOST_ROLE: &str = "petting-zoo-mini";
 const ENVELOPE_SCHEMA: &str = "dcx.live-discovery-envelope/v1";
 const PACKET_SCHEMA: &str = "dcx.live-discovery-word-packet/v1";
 const RECEIPT_SCHEMA: &str = "dcx.native-discovery-receipt/v1";
-const SAFE_PROFILE_EXPECTED_DEVICE_ID: u8 = 0;
-const SAFE_PROFILE_DIGEST: &str =
+const PREPARE_RESPONSE_SCHEMA: &str = "dcx.native-discovery-prepare-response/v1";
+const GATE_FAILURE_SCHEMA: &str = "dcx.native-discovery-gate-failure/v1";
+const DCX_SAFE_MUTED_PROFILE_EXPECTED_DEVICE_ID: u8 = 0;
+const DCX_SAFE_MUTED_PROFILE_DIGEST: &str =
     "sha256/177836a70709a1a12c9bbf52d9a359c691d91c6dcfabe729a1e16b546cf60b0d";
+const LEGALAB_INTEGRATION_PROFILE_DIGEST: &str =
+    "sha256/a75064b31387ebf4720218eb58bd542f0931460c38bd21f9511565ab7add2436";
 const QUERY_HEX: &str = "F0002032200E40F7";
 const QUERY_DIGEST: &str =
     "sha256/b6e9f1f31d934708087d0796a50a3705e4bfd53dbd80fbc7012b4a5dd154ec49";
@@ -63,7 +67,7 @@ pub struct LiveCommandFailed;
 
 impl fmt::Display for LiveCommandFailed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("live discovery failed; see sanitized stdout receipt")
+        formatter.write_str("live discovery failed; see sanitized stdout result")
     }
 }
 
@@ -89,18 +93,7 @@ pub fn run(command: LiveCommand) -> Result<(), LiveCommandFailed> {
     let result = run_inner(command);
     let (value, success) = match result {
         Ok(output) => (output.value, output.success),
-        Err(failure) => (
-            serde_json::json!({
-                "schemaVersion": RECEIPT_SCHEMA,
-                "status": "failed",
-                "sanitized": true,
-                "action": command.label(),
-                "failureCode": failure.code,
-                "attempts": [],
-                "effects": Effects::zero(),
-            }),
-            false,
-        ),
+        Err(failure) => (gate_failure_output(command, failure)?, false),
     };
 
     let encoded = serde_json::to_string_pretty(&value).map_err(|_| LiveCommandFailed)?;
@@ -113,9 +106,9 @@ pub fn run(command: LiveCommand) -> Result<(), LiveCommandFailed> {
 }
 
 fn run_inner(command: LiveCommand) -> Result<CommandOutput, SanitizedFailure> {
-    let bytes = read_bounded_stdin()?;
-    let envelope: GateEnvelope =
-        serde_json::from_slice(&bytes).map_err(|_| SanitizedFailure::new("invalid_envelope"))?;
+    let mut bytes = read_bounded_stdin()?;
+    let envelope = parse_private_envelope(bytes.as_mut_slice())?;
+    drop(bytes);
     let validated = ValidatedGate::new(envelope, command)?;
 
     match command {
@@ -125,22 +118,88 @@ fn run_inner(command: LiveCommand) -> Result<CommandOutput, SanitizedFailure> {
     }
 }
 
-fn read_bounded_stdin() -> Result<Vec<u8>, SanitizedFailure> {
+fn parse_private_envelope(bytes: &mut [u8]) -> Result<GateEnvelope, SanitizedFailure> {
+    let parsed = serde_json::from_slice(bytes);
+    bytes.fill(0);
+    parsed.map_err(|_| SanitizedFailure::new("invalid_envelope"))
+}
+
+struct PrivateInputBuffer {
+    // One fixed allocation: moving the owner moves only the Box pointer, and
+    // no private prefix can escape through Vec growth or a stack-array move.
+    bytes: Box<[u8; MAX_STDIN_BYTES + 1]>,
+    len: usize,
+}
+
+impl PrivateInputBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: Box::new([0; MAX_STDIN_BYTES + 1]),
+            len: 0,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.len]
+    }
+
+    fn wipe(&mut self) {
+        self.bytes.fill(0);
+        self.len = 0;
+    }
+
+    fn read_from(&mut self, mut reader: impl Read) -> Result<(), SanitizedFailure> {
+        while self.len < self.bytes.len() {
+            match reader.read(&mut self.bytes[self.len..]) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let Some(next_len) = self.len.checked_add(count) else {
+                        self.wipe();
+                        return Err(SanitizedFailure::new("stdin_read_failed"));
+                    };
+                    if next_len > self.bytes.len() {
+                        self.wipe();
+                        return Err(SanitizedFailure::new("stdin_read_failed"));
+                    }
+                    self.len = next_len;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    self.wipe();
+                    return Err(SanitizedFailure::new("stdin_read_failed"));
+                }
+            }
+        }
+        if self.len > MAX_STDIN_BYTES {
+            self.wipe();
+            return Err(SanitizedFailure::new("stdin_too_large"));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PrivateInputBuffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateInputBuffer([redacted])")
+    }
+}
+
+impl Drop for PrivateInputBuffer {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+fn read_bounded_stdin() -> Result<PrivateInputBuffer, SanitizedFailure> {
     if io::stdin().is_terminal() {
         return Err(SanitizedFailure::new("interactive_stdin_rejected"));
     }
     read_bounded(io::stdin().lock())
 }
 
-fn read_bounded(reader: impl Read) -> Result<Vec<u8>, SanitizedFailure> {
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_STDIN_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| SanitizedFailure::new("stdin_read_failed"))?;
-    if bytes.len() > MAX_STDIN_BYTES {
-        return Err(SanitizedFailure::new("stdin_too_large"));
-    }
+fn read_bounded(reader: impl Read) -> Result<PrivateInputBuffer, SanitizedFailure> {
+    let mut bytes = PrivateInputBuffer::new();
+    bytes.read_from(reader)?;
     Ok(bytes)
 }
 
@@ -160,7 +219,8 @@ impl GateAction {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Clone, Serialize))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GateEnvelope {
     schema_version: String,
@@ -195,7 +255,6 @@ struct PhysicalDeclaration {
     firmware_version: String,
     port_mode: String,
     rear_rs232_connected: bool,
-    adapter_rs232_electrical_verified: bool,
     speakers_disconnected: bool,
 }
 
@@ -204,10 +263,21 @@ struct PhysicalDeclaration {
 struct EvidenceDeclaration {
     passive_receipt_digest: String,
     passive_captured_at_unix_seconds: u64,
-    adapter_electrical_evidence_digest: String,
-    profile_digest: String,
+    operator_physical_evidence: SsotEvidenceReference,
+    adapter_electrical_evidence: SsotEvidenceReference,
+    carrier_review_evidence: SsotEvidenceReference,
+    dcx_safe_muted_profile_digest: String,
+    legalab_integration_profile_digest: String,
     source_revision: String,
     source_tree: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SsotEvidenceReference {
+    record_kind: String,
+    record_id: String,
+    content_digest: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -224,9 +294,12 @@ struct PriorSearch {
     first_host_identity_digest: String,
     first_boot_digest: String,
     first_executable_digest: String,
-    first_profile_digest: String,
+    first_dcx_safe_muted_profile_digest: String,
+    first_legalab_integration_profile_digest: String,
     first_passive_receipt_digest: String,
-    first_adapter_electrical_evidence_digest: String,
+    first_operator_physical_evidence: SsotEvidenceReference,
+    first_adapter_electrical_evidence: SsotEvidenceReference,
+    first_carrier_review_evidence: SsotEvidenceReference,
     first_source_revision: String,
     first_source_tree: String,
     first_physical_digest: String,
@@ -323,16 +396,39 @@ fn digest_bytes(bytes: &[u8]) -> String {
     format_digest(Sha256::digest(bytes).into())
 }
 
-fn canonical_json_digest(value: &serde_json::Value) -> Result<String, SanitizedFailure> {
-    serde_json::to_vec(value)
-        .map(|bytes| digest_bytes(&bytes))
-        .map_err(|_| SanitizedFailure::new("canonical_encoding_failed"))
+fn canonical_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json_value(&object[key]));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json_value).collect())
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    // `serde_json::Value` contains no map-key or non-finite-number state that
+    // its serializer can reject, and a Vec writer has no I/O failure mode.
+    serde_json::to_vec(&canonical_json_value(value))
+        .expect("serializing a canonical serde_json::Value is infallible")
+}
+
+fn canonical_json_digest(value: &serde_json::Value) -> String {
+    digest_bytes(&canonical_json_bytes(value))
 }
 
 fn serialized_digest<T: Serialize>(value: &T) -> Result<String, SanitizedFailure> {
     let value = serde_json::to_value(value)
         .map_err(|_| SanitizedFailure::new("canonical_encoding_failed"))?;
-    canonical_json_digest(&value)
+    Ok(canonical_json_digest(&value))
 }
 
 fn format_digest(bytes: [u8; 32]) -> String {
@@ -363,6 +459,32 @@ fn canonical_git_object(value: &str) -> Result<String, SanitizedFailure> {
     }
 }
 
+fn validate_ssot_evidence_reference(
+    reference: &mut SsotEvidenceReference,
+    expected_kind: &str,
+    required_id_prefix: &str,
+) -> Result<(), SanitizedFailure> {
+    if reference.record_kind != expected_kind
+        || !canonical_record_id(&reference.record_id)
+        || !reference.record_id.starts_with(required_id_prefix)
+    {
+        return Err(SanitizedFailure::new("invalid_ssot_evidence_reference"));
+    }
+    reference.content_digest = canonical_digest(&reference.content_digest)?;
+    Ok(())
+}
+
+fn canonical_record_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'.'
+        })
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GatePacket {
@@ -387,7 +509,10 @@ struct EvidenceBasis {
     runtime_binding: &'static str,
     expected_device_id: &'static str,
     physical: &'static str,
-    artifact_digests_and_source_revision: &'static str,
+    adapter_electrical: &'static str,
+    carrier_review: &'static str,
+    legalab_integration_profile: &'static str,
+    source_revision_and_tree: &'static str,
     protocol_result: &'static str,
 }
 
@@ -395,9 +520,12 @@ impl EvidenceBasis {
     const fn exact() -> Self {
         Self {
             runtime_binding: "native_observed",
-            expected_device_id: "desired_profile_declared",
-            physical: "operator_reported",
-            artifact_digests_and_source_revision: "operator_declared",
+            expected_device_id: "dcx_safe_muted_profile_fixture_declared",
+            physical: "legalab_ssot_reference_operator_declared",
+            adapter_electrical: "legalab_ssot_reference_operator_declared",
+            carrier_review: "legalab_ssot_reference_operator_declared",
+            legalab_integration_profile: "legalab_operator_declared",
+            source_revision_and_tree: "legalab_artifact_manifest_declared",
             protocol_result: "native_observed",
         }
     }
@@ -441,8 +569,8 @@ enum GateLimits {
 struct ValidatedGate {
     binding: PrivateTtyBinding,
     packet: GatePacket,
+    packet_value: serde_json::Value,
     packet_digest: String,
-    required_word: String,
 }
 
 impl ValidatedGate {
@@ -497,11 +625,29 @@ impl ValidatedGate {
         envelope.binding_digest = canonical_digest(&envelope.binding_digest)?;
         envelope.evidence.passive_receipt_digest =
             canonical_digest(&envelope.evidence.passive_receipt_digest)?;
-        envelope.evidence.adapter_electrical_evidence_digest =
-            canonical_digest(&envelope.evidence.adapter_electrical_evidence_digest)?;
-        envelope.evidence.profile_digest = canonical_digest(&envelope.evidence.profile_digest)?;
-        if envelope.expected_device_id != SAFE_PROFILE_EXPECTED_DEVICE_ID
-            || envelope.evidence.profile_digest != SAFE_PROFILE_DIGEST
+        validate_ssot_evidence_reference(
+            &mut envelope.evidence.operator_physical_evidence,
+            "legalab.decision-record/v1",
+            "dec-",
+        )?;
+        validate_ssot_evidence_reference(
+            &mut envelope.evidence.adapter_electrical_evidence,
+            "legalab.claim-record/v1",
+            "clm-",
+        )?;
+        validate_ssot_evidence_reference(
+            &mut envelope.evidence.carrier_review_evidence,
+            "legalab.review-reference/v1",
+            "rev-",
+        )?;
+        envelope.evidence.dcx_safe_muted_profile_digest =
+            canonical_digest(&envelope.evidence.dcx_safe_muted_profile_digest)?;
+        envelope.evidence.legalab_integration_profile_digest =
+            canonical_digest(&envelope.evidence.legalab_integration_profile_digest)?;
+        if envelope.expected_device_id != DCX_SAFE_MUTED_PROFILE_EXPECTED_DEVICE_ID
+            || envelope.evidence.dcx_safe_muted_profile_digest != DCX_SAFE_MUTED_PROFILE_DIGEST
+            || envelope.evidence.legalab_integration_profile_digest
+                != LEGALAB_INTEGRATION_PROFILE_DIGEST
         {
             return Err(SanitizedFailure::new("unsupported_live_profile"));
         }
@@ -520,16 +666,32 @@ impl ValidatedGate {
             prior.first_host_identity_digest = canonical_digest(&prior.first_host_identity_digest)?;
             prior.first_boot_digest = canonical_digest(&prior.first_boot_digest)?;
             prior.first_executable_digest = canonical_digest(&prior.first_executable_digest)?;
-            prior.first_profile_digest = canonical_digest(&prior.first_profile_digest)?;
+            prior.first_dcx_safe_muted_profile_digest =
+                canonical_digest(&prior.first_dcx_safe_muted_profile_digest)?;
+            prior.first_legalab_integration_profile_digest =
+                canonical_digest(&prior.first_legalab_integration_profile_digest)?;
             prior.first_passive_receipt_digest =
                 canonical_digest(&prior.first_passive_receipt_digest)?;
-            prior.first_adapter_electrical_evidence_digest =
-                canonical_digest(&prior.first_adapter_electrical_evidence_digest)?;
+            validate_ssot_evidence_reference(
+                &mut prior.first_operator_physical_evidence,
+                "legalab.decision-record/v1",
+                "dec-",
+            )?;
+            validate_ssot_evidence_reference(
+                &mut prior.first_adapter_electrical_evidence,
+                "legalab.claim-record/v1",
+                "clm-",
+            )?;
+            validate_ssot_evidence_reference(
+                &mut prior.first_carrier_review_evidence,
+                "legalab.review-reference/v1",
+                "rev-",
+            )?;
             prior.first_source_revision = canonical_git_object(&prior.first_source_revision)?;
             prior.first_source_tree = canonical_git_object(&prior.first_source_tree)?;
             prior.first_physical_digest = canonical_digest(&prior.first_physical_digest)?;
-            if canonical_json_digest(&prior.first_packet)? != prior.first_packet_digest
-                || canonical_json_digest(&prior.first_receipt_body)?
+            if canonical_json_digest(&prior.first_packet) != prior.first_packet_digest
+                || canonical_json_digest(&prior.first_receipt_body)
                     != prior.first_receipt_body_digest
             {
                 return Err(SanitizedFailure::new("prior_search_digest_mismatch"));
@@ -558,14 +720,20 @@ impl ValidatedGate {
                     != Some(host.hardware_model.as_str())
                 || json_string(&prior.first_packet, "/host/osBuild")
                     != Some(host.os_build.as_str())
-                || prior.first_profile_digest != envelope.evidence.profile_digest
+                || prior.first_dcx_safe_muted_profile_digest
+                    != envelope.evidence.dcx_safe_muted_profile_digest
+                || prior.first_legalab_integration_profile_digest
+                    != envelope.evidence.legalab_integration_profile_digest
                 || prior.first_passive_receipt_digest != envelope.evidence.passive_receipt_digest
                 || json_u64(
                     &prior.first_packet,
                     "/operatorDeclaredEvidence/passiveCapturedAtUnixSeconds",
                 ) != Some(envelope.evidence.passive_captured_at_unix_seconds)
-                || prior.first_adapter_electrical_evidence_digest
-                    != envelope.evidence.adapter_electrical_evidence_digest
+                || prior.first_operator_physical_evidence
+                    != envelope.evidence.operator_physical_evidence
+                || prior.first_adapter_electrical_evidence
+                    != envelope.evidence.adapter_electrical_evidence
+                || prior.first_carrier_review_evidence != envelope.evidence.carrier_review_evidence
                 || prior.first_source_revision != envelope.evidence.source_revision
                 || prior.first_source_tree != envelope.evidence.source_tree
                 || prior.first_physical_digest != physical_digest)
@@ -619,11 +787,13 @@ impl ValidatedGate {
             prior_search: envelope.prior_search,
             limits,
         };
-        let packet_digest = serialized_digest(&packet)?;
-        let required_word = format!("WORD {} {packet_digest}", packet.action.word());
+        let packet_value = serde_json::to_value(&packet)
+            .map_err(|_| SanitizedFailure::new("canonical_encoding_failed"))?;
+        let packet_digest = canonical_json_digest(&packet_value);
         match command {
             LiveCommand::Prepare => {}
             LiveCommand::Live | LiveCommand::Repeat => {
+                let required_word = format!("WORD {} {packet_digest}", packet.action.word());
                 if envelope.authorization.as_deref() != Some(required_word.as_str()) {
                     return Err(SanitizedFailure::new("authorization_mismatch"));
                 }
@@ -633,8 +803,8 @@ impl ValidatedGate {
         Ok(Self {
             binding,
             packet,
+            packet_value,
             packet_digest,
-            required_word,
         })
     }
 }
@@ -661,7 +831,6 @@ fn validate_physical(physical: &PhysicalDeclaration) -> Result<(), SanitizedFail
         || physical.firmware_version != "1.17"
         || physical.port_mode != "RS-232"
         || !physical.rear_rs232_connected
-        || !physical.adapter_rs232_electrical_verified
         || !physical.speakers_disconnected
     {
         return Err(SanitizedFailure::new("physical_precondition_failed"));
@@ -729,7 +898,10 @@ fn validate_prior_search_proof(
                     "runtimeBinding",
                     "expectedDeviceId",
                     "physical",
-                    "artifactDigestsAndSourceRevision",
+                    "adapterElectrical",
+                    "carrierReview",
+                    "legalabIntegrationProfile",
+                    "sourceRevisionAndTree",
                     "protocolResult",
                 ],
             )
@@ -745,7 +917,6 @@ fn validate_prior_search_proof(
                         "firmwareVersion",
                         "portMode",
                         "rearRs232Connected",
-                        "adapterRs232ElectricalVerified",
                         "speakersDisconnected",
                     ],
                 )
@@ -758,13 +929,25 @@ fn validate_prior_search_proof(
                     &[
                         "passiveReceiptDigest",
                         "passiveCapturedAtUnixSeconds",
-                        "adapterElectricalEvidenceDigest",
-                        "profileDigest",
+                        "operatorPhysicalEvidence",
+                        "adapterElectricalEvidence",
+                        "carrierReviewEvidence",
+                        "dcxSafeMutedProfileDigest",
+                        "legalabIntegrationProfileDigest",
                         "sourceRevision",
                         "sourceTree",
                     ],
                 )
             })
+        && packet
+            .pointer("/operatorDeclaredEvidence/operatorPhysicalEvidence")
+            .is_some_and(ssot_evidence_reference_has_exact_shape)
+        && packet
+            .pointer("/operatorDeclaredEvidence/adapterElectricalEvidence")
+            .is_some_and(ssot_evidence_reference_has_exact_shape)
+        && packet
+            .pointer("/operatorDeclaredEvidence/carrierReviewEvidence")
+            .is_some_and(ssot_evidence_reference_has_exact_shape)
         && packet.pointer("/limits").is_some_and(|value| {
             has_exact_keys(
                 value,
@@ -818,10 +1001,18 @@ fn validate_prior_search_proof(
         max_total_rx_bytes: SEARCH_RESPONSE_LIMIT,
     })
     .map_err(|_| SanitizedFailure::new("canonical_encoding_failed"))?;
+    let expected_operator_physical_evidence =
+        serde_json::to_value(&prior.first_operator_physical_evidence)
+            .map_err(|_| SanitizedFailure::new("canonical_encoding_failed"))?;
+    let expected_adapter_electrical_evidence =
+        serde_json::to_value(&prior.first_adapter_electrical_evidence)
+            .map_err(|_| SanitizedFailure::new("canonical_encoding_failed"))?;
+    let expected_carrier_review_evidence =
+        serde_json::to_value(&prior.first_carrier_review_evidence)
+            .map_err(|_| SanitizedFailure::new("canonical_encoding_failed"))?;
     let embedded_physical_digest = packet
         .pointer("/operatorDeclaredPhysical")
-        .map(canonical_json_digest)
-        .transpose()?;
+        .map(canonical_json_digest);
     let first_issued_at = json_u64(packet, "/issuedAtUnixSeconds");
     let first_expires_at = json_u64(packet, "/expiresAtUnixSeconds");
     let first_passive_at = json_u64(
@@ -835,6 +1026,8 @@ fn validate_prior_search_proof(
             if passive <= issued
                 && issued <= completed
                 && completed < expires
+                && expires.saturating_sub(issued) <= MAX_AUTHORIZATION_SECONDS
+                && issued.saturating_sub(passive) <= MAX_AUTHORIZATION_SECONDS
                 && completed <= repeat_issued_at
                 && repeat_issued_at.saturating_sub(completed) <= MAX_AUTHORIZATION_SECONDS
     );
@@ -853,14 +1046,22 @@ fn validate_prior_search_proof(
         && embedded_physical_digest.as_deref() == Some(prior.first_physical_digest.as_str())
         && json_string(packet, "/operatorDeclaredPhysicalDigest")
             == Some(prior.first_physical_digest.as_str())
-        && json_string(packet, "/operatorDeclaredEvidence/profileDigest")
-            == Some(prior.first_profile_digest.as_str())
-        && json_string(packet, "/operatorDeclaredEvidence/passiveReceiptDigest")
-            == Some(prior.first_passive_receipt_digest.as_str())
         && json_string(
             packet,
-            "/operatorDeclaredEvidence/adapterElectricalEvidenceDigest",
-        ) == Some(prior.first_adapter_electrical_evidence_digest.as_str())
+            "/operatorDeclaredEvidence/dcxSafeMutedProfileDigest",
+        ) == Some(prior.first_dcx_safe_muted_profile_digest.as_str())
+        && json_string(
+            packet,
+            "/operatorDeclaredEvidence/legalabIntegrationProfileDigest",
+        ) == Some(prior.first_legalab_integration_profile_digest.as_str())
+        && json_string(packet, "/operatorDeclaredEvidence/passiveReceiptDigest")
+            == Some(prior.first_passive_receipt_digest.as_str())
+        && packet.pointer("/operatorDeclaredEvidence/operatorPhysicalEvidence")
+            == Some(&expected_operator_physical_evidence)
+        && packet.pointer("/operatorDeclaredEvidence/adapterElectricalEvidence")
+            == Some(&expected_adapter_electrical_evidence)
+        && packet.pointer("/operatorDeclaredEvidence/carrierReviewEvidence")
+            == Some(&expected_carrier_review_evidence)
         && json_string(packet, "/operatorDeclaredEvidence/sourceRevision")
             == Some(prior.first_source_revision.as_str())
         && json_string(packet, "/operatorDeclaredEvidence/sourceTree")
@@ -992,8 +1193,8 @@ fn validate_attempt(
                 .is_some_and(serde_json::Value::is_null),
         }
         && json_string(attempt, "/outcome") == Some(outcome)
-        && json_string(attempt, "/termiosCleanup") == Some("restored")
-        && json_string(attempt, "/controlLinesCleanup") == Some("restored")
+        && json_string(attempt, "/termiosCleanup") == Some("verified_restored")
+        && json_string(attempt, "/controlLinesCleanup") == Some("verified_restored")
         && attempt
             .pointer("/closed")
             .and_then(serde_json::Value::as_bool)
@@ -1008,6 +1209,10 @@ fn has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
     })
+}
+
+fn ssot_evidence_reference_has_exact_shape(value: &serde_json::Value) -> bool {
+    has_exact_keys(value, &["recordKind", "recordId", "contentDigest"])
 }
 
 fn contains_private_material(value: &serde_json::Value) -> bool {
@@ -1040,12 +1245,11 @@ fn duration_millis(duration: Duration) -> u64 {
 
 fn prepare(validated: &ValidatedGate) -> CommandOutput {
     let value = serde_json::json!({
-        "schemaVersion": RECEIPT_SCHEMA,
+        "schemaVersion": PREPARE_RESPONSE_SCHEMA,
         "status": "prepared",
         "sanitized": true,
-        "packet": validated.packet,
+        "action": validated.packet.action,
         "packetDigest": validated.packet_digest,
-        "requiredWord": validated.required_word,
         "attempts": [],
         "effects": Effects::zero(),
     });
@@ -1101,114 +1305,233 @@ impl Effects {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NativeReceiptBody {
+struct GateFailureBody {
     schema_version: &'static str,
     status: &'static str,
     sanitized: bool,
-    packet: GatePacket,
-    packet_digest: String,
-    completed_at_unix_seconds: u64,
-    failure_code: Option<&'static str>,
-    selected_baud: Option<u32>,
-    observed_device_id: Option<u8>,
-    valid_response_count: usize,
-    rx_digests: Vec<Sha256Digest>,
-    attempts: Vec<SanitizedAttemptReceipt>,
+    action: &'static str,
+    failure_code: &'static str,
+    attempts: [(); 0],
     effects: Effects,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NativeReceipt {
+struct GateFailure {
     #[serde(flatten)]
-    body: NativeReceiptBody,
-    receipt_body_digest: String,
+    body: GateFailureBody,
+    failure_body_digest: String,
+}
+
+fn gate_failure_output(
+    command: LiveCommand,
+    failure: SanitizedFailure,
+) -> Result<serde_json::Value, LiveCommandFailed> {
+    let body = GateFailureBody {
+        schema_version: GATE_FAILURE_SCHEMA,
+        status: "failed",
+        sanitized: true,
+        action: command.label(),
+        failure_code: failure.code,
+        attempts: [],
+        effects: Effects::zero(),
+    };
+    let failure_body_digest = serialized_digest(&body).map_err(|_| LiveCommandFailed)?;
+    serde_json::to_value(GateFailure {
+        body,
+        failure_body_digest,
+    })
+    .map_err(|_| LiveCommandFailed)
+}
+
+fn attempt_kind_label(value: SanitizedAttemptKind) -> &'static str {
+    match value {
+        SanitizedAttemptKind::Primary => "primary",
+        SanitizedAttemptKind::SingleFallback => "single_fallback",
+    }
+}
+
+fn attempt_outcome_label(value: SanitizedAttemptOutcome) -> &'static str {
+    match value {
+        SanitizedAttemptOutcome::Complete => "complete",
+        SanitizedAttemptOutcome::TimedOut => "timed_out",
+        SanitizedAttemptOutcome::BindingRejected => "binding_rejected",
+        SanitizedAttemptOutcome::SystemError => "system_error",
+        SanitizedAttemptOutcome::DeadlineExceeded => "deadline_exceeded",
+        SanitizedAttemptOutcome::ShortWrite => "short_write",
+        SanitizedAttemptOutcome::PreexistingInput => "preexisting_input",
+        SanitizedAttemptOutcome::Overflow => "overflow",
+        SanitizedAttemptOutcome::EndOfFile => "end_of_file",
+        SanitizedAttemptOutcome::ReadInvariant => "read_invariant",
+        SanitizedAttemptOutcome::CleanupFailed => "cleanup_failed",
+    }
+}
+
+fn cleanup_label(value: CleanupDisposition) -> &'static str {
+    match value {
+        CleanupDisposition::NotRequired => "not_required",
+        CleanupDisposition::VerifiedRestored => "verified_restored",
+        CleanupDisposition::Failed => "failed",
+    }
+}
+
+fn attempt_receipt_value(attempt: &SanitizedAttemptReceipt) -> serde_json::Value {
+    serde_json::json!({
+        "attempt": attempt_kind_label(attempt.attempt),
+        "bindingDigest": attempt.binding_digest.to_string(),
+        "baud": attempt.baud,
+        "deadlineMillis": attempt.deadline_millis,
+        "cleanupReserveMillis": attempt.cleanup_reserve_millis,
+        "elapsedMicros": attempt.elapsed_micros,
+        "txBytes": attempt.tx_bytes,
+        "rxBytes": attempt.rx_bytes,
+        "rxDigest": attempt.rx_digest.map(|digest| digest.to_string()),
+        "outcome": attempt_outcome_label(attempt.outcome),
+        "termiosCleanup": cleanup_label(attempt.termios_cleanup),
+        "controlLinesCleanup": cleanup_label(attempt.control_lines_cleanup),
+        "closed": attempt.closed,
+    })
+}
+
+fn effects_value(effects: &Effects) -> serde_json::Value {
+    serde_json::json!({
+        "queryTxBytes": effects.query_tx_bytes,
+        "queryRxBytes": effects.query_rx_bytes,
+        "deviceConfigurationWrites": effects.device_configuration_writes,
+        "audioRoutingChanged": effects.audio_routing_changed,
+        "soundOutput": effects.sound_output,
+        "clockChanged": effects.clock_changed,
+        "driverChanged": effects.driver_changed,
+        "systemExtensionChanged": effects.system_extension_changed,
+        "sipChanged": effects.sip_changed,
+        "persistentHostMutation": effects.persistent_host_mutation,
+        "transientHostFileStaging": effects.transient_host_file_staging,
+    })
 }
 
 fn receipt_output(
-    packet: GatePacket,
+    packet_value: serde_json::Value,
     packet_digest: String,
+    completed_at_unix_seconds: u64,
     attempts: Vec<SanitizedAttemptReceipt>,
     failure_code: Option<&'static str>,
     selected_baud: Option<u32>,
     observed_device_id: Option<u8>,
     valid_response_count: usize,
-) -> Result<CommandOutput, SanitizedFailure> {
+) -> CommandOutput {
     let rx_digests = attempts
         .iter()
         .filter_map(|attempt| attempt.rx_digest)
-        .collect();
+        .map(|digest| digest.to_string())
+        .collect::<Vec<_>>();
+    let attempt_values = attempts
+        .iter()
+        .map(attempt_receipt_value)
+        .collect::<Vec<_>>();
     let effects = Effects::from_attempts(&attempts);
     let success = failure_code.is_none();
-    let body = NativeReceiptBody {
-        schema_version: RECEIPT_SCHEMA,
-        status: if success { "succeeded" } else { "failed" },
-        sanitized: true,
-        packet,
-        packet_digest,
-        completed_at_unix_seconds: unix_now()?,
-        failure_code,
-        selected_baud,
-        observed_device_id,
-        valid_response_count,
-        rx_digests,
-        attempts,
-        effects,
-    };
-    let receipt_body_digest = serialized_digest(&body)?;
-    let receipt = NativeReceipt {
-        body,
-        receipt_body_digest,
-    };
-    let value = serde_json::to_value(receipt)
-        .map_err(|_| SanitizedFailure::new("receipt_encoding_failed"))?;
-    Ok(CommandOutput { value, success })
+    let mut value = serde_json::json!({
+        "schemaVersion": RECEIPT_SCHEMA,
+        "status": if success { "succeeded" } else { "failed" },
+        "sanitized": true,
+        "packet": packet_value,
+        "packetDigest": packet_digest,
+        "completedAtUnixSeconds": completed_at_unix_seconds,
+        "failureCode": failure_code,
+        "selectedBaud": selected_baud,
+        "observedDeviceId": observed_device_id,
+        "validResponseCount": valid_response_count,
+        "rxDigests": rx_digests,
+        "attempts": attempt_values,
+        "effects": effects_value(&effects),
+    });
+    let receipt_body_digest = digest_bytes(&canonical_json_bytes(&value));
+    value
+        .as_object_mut()
+        .expect("native receipt body is an object")
+        .insert(
+            "receiptBodyDigest".to_owned(),
+            serde_json::Value::String(receipt_body_digest),
+        );
+    CommandOutput { value, success }
+}
+
+struct CompletionClock {
+    epoch_at_start: Duration,
+    monotonic_start: Instant,
+}
+
+impl CompletionClock {
+    fn start() -> Result<Self, SanitizedFailure> {
+        let epoch_at_start = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| SanitizedFailure::new("system_time_invalid"))?;
+        Ok(Self {
+            epoch_at_start,
+            monotonic_start: Instant::now(),
+        })
+    }
+
+    fn completed_at_unix_seconds(&self) -> u64 {
+        self.epoch_at_start
+            .saturating_add(self.monotonic_start.elapsed())
+            .as_secs()
+    }
 }
 
 fn execute_live(validated: ValidatedGate) -> Result<CommandOutput, SanitizedFailure> {
     let ValidatedGate {
         binding,
         packet,
+        packet_value,
         packet_digest,
-        required_word: _,
     } = validated;
     let expected = DeviceId::new(packet.expected_device_id)
         .map_err(|_| SanitizedFailure::new("invalid_device_id"))?;
+    // This is the final fallible operation before the carrier can open or
+    // write. Completion thereafter is derived from this valid wall-clock
+    // basis plus monotonic elapsed time, and receipt construction is
+    // infallible over closed JSON values.
+    let completion_clock = CompletionClock::start()?;
     let mut transport = DarwinSearchTransport::new(binding);
     let outcome = execute_search(&mut transport, expected);
     let attempts = transport.take_receipts();
+    let completed_at_unix_seconds = completion_clock.completed_at_unix_seconds();
     match outcome {
         Ok(SearchOutcome::Identified(identity)) => {
             let selected_baud = attempts.last().map(|attempt| attempt.baud);
             debug_assert_eq!(identity.device(), expected);
-            receipt_output(
-                packet,
+            Ok(receipt_output(
+                packet_value,
                 packet_digest,
+                completed_at_unix_seconds,
                 attempts,
                 None,
                 selected_baud,
                 Some(identity.device().get()),
                 1,
-            )
+            ))
         }
-        Ok(SearchOutcome::Exhausted) => receipt_output(
-            packet,
+        Ok(SearchOutcome::Exhausted) => Ok(receipt_output(
+            packet_value,
             packet_digest,
+            completed_at_unix_seconds,
             attempts,
             Some("search_exhausted"),
             None,
             None,
             0,
-        ),
-        Err(error) => receipt_output(
-            packet,
+        )),
+        Err(error) => Ok(receipt_output(
+            packet_value,
             packet_digest,
+            completed_at_unix_seconds,
             attempts,
             Some(search_error_code(&error)),
             None,
             search_error_device(&error),
             0,
-        ),
+        )),
     }
 }
 
@@ -1275,8 +1598,8 @@ fn execute_repeat(validated: ValidatedGate) -> Result<CommandOutput, SanitizedFa
     let ValidatedGate {
         binding,
         packet,
+        packet_value,
         packet_digest,
-        required_word: _,
     } = validated;
     let expected = DeviceId::new(packet.expected_device_id)
         .map_err(|_| SanitizedFailure::new("invalid_device_id"))?;
@@ -1287,33 +1610,39 @@ fn execute_repeat(validated: ValidatedGate) -> Result<CommandOutput, SanitizedFa
         .successful_baud;
     let repeat_binding = RepeatSearchBinding::from_successful_baud(expected, successful_baud)
         .map_err(|_| SanitizedFailure::new("unsupported_repeat_baud"))?;
+    // As in `execute_live`, no fallible gate/clock/encoding operation remains
+    // after this point and before the native receipt is materialized.
+    let completion_clock = CompletionClock::start()?;
     let mut transport = DarwinSearchTransport::new(binding);
     let mut pacer = SystemPacer::new();
     let outcome = execute_search_repeat(&mut transport, &mut pacer, repeat_binding);
     let attempts = transport.take_receipts();
+    let completed_at_unix_seconds = completion_clock.completed_at_unix_seconds();
     match outcome {
-        Ok(repeated) => receipt_output(
-            packet,
+        Ok(repeated) => Ok(receipt_output(
+            packet_value,
             packet_digest,
+            completed_at_unix_seconds,
             attempts,
             None,
             Some(repeated.baud()),
             Some(repeated.device().get()),
             repeated.valid_response_count(),
-        ),
+        )),
         Err(error) => {
             let valid_response_count = repeat_valid_response_count(&error);
             let observed_device_id = repeat_error_device(&error)
                 .or_else(|| (valid_response_count != 0).then_some(expected.get()));
-            receipt_output(
-                packet,
+            Ok(receipt_output(
+                packet_value,
                 packet_digest,
+                completed_at_unix_seconds,
                 attempts,
                 Some(repeat_error_code(&error)),
                 Some(successful_baud),
                 observed_device_id,
                 valid_response_count,
-            )
+            ))
         }
     }
 }
@@ -1343,6 +1672,7 @@ fn repeat_valid_response_count(error: &RepeatSearchError<DarwinCarrierError, Inf
     trial.saturating_sub(1)
 }
 
+#[cfg(test)]
 fn unix_now() -> Result<u64, SanitizedFailure> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1378,6 +1708,14 @@ mod tests {
         }
     }
 
+    fn synthetic_ssot_reference(record_kind: &str, record_id: &str) -> SsotEvidenceReference {
+        SsotEvidenceReference {
+            record_kind: record_kind.to_owned(),
+            record_id: record_id.to_owned(),
+            content_digest: digest_bytes(record_id.as_bytes()),
+        }
+    }
+
     fn synthetic_envelope(action: GateAction) -> GateEnvelope {
         let now = unix_now().unwrap();
         GateEnvelope {
@@ -1390,21 +1728,32 @@ mod tests {
                 hardware_model: "Mac16,10".to_owned(),
                 os_build: "25G220".to_owned(),
             },
-            expected_device_id: SAFE_PROFILE_EXPECTED_DEVICE_ID,
+            expected_device_id: DCX_SAFE_MUTED_PROFILE_EXPECTED_DEVICE_ID,
             physical: PhysicalDeclaration {
                 powered: true,
                 edition: "standard-non-le".to_owned(),
                 firmware_version: "1.17".to_owned(),
                 port_mode: "RS-232".to_owned(),
                 rear_rs232_connected: true,
-                adapter_rs232_electrical_verified: true,
                 speakers_disconnected: true,
             },
             evidence: EvidenceDeclaration {
                 passive_receipt_digest: digest_bytes(b"synthetic-passive-receipt"),
                 passive_captured_at_unix_seconds: now,
-                adapter_electrical_evidence_digest: digest_bytes(b"synthetic-rs232-evidence"),
-                profile_digest: SAFE_PROFILE_DIGEST.to_owned(),
+                operator_physical_evidence: synthetic_ssot_reference(
+                    "legalab.decision-record/v1",
+                    "dec-synthetic-dcx-physical",
+                ),
+                adapter_electrical_evidence: synthetic_ssot_reference(
+                    "legalab.claim-record/v1",
+                    "clm-synthetic-rs232-electrical",
+                ),
+                carrier_review_evidence: synthetic_ssot_reference(
+                    "legalab.review-reference/v1",
+                    "rev-synthetic-darwin-carrier",
+                ),
+                dcx_safe_muted_profile_digest: DCX_SAFE_MUTED_PROFILE_DIGEST.to_owned(),
+                legalab_integration_profile_digest: LEGALAB_INTEGRATION_PROFILE_DIGEST.to_owned(),
                 source_revision: "a".repeat(40),
                 source_tree: "b".repeat(40),
             },
@@ -1413,6 +1762,14 @@ mod tests {
             prior_search: None,
             authorization: None,
         }
+    }
+
+    fn resign_prior_packet(prior: &mut PriorSearch) {
+        prior.first_packet_digest = canonical_json_digest(&prior.first_packet);
+        prior.first_receipt_body["packet"] = prior.first_packet.clone();
+        prior.first_receipt_body["packetDigest"] =
+            serde_json::json!(prior.first_packet_digest.clone());
+        prior.first_receipt_body_digest = canonical_json_digest(&prior.first_receipt_body);
     }
 
     fn failure_code(result: &Result<ValidatedGate, SanitizedFailure>) -> &'static str {
@@ -1430,6 +1787,60 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_recursively_sorts_keys_and_preserves_array_order() {
+        let value = serde_json::json!({
+            "z": [2, 1],
+            "a": {"b": 2, "a": 1},
+        });
+        assert_eq!(
+            canonical_json_bytes(&value),
+            br#"{"a":{"a":1,"b":2},"z":[2,1]}"#
+        );
+        assert_ne!(
+            canonical_json_digest(&value),
+            canonical_json_digest(&serde_json::json!({
+                "a": {"a": 1, "b": 2},
+                "z": [1, 2],
+            }))
+        );
+    }
+
+    #[test]
+    fn prevalidation_failure_has_a_distinct_exact_hashed_shape() {
+        let failure = gate_failure_output(
+            LiveCommand::Prepare,
+            SanitizedFailure::new("invalid_envelope"),
+        )
+        .unwrap();
+        assert!(has_exact_keys(
+            &failure,
+            &[
+                "schemaVersion",
+                "status",
+                "sanitized",
+                "action",
+                "failureCode",
+                "attempts",
+                "effects",
+                "failureBodyDigest",
+            ],
+        ));
+        assert_eq!(
+            json_string(&failure, "/schemaVersion"),
+            Some(GATE_FAILURE_SCHEMA)
+        );
+        assert_ne!(
+            json_string(&failure, "/schemaVersion"),
+            Some(RECEIPT_SCHEMA)
+        );
+        assert!(!contains_private_material(&failure));
+        let expected_digest = json_string(&failure, "/failureBodyDigest").unwrap();
+        let mut body = failure.clone();
+        body.as_object_mut().unwrap().remove("failureBodyDigest");
+        assert_eq!(canonical_json_digest(&body), expected_digest);
+    }
+
+    #[test]
     fn physical_gate_requires_all_operator_reported_preconditions() {
         let mut physical = PhysicalDeclaration {
             powered: true,
@@ -1437,12 +1848,36 @@ mod tests {
             firmware_version: "1.17".to_owned(),
             port_mode: "RS-232".to_owned(),
             rear_rs232_connected: true,
-            adapter_rs232_electrical_verified: true,
             speakers_disconnected: true,
         };
         assert!(validate_physical(&physical).is_ok());
         physical.powered = false;
         assert!(validate_physical(&physical).is_err());
+    }
+
+    #[test]
+    fn evidence_gate_rejects_free_or_noncanonical_ssot_references() {
+        let mut envelope = synthetic_envelope(GateAction::Search);
+        envelope.evidence.adapter_electrical_evidence.record_kind = "receipt".to_owned();
+        assert_eq!(
+            failure_code(&ValidatedGate::new_with_runtime(
+                envelope,
+                LiveCommand::Prepare,
+                synthetic_runtime(),
+            )),
+            "invalid_ssot_evidence_reference"
+        );
+
+        let mut envelope = synthetic_envelope(GateAction::Search);
+        envelope.evidence.operator_physical_evidence.record_id = "review with spaces".to_owned();
+        assert_eq!(
+            failure_code(&ValidatedGate::new_with_runtime(
+                envelope,
+                LiveCommand::Prepare,
+                synthetic_runtime(),
+            )),
+            "invalid_ssot_evidence_reference"
+        );
     }
 
     #[test]
@@ -1459,10 +1894,23 @@ mod tests {
         );
 
         let mut wrong_profile = synthetic_envelope(GateAction::Search);
-        wrong_profile.evidence.profile_digest = digest_bytes(b"different-profile");
+        wrong_profile.evidence.dcx_safe_muted_profile_digest = digest_bytes(b"different-profile");
         assert_eq!(
             failure_code(&ValidatedGate::new_with_runtime(
                 wrong_profile,
+                LiveCommand::Prepare,
+                synthetic_runtime(),
+            )),
+            "unsupported_live_profile"
+        );
+
+        let mut wrong_integration_profile = synthetic_envelope(GateAction::Search);
+        wrong_integration_profile
+            .evidence
+            .legalab_integration_profile_digest = digest_bytes(b"different-integration-profile");
+        assert_eq!(
+            failure_code(&ValidatedGate::new_with_runtime(
+                wrong_integration_profile,
                 LiveCommand::Prepare,
                 synthetic_runtime(),
             )),
@@ -1502,10 +1950,47 @@ mod tests {
         )
         .unwrap();
         let packet_digest = prepared.packet_digest.clone();
-        let word = prepared.required_word.clone();
+        let word = format!("WORD {SEARCH_WORD} {packet_digest}");
         let packet_json = serde_json::to_string(&prepared.packet).unwrap();
         assert!(!packet_json.contains(SYNTHETIC_PATH));
         assert!(!packet_json.contains(&word));
+        let prepare_output = prepare(&prepared);
+        assert!(has_exact_keys(
+            &prepare_output.value,
+            &[
+                "schemaVersion",
+                "status",
+                "sanitized",
+                "action",
+                "packetDigest",
+                "attempts",
+                "effects",
+            ],
+        ));
+        assert_eq!(
+            json_string(&prepare_output.value, "/schemaVersion"),
+            Some(PREPARE_RESPONSE_SCHEMA)
+        );
+        assert_eq!(
+            json_string(&prepare_output.value, "/status"),
+            Some("prepared")
+        );
+        assert_eq!(
+            json_string(&prepare_output.value, "/action"),
+            Some("search")
+        );
+        assert_eq!(
+            prepare_output
+                .value
+                .pointer("/sanitized")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(prepare_output.value.pointer("/packet").is_none());
+        assert!(prepare_output.value.pointer("/requiredWord").is_none());
+        let prepare_json = serde_json::to_string(&prepare_output.value).unwrap();
+        assert!(!prepare_json.contains(&word));
+        assert!(!prepare_json.contains(SYNTHETIC_PATH));
 
         let mut authorized = envelope;
         authorized.authorization = Some(word.clone());
@@ -1513,22 +1998,25 @@ mod tests {
             ValidatedGate::new_with_runtime(authorized, LiveCommand::Live, synthetic_runtime())
                 .unwrap();
         assert_eq!(live.packet_digest, packet_digest);
-        assert_eq!(live.required_word, word);
 
         let output = receipt_output(
-            live.packet,
+            live.packet_value,
             live.packet_digest,
+            unix_now().unwrap(),
             Vec::new(),
             Some("search_exhausted"),
             None,
             None,
             0,
-        )
-        .unwrap();
+        );
         let receipt_json = serde_json::to_string(&output.value).unwrap();
         assert!(!receipt_json.contains(SYNTHETIC_PATH));
-        assert!(!receipt_json.contains(&live.required_word));
+        assert!(!receipt_json.contains(&word));
         assert!(receipt_json.contains("receiptBodyDigest"));
+        let expected_digest = json_string(&output.value, "/receiptBodyDigest").unwrap();
+        let mut body = output.value.clone();
+        body.as_object_mut().unwrap().remove("receiptBodyDigest");
+        assert_eq!(canonical_json_digest(&body), expected_digest);
     }
 
     #[test]
@@ -1577,7 +2065,7 @@ mod tests {
             "completedAtUnixSeconds": unix_now().unwrap(),
             "failureCode": null,
             "selectedBaud": 115_200,
-            "observedDeviceId": SAFE_PROFILE_EXPECTED_DEVICE_ID,
+            "observedDeviceId": DCX_SAFE_MUTED_PROFILE_EXPECTED_DEVICE_ID,
             "validResponseCount": 1,
             "rxDigests": [first_response_digest],
             "attempts": [{
@@ -1591,8 +2079,8 @@ mod tests {
                 "rxBytes": 26,
                 "rxDigest": first_response_digest,
                 "outcome": "complete",
-                "termiosCleanup": "restored",
-                "controlLinesCleanup": "restored",
+                "termiosCleanup": "verified_restored",
+                "controlLinesCleanup": "verified_restored",
                 "closed": true
             }],
             "effects": {
@@ -1614,7 +2102,7 @@ mod tests {
             first_packet: serde_json::to_value(&search.packet).unwrap(),
             first_packet_digest: search.packet_digest,
             first_receipt_body: first_receipt_body.clone(),
-            first_receipt_body_digest: canonical_json_digest(&first_receipt_body).unwrap(),
+            first_receipt_body_digest: canonical_json_digest(&first_receipt_body),
             first_response_digest,
             binding_digest: search.packet.binding_digest.clone(),
             expected_device_id: search.packet.expected_device_id,
@@ -1622,20 +2110,35 @@ mod tests {
             first_host_identity_digest: search.packet.host.host_identity_digest.clone(),
             first_boot_digest: search.packet.host.boot_digest.clone(),
             first_executable_digest: search.packet.host.executable_digest.clone(),
-            first_profile_digest: search
+            first_dcx_safe_muted_profile_digest: search
                 .packet
                 .operator_declared_evidence
-                .profile_digest
+                .dcx_safe_muted_profile_digest
+                .clone(),
+            first_legalab_integration_profile_digest: search
+                .packet
+                .operator_declared_evidence
+                .legalab_integration_profile_digest
                 .clone(),
             first_passive_receipt_digest: search
                 .packet
                 .operator_declared_evidence
                 .passive_receipt_digest
                 .clone(),
-            first_adapter_electrical_evidence_digest: search
+            first_operator_physical_evidence: search
                 .packet
                 .operator_declared_evidence
-                .adapter_electrical_evidence_digest
+                .operator_physical_evidence
+                .clone(),
+            first_adapter_electrical_evidence: search
+                .packet
+                .operator_declared_evidence
+                .adapter_electrical_evidence
+                .clone(),
+            first_carrier_review_evidence: search
+                .packet
+                .operator_declared_evidence
+                .carrier_review_evidence
                 .clone(),
             first_source_revision: search
                 .packet
@@ -1645,6 +2148,29 @@ mod tests {
             first_source_tree: search.packet.operator_declared_evidence.source_tree.clone(),
             first_physical_digest: search.packet.operator_declared_physical_digest,
         });
+
+        let mut overlong_window = repeat.prior_search.clone().unwrap();
+        let first_issued = json_u64(&overlong_window.first_packet, "/issuedAtUnixSeconds").unwrap();
+        overlong_window.first_packet["expiresAtUnixSeconds"] =
+            serde_json::json!(first_issued + MAX_AUTHORIZATION_SECONDS + 1);
+        resign_prior_packet(&mut overlong_window);
+        assert_eq!(
+            validate_prior_search_proof(&overlong_window, first_issued)
+                .unwrap_err()
+                .code,
+            "invalid_prior_search_proof"
+        );
+
+        let mut stale_at_issue = repeat.prior_search.clone().unwrap();
+        stale_at_issue.first_packet["operatorDeclaredEvidence"]["passiveCapturedAtUnixSeconds"] =
+            serde_json::json!(first_issued - MAX_AUTHORIZATION_SECONDS - 1);
+        resign_prior_packet(&mut stale_at_issue);
+        assert_eq!(
+            validate_prior_search_proof(&stale_at_issue, first_issued)
+                .unwrap_err()
+                .code,
+            "invalid_prior_search_proof"
+        );
 
         let mut passive_drift = repeat.clone();
         passive_drift.evidence.passive_captured_at_unix_seconds -= 1;
@@ -1663,7 +2189,7 @@ mod tests {
         prior.first_receipt_body["selectedBaud"] = serde_json::json!(38_400);
         prior.first_receipt_body["attempts"][0]["attempt"] = serde_json::json!("single_fallback");
         prior.first_receipt_body["attempts"][0]["baud"] = serde_json::json!(38_400);
-        prior.first_receipt_body_digest = canonical_json_digest(&prior.first_receipt_body).unwrap();
+        prior.first_receipt_body_digest = canonical_json_digest(&prior.first_receipt_body);
         assert_eq!(
             failure_code(&ValidatedGate::new_with_runtime(
                 impossible_fallback,
@@ -1687,6 +2213,22 @@ mod tests {
 
     #[test]
     fn strict_envelope_rejects_unknown_fields_and_oversized_input() {
+        struct PrefixThenError {
+            emitted: bool,
+        }
+
+        impl Read for PrefixThenError {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.emitted {
+                    return Err(io::Error::other("synthetic read failure"));
+                }
+                self.emitted = true;
+                let private_prefix = b"WORD DCX_QUERY_V1 private-prefix";
+                output[..private_prefix.len()].copy_from_slice(private_prefix);
+                Ok(private_prefix.len())
+            }
+        }
+
         let mut value = serde_json::to_value(synthetic_envelope(GateAction::Search)).unwrap();
         value
             .as_object_mut()
@@ -1694,8 +2236,41 @@ mod tests {
             .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<GateEnvelope>(value).is_err());
 
+        let exact_maximum = read_bounded(io::Cursor::new(vec![b'x'; MAX_STDIN_BYTES])).unwrap();
+        assert_eq!(exact_maximum.len, MAX_STDIN_BYTES);
+        assert!(
+            exact_maximum.bytes[..exact_maximum.len]
+                .iter()
+                .all(|byte| *byte == b'x')
+        );
+
         let oversized = vec![0_u8; MAX_STDIN_BYTES + 1];
         let failure = read_bounded(io::Cursor::new(oversized)).unwrap_err();
         assert_eq!(failure.code, "stdin_too_large");
+
+        let mut oversized_buffer = PrivateInputBuffer::new();
+        let failure = oversized_buffer
+            .read_from(io::Cursor::new(vec![b'y'; MAX_STDIN_BYTES + 1]))
+            .unwrap_err();
+        assert_eq!(failure.code, "stdin_too_large");
+        assert_eq!(oversized_buffer.len, 0);
+        assert!(oversized_buffer.bytes.iter().all(|byte| *byte == 0));
+
+        let mut failed_buffer = PrivateInputBuffer::new();
+        let failure = failed_buffer
+            .read_from(PrefixThenError { emitted: false })
+            .unwrap_err();
+        assert_eq!(failure.code, "stdin_read_failed");
+        assert_eq!(failed_buffer.len, 0);
+        assert!(failed_buffer.bytes.iter().all(|byte| *byte == 0));
+
+        let mut valid_private =
+            serde_json::to_vec(&synthetic_envelope(GateAction::Search)).unwrap();
+        assert!(parse_private_envelope(&mut valid_private).is_ok());
+        assert!(valid_private.iter().all(|byte| *byte == 0));
+
+        let mut invalid_private = br#"{"privateTtyPath":"/dev/cu.usbserial-PRIVATE"}"#.to_vec();
+        assert!(parse_private_envelope(&mut invalid_private).is_err());
+        assert!(invalid_private.iter().all(|byte| *byte == 0));
     }
 }

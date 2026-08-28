@@ -18,7 +18,9 @@ enum Call {
     WaitReadable,
     Read(usize),
     RestoreTermios,
+    VerifyTermiosRestore,
     RestoreControlLines,
+    VerifyControlLinesRestore,
     Close,
 }
 
@@ -38,6 +40,8 @@ struct FakeBackend {
     written: bool,
     preexisting_input: usize,
     preexisting_script: VecDeque<usize>,
+    termios_readback: FakeTermios,
+    control_lines_readback: i32,
 }
 
 impl FakeBackend {
@@ -55,6 +59,8 @@ impl FakeBackend {
             written: false,
             preexisting_input: 0,
             preexisting_script: VecDeque::new(),
+            termios_readback: FakeTermios(8),
+            control_lines_readback: 0x2496,
         }
     }
 
@@ -158,9 +164,28 @@ impl SerialBackend for FakeBackend {
         self.step(CarrierStage::RestoreTermios, Call::RestoreTermios)
     }
 
+    fn verify_termios_restore(
+        &mut self,
+        snapshot: &Self::TermiosSnapshot,
+    ) -> Result<bool, SystemFault> {
+        self.step(
+            CarrierStage::VerifyTermiosRestore,
+            Call::VerifyTermiosRestore,
+        )?;
+        Ok(&self.termios_readback == snapshot)
+    }
+
     fn restore_control_lines(&mut self, state: i32) -> Result<(), SystemFault> {
         assert_eq!(state, 0x2496);
         self.step(CarrierStage::RestoreControlLines, Call::RestoreControlLines)
+    }
+
+    fn verify_control_lines_restore(&mut self, state: i32) -> Result<bool, SystemFault> {
+        self.step(
+            CarrierStage::VerifyControlLinesRestore,
+            Call::VerifyControlLinesRestore,
+        )?;
+        Ok(self.control_lines_readback == state)
     }
 
     fn close(&mut self) {
@@ -211,7 +236,9 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
             Call::Read(26),
             Call::BytesAvailable,
             Call::RestoreTermios,
+            Call::VerifyTermiosRestore,
             Call::RestoreControlLines,
+            Call::VerifyControlLinesRestore,
             Call::Close,
         ]
     );
@@ -224,8 +251,14 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
     assert_eq!(receipt.cleanup_reserve_millis, 25);
     assert_eq!(receipt.rx_digest, Some(Sha256Digest::of_bytes(&response)));
     assert_eq!(receipt.outcome, SanitizedAttemptOutcome::Complete);
-    assert_eq!(receipt.termios_cleanup, CleanupDisposition::Restored);
-    assert_eq!(receipt.control_lines_cleanup, CleanupDisposition::Restored);
+    assert_eq!(
+        receipt.termios_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert_eq!(
+        receipt.control_lines_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
     assert!(receipt.closed);
 }
 
@@ -292,8 +325,14 @@ fn input_arriving_during_configuration_blocks_write_and_restores() {
     assert_eq!(receipt.tx_bytes, 0);
     assert_eq!(receipt.rx_bytes, 0);
     assert_eq!(receipt.outcome, SanitizedAttemptOutcome::PreexistingInput);
-    assert_eq!(receipt.termios_cleanup, CleanupDisposition::Restored);
-    assert_eq!(receipt.control_lines_cleanup, CleanupDisposition::Restored);
+    assert_eq!(
+        receipt.termios_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert_eq!(
+        receipt.control_lines_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
     assert!(receipt.closed);
 }
 
@@ -408,7 +447,9 @@ fn a_short_write_is_never_retried_and_always_restores() {
     );
     assert!(carrier.backend.calls.ends_with(&[
         Call::RestoreTermios,
+        Call::VerifyTermiosRestore,
         Call::RestoreControlLines,
+        Call::VerifyControlLinesRestore,
         Call::Close,
     ]));
 }
@@ -485,7 +526,9 @@ fn every_post_snapshot_failure_path_closes_and_restores_both_states() {
         assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_err());
         assert!(carrier.backend.calls.ends_with(&[
             Call::RestoreTermios,
+            Call::VerifyTermiosRestore,
             Call::RestoreControlLines,
+            Call::VerifyControlLinesRestore,
             Call::Close,
         ]));
         assert!(carrier.receipts()[0].closed);
@@ -496,7 +539,9 @@ fn every_post_snapshot_failure_path_closes_and_restores_both_states() {
 fn cleanup_failure_is_terminal_but_still_runs_other_restore_and_close() {
     for failing_stage in [
         CarrierStage::RestoreTermios,
+        CarrierStage::VerifyTermiosRestore,
         CarrierStage::RestoreControlLines,
+        CarrierStage::VerifyControlLinesRestore,
     ] {
         let mut backend = FakeBackend::with_inbound(synthetic_response(0));
         backend.fail_at = Some(failing_stage);
@@ -509,16 +554,41 @@ fn cleanup_failure_is_terminal_but_still_runs_other_restore_and_close() {
                 ..
             })
         ));
-        assert!(carrier.backend.calls.ends_with(&[
-            Call::RestoreTermios,
-            Call::RestoreControlLines,
-            Call::Close,
-        ]));
+        assert_eq!(carrier.backend.calls.last(), Some(&Call::Close));
+        assert!(carrier.backend.calls.contains(&Call::RestoreTermios));
+        assert!(carrier.backend.calls.contains(&Call::RestoreControlLines));
         assert!(carrier.receipts()[0].closed);
         assert_eq!(
             carrier.receipts()[0].outcome,
             SanitizedAttemptOutcome::CleanupFailed
         );
+    }
+}
+
+#[test]
+fn cleanup_readback_mismatch_is_terminal_and_never_reports_verified_restore() {
+    for (termios_readback, control_lines_readback) in
+        [(FakeTermios(9), 0x2496), (FakeTermios(8), 0x2497)]
+    {
+        let mut backend = FakeBackend::with_inbound(synthetic_response(0));
+        backend.termios_readback = termios_readback;
+        backend.control_lines_readback = control_lines_readback;
+        let mut carrier = Carrier::new(binding(), backend);
+
+        assert!(matches!(
+            execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+            Err(SearchExecutionError::Transport {
+                source: DarwinCarrierError::Cleanup { .. },
+                ..
+            })
+        ));
+        let receipt = &carrier.receipts()[0];
+        assert_eq!(receipt.outcome, SanitizedAttemptOutcome::CleanupFailed);
+        assert!(
+            receipt.termios_cleanup == CleanupDisposition::Failed
+                || receipt.control_lines_cleanup == CleanupDisposition::Failed
+        );
+        assert!(receipt.closed);
     }
 }
 

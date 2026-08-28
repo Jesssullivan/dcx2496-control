@@ -50,17 +50,27 @@ byte-write surface.
 
 The carrier is not permission to probe. The feature-gated CLI reads a strict,
 16 KiB maximum envelope only from redirected stdin; interactive stdin is
-rejected. The raw path exists only in a non-cloneable, redacted in-memory
-binding and must match an independently observed `sha256/...` digest immediately
-before open. Only `/dev/cu.usbserial-*` is in scope. The authorization packet
-binds the current LocalHostName, hardware/OS, boot, executable digest, physical
-declarations, evidence revisions, and fixed I/O limits. Sanitized receipts
-contain digests, byte counts, deadlines, cleanup, and an independently
-recomputable `receiptBodyDigest`; they never retain the path, WORD, or raw
-response. A WORD is replayable until its maximum 15-minute expiry, so a fresh
-packet remains required after reboot, binary/profile/source/physical drift, or
-binding change. The 38400 fallback remains a bounded compatibility hypothesis,
-not a vendor claim for direct RS-232.
+rejected. One fixed, non-growing parse buffer and a Deserialize-only envelope
+briefly hold the raw input. Normal, error, and drop paths explicitly clear the
+buffer, and the path is then moved into a non-cloneable, redacted binding before
+open; production code cannot clone or serialize the envelope, and neither form
+is emitted or persisted. This clearing is bounded in-process hygiene, not a
+claim of compiler-guaranteed zeroization: serde-owned path/authorization
+allocations remain process-private until consumed and dropped. The path must
+match an independently observed `sha256/...` digest immediately before open.
+Only `/dev/cu.usbserial-*` is in scope. The
+authorization packet binds the current LocalHostName, hardware/OS, boot,
+executable digest, physical declarations, closed Legalab decision/claim/review
+references, distinct DCX safe-muted and Legalab integration profile digests,
+and fixed I/O limits. The sanitized `prepare` response exposes only the
+semantic action and packet digest; Legalab derives the WORD transiently at its
+attended surface. Native receipts contain digests, byte counts, deadlines,
+verified-restoration cleanup, and an independently recomputable
+`receiptBodyDigest`; they never retain the path, WORD, or raw response. A WORD
+is replayable until its maximum 15-minute expiry, so a fresh packet remains
+required after reboot, binary/profile/source/physical drift, or binding change.
+The 38400 fallback remains a bounded compatibility hypothesis, not a vendor
+claim for direct RS-232.
 
 `discovery repeat` accepts only the complete canonical packet and successful
 receipt body from the first Search, verifies both digests and all bindings, and
@@ -69,8 +79,8 @@ by at least 500 ms, the session is capped at ten seconds, and the first timeout,
 identity, transport, pacing, or cleanup failure stops the run.
 
 The exact private-envelope contract, prepare/live/repeat behavior, receipt
-mapping, merged-main artifact layout, and Legalab-owned execution boundary are
-documented in [`docs/live-discovery.md`](docs/live-discovery.md).
+mapping, blocked future artifact contract, and Legalab-owned execution boundary
+are documented in [`docs/live-discovery.md`](docs/live-discovery.md).
 
 ## Entrypoints
 

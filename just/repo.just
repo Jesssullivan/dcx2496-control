@@ -11,9 +11,17 @@ fmt-check:
     rg --files -0 -g 'BUILD.bazel' -g '*.bzl' -g 'MODULE.bazel' | xargs -0 buildifier -mode=check
 
 lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     shellcheck tests/*.sh
-    actionlint .github/workflows/*.yml
+    workflow_files=()
+    while IFS= read -r workflow_file; do
+        workflow_files+=("$workflow_file")
+    done < <(rg --files .github/workflows -g '*.yml' -g '*.yaml' 2>/dev/null || true)
+    if ((${#workflow_files[@]})); then
+        actionlint "${workflow_files[@]}"
+    fi
 
 test:
     cargo test --workspace --all-targets --all-features
@@ -28,6 +36,12 @@ darwin-carrier-check:
 
 # Compile and test the explicit macOS-only live discovery surface without I/O.
 live-discovery-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ $(uname -s) != Darwin ]]; then
+        echo "live-discovery-check unavailable: requires an admitted Darwin runner" >&2
+        exit 78
+    fi
     cargo test --locked --package dcxctl --features live-discovery
 
 fixtures:
@@ -54,11 +68,13 @@ bazel-check:
     #!/usr/bin/env bash
     set -euo pipefail
     repo_env=()
+    build_targets=(//:dcxctl //crates/dcx-darwin-tty:dcx_darwin_tty)
     if [[ $(uname -s) == Darwin ]]; then
         repo_env=(--repo_env=CC=/usr/bin/clang --repo_env=CXX=/usr/bin/clang++)
+        build_targets+=(//:dcxctl_live_discovery)
     fi
     bazelisk test "${repo_env[@]}" //:check
-    bazelisk build "${repo_env[@]}" //:dcxctl //:dcxctl_live_discovery //crates/dcx-darwin-tty:dcx_darwin_tty
+    bazelisk build "${repo_env[@]}" "${build_targets[@]}"
 
 nix-check:
     nix flake check
