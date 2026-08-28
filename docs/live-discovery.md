@@ -22,9 +22,10 @@ The command performs one uninterrupted Search-and-repeat transaction:
 4. Require one exact 26-byte Behringer/DCX Search response at the expected
    address.
 5. Derive the successful baud from the validated attempt.
-6. Wait at least 500 ms before each of exactly nine same-baud repeats, stopping
-   on the first timeout, identity failure, carrier failure, or 10-second repeat
-   budget overrun.
+6. Wait at least five seconds before each of exactly nine same-baud repeats,
+   matching the cadence of the pinned behavioral reference and stopping on the
+   first timeout, identity failure, carrier failure, or 60-second repeat budget
+   overrun.
 
 Success is JSON with `status: identified`, device address, selected baud,
 `validResponses: 10`, and sanitized carrier attempts. Failure also emits JSON

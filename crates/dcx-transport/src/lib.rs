@@ -29,9 +29,13 @@ pub const SEARCH_DISCOVERY_BUDGET: Duration = Duration::from_millis(1_000);
 /// Number of same-baud Search trials after the first identity.
 pub const REPEAT_SEARCH_COUNT: usize = 9;
 /// Minimum delay before every repeat Search.
-pub const REPEAT_SEARCH_GAP: Duration = Duration::from_millis(500);
+///
+/// The pinned DuinoDCX behavioral reference searches on a five-second cadence.
+/// Keeping the same cadence avoids overrunning the legacy device's discovery
+/// response path.
+pub const REPEAT_SEARCH_GAP: Duration = Duration::from_secs(5);
 /// Whole nominal budget for the fixed nine-trial repeat session.
-pub const REPEAT_SEARCH_BUDGET: Duration = Duration::from_secs(10);
+pub const REPEAT_SEARCH_BUDGET: Duration = Duration::from_secs(60);
 
 const SEARCH_REQUEST_BYTES: [u8; SEARCH_REQUEST_LEN] =
     [0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7];
@@ -328,8 +332,8 @@ pub enum RepeatSearchError<T: StdError + Send + Sync + 'static, P: StdError + Se
         #[source]
         source: P,
     },
-    /// The ten-second whole-session budget was exceeded.
-    #[error("repeat session exceeded its 10 second budget at trial {trial}")]
+    /// The one-minute whole-session budget was exceeded.
+    #[error("repeat session exceeded its 60 second budget at trial {trial}")]
     BudgetExceeded {
         /// One-based repeat trial number.
         trial: usize,
@@ -364,7 +368,7 @@ pub enum RepeatSearchError<T: StdError + Send + Sync + 'static, P: StdError + Se
 
 /// Execute exactly nine same-baud Searches from reviewed first-success evidence.
 ///
-/// Every trial is preceded by at least 500 ms of injected pacing. The baud is
+/// Every trial is preceded by at least five seconds of injected pacing. The baud is
 /// pinned to the successful primary or fallback rate; a repeat never restarts
 /// discovery and therefore can never change baud. Any timeout, invalid response,
 /// transport error, pacing error, or whole-session budget overrun stops without
@@ -865,7 +869,10 @@ mod tests {
         let frame = synthetic_response(0);
         let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
         let mut pacer = FakePacer {
-            next_wait: Some(Duration::from_millis(9_501)),
+            next_wait: Some(
+                REPEAT_SEARCH_BUDGET.saturating_sub(SEARCH_ATTEMPT_TIMEOUT)
+                    + Duration::from_millis(1),
+            ),
             ..FakePacer::default()
         };
         let first = identified(DiscoveryAttemptKind::Primary, 0);

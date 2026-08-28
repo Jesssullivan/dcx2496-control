@@ -30,7 +30,7 @@ One invocation performs the complete discovery milestone:
 3. Validate the exact 26-byte Behringer/DCX response and expected device
    address.
 4. Derive the successful baud from that typed response path and issue exactly
-   nine more Searches at the same baud.
+   nine more Searches at the same baud, paced five seconds apart.
 5. Print structured JSON with the parsed identity, selected baud, valid-response
    count, and carrier diagnostics.
 
