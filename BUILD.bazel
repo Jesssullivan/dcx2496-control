@@ -16,6 +16,11 @@ alias(
     actual = "//crates/dcxctl",
 )
 
+alias(
+    name = "dcxctl_live_discovery",
+    actual = "//crates/dcxctl:dcxctl_live_discovery",
+)
+
 filegroup(
     name = "safe_profile_fixture",
     srcs = ["fixtures/profiles/safe-muted-v1.json"],

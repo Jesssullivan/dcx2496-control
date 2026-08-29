@@ -1,4 +1,8 @@
-//! Offline-only operator CLI. There is intentionally no serial dependency.
+//! Offline-by-default operator CLI. The explicit Darwin `live-discovery`
+//! feature adds one Search-only serial command.
+
+#[cfg(all(feature = "live-discovery", target_os = "macos"))]
+mod live_discovery;
 
 use std::{
     error::Error,
@@ -90,6 +94,16 @@ enum DiscoveryCommand {
         #[arg(long)]
         expected_device: u8,
     },
+    /// Run one DCX Search and nine repeats at the MVP 38400 binding.
+    #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+    LiveSearch {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -177,6 +191,11 @@ fn discovery(command: DiscoveryCommand) -> Result<(), Box<dyn Error>> {
             let response = discovery.accept_candidates(&[&bytes])?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
+        #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+        DiscoveryCommand::LiveSearch {
+            tty,
+            expected_device,
+        } => live_discovery::run(tty, expected_device)?,
     }
     Ok(())
 }

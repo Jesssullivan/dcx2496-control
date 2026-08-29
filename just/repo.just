@@ -11,9 +11,17 @@ fmt-check:
     rg --files -0 -g 'BUILD.bazel' -g '*.bzl' -g 'MODULE.bazel' | xargs -0 buildifier -mode=check
 
 lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     shellcheck tests/*.sh
-    actionlint .github/workflows/*.yml
+    workflow_files=()
+    while IFS= read -r workflow_file; do
+        workflow_files+=("$workflow_file")
+    done < <(rg --files .github/workflows -g '*.yml' -g '*.yaml' 2>/dev/null || true)
+    if ((${#workflow_files[@]})); then
+        actionlint "${workflow_files[@]}"
+    fi
 
 test:
     cargo test --workspace --all-targets --all-features
@@ -47,11 +55,23 @@ lockfiles:
 check: fmt-check lint test fixtures lockfiles
 
 bazel-check:
-    bazelisk test //:check
-    bazelisk build //:dcxctl //crates/dcx-darwin-tty:dcx_darwin_tty
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repo_env=()
+    build_targets=(//:dcxctl //crates/dcx-darwin-tty:dcx_darwin_tty)
+    if [[ $(uname -s) == Darwin ]]; then
+        repo_env=(--repo_env=CC=/usr/bin/clang --repo_env=CXX=/usr/bin/clang++)
+        build_targets+=(//:dcxctl_live_discovery)
+    fi
+    bazelisk test "${repo_env[@]}" //:check
+    bazelisk build "${repo_env[@]}" "${build_targets[@]}"
 
 nix-check:
     nix flake check
+
+# Materialize the aarch64-darwin live binary without profile activation.
+live-package:
+    nix build .#dcxctl-live --no-link
 
 security:
     cargo deny check

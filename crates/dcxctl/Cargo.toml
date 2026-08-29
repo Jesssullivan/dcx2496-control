@@ -1,6 +1,6 @@
 [package]
 name = "dcxctl"
-description = "Offline-only DCX2496 fixture, profile, and REW inspection CLI"
+description = "Offline-by-default DCX2496 fixture, profile, REW, and live Search CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +8,22 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+live-discovery = [
+    "dep:dcx-darwin-tty",
+    "dep:dcx-transport",
+]
+
 [dependencies]
 clap.workspace = true
 dcx-core = { path = "../dcx-core", version = "=0.1.0" }
 hex.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dcx-darwin-tty = { path = "../dcx-darwin-tty", version = "=0.1.0", optional = true }
+dcx-transport = { path = "../dcx-transport", version = "=0.1.0", optional = true }
 
 [lints]
 workspace = true

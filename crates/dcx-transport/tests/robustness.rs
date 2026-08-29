@@ -8,8 +8,8 @@ use dcx_core::{
 };
 use dcx_transport::{
     MAX_SEARCH_ATTEMPTS, SEARCH_ATTEMPT_TIMEOUT, SEARCH_DISCOVERY_BUDGET, SEARCH_REQUEST_LEN,
-    SEARCH_RESPONSE_LIMIT, SearchExecutionError, SearchOperation, SearchOutcome, SearchRead,
-    SearchReadError, SearchTransport, execute_search,
+    SEARCH_RESPONSE_LIMIT, SearchExecutionError, SearchOperation, SearchOperationKind,
+    SearchOutcome, SearchRead, SearchReadError, SearchTransport, execute_search,
 };
 use thiserror::Error;
 
@@ -80,7 +80,7 @@ fn every_supported_address_requires_the_exact_expected_identity() {
                     panic!("matching exact identity must be identified")
                 };
                 assert_eq!(identity.device().get(), expected);
-                assert_eq!(identity.attempt(), DiscoveryAttemptKind::Primary);
+                assert_eq!(identity.kind(), SearchOperationKind::Primary);
             } else {
                 assert!(matches!(
                     result,
@@ -174,7 +174,7 @@ fn all_addresses_follow_primary_then_one_fallback_with_no_third_attempt() {
         else {
             panic!("fallback identity must complete")
         };
-        assert_eq!(identity.attempt(), DiscoveryAttemptKind::SingleFallback);
+        assert_eq!(identity.kind(), SearchOperationKind::SingleFallback);
         assert_eq!(transport.operations.len(), MAX_SEARCH_ATTEMPTS);
         assert_eq!(transport.operations[0].settings().baud(), PRIMARY_BAUD);
         assert_eq!(transport.operations[1].settings().baud(), FALLBACK_BAUD);

@@ -175,6 +175,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dcx-core",
+ "dcx-darwin-tty",
+ "dcx-transport",
  "hex",
  "serde_json",
 ]

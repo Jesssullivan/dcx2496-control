@@ -42,12 +42,9 @@ separately reviewed, query-only named-device receipt.
 
 The transport boundary's 500 ms per-attempt timeout and 26-byte input ceiling
 are fail-closed Legalab engineering limits, not vendor timing claims. The
-boundary is injected and has no serial-port implementation: it does not
-enumerate, open, configure, read, or write any device.
-It is not the reviewed macOS carrier and does not authorize a live Search. A
-future carrier must separately prove current-boot private-path binding,
-single-write/no-internal-retry behavior, the declared byte and time ceilings,
-and restoration of prior termios and control-line state.
+OS-neutral boundary is injected and does not enumerate or open ports. The
+Darwin carrier below supplies the explicit Search-only serial implementation;
+Legalab owns live hardware readiness.
 
 The Darwin carrier follows Apple's documented BSD serial-device interface and
 the macOS SDK ABI; these are operating-system interface references, not DCX
@@ -68,10 +65,10 @@ behavioral evidence:
   TIOCEXCL, TIOCMGET, and TIOCMSET. No XNU source was copied:
   https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/ttycom.h
 
-The 25 ms cleanup reserve, digest-bound `/dev/cu.usbserial-*` envelope, overflow
-policy, and single-syscall write policy are fail-closed Legalab engineering
-limits, not Apple or Behringer compatibility claims. The implementation uses
-the independently licensed rustix 1.1.4 and sha2 0.10.9 crates as pinned in
-Cargo.lock; only the small, documented macOS ioctl/select ABI shim contains
-local unsafe Rust. Offline tests use injected fake syscalls and are not named-
-device evidence. Merging the carrier does not authorize a live Search.
+The 25 ms cleanup reserve, explicit `/dev/cu.usbserial-*` path restriction,
+overflow policy, and single-syscall write policy are fail-closed Legalab
+engineering limits, not Apple or Behringer compatibility claims. The
+implementation uses the independently licensed rustix 1.1.4 and sha2 0.10.9
+crates as pinned in Cargo.lock; only the small, documented macOS ioctl/select
+ABI shim contains local unsafe Rust. Offline tests use injected fake syscalls
+and are not named-device observations. Legalab owns live hardware readiness.

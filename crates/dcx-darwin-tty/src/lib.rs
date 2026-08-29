@@ -1,7 +1,7 @@
 //! Darwin-only, Search-only tty carrier for the DCX2496 discovery boundary.
 //!
-//! The public carrier exists only on macOS. It accepts one private, in-memory
-//! callout-device binding and implements only [`SearchTransport`]. There is no
+//! The public carrier exists only on macOS. It accepts one explicit, validated
+//! callout-device path and implements only [`SearchTransport`]. There is no
 //! port enumeration, CLI, generic byte-write method, retry loop, or retained
 //! raw capture. Tests exercise the same state machine through injected fake
 //! syscalls without opening any device.
@@ -14,8 +14,8 @@ use std::{
 };
 
 use dcx_transport::{
-    SEARCH_RESPONSE_LIMIT, SearchOperation, SearchRead, SearchReadEnd, SearchReadError,
-    SearchTransport,
+    SEARCH_RESPONSE_LIMIT, SearchOperation, SearchOperationKind, SearchRead, SearchReadEnd,
+    SearchReadError, SearchTransport,
 };
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -23,7 +23,6 @@ use thiserror::Error;
 
 const PRIVATE_CALLOUT_PREFIX: &[u8] = b"/dev/cu.usbserial-";
 const SHA256_PREFIX: &str = "sha256/";
-const SHA256_HEX_LEN: usize = 64;
 /// Portion of the 500 ms whole-attempt budget reserved for restoration/close.
 pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
 
@@ -32,32 +31,6 @@ pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
 pub struct Sha256Digest([u8; 32]);
 
 impl Sha256Digest {
-    /// Parse the exact `sha256/<64 lower-case hex>` receipt form.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BindingError::InvalidDigest`] for any other representation.
-    pub fn parse(value: &str) -> Result<Self, BindingError> {
-        let Some(hex) = value.strip_prefix(SHA256_PREFIX) else {
-            return Err(BindingError::InvalidDigest);
-        };
-        if hex.len() != SHA256_HEX_LEN
-            || !hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(BindingError::InvalidDigest);
-        }
-
-        let mut bytes = [0_u8; 32];
-        let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
-        debug_assert!(remainder.is_empty());
-        for (index, pair) in pairs.iter().enumerate() {
-            bytes[index] = (decode_hex(pair[0]) << 4) | decode_hex(pair[1]);
-        }
-        Ok(Self(bytes))
-    }
-
     fn of_bytes(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
     }
@@ -85,59 +58,35 @@ impl Serialize for Sha256Digest {
     }
 }
 
-const fn decode_hex(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => 0,
-    }
-}
-
-/// A private callout path paired with an independently observed path digest.
+/// One explicit Darwin callout path for the Search-only carrier.
 ///
-/// The raw path is intentionally not cloneable, serializable, displayable, or
-/// accessible after construction. Callers must obtain it through a private
-/// in-process channel; command-line and environment-variable transport are not
-/// provided. The digest is recomputed immediately before every open.
+/// The path is validated at construction and again immediately before every
+/// open. It is intentionally omitted from `Debug` and carrier receipts.
 pub struct PrivateTtyBinding {
     path: PathBuf,
-    expected_digest: Sha256Digest,
+    digest: Sha256Digest,
 }
 
 impl PrivateTtyBinding {
-    /// Bind one exact FTDI-style Darwin callout path to an independent digest.
+    /// Bind one exact FTDI-style Darwin callout path.
     ///
     /// # Errors
     ///
     /// Returns [`BindingError`] when the path is outside the narrow
-    /// `/dev/cu.usbserial-*` envelope, the digest is malformed, or the supplied
-    /// path does not match it.
-    pub fn new(path: PathBuf, expected_digest: &str) -> Result<Self, BindingError> {
+    /// `/dev/cu.usbserial-*` callout namespace.
+    pub fn new(path: PathBuf) -> Result<Self, BindingError> {
         validate_private_path(&path)?;
-        let expected_digest = Sha256Digest::parse(expected_digest)?;
-        let binding = Self {
-            path,
-            expected_digest,
-        };
-        binding.verify()?;
-        Ok(binding)
+        let digest = Sha256Digest::of_bytes(path.as_os_str().as_bytes());
+        Ok(Self { path, digest })
     }
 
     /// Return only the sanitized path digest.
     pub const fn digest(&self) -> Sha256Digest {
-        self.expected_digest
+        self.digest
     }
 
     fn verify(&self) -> Result<(), BindingError> {
-        validate_private_path(&self.path)?;
-        let actual = Sha256Digest::of_bytes(self.path.as_os_str().as_bytes());
-        if actual != self.expected_digest {
-            return Err(BindingError::DigestMismatch {
-                expected: self.expected_digest,
-                actual,
-            });
-        }
-        Ok(())
+        validate_private_path(&self.path)
     }
 }
 
@@ -146,7 +95,7 @@ impl fmt::Debug for PrivateTtyBinding {
         formatter
             .debug_struct("PrivateTtyBinding")
             .field("path", &"[redacted]")
-            .field("digest", &self.expected_digest)
+            .field("digest", &self.digest)
             .finish()
     }
 }
@@ -162,30 +111,19 @@ fn validate_private_path(path: &Path) -> Result<(), BindingError> {
     Ok(())
 }
 
-/// Fail-closed private-binding validation failures.
+/// Fail-closed callout-path validation failures.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum BindingError {
-    /// Digest syntax was not the canonical lower-case SHA-256 form.
-    #[error("binding digest is not canonical sha256/<64 lower-case hex>")]
-    InvalidDigest,
     /// The path was not one exact FTDI-style Darwin callout node.
-    #[error("private tty binding is outside the approved Darwin callout envelope")]
+    #[error("tty path is outside the supported Darwin callout namespace")]
     UnsupportedPrivatePath,
-    /// The in-memory path did not match the independently supplied digest.
-    #[error("private tty binding digest mismatch (expected {expected}, observed {actual})")]
-    DigestMismatch {
-        /// Independently observed digest.
-        expected: Sha256Digest,
-        /// Digest recomputed from the private path.
-        actual: Sha256Digest,
-    },
 }
 
 /// A named carrier operation suitable for sanitized failure receipts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CarrierStage {
-    /// Revalidate the private path digest.
+    /// Revalidate the explicit callout path.
     VerifyBinding,
     /// Open the callout with the declared nonblocking/no-controlling-tty policy.
     OpenExclusive,
@@ -195,6 +133,8 @@ pub enum CarrierStage {
     SnapshotControlLines,
     /// Apply exact raw 8N1/no-flow settings.
     Configure,
+    /// Check queued input before configuration or the sole outbound write.
+    CheckPreexistingInput,
     /// Perform the sole eight-byte write syscall.
     Write,
     /// Query queued input without consuming bytes.
@@ -205,8 +145,12 @@ pub enum CarrierStage {
     Read,
     /// Restore the saved termios structure.
     RestoreTermios,
+    /// Read termios back and compare every represented field with the snapshot.
+    VerifyTermiosRestore,
     /// Restore the saved modem control-line bits.
     RestoreControlLines,
+    /// Read modem control-line bits back and compare them with the snapshot.
+    VerifyControlLinesRestore,
     /// Close the owned descriptor after all restoration attempts.
     Close,
 }
@@ -223,6 +167,8 @@ pub enum CarrierFailureKind {
     System,
     /// The sole write did not accept exactly eight bytes.
     ShortWrite,
+    /// Input was already queued before the Search write.
+    PreexistingInput,
     /// More than 26 input bytes were pending.
     Overflow,
     /// The tty reached end-of-file.
@@ -234,7 +180,7 @@ pub enum CarrierFailureKind {
 /// Error from one Darwin Search attempt.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DarwinCarrierError {
-    /// Exact private binding failed before any open.
+    /// Exact callout-path validation failed before any open.
     #[error(transparent)]
     Binding(#[from] BindingError),
     /// The monotonic 500 ms attempt deadline expired.
@@ -256,6 +202,12 @@ pub enum DarwinCarrierError {
     ShortWrite {
         /// Number accepted by the single syscall.
         written: usize,
+    },
+    /// Input was queued before configuration or the Search write.
+    #[error("Search blocked because {queued} pre-existing input bytes were queued")]
+    PreexistingInput {
+        /// Bytes observed without consuming or flushing them.
+        queued: usize,
     },
     /// More bytes were queued than the exact response budget permits.
     #[error("Search response overflow: {received} received and {queued} additional queued")]
@@ -295,6 +247,7 @@ impl DarwinCarrierError {
             Self::Deadline { .. } => CarrierFailureKind::Deadline,
             Self::System { .. } | Self::Cleanup { .. } => CarrierFailureKind::System,
             Self::ShortWrite { .. } => CarrierFailureKind::ShortWrite,
+            Self::PreexistingInput { .. } => CarrierFailureKind::PreexistingInput,
             Self::Overflow { .. } => CarrierFailureKind::Overflow,
             Self::EndOfFile { .. } => CarrierFailureKind::EndOfFile,
             Self::ReadInvariant(_) => CarrierFailureKind::ReadInvariant,
@@ -308,8 +261,8 @@ impl DarwinCarrierError {
 pub enum CleanupDisposition {
     /// No carrier setting had been applied.
     NotRequired,
-    /// The original state was restored.
-    Restored,
+    /// The restore write succeeded and exact post-restore readback matched.
+    VerifiedRestored,
     /// Restoration was attempted and failed closed.
     Failed,
 }
@@ -330,6 +283,8 @@ pub enum SanitizedAttemptOutcome {
     DeadlineExceeded,
     /// The sole write was short.
     ShortWrite,
+    /// Input was already queued before any Search byte was transmitted.
+    PreexistingInput,
     /// Additional input was detected without crossing the 26-byte ceiling.
     Overflow,
     /// The tty reached EOF.
@@ -340,7 +295,7 @@ pub enum SanitizedAttemptOutcome {
     CleanupFailed,
 }
 
-/// Primary or sole fallback attempt represented in a sanitized receipt.
+/// Closed Search operation kind represented in a sanitized receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SanitizedAttemptKind {
@@ -348,13 +303,16 @@ pub enum SanitizedAttemptKind {
     Primary,
     /// One 38400 baud compatibility fallback.
     SingleFallback,
+    /// Direct 38400 operation for the observed MVP binding.
+    Known38400,
 }
 
 impl From<SearchOperation> for SanitizedAttemptKind {
     fn from(operation: SearchOperation) -> Self {
-        match operation.attempt() {
-            dcx_core::discovery::DiscoveryAttemptKind::Primary => Self::Primary,
-            dcx_core::discovery::DiscoveryAttemptKind::SingleFallback => Self::SingleFallback,
+        match operation.kind() {
+            SearchOperationKind::Primary => Self::Primary,
+            SearchOperationKind::SingleFallback => Self::SingleFallback,
+            SearchOperationKind::Known38400 => Self::Known38400,
         }
     }
 }
@@ -363,9 +321,9 @@ impl From<SearchOperation> for SanitizedAttemptKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SanitizedAttemptReceipt {
-    /// Primary or sole fallback attempt.
+    /// Closed Search operation kind.
     pub attempt: SanitizedAttemptKind,
-    /// Independently supplied private-path digest.
+    /// Digest of the validated callout path; the path itself is never emitted.
     pub binding_digest: Sha256Digest,
     /// Requested line rate.
     pub baud: u32,
@@ -424,7 +382,12 @@ trait SerialBackend {
     fn wait_readable(&mut self, remaining: Duration) -> Result<bool, SystemFault>;
     fn read_once(&mut self, bytes: &mut [u8]) -> Result<ReadProgress, SystemFault>;
     fn restore_termios(&mut self, snapshot: &Self::TermiosSnapshot) -> Result<(), SystemFault>;
+    fn verify_termios_restore(
+        &mut self,
+        snapshot: &Self::TermiosSnapshot,
+    ) -> Result<bool, SystemFault>;
     fn restore_control_lines(&mut self, state: i32) -> Result<(), SystemFault>;
+    fn verify_control_lines_restore(&mut self, state: i32) -> Result<bool, SystemFault>;
     fn close(&mut self);
 }
 
@@ -531,19 +494,18 @@ impl<B: SerialBackend> SearchTransport for Carrier<B> {
     }
 }
 
+type AttemptResult = (
+    Result<SearchRead, DarwinCarrierError>,
+    SanitizedAttemptReceipt,
+);
+
 fn run_attempt<B: SerialBackend>(
     binding: &PrivateTtyBinding,
     backend: &mut B,
     operation: SearchOperation,
-) -> (
-    Result<SearchRead, DarwinCarrierError>,
-    SanitizedAttemptReceipt,
-) {
+) -> AttemptResult {
     let start = backend.monotonic_now();
-    let whole_attempt_deadline = start
-        .checked_add(operation.timeout())
-        .unwrap_or(Duration::MAX);
-    let active_io_deadline = whole_attempt_deadline.saturating_sub(SEARCH_CLEANUP_RESERVE);
+    let active_io_deadline = active_io_deadline(start, operation.timeout());
     let mut receipt = ReceiptBuilder::new(binding, operation);
     let mut opened = false;
     let mut configuration_attempted = false;
@@ -574,11 +536,13 @@ fn run_attempt<B: SerialBackend>(
                 .map_err(|fault| system_error(CarrierStage::SnapshotControlLines, fault))?,
         );
 
+        reject_preexisting_input(backend, active_io_deadline)?;
         ensure_before_deadline(backend, active_io_deadline, CarrierStage::Configure)?;
         configuration_attempted = true;
         backend
             .configure(&snapshot, operation.settings().baud())
             .map_err(|fault| system_error(CarrierStage::Configure, fault))?;
+        reject_preexisting_input(backend, active_io_deadline)?;
         ensure_before_deadline(backend, active_io_deadline, CarrierStage::Write)?;
 
         let written = backend
@@ -604,8 +568,11 @@ fn run_attempt<B: SerialBackend>(
 
     if configuration_attempted {
         receipt.termios_cleanup = match termios_snapshot.as_ref() {
-            Some(snapshot) if backend.restore_termios(snapshot).is_ok() => {
-                CleanupDisposition::Restored
+            Some(snapshot)
+                if backend.restore_termios(snapshot).is_ok()
+                    && backend.verify_termios_restore(snapshot) == Ok(true) =>
+            {
+                CleanupDisposition::VerifiedRestored
             }
             Some(_) => {
                 termios_failed = true;
@@ -614,8 +581,11 @@ fn run_attempt<B: SerialBackend>(
             None => CleanupDisposition::NotRequired,
         };
         receipt.control_lines_cleanup = match control_lines_snapshot {
-            Some(state) if backend.restore_control_lines(state).is_ok() => {
-                CleanupDisposition::Restored
+            Some(state)
+                if backend.restore_control_lines(state).is_ok()
+                    && backend.verify_control_lines_restore(state) == Ok(true) =>
+            {
+                CleanupDisposition::VerifiedRestored
             }
             Some(_) => {
                 control_lines_failed = true;
@@ -648,6 +618,26 @@ fn run_attempt<B: SerialBackend>(
     }
     let outcome = classify_outcome(&result);
     (result, receipt.finish(elapsed, outcome))
+}
+
+fn active_io_deadline(start: Duration, timeout: Duration) -> Duration {
+    let whole = start.checked_add(timeout).unwrap_or(Duration::MAX);
+    whole.saturating_sub(SEARCH_CLEANUP_RESERVE)
+}
+
+fn reject_preexisting_input<B: SerialBackend>(
+    backend: &mut B,
+    deadline: Duration,
+) -> Result<(), DarwinCarrierError> {
+    ensure_before_deadline(backend, deadline, CarrierStage::CheckPreexistingInput)?;
+    let queued = backend
+        .bytes_available()
+        .map_err(|fault| system_error(CarrierStage::CheckPreexistingInput, fault))?;
+    if queued == 0 {
+        Ok(())
+    } else {
+        Err(DarwinCarrierError::PreexistingInput { queued })
+    }
 }
 
 fn ensure_before_deadline<B: SerialBackend>(
@@ -746,6 +736,9 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         Err(DarwinCarrierError::System { .. }) => SanitizedAttemptOutcome::SystemError,
         Err(DarwinCarrierError::Deadline { .. }) => SanitizedAttemptOutcome::DeadlineExceeded,
         Err(DarwinCarrierError::ShortWrite { .. }) => SanitizedAttemptOutcome::ShortWrite,
+        Err(DarwinCarrierError::PreexistingInput { .. }) => {
+            SanitizedAttemptOutcome::PreexistingInput
+        }
         Err(DarwinCarrierError::Overflow { .. }) => SanitizedAttemptOutcome::Overflow,
         Err(DarwinCarrierError::EndOfFile { .. }) => SanitizedAttemptOutcome::EndOfFile,
         Err(DarwinCarrierError::ReadInvariant(_)) => SanitizedAttemptOutcome::ReadInvariant,
@@ -753,12 +746,11 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
     }
 }
 
-/// Review-gated macOS implementation of the typed Search-only transport.
+/// macOS implementation of the typed Search-only transport.
 ///
 /// Construction does not open a descriptor. Each `search` call revalidates the
-/// private binding, opens one descriptor, performs one bounded attempt, restores
-/// prior state, and closes. A live call still requires Legalab's attended
-/// hardware WORD gate; this type does not represent authorization.
+/// callout path, opens one descriptor, performs one bounded attempt, restores
+/// prior state, and closes. Legalab owns any external operator authorization.
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
 pub struct DarwinSearchTransport {
     inner: Carrier<macos::MacOsBackend>,
@@ -766,7 +758,7 @@ pub struct DarwinSearchTransport {
 
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
 impl DarwinSearchTransport {
-    /// Create an inert carrier for one already validated private binding.
+    /// Create an inert carrier for one already validated callout path.
     pub fn new(binding: PrivateTtyBinding) -> Self {
         Self {
             inner: Carrier::new(binding, macos::MacOsBackend::new()),
@@ -955,14 +947,33 @@ mod macos {
 
         fn restore_termios(&mut self, snapshot: &Self::TermiosSnapshot) -> Result<(), SystemFault> {
             termios::tcsetattr(self.fd()?, OptionalActions::Now, snapshot).map_err(fault)?;
-            self.saved_termios = None;
             Ok(())
+        }
+
+        fn verify_termios_restore(
+            &mut self,
+            snapshot: &Self::TermiosSnapshot,
+        ) -> Result<bool, SystemFault> {
+            let observed = termios::tcgetattr(self.fd()?).map_err(fault)?;
+            let matches = termios_matches(snapshot, &observed);
+            if matches {
+                self.saved_termios = None;
+            }
+            Ok(matches)
         }
 
         fn restore_control_lines(&mut self, state: i32) -> Result<(), SystemFault> {
             abi::set_control_lines(self.fd()?.as_raw_fd(), state)?;
-            self.saved_control_lines = None;
             Ok(())
+        }
+
+        fn verify_control_lines_restore(&mut self, state: i32) -> Result<bool, SystemFault> {
+            let observed = abi::get_control_lines(self.fd()?.as_raw_fd())?;
+            let matches = observed == state;
+            if matches {
+                self.saved_control_lines = None;
+            }
+            Ok(matches)
         }
 
         fn close(&mut self) {
@@ -974,6 +985,19 @@ mod macos {
 
     fn fault(error: Errno) -> SystemFault {
         SystemFault::new(error.raw_os_error())
+    }
+
+    fn termios_matches(expected: &Termios, observed: &Termios) -> bool {
+        expected.input_modes == observed.input_modes
+            && expected.output_modes == observed.output_modes
+            && expected.control_modes == observed.control_modes
+            && expected.local_modes == observed.local_modes
+            && expected.input_speed() == observed.input_speed()
+            && expected.output_speed() == observed.output_speed()
+            // `SpecialCodes` intentionally has no `PartialEq`; its pinned Debug
+            // implementation enumerates every c_cc slot and value.
+            && format!("{:?}", expected.special_codes)
+                == format!("{:?}", observed.special_codes)
     }
 
     mod abi {

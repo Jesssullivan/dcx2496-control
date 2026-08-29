@@ -2,15 +2,15 @@
 //!
 //! This crate does not enumerate or open ports and has no operating-system
 //! serial dependency. It exposes one operation: the exact broadcast Search
-//! request. A separately reviewed adapter may implement [`SearchTransport`]
-//! after satisfying Legalab's hardware gate.
+//! request. A platform adapter may implement [`SearchTransport`]; Legalab owns
+//! the external hardware and operator preconditions for invoking it.
 
 use std::{error::Error as StdError, fmt, time::Duration};
 
 use dcx_core::{
     discovery::{
-        DiscoveryAttempt, DiscoveryAttemptKind, DiscoveryError, DiscoveryState, QueryOnlyDiscovery,
-        SerialSettings,
+        DiscoveryAttempt, DiscoveryAttemptKind, DiscoveryError, DiscoveryState, FALLBACK_BAUD,
+        PRIMARY_BAUD, QueryOnlyDiscovery, SerialSettings,
     },
     protocol::{DeviceId, SEARCH_RESPONSE_LEN, SearchResponse26},
 };
@@ -26,6 +26,16 @@ pub const SEARCH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MAX_SEARCH_ATTEMPTS: usize = 2;
 /// Nominal sum of the two per-attempt deadlines, excluding immediate errors.
 pub const SEARCH_DISCOVERY_BUDGET: Duration = Duration::from_millis(1_000);
+/// Number of same-baud Search trials after the first identity.
+pub const REPEAT_SEARCH_COUNT: usize = 9;
+/// Minimum delay before every repeat Search.
+///
+/// The pinned DuinoDCX behavioral reference searches on a five-second cadence.
+/// Keeping the same cadence avoids overrunning the legacy device's discovery
+/// response path.
+pub const REPEAT_SEARCH_GAP: Duration = Duration::from_secs(5);
+/// Whole nominal budget for the fixed nine-trial repeat session.
+pub const REPEAT_SEARCH_BUDGET: Duration = Duration::from_secs(60);
 
 const SEARCH_REQUEST_BYTES: [u8; SEARCH_REQUEST_LEN] =
     [0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7];
@@ -48,7 +58,18 @@ impl SearchRequest {
     }
 }
 
-/// One immutable operation issued by [`execute_search`].
+/// Closed kind of one typed Search operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOperationKind {
+    /// Vendor-documented 115200 attempt in the generic discovery plan.
+    Primary,
+    /// 38400 attempt reached after an empty primary timeout.
+    SingleFallback,
+    /// Direct 38400 binding used by the observed MVP device path.
+    Known38400,
+}
+
+/// One immutable operation issued by a Search executor.
 ///
 /// The timeout covers the complete adapter attempt: serial configuration,
 /// writing all eight Search bytes, and reading no more than 26 bytes. The
@@ -56,7 +77,7 @@ impl SearchRequest {
 /// executor deliberately owns no clock, thread, file descriptor, or TTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchOperation {
-    attempt: DiscoveryAttemptKind,
+    kind: SearchOperationKind,
     settings: SerialSettings,
     expected_device: DeviceId,
 }
@@ -64,15 +85,18 @@ pub struct SearchOperation {
 impl SearchOperation {
     const fn new(attempt: DiscoveryAttempt, expected_device: DeviceId) -> Self {
         Self {
-            attempt: attempt.kind(),
+            kind: match attempt.kind() {
+                DiscoveryAttemptKind::Primary => SearchOperationKind::Primary,
+                DiscoveryAttemptKind::SingleFallback => SearchOperationKind::SingleFallback,
+            },
             settings: attempt.settings(),
             expected_device,
         }
     }
 
-    /// Return whether this is the primary or sole fallback attempt.
-    pub const fn attempt(self) -> DiscoveryAttemptKind {
-        self.attempt
+    /// Return the closed operation kind.
+    pub const fn kind(self) -> SearchOperationKind {
+        self.kind
     }
 
     /// Return exact line settings for this attempt.
@@ -99,6 +123,35 @@ impl SearchOperation {
     pub const fn response_limit(self) -> usize {
         SEARCH_RESPONSE_LIMIT
     }
+}
+
+fn operation_for_attempt(
+    attempt: DiscoveryAttemptKind,
+    expected_device: DeviceId,
+) -> Result<SearchOperation, DiscoveryError> {
+    let mut discovery = QueryOnlyDiscovery::new(expected_device);
+    if attempt == DiscoveryAttemptKind::SingleFallback {
+        discovery.timeout_current()?;
+    }
+    discovery
+        .current_attempt()
+        .map(|planned| SearchOperation::new(planned, expected_device))
+        .ok_or(DiscoveryError::NoPendingAttempt)
+}
+
+fn operation_for_kind(
+    kind: SearchOperationKind,
+    expected_device: DeviceId,
+) -> Result<SearchOperation, DiscoveryError> {
+    let planned = match kind {
+        SearchOperationKind::Primary => DiscoveryAttemptKind::Primary,
+        SearchOperationKind::SingleFallback | SearchOperationKind::Known38400 => {
+            DiscoveryAttemptKind::SingleFallback
+        }
+    };
+    let mut operation = operation_for_attempt(planned, expected_device)?;
+    operation.kind = kind;
+    Ok(operation)
 }
 
 /// How one bounded adapter read ended.
@@ -219,16 +272,205 @@ pub trait SearchTransport {
     fn search(&mut self, operation: SearchOperation) -> Result<SearchRead, Self::Error>;
 }
 
+/// Injected monotonic clock and delay boundary for an exact repeat session.
+///
+/// Implementations must wait for at least the supplied duration. Keeping this
+/// boundary separate from [`SearchTransport`] leaves ordinary discovery free
+/// of retry or sleep behavior and makes the nine-trial policy testable without
+/// wall-clock delays.
+pub trait RepeatPacer {
+    /// Pacer-specific failure.
+    type Error: StdError + Send + Sync + 'static;
+
+    /// Return monotonic elapsed time from an implementation-owned epoch.
+    fn elapsed(&mut self) -> Duration;
+
+    /// Wait for at least the supplied minimum interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific failure without issuing a Search.
+    fn wait(&mut self, minimum: Duration) -> Result<(), Self::Error>;
+}
+
+/// Successful attempt derived directly from the first validated Search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatSearchBinding {
+    expected_device: DeviceId,
+    successful_kind: SearchOperationKind,
+}
+
+impl RepeatSearchBinding {
+    /// Derive the repeat session from the successful typed Search result.
+    pub const fn from_identified(search: &IdentifiedSearch) -> Self {
+        Self {
+            expected_device: search.device(),
+            successful_kind: search.kind(),
+        }
+    }
+
+    /// Expected device address from the first successful receipt.
+    pub const fn expected_device(self) -> DeviceId {
+        self.expected_device
+    }
+
+    /// Successful first-attempt baud pinned for all nine trials.
+    pub const fn successful_baud(self) -> u32 {
+        match self.successful_kind {
+            SearchOperationKind::Primary => PRIMARY_BAUD,
+            SearchOperationKind::SingleFallback | SearchOperationKind::Known38400 => FALLBACK_BAUD,
+        }
+    }
+}
+
+/// Sanitized success summary for all nine same-baud trials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatedSearch {
+    expected_device: DeviceId,
+    successful_baud: u32,
+    valid_response_count: usize,
+}
+
+impl RepeatedSearch {
+    /// Expected and observed device address for every response.
+    pub const fn device(self) -> DeviceId {
+        self.expected_device
+    }
+
+    /// Baud rate reused from the first successful Search.
+    pub const fn baud(self) -> u32 {
+        self.successful_baud
+    }
+
+    /// Number of valid responses, always nine for a returned value.
+    pub const fn valid_response_count(self) -> usize {
+        self.valid_response_count
+    }
+}
+
+/// Terminal failure from the fixed repeat executor.
+#[derive(Debug, Error)]
+pub enum RepeatSearchError<T: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>
+{
+    /// The injected pacer failed before the named trial.
+    #[error("repeat pacing failed before trial {trial}")]
+    Pacing {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Pacer-specific cause.
+        #[source]
+        source: P,
+    },
+    /// The one-minute whole-session budget was exceeded.
+    #[error("repeat session exceeded its 60 second budget at trial {trial}")]
+    BudgetExceeded {
+        /// One-based repeat trial number.
+        trial: usize,
+    },
+    /// The injected carrier failed; no later trial is eligible.
+    #[error("repeat Search transport failed during trial {trial}")]
+    Transport {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Carrier-specific cause.
+        #[source]
+        source: T,
+    },
+    /// A repeat timed out, including an empty timeout; no fallback is allowed.
+    #[error("repeat Search timed out with {received} bytes during trial {trial}")]
+    Timeout {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Bounded bytes received before the deadline.
+        received: usize,
+    },
+    /// Exact response or expected-device validation failed.
+    #[error("repeat Search validation failed during trial {trial}: {source}")]
+    Validation {
+        /// One-based repeat trial number.
+        trial: usize,
+        /// Pure discovery failure.
+        #[source]
+        source: DiscoveryError,
+    },
+}
+
+/// Execute exactly nine same-baud Searches from reviewed first-success evidence.
+///
+/// Every trial is preceded by at least five seconds of injected pacing. The baud is
+/// pinned to the successful primary or fallback rate; a repeat never restarts
+/// discovery and therefore can never change baud. Any timeout, invalid response,
+/// transport error, pacing error, or whole-session budget overrun stops without
+/// issuing a later trial. Opaque response payloads are validated but neither
+/// retained nor compared for equality.
+///
+/// # Errors
+///
+/// Returns [`RepeatSearchError`] on the first terminal failure.
+pub fn execute_search_repeat<T: SearchTransport, P: RepeatPacer>(
+    transport: &mut T,
+    pacer: &mut P,
+    binding: RepeatSearchBinding,
+) -> Result<RepeatedSearch, RepeatSearchError<T::Error, P::Error>> {
+    let start = pacer.elapsed();
+    let operation = operation_for_kind(binding.successful_kind, binding.expected_device)
+        .map_err(|source| RepeatSearchError::Validation { trial: 1, source })?;
+
+    for index in 0..REPEAT_SEARCH_COUNT {
+        let trial = index + 1;
+        pacer
+            .wait(REPEAT_SEARCH_GAP)
+            .map_err(|source| RepeatSearchError::Pacing { trial, source })?;
+        let elapsed = pacer.elapsed().saturating_sub(start);
+        if elapsed > REPEAT_SEARCH_BUDGET.saturating_sub(operation.timeout()) {
+            return Err(RepeatSearchError::BudgetExceeded { trial });
+        }
+
+        let read = transport
+            .search(operation)
+            .map_err(|source| RepeatSearchError::Transport { trial, source })?;
+        if pacer.elapsed().saturating_sub(start) > REPEAT_SEARCH_BUDGET {
+            return Err(RepeatSearchError::BudgetExceeded { trial });
+        }
+
+        match read.end() {
+            SearchReadEnd::Complete => {
+                let mut discovery = QueryOnlyDiscovery::new(binding.expected_device);
+                if binding.successful_kind != SearchOperationKind::Primary {
+                    discovery
+                        .timeout_current()
+                        .map_err(|source| RepeatSearchError::Validation { trial, source })?;
+                }
+                discovery
+                    .accept_candidates(&[read.bytes()])
+                    .map_err(|source| RepeatSearchError::Validation { trial, source })?;
+            }
+            SearchReadEnd::TimedOut => {
+                return Err(RepeatSearchError::Timeout {
+                    trial,
+                    received: read.received_len(),
+                });
+            }
+        }
+    }
+
+    Ok(RepeatedSearch {
+        expected_device: binding.expected_device,
+        successful_baud: binding.successful_baud(),
+        valid_response_count: REPEAT_SEARCH_COUNT,
+    })
+}
+
 /// Successful exact identity returned by the executor.
 pub struct IdentifiedSearch {
-    attempt: DiscoveryAttemptKind,
+    kind: SearchOperationKind,
     response: SearchResponse26,
 }
 
 impl IdentifiedSearch {
-    /// Return the attempt that produced the validated identity.
-    pub const fn attempt(&self) -> DiscoveryAttemptKind {
-        self.attempt
+    /// Return the operation kind that produced the validated identity.
+    pub const fn kind(&self) -> SearchOperationKind {
+        self.kind
     }
 
     /// Return the validated expected unit address.
@@ -249,7 +491,7 @@ impl fmt::Debug for IdentifiedSearch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("IdentifiedSearch")
-            .field("attempt", &self.attempt)
+            .field("kind", &self.kind)
             .field("device", &self.device())
             .field("response_bytes", &SEARCH_RESPONSE_LIMIT)
             .field("response", &"[redacted]")
@@ -298,6 +540,82 @@ pub enum SearchExecutionError<E: StdError + Send + Sync + 'static> {
     },
 }
 
+/// Result from one direct Search at the observed 38400 MVP binding.
+#[derive(Debug)]
+pub enum Known38400SearchOutcome {
+    /// One exact response matched the caller-bound unit address.
+    Identified(IdentifiedSearch),
+    /// The single attempt reached its deadline without receiving bytes.
+    TimedOut,
+}
+
+/// Fail-closed error from one direct 38400 Search.
+#[derive(Debug, Error)]
+pub enum Known38400SearchError<E: StdError + Send + Sync + 'static> {
+    /// The injected adapter failed.
+    #[error("known 38400 Search transport failed")]
+    Transport {
+        /// Adapter-specific cause.
+        #[source]
+        source: E,
+    },
+    /// A deadline arrived after a partial response.
+    #[error("known 38400 Search timed out with {received} partial bytes")]
+    PartialTimeout {
+        /// Bounded number of bytes received before the deadline.
+        received: usize,
+    },
+    /// Exact response validation or operation construction failed.
+    #[error("known 38400 Search validation failed: {source}")]
+    Validation {
+        /// Pure discovery failure.
+        #[source]
+        source: DiscoveryError,
+    },
+}
+
+/// Execute one Search at the closed 38400 MVP binding.
+///
+/// This path exists for the named device after its working baud has been
+/// observed. It issues no 115200 probe and exposes no caller-selected baud.
+///
+/// # Errors
+///
+/// Returns [`Known38400SearchError`] for transport, partial-timeout, protocol,
+/// identity, or impossible state errors.
+pub fn execute_known_38400_search<T: SearchTransport>(
+    transport: &mut T,
+    expected_device: DeviceId,
+) -> Result<Known38400SearchOutcome, Known38400SearchError<T::Error>> {
+    let operation = operation_for_kind(SearchOperationKind::Known38400, expected_device)
+        .map_err(|source| Known38400SearchError::Validation { source })?;
+    let read = transport
+        .search(operation)
+        .map_err(|source| Known38400SearchError::Transport { source })?;
+
+    match read.end() {
+        SearchReadEnd::Complete => {
+            let mut discovery = QueryOnlyDiscovery::new(expected_device);
+            discovery
+                .timeout_current()
+                .map_err(|source| Known38400SearchError::Validation { source })?;
+            let response = discovery
+                .accept_candidates(&[read.bytes()])
+                .map_err(|source| Known38400SearchError::Validation { source })?;
+            Ok(Known38400SearchOutcome::Identified(IdentifiedSearch {
+                kind: SearchOperationKind::Known38400,
+                response,
+            }))
+        }
+        SearchReadEnd::TimedOut if read.received_len() != 0 => {
+            Err(Known38400SearchError::PartialTimeout {
+                received: read.received_len(),
+            })
+        }
+        SearchReadEnd::TimedOut => Ok(Known38400SearchOutcome::TimedOut),
+    }
+}
+
 /// Execute the exact Search-only discovery policy through an injected adapter.
 ///
 /// Attempt one is 115200 8N1/no-flow. Exactly one 38400 8N1/no-flow fallback
@@ -325,12 +643,15 @@ pub fn execute_search<T: SearchTransport>(
                     source: DiscoveryError::NoPendingAttempt,
                 })?;
         let kind = attempt.kind();
-        let read = transport
-            .search(SearchOperation::new(attempt, expected_device))
-            .map_err(|source| SearchExecutionError::Transport {
-                attempt: kind,
-                source,
-            })?;
+        let operation = SearchOperation::new(attempt, expected_device);
+        let operation_kind = operation.kind();
+        let read =
+            transport
+                .search(operation)
+                .map_err(|source| SearchExecutionError::Transport {
+                    attempt: kind,
+                    source,
+                })?;
 
         match read.end() {
             SearchReadEnd::Complete => {
@@ -341,7 +662,7 @@ pub fn execute_search<T: SearchTransport>(
                         source,
                     })?;
                 return Ok(SearchOutcome::Identified(IdentifiedSearch {
-                    attempt: kind,
+                    kind: operation_kind,
                     response,
                 }));
             }
@@ -392,6 +713,35 @@ mod tests {
         operations: Vec<SearchOperation>,
     }
 
+    #[derive(Debug, Error)]
+    #[error("synthetic pacing failure")]
+    struct FakePacingError;
+
+    #[derive(Default)]
+    struct FakePacer {
+        now: Duration,
+        waits: Vec<Duration>,
+        next_wait: Option<Duration>,
+        fail: bool,
+    }
+
+    impl RepeatPacer for FakePacer {
+        type Error = FakePacingError;
+
+        fn elapsed(&mut self) -> Duration {
+            self.now
+        }
+
+        fn wait(&mut self, minimum: Duration) -> Result<(), Self::Error> {
+            self.waits.push(minimum);
+            if self.fail {
+                return Err(FakePacingError);
+            }
+            self.now += self.next_wait.take().unwrap_or(minimum);
+            Ok(())
+        }
+    }
+
     impl FakeTransport {
         fn new(steps: impl IntoIterator<Item = Step>) -> Self {
             Self {
@@ -421,8 +771,8 @@ mod tests {
         frame
     }
 
-    fn assert_operation(operation: SearchOperation, kind: DiscoveryAttemptKind, baud: u32) {
-        assert_eq!(operation.attempt(), kind);
+    fn assert_operation(operation: SearchOperation, kind: SearchOperationKind, baud: u32) {
+        assert_eq!(operation.kind(), kind);
         assert_eq!(operation.expected_device(), DeviceId::new(0).unwrap());
         assert_eq!(operation.settings().baud(), baud);
         assert_eq!(operation.settings().data_bits(), 8);
@@ -432,6 +782,13 @@ mod tests {
         assert_eq!(operation.request().as_bytes(), &SEARCH_REQUEST_BYTES);
         assert_eq!(operation.timeout(), Duration::from_millis(500));
         assert_eq!(operation.response_limit(), 26);
+    }
+
+    fn identified(kind: SearchOperationKind, device: u8) -> IdentifiedSearch {
+        IdentifiedSearch {
+            kind,
+            response: SearchResponse26::parse(&synthetic_response(device)).unwrap(),
+        }
     }
 
     #[test]
@@ -451,13 +808,13 @@ mod tests {
         let SearchOutcome::Identified(identity) = outcome else {
             panic!("expected exact identity")
         };
-        assert_eq!(identity.attempt(), DiscoveryAttemptKind::Primary);
+        assert_eq!(identity.kind(), SearchOperationKind::Primary);
         assert_eq!(identity.device(), DeviceId::new(0).unwrap());
         assert_eq!(identity.response().opaque_payload(), b"SYNTHETIC-IDENTITY");
         assert_eq!(transport.operations.len(), 1);
         assert_operation(
             transport.operations[0],
-            DiscoveryAttemptKind::Primary,
+            SearchOperationKind::Primary,
             PRIMARY_BAUD,
         );
     }
@@ -474,17 +831,42 @@ mod tests {
         let SearchOutcome::Identified(identity) = outcome else {
             panic!("expected fallback identity")
         };
-        assert_eq!(identity.attempt(), DiscoveryAttemptKind::SingleFallback);
+        assert_eq!(identity.kind(), SearchOperationKind::SingleFallback);
         assert_eq!(transport.operations.len(), MAX_SEARCH_ATTEMPTS);
         assert_operation(
             transport.operations[0],
-            DiscoveryAttemptKind::Primary,
+            SearchOperationKind::Primary,
             PRIMARY_BAUD,
         );
         assert_operation(
             transport.operations[1],
-            DiscoveryAttemptKind::SingleFallback,
+            SearchOperationKind::SingleFallback,
             FALLBACK_BAUD,
+        );
+    }
+
+    #[test]
+    fn known_38400_search_issues_one_truthful_operation() {
+        let frame = synthetic_response(0);
+        let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
+
+        let Known38400SearchOutcome::Identified(identity) =
+            execute_known_38400_search(&mut transport, DeviceId::new(0).unwrap()).unwrap()
+        else {
+            panic!("expected known-38400 identity")
+        };
+
+        assert_eq!(identity.kind(), SearchOperationKind::Known38400);
+        assert_eq!(identity.device(), DeviceId::new(0).unwrap());
+        assert_eq!(transport.operations.len(), 1);
+        assert_operation(
+            transport.operations[0],
+            SearchOperationKind::Known38400,
+            FALLBACK_BAUD,
+        );
+        assert_eq!(
+            RepeatSearchBinding::from_identified(&identity).successful_baud(),
+            FALLBACK_BAUD
         );
     }
 
@@ -563,6 +945,77 @@ mod tests {
             })
         ));
         assert_eq!(transport.operations.len(), 1);
+    }
+
+    #[test]
+    fn repeat_executes_exactly_nine_primary_searches_with_fixed_pacing() {
+        assert_eq!(REPEAT_SEARCH_COUNT, 9);
+        let frame = synthetic_response(0);
+        let steps =
+            (0..REPEAT_SEARCH_COUNT).map(|_| Step::Read(SearchRead::complete(&frame).unwrap()));
+        let mut transport = FakeTransport::new(steps);
+        let mut pacer = FakePacer::default();
+        let first = identified(SearchOperationKind::Primary, 0);
+        let binding = RepeatSearchBinding::from_identified(&first);
+
+        let repeated = execute_search_repeat(&mut transport, &mut pacer, binding).unwrap();
+        assert_eq!(repeated.device(), DeviceId::new(0).unwrap());
+        assert_eq!(repeated.baud(), PRIMARY_BAUD);
+        assert_eq!(repeated.valid_response_count(), REPEAT_SEARCH_COUNT);
+        assert_eq!(transport.operations.len(), REPEAT_SEARCH_COUNT);
+        assert!(transport.operations.iter().all(|operation| {
+            operation.kind() == SearchOperationKind::Primary
+                && operation.settings().baud() == PRIMARY_BAUD
+        }));
+        assert_eq!(pacer.waits, [REPEAT_SEARCH_GAP; REPEAT_SEARCH_COUNT]);
+    }
+
+    #[test]
+    fn repeat_pins_fallback_baud_and_stops_on_first_timeout() {
+        let frame = synthetic_response(0);
+        let mut transport = FakeTransport::new([
+            Step::Read(SearchRead::complete(&frame).unwrap()),
+            Step::Read(SearchRead::timed_out(&[]).unwrap()),
+            Step::Read(SearchRead::complete(&frame).unwrap()),
+        ]);
+        let mut pacer = FakePacer::default();
+        let first = identified(SearchOperationKind::SingleFallback, 0);
+        let binding = RepeatSearchBinding::from_identified(&first);
+
+        assert!(matches!(
+            execute_search_repeat(&mut transport, &mut pacer, binding),
+            Err(RepeatSearchError::Timeout {
+                trial: 2,
+                received: 0,
+            })
+        ));
+        assert_eq!(transport.operations.len(), 2);
+        assert!(transport.operations.iter().all(|operation| {
+            operation.kind() == SearchOperationKind::SingleFallback
+                && operation.settings().baud() == FALLBACK_BAUD
+        }));
+        assert_eq!(pacer.waits.len(), 2);
+    }
+
+    #[test]
+    fn repeat_rejects_insufficient_remaining_budget() {
+        let frame = synthetic_response(0);
+        let mut transport = FakeTransport::new([Step::Read(SearchRead::complete(&frame).unwrap())]);
+        let mut pacer = FakePacer {
+            next_wait: Some(
+                REPEAT_SEARCH_BUDGET.saturating_sub(SEARCH_ATTEMPT_TIMEOUT)
+                    + Duration::from_millis(1),
+            ),
+            ..FakePacer::default()
+        };
+        let first = identified(SearchOperationKind::Primary, 0);
+        let binding = RepeatSearchBinding::from_identified(&first);
+
+        assert!(matches!(
+            execute_search_repeat(&mut transport, &mut pacer, binding),
+            Err(RepeatSearchError::BudgetExceeded { trial: 1 })
+        ));
+        assert!(transport.operations.is_empty());
     }
 
     #[test]

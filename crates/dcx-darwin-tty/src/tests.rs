@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, path::PathBuf, time::Duration};
 
-use dcx_core::{discovery::DiscoveryAttemptKind, protocol::DeviceId};
-use dcx_transport::{SearchExecutionError, SearchOutcome, execute_search};
+use dcx_core::protocol::DeviceId;
+use dcx_transport::{SearchExecutionError, SearchOperationKind, SearchOutcome, execute_search};
 
 use super::*;
 
@@ -18,7 +18,9 @@ enum Call {
     WaitReadable,
     Read(usize),
     RestoreTermios,
+    VerifyTermiosRestore,
     RestoreControlLines,
+    VerifyControlLinesRestore,
     Close,
 }
 
@@ -35,6 +37,11 @@ struct FakeBackend {
     fail_at: Option<CarrierStage>,
     advance_at: Option<(CarrierStage, Duration)>,
     opened: bool,
+    written: bool,
+    preexisting_input: usize,
+    preexisting_script: VecDeque<usize>,
+    termios_readback: FakeTermios,
+    control_lines_readback: i32,
 }
 
 impl FakeBackend {
@@ -49,6 +56,11 @@ impl FakeBackend {
             fail_at: None,
             advance_at: None,
             opened: false,
+            written: false,
+            preexisting_input: 0,
+            preexisting_script: VecDeque::new(),
+            termios_readback: FakeTermios(8),
+            control_lines_readback: 0x2496,
         }
     }
 
@@ -104,11 +116,24 @@ impl SerialBackend for FakeBackend {
     fn write_once(&mut self, bytes: &[u8]) -> Result<usize, SystemFault> {
         self.step(CarrierStage::Write, Call::Write(bytes.len()))?;
         assert_eq!(bytes, &[0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7]);
-        Ok(self.short_write.unwrap_or(bytes.len()))
+        let written = self.short_write.unwrap_or(bytes.len());
+        self.written = true;
+        Ok(written)
     }
 
     fn bytes_available(&mut self) -> Result<usize, SystemFault> {
-        self.step(CarrierStage::BytesAvailable, Call::BytesAvailable)?;
+        let stage = if self.written {
+            CarrierStage::BytesAvailable
+        } else {
+            CarrierStage::CheckPreexistingInput
+        };
+        self.step(stage, Call::BytesAvailable)?;
+        if !self.written {
+            return Ok(self
+                .preexisting_script
+                .pop_front()
+                .unwrap_or(self.preexisting_input));
+        }
         Ok(self
             .available_script
             .pop_front()
@@ -139,14 +164,34 @@ impl SerialBackend for FakeBackend {
         self.step(CarrierStage::RestoreTermios, Call::RestoreTermios)
     }
 
+    fn verify_termios_restore(
+        &mut self,
+        snapshot: &Self::TermiosSnapshot,
+    ) -> Result<bool, SystemFault> {
+        self.step(
+            CarrierStage::VerifyTermiosRestore,
+            Call::VerifyTermiosRestore,
+        )?;
+        Ok(&self.termios_readback == snapshot)
+    }
+
     fn restore_control_lines(&mut self, state: i32) -> Result<(), SystemFault> {
         assert_eq!(state, 0x2496);
         self.step(CarrierStage::RestoreControlLines, Call::RestoreControlLines)
     }
 
+    fn verify_control_lines_restore(&mut self, state: i32) -> Result<bool, SystemFault> {
+        self.step(
+            CarrierStage::VerifyControlLinesRestore,
+            Call::VerifyControlLinesRestore,
+        )?;
+        Ok(self.control_lines_readback == state)
+    }
+
     fn close(&mut self) {
         self.calls.push(Call::Close);
         self.opened = false;
+        self.written = false;
     }
 }
 
@@ -159,9 +204,7 @@ fn synthetic_response(device: u8) -> [u8; SEARCH_RESPONSE_LIMIT] {
 }
 
 fn binding() -> PrivateTtyBinding {
-    let path = PathBuf::from(SYNTHETIC_PATH);
-    let digest = Sha256Digest::of_bytes(path.as_os_str().as_bytes()).to_string();
-    PrivateTtyBinding::new(path, &digest).unwrap()
+    PrivateTtyBinding::new(PathBuf::from(SYNTHETIC_PATH)).unwrap()
 }
 
 #[test]
@@ -175,7 +218,7 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
     else {
         panic!("expected exact identity")
     };
-    assert_eq!(identity.attempt(), DiscoveryAttemptKind::Primary);
+    assert_eq!(identity.kind(), SearchOperationKind::Primary);
     assert_eq!(carrier.backend.inbound.len(), 0);
     assert_eq!(
         carrier.backend.calls,
@@ -183,13 +226,17 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
             Call::Open,
             Call::SnapshotTermios,
             Call::SnapshotControlLines,
+            Call::BytesAvailable,
             Call::Configure(115_200),
+            Call::BytesAvailable,
             Call::Write(8),
             Call::BytesAvailable,
             Call::Read(26),
             Call::BytesAvailable,
             Call::RestoreTermios,
+            Call::VerifyTermiosRestore,
             Call::RestoreControlLines,
+            Call::VerifyControlLinesRestore,
             Call::Close,
         ]
     );
@@ -202,8 +249,88 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
     assert_eq!(receipt.cleanup_reserve_millis, 25);
     assert_eq!(receipt.rx_digest, Some(Sha256Digest::of_bytes(&response)));
     assert_eq!(receipt.outcome, SanitizedAttemptOutcome::Complete);
-    assert_eq!(receipt.termios_cleanup, CleanupDisposition::Restored);
-    assert_eq!(receipt.control_lines_cleanup, CleanupDisposition::Restored);
+    assert_eq!(
+        receipt.termios_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert_eq!(
+        receipt.control_lines_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert!(receipt.closed);
+}
+
+#[test]
+fn preexisting_input_blocks_write_without_consuming_and_restores() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.preexisting_input = 3;
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(matches!(
+        execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+        Err(SearchExecutionError::Transport {
+            source: DarwinCarrierError::PreexistingInput { queued: 3 },
+            ..
+        })
+    ));
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Write(_)))
+    );
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Configure(_)))
+    );
+    let receipt = &carrier.receipts()[0];
+    assert_eq!(receipt.tx_bytes, 0);
+    assert_eq!(receipt.rx_bytes, 0);
+    assert_eq!(receipt.outcome, SanitizedAttemptOutcome::PreexistingInput);
+    assert_eq!(receipt.termios_cleanup, CleanupDisposition::NotRequired);
+    assert_eq!(
+        receipt.control_lines_cleanup,
+        CleanupDisposition::NotRequired
+    );
+    assert!(receipt.closed);
+}
+
+#[test]
+fn input_arriving_during_configuration_blocks_write_and_restores() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.preexisting_script = [0, 3].into_iter().collect();
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(matches!(
+        execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+        Err(SearchExecutionError::Transport {
+            source: DarwinCarrierError::PreexistingInput { queued: 3 },
+            ..
+        })
+    ));
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Write(_)))
+    );
+    let receipt = &carrier.receipts()[0];
+    assert_eq!(receipt.tx_bytes, 0);
+    assert_eq!(receipt.rx_bytes, 0);
+    assert_eq!(receipt.outcome, SanitizedAttemptOutcome::PreexistingInput);
+    assert_eq!(
+        receipt.termios_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert_eq!(
+        receipt.control_lines_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
     assert!(receipt.closed);
 }
 
@@ -318,13 +445,15 @@ fn a_short_write_is_never_retried_and_always_restores() {
     );
     assert!(carrier.backend.calls.ends_with(&[
         Call::RestoreTermios,
+        Call::VerifyTermiosRestore,
         Call::RestoreControlLines,
+        Call::VerifyControlLinesRestore,
         Call::Close,
     ]));
 }
 
 #[test]
-fn deadline_includes_configuration_and_blocks_the_write_at_500_ms() {
+fn deadline_after_configuration_blocks_the_write_at_preexisting_input_check() {
     let mut backend = FakeBackend::with_inbound([]);
     backend.advance_at = Some((CarrierStage::Configure, Duration::from_millis(500)));
     let mut carrier = Carrier::new(binding(), backend);
@@ -333,7 +462,7 @@ fn deadline_includes_configuration_and_blocks_the_write_at_500_ms() {
         execute_search(&mut carrier, DeviceId::new(0).unwrap()),
         Err(SearchExecutionError::Transport {
             source: DarwinCarrierError::Deadline {
-                stage: CarrierStage::Write,
+                stage: CarrierStage::CheckPreexistingInput,
             },
             ..
         })
@@ -395,7 +524,9 @@ fn every_post_snapshot_failure_path_closes_and_restores_both_states() {
         assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_err());
         assert!(carrier.backend.calls.ends_with(&[
             Call::RestoreTermios,
+            Call::VerifyTermiosRestore,
             Call::RestoreControlLines,
+            Call::VerifyControlLinesRestore,
             Call::Close,
         ]));
         assert!(carrier.receipts()[0].closed);
@@ -406,7 +537,9 @@ fn every_post_snapshot_failure_path_closes_and_restores_both_states() {
 fn cleanup_failure_is_terminal_but_still_runs_other_restore_and_close() {
     for failing_stage in [
         CarrierStage::RestoreTermios,
+        CarrierStage::VerifyTermiosRestore,
         CarrierStage::RestoreControlLines,
+        CarrierStage::VerifyControlLinesRestore,
     ] {
         let mut backend = FakeBackend::with_inbound(synthetic_response(0));
         backend.fail_at = Some(failing_stage);
@@ -419,16 +552,41 @@ fn cleanup_failure_is_terminal_but_still_runs_other_restore_and_close() {
                 ..
             })
         ));
-        assert!(carrier.backend.calls.ends_with(&[
-            Call::RestoreTermios,
-            Call::RestoreControlLines,
-            Call::Close,
-        ]));
+        assert_eq!(carrier.backend.calls.last(), Some(&Call::Close));
+        assert!(carrier.backend.calls.contains(&Call::RestoreTermios));
+        assert!(carrier.backend.calls.contains(&Call::RestoreControlLines));
         assert!(carrier.receipts()[0].closed);
         assert_eq!(
             carrier.receipts()[0].outcome,
             SanitizedAttemptOutcome::CleanupFailed
         );
+    }
+}
+
+#[test]
+fn cleanup_readback_mismatch_is_terminal_and_never_reports_verified_restore() {
+    for (termios_readback, control_lines_readback) in
+        [(FakeTermios(9), 0x2496), (FakeTermios(8), 0x2497)]
+    {
+        let mut backend = FakeBackend::with_inbound(synthetic_response(0));
+        backend.termios_readback = termios_readback;
+        backend.control_lines_readback = control_lines_readback;
+        let mut carrier = Carrier::new(binding(), backend);
+
+        assert!(matches!(
+            execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+            Err(SearchExecutionError::Transport {
+                source: DarwinCarrierError::Cleanup { .. },
+                ..
+            })
+        ));
+        let receipt = &carrier.receipts()[0];
+        assert_eq!(receipt.outcome, SanitizedAttemptOutcome::CleanupFailed);
+        assert!(
+            receipt.termios_cleanup == CleanupDisposition::Failed
+                || receipt.control_lines_cleanup == CleanupDisposition::Failed
+        );
+        assert!(receipt.closed);
     }
 }
 
@@ -472,7 +630,7 @@ fn generated_read_partitions_never_cross_the_26_byte_ceiling() {
 }
 
 #[test]
-fn binding_and_receipt_debug_output_never_expose_the_private_path_or_payload() {
+fn binding_and_receipt_debug_output_never_expose_the_path_or_payload() {
     let binding = binding();
     let debug = format!("{binding:?}");
     assert!(!debug.contains(SYNTHETIC_PATH));
@@ -488,27 +646,11 @@ fn binding_and_receipt_debug_output_never_expose_the_private_path_or_payload() {
 }
 
 #[test]
-fn private_binding_rejects_noncanonical_digest_and_non_callout_paths() {
+fn explicit_binding_rejects_non_callout_paths() {
     assert!(matches!(
-        PrivateTtyBinding::new(PathBuf::from(SYNTHETIC_PATH), "SHA256/not-canonical"),
-        Err(BindingError::InvalidDigest)
-    ));
-    let digest = Sha256Digest::of_bytes(b"not-a-callout").to_string();
-    assert!(matches!(
-        PrivateTtyBinding::new(PathBuf::from("not-a-callout"), &digest),
+        PrivateTtyBinding::new(PathBuf::from("not-a-callout")),
         Err(BindingError::UnsupportedPrivatePath)
     ));
-}
-
-#[test]
-fn binding_digest_mismatch_is_sanitized_and_prevents_construction() {
-    let expected = Sha256Digest::of_bytes(b"different-private-binding");
-    let error =
-        PrivateTtyBinding::new(PathBuf::from(SYNTHETIC_PATH), &expected.to_string()).unwrap_err();
-    assert!(matches!(error, BindingError::DigestMismatch { .. }));
-    let message = error.to_string();
-    assert!(!message.contains(SYNTHETIC_PATH));
-    assert!(message.contains("digest mismatch"));
 }
 
 #[test]
