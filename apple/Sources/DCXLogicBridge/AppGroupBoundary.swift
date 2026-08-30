@@ -156,6 +156,7 @@ public final class AppGroupSocketServer: @unchecked Sendable {
     private let stateLock = NSLock()
     private var source: DispatchSourceRead?
     private var descriptor: Int32 = -1
+    private var listenerLockDescriptor: Int32 = -1
     private var socketURL: URL?
     private var handler: Handler?
 
@@ -167,6 +168,35 @@ public final class AppGroupSocketServer: @unchecked Sendable {
         guard source == nil else { throw AppGroupBoundaryError.alreadyListening }
 
         var address = try UnixSocketAddress(path: socketURL.path).value
+        let listenerLockURL = socketURL.appendingPathExtension("lock")
+        let listenerLock = Darwin.open(
+            listenerLockURL.path,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR
+        )
+        guard listenerLock >= 0 else {
+            throw AppGroupBoundaryError.socketFailure(errno)
+        }
+        var ownsListenerLock = true
+        defer {
+            if ownsListenerLock {
+                _ = Darwin.flock(listenerLock, LOCK_UN)
+                Darwin.close(listenerLock)
+            }
+        }
+        var lockMetadata = stat()
+        guard Darwin.fstat(listenerLock, &lockMetadata) == 0,
+              (lockMetadata.st_mode & S_IFMT) == S_IFREG,
+              lockMetadata.st_uid == geteuid(),
+              lockMetadata.st_mode & 0o077 == 0 else {
+            throw AppGroupBoundaryError.socketFailure(EACCES)
+        }
+        guard Darwin.flock(listenerLock, LOCK_EX | LOCK_NB) == 0 else {
+            if errno == EWOULDBLOCK || errno == EAGAIN {
+                throw AppGroupBoundaryError.alreadyListening
+            }
+            throw AppGroupBoundaryError.socketFailure(errno)
+        }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw AppGroupBoundaryError.socketFailure(errno) }
         var ownsDescriptor = true
@@ -195,10 +225,12 @@ public final class AppGroupSocketServer: @unchecked Sendable {
         source.setEventHandler { [weak self] in self?.acceptOne() }
         source.setCancelHandler { Darwin.close(fd) }
         self.descriptor = fd
+        listenerLockDescriptor = listenerLock
         self.socketURL = socketURL
         self.handler = handler
         self.source = source
         ownsDescriptor = false
+        ownsListenerLock = false
         source.resume()
     }
 
@@ -206,15 +238,21 @@ public final class AppGroupSocketServer: @unchecked Sendable {
         stateLock.lock()
         let source = self.source
         let socketURL = self.socketURL
+        let listenerLock = listenerLockDescriptor
         self.source = nil
         self.socketURL = nil
         handler = nil
         descriptor = -1
+        listenerLockDescriptor = -1
         stateLock.unlock()
 
         source?.cancel()
         if let socketURL {
             _ = Darwin.unlink(socketURL.path)
+        }
+        if listenerLock >= 0 {
+            _ = Darwin.flock(listenerLock, LOCK_UN)
+            Darwin.close(listenerLock)
         }
     }
 

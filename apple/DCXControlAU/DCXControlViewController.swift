@@ -16,6 +16,9 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     private var configuredTarget: DCXTargetReference?
     private var helperCapabilities: Set<BridgeOperation> = []
     private var helperForeground = false
+    private var helperRecovery: HelperRecoveryStatusV1?
+    private var helperRecoveryUnavailable = false
+    private var cachedMutationTarget: DCXTargetReference?
     private var bridgeRequestInFlight = false
     private var actionButtons: [NSButton] = []
     private var capabilityButtons: [BridgeOperation: NSButton] = [:]
@@ -123,16 +126,54 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             guard let self, case let .helperStatus(status) = body else { return }
             helperForeground = status.foreground
             helperCapabilities = Set(status.capabilities)
+            helperRecoveryUnavailable = status.recoveryUnavailable
+            if BridgeOperation.mutationCapabilities.isSubset(of: helperCapabilities),
+               let target = status.target {
+                cachedMutationTarget = target
+            }
+            if !status.recoveryUnavailable {
+                helperRecovery = status.recovery
+            }
             let targetChanged = configuredTarget != status.target
             configuredTarget = status.target
             if targetChanged {
                 identityLabel.stringValue = "Device: not identified"
-                refreshLabels()
             }
-            refreshActionAvailability()
-            statusLabel.stringValue = status.foreground
-                ? "Helper foreground; \(status.capabilities.count) capability entries"
-                : "Helper is not foreground"
+            var acceptedCompletion = false
+            var rejectedCompletion = false
+            if !status.recoveryUnavailable,
+               status.recovery == nil,
+               let completion = status.completion,
+               dcxAudioUnit?.controlState.view().recoveryActive == true {
+                if let controlState = dcxAudioUnit?.controlState {
+                    do {
+                        try controlState.acceptRecoveryCompletion(completion)
+                        acceptedCompletion = true
+                    } catch {
+                        rejectedCompletion = true
+                    }
+                } else {
+                    rejectedCompletion = true
+                }
+            }
+            refreshLabels()
+            if status.recoveryUnavailable {
+                statusLabel.stringValue = "Helper recovery authority is temporarily unavailable; no device operation is authorized"
+            } else if let recovery = status.recovery {
+                statusLabel.stringValue = status.foreground
+                    ? "Helper reachable; mutation recovery \(recovery.transactionID) is pinned"
+                    : "Helper is not foreground; mutation recovery remains pinned"
+            } else if acceptedCompletion {
+                statusLabel.stringValue = "Helper terminal proof matched the local transaction; exact baseline recovery is complete"
+            } else if rejectedCompletion {
+                statusLabel.stringValue = "Helper terminal proof does not match the local recovery transaction"
+            } else if let completion = status.completion {
+                statusLabel.stringValue = "Helper retained exact-baseline completion \(completion.transactionID)"
+            } else {
+                statusLabel.stringValue = status.foreground
+                    ? "Helper reachable; \(status.capabilities.count) capability entries"
+                    : "Helper is not foreground"
+            }
         }
     }
 
@@ -154,6 +195,12 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @objc private func stageDesiredProfile() {
+        guard dcxAudioUnit?.controlState.view().recoveryActive != true,
+              helperRecovery == nil,
+              !helperRecoveryUnavailable else {
+            report("Staging is blocked until the active mutation recovery reaches its baseline")
+            return
+        }
         guard let target = configuredTarget else {
             report("Request Helper Status before staging the configured DCX target")
             return
@@ -165,6 +212,11 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         panel.canChooseFiles = true
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
+            guard self?.helperRecovery == nil,
+                  self?.helperRecoveryUnavailable == false else {
+                self?.report("Staging is blocked until the helper's mutation recovery completes")
+                return
+            }
             do {
                 let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
                 guard values.isRegularFile == true,
@@ -182,6 +234,9 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 try staged.validate()
                 try self?.dcxAudioUnit?.controlState.stage(staged)
                 self?.report("Desired profile staged in Logic project state; no device call occurred")
+                self?.refreshLabels()
+            } catch DCXControlStateError.recoveryInProgress {
+                self?.report("Staging is blocked until mutation recovery reaches its baseline")
                 self?.refreshLabels()
             } catch {
                 self?.report("Selected file is not a valid bounded desired profile")
@@ -246,6 +301,10 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @objc private func applyDesired() {
+        guard helperRecovery == nil else {
+            report("The helper already has a pinned mutation recovery transaction")
+            return
+        }
         guard let state = dcxAudioUnit?.controlState.view(),
               let project = state.projectState,
               let baseline = state.currentSnapshot,
@@ -264,7 +323,26 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 baseline: baseline
             )
             refreshLabels()
-            send(.apply(.init(target: project.target, plan: plan))) { [weak self] body in
+            send(
+                .apply(.init(target: project.target, plan: plan)),
+                onError: { [weak self] error in
+                    guard let self else { return }
+                    guard error.code == .mutationNotAdmitted else {
+                        report(error.message)
+                        return
+                    }
+                    do {
+                        try dcxAudioUnit?.controlState.rejectApplyBeforeAdmission(
+                            transactionID: diff.applyPlanDigest,
+                            baseline: baseline
+                        )
+                        report("Apply was rejected before mutation admission; the reviewed diff remains staged")
+                        refreshLabels()
+                    } catch {
+                        report("Apply admission rejection no longer matches the local transaction")
+                    }
+                }
+            ) { [weak self] body in
                 guard case let .apply(result) = body else { return }
                 do {
                     try self?.dcxAudioUnit?.controlState.acceptApply(
@@ -290,28 +368,55 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @objc private func readback() {
-        guard let state = dcxAudioUnit?.controlState.view(),
-              let project = state.projectState,
-              let transactionID = state.transactionID,
-              let diff = state.diff else {
-            report("No bounded apply transaction is available for readback")
-            return
-        }
         do {
-            let request = try ReadbackRequest(
-                target: project.target,
-                transactionID: transactionID,
-                expectedDesiredDigest: diff.desiredSnapshotDigest
-            )
+            let state = dcxAudioUnit?.controlState.view()
+            let request: ReadbackRequest
+            let baselineDigest: String
+            let updatesLocalState: Bool
+            if let project = state?.projectState,
+               let transactionID = state?.transactionID,
+               let diff = state?.diff,
+               let baseline = state?.rollbackBaseline {
+                request = try ReadbackRequest(
+                    target: project.target,
+                    transactionID: transactionID,
+                    expectedDesiredDigest: diff.desiredSnapshotDigest
+                )
+                baselineDigest = baseline.digest
+                updatesLocalState = true
+            } else if let recovery = helperRecovery {
+                request = try ReadbackRequest(
+                    target: recovery.target,
+                    transactionID: recovery.transactionID,
+                    expectedDesiredDigest: recovery.desiredSnapshotDigest
+                )
+                baselineDigest = recovery.baseline.digest
+                updatesLocalState = false
+            } else {
+                report("No bounded apply transaction is available for readback")
+                return
+            }
             send(.readback(request)) { [weak self] body in
                 guard case let .readback(result) = body else { return }
                 do {
-                    try self?.dcxAudioUnit?.controlState.acceptReadback(
-                        transactionID: result.transactionID,
-                        snapshot: result.snapshot,
-                        validSearchResponses: 10
-                    )
-                    self?.report(result.matchesDesired ? "Readback matches desired" : "Readback mismatch")
+                    if updatesLocalState {
+                        try self?.dcxAudioUnit?.controlState.acceptReadback(
+                            transactionID: result.transactionID,
+                            snapshot: result.snapshot,
+                            validSearchResponses: 10
+                        )
+                    } else {
+                        guard result.transactionID == request.transactionID,
+                              result.snapshot.target == request.target else {
+                            throw DCXControlStateError.invalidTransactionBinding
+                        }
+                    }
+                    if result.snapshot.digest == baselineDigest {
+                        self?.helperRecovery = nil
+                        self?.report("Readback equals the immutable baseline; recovery is complete")
+                    } else {
+                        self?.report(result.matchesDesired ? "Readback matches desired" : "Readback mismatch")
+                    }
                     self?.refreshLabels()
                 } catch {
                     self?.report("Readback no longer matches the active transaction")
@@ -323,35 +428,65 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @objc private func rollback() {
-        guard let state = dcxAudioUnit?.controlState.view(),
-              let project = state.projectState,
-              let transactionID = state.transactionID,
-              let baseline = state.rollbackBaseline,
-              let diff = state.diff else {
-            report("No immutable rollback baseline is available")
-            return
-        }
         do {
+            let state = dcxAudioUnit?.controlState.view()
+            let target: DCXTargetReference
+            let transactionID: String
+            let baseline: SnapshotV1
+            let rollbackPlanDigest: String
+            let updatesLocalState: Bool
+            if let project = state?.projectState,
+               let localTransactionID = state?.transactionID,
+               let localBaseline = state?.rollbackBaseline,
+               let diff = state?.diff {
+                target = project.target
+                transactionID = localTransactionID
+                baseline = localBaseline
+                rollbackPlanDigest = diff.rollbackPlanDigest
+                updatesLocalState = true
+            } else if let recovery = helperRecovery {
+                target = recovery.target
+                transactionID = recovery.transactionID
+                baseline = recovery.baseline
+                rollbackPlanDigest = recovery.rollbackPlanDigest
+                updatesLocalState = false
+            } else {
+                report("No immutable rollback baseline is available")
+                return
+            }
             let plan = try RollbackPlanV1(
                 transactionID: transactionID,
                 baseline: baseline,
-                rollbackPlanDigest: diff.rollbackPlanDigest
+                rollbackPlanDigest: rollbackPlanDigest
             )
-            try dcxAudioUnit?.controlState.beginRollbackAttempt(
-                transactionID: transactionID,
-                baseline: baseline
-            )
+            if updatesLocalState {
+                try dcxAudioUnit?.controlState.beginRollbackAttempt(
+                    transactionID: transactionID,
+                    baseline: baseline
+                )
+            }
             refreshLabels()
-            send(.rollback(.init(target: project.target, plan: plan))) { [weak self] body in
+            send(.rollback(.init(target: target, plan: plan))) { [weak self] body in
                 guard case let .rollback(result) = body else { return }
                 do {
-                    try self?.dcxAudioUnit?.controlState.acceptRollback(
-                        transactionID: result.transactionID,
-                        baselineDigest: result.baselineDigest,
-                        restored: result.restored,
-                        equalsBaseline: result.equalsBaseline,
-                        validSearchResponses: 1
-                    )
+                    if updatesLocalState {
+                        try self?.dcxAudioUnit?.controlState.acceptRollback(
+                            transactionID: result.transactionID,
+                            baselineDigest: result.baselineDigest,
+                            restored: result.restored,
+                            equalsBaseline: result.equalsBaseline,
+                            validSearchResponses: 1
+                        )
+                    } else {
+                        guard result.transactionID == transactionID,
+                              result.baselineDigest == baseline.digest,
+                              result.equalsBaseline == (result.restored?.digest == baseline.digest) else {
+                            throw DCXControlStateError.invalidRollbackBinding
+                        }
+                    }
+                    if result.equalsBaseline {
+                        self?.helperRecovery = nil
+                    }
                     self?.report(result.restored == nil
                         ? "Rollback may have written; device state remains unknown"
                         : result.equalsBaseline
@@ -369,14 +504,40 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
 
     private func send(
         _ body: BridgeRequestBody,
+        onError: (@MainActor (BridgeErrorPayload) -> Void)? = nil,
         accept: @escaping @MainActor (BridgeResponseBody) -> Void
     ) {
         guard isOperationAvailable(body.operation) else {
-            report("\(body.operation.rawValue) is not available from the foreground helper")
+            let error = BridgeErrorPayload(
+                code: body.operation == .apply ? .mutationNotAdmitted : .operationUnavailable,
+                message: "\(body.operation.rawValue) is not available from the foreground helper",
+                retryable: false
+            )
+            if let onError { onError(error) } else { report(error.message) }
             return
         }
         guard !bridgeRequestInFlight else {
-            report("One bounded helper request is already in progress")
+            let error = BridgeErrorPayload(
+                code: body.operation == .apply ? .mutationNotAdmitted : .operationInFlight,
+                message: "One bounded helper request is already in progress",
+                retryable: true
+            )
+            if let onError { onError(error) } else { report(error.message) }
+            return
+        }
+        let request: BridgeRequest
+        let client: AppGroupSocketClient
+        do {
+            request = try BridgeRequest(body: body)
+            let locations = try AppGroupLocations()
+            client = try AppGroupSocketClient(socketURL: locations.socketURL)
+        } catch {
+            let error = BridgeErrorPayload(
+                code: body.operation == .apply ? .mutationNotAdmitted : .ipcUnavailable,
+                message: "The bounded helper request could not be prepared",
+                retryable: true
+            )
+            if let onError { onError(error) } else { report(error.message) }
             return
         }
         bridgeRequestInFlight = true
@@ -384,26 +545,29 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         report("Request in progress")
         workQueue.async { [weak self] in
             do {
-                let locations = try AppGroupLocations()
-                let client = try AppGroupSocketClient(socketURL: locations.socketURL)
-                let request = try BridgeRequest(body: body)
                 let response = try client.exchange(request)
                 DispatchQueue.main.async {
                     self?.completeBridgeRequest()
                     if let error = response.error {
-                        self?.invalidateHelperAvailability()
-                        self?.report(error.message)
+                        if error.code == .helperNotForeground
+                            || error.code == .mutationNotAdmitted {
+                            self?.invalidateVolatileHelperState()
+                        }
+                        if let onError {
+                            onError(error)
+                        } else {
+                            self?.report(error.message)
+                        }
                     } else if let body = response.body {
                         accept(body)
                     } else {
-                        self?.invalidateHelperAvailability()
                         self?.report("Helper returned an empty response")
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self?.invalidateHelperAvailability()
                     self?.completeBridgeRequest()
+                    self?.invalidateVolatileHelperState()
                     self?.report("Foreground helper is unavailable")
                 }
             }
@@ -417,7 +581,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @MainActor
-    private func invalidateHelperAvailability() {
+    private func invalidateVolatileHelperState() {
         helperForeground = false
         helperCapabilities = []
         refreshActionAvailability()
@@ -426,24 +590,74 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     @MainActor
     private func isOperationAvailable(_ operation: BridgeOperation) -> Bool {
         if operation == .helperStatus { return true }
-        guard helperForeground, configuredTarget != nil else { return false }
+        guard helperForeground else { return false }
+        guard !helperRecoveryUnavailable else { return false }
         if BridgeOperation.mutationCapabilities.contains(operation) {
-            return BridgeOperation.mutationCapabilities.isSubset(of: helperCapabilities)
+            return hasMutationAuthorization(
+                operation,
+                for: dcxAudioUnit?.controlState.view()
+            )
         }
-        return helperCapabilities.contains(operation)
+        return configuredTarget != nil && helperCapabilities.contains(operation)
+    }
+
+    @MainActor
+    private func hasMutationAuthorization(
+        _ operation: BridgeOperation,
+        for state: DCXControlStateView?
+    ) -> Bool {
+        let localRecoveryActive = state?.recoveryActive == true
+        if let helperRecovery {
+            guard !localRecoveryActive
+                    || (helperRecovery.transactionID == state?.transactionID
+                        && helperRecovery.target == state?.projectState?.target) else {
+                return false
+            }
+            return Set(helperRecovery.capabilities).contains(operation)
+        }
+        if localRecoveryActive {
+            return operation != .apply
+                && cachedMutationTarget == state?.projectState?.target
+        }
+        let requiredTarget = state?.projectState?.target ?? configuredTarget
+        return configuredTarget == requiredTarget
+            && requiredTarget != nil
+            && BridgeOperation.mutationCapabilities.isSubset(of: helperCapabilities)
     }
 
     @MainActor
     private func refreshActionAvailability() {
-        let mutationAvailable = isOperationAvailable(.apply)
+        let state = dcxAudioUnit?.controlState.view()
+        let localRecoveryActive = state?.recoveryActive == true
+        let advertisedRecoveryActive = helperRecovery != nil
+        let recoveryAuthorityMatches = !localRecoveryActive
+            || helperRecovery == nil
+            || (helperRecovery?.transactionID == state?.transactionID
+                && helperRecovery?.target == state?.projectState?.target)
+        let recoveryActive = localRecoveryActive
+            || advertisedRecoveryActive
+            || helperRecoveryUnavailable
         for (operation, button) in capabilityButtons {
-            button.isEnabled = !bridgeRequestInFlight && isOperationAvailable(operation)
+            let phaseAllows: Bool
+            switch operation {
+            case .helperStatus:
+                phaseAllows = true
+            case .readback, .rollback:
+                phaseAllows = recoveryActive && recoveryAuthorityMatches
+            case .identitySearch, .snapshotCapture, .diffPreview, .apply:
+                phaseAllows = !recoveryActive
+            }
+            button.isEnabled = !bridgeRequestInFlight
+                && phaseAllows
+                && isOperationAvailable(operation)
             if BridgeOperation.mutationCapabilities.contains(operation) {
-                button.isHidden = !mutationAvailable
+                button.isHidden = !hasMutationAuthorization(operation, for: state)
             }
         }
         localActionButtons.forEach {
-            $0.isEnabled = !bridgeRequestInFlight && configuredTarget != nil
+            $0.isEnabled = !bridgeRequestInFlight
+                && !recoveryActive
+                && configuredTarget != nil
         }
     }
 
@@ -454,12 +668,16 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
 
     @MainActor
     private func refreshLabels() {
-        guard let state = dcxAudioUnit?.controlState.view() else { return }
+        guard let state = dcxAudioUnit?.controlState.view() else {
+            refreshActionAvailability()
+            return
+        }
         currentLabel.stringValue = state.deviceStateUncertain
             ? "Current: unresolved after a device write"
             : "Current: " + (state.currentSnapshot?.digest ?? "not captured")
         desiredLabel.stringValue = "Desired: " + (state.projectState?.desired.digest ?? "not staged")
         diffTextView.string = render(diff: state.diff)
+        refreshActionAvailability()
     }
 
     private func render(diff: SemanticDiffV1?) -> String {

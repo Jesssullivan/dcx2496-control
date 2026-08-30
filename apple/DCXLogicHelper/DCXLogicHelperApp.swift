@@ -36,6 +36,7 @@ final class HelperAppModel: ObservableObject {
     @Published private(set) var midiOnline = false
     @Published private(set) var target = "Not configured"
     @Published private(set) var capabilities = "helper.status"
+    @Published private(set) var recovery = "None"
     @Published var bindingID = ""
     @Published var ttyPath = "/dev/cu.usbserial-"
     @Published var expectedDeviceAddress = 0
@@ -90,6 +91,16 @@ final class HelperAppModel: ObservableObject {
             "\($0.bindingID), device \($0.expectedDeviceAddress)"
         } ?? "Not configured"
         capabilities = status.capabilities.map(\.rawValue).joined(separator: ", ")
+        if status.recoveryUnavailable {
+            recovery = "Unavailable (durable state is fail-closed)"
+        } else if let active = status.recovery {
+            recovery = "\(active.transactionID) · \(active.target.bindingID) · "
+                + active.capabilities.map(\.rawValue).joined(separator: ", ")
+        } else if let completion = status.completion {
+            recovery = "Completed \(completion.transactionID) · exact baseline verified"
+        } else {
+            recovery = "None"
+        }
     }
 
     func isEnabled(_ feature: HelperFeature) -> Bool {
@@ -143,6 +154,8 @@ final class HelperAppModel: ObservableObject {
             populate(from: configuration)
             refresh()
             status = "Configuration saved atomically and reloaded"
+        } catch HelperConfigurationError.recoveryConfigurationPinned {
+            status = "Configuration is pinned until mutation recovery verifies the baseline"
         } catch {
             status = "Configuration was rejected; verify binding, tty, device, features, and timeout"
         }
@@ -155,6 +168,9 @@ final class HelperAppModel: ObservableObject {
             populate(from: configuration)
             refresh()
             status = "Saved configuration reloaded"
+        } catch HelperConfigurationError.recoveryConfigurationPinned {
+            refresh()
+            status = "Saved configuration cannot replace the pinned mutation recovery configuration"
         } catch {
             refresh()
             status = "Saved configuration is unavailable or invalid"
@@ -184,6 +200,7 @@ private struct HelperContentView: View {
                 GridRow { Text("Target"); Text(model.target) }
                 GridRow { Text("CoreMIDI"); Text(model.midiOnline ? "Commands + Status online" : "Offline") }
                 GridRow { Text("Operations"); Text(model.capabilities).textSelection(.enabled) }
+                GridRow { Text("Mutation recovery"); Text(model.recovery).textSelection(.enabled) }
             }
             Divider()
             Text("Exact DCX binding")
