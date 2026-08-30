@@ -11,6 +11,8 @@ public enum BridgeOperation: String, Codable, CaseIterable, Hashable, Sendable {
 
     /// Device mutation is exposed only with both verification and recovery.
     public static let mutationCapabilities: Set<BridgeOperation> = [.apply, .readback, .rollback]
+    /// Once Apply is admitted, only verification and restoration remain valid.
+    public static let recoveryCapabilities: Set<BridgeOperation> = [.readback, .rollback]
 
     public static func hasValidMutationCapabilities(_ capabilities: Set<BridgeOperation>) -> Bool {
         let selected = capabilities.intersection(mutationCapabilities)
@@ -252,6 +254,9 @@ public struct HelperStatusResponse: Codable, Equatable, Sendable {
     public let capabilities: [BridgeOperation]
     public let coreMIDI: CoreMIDIEndpointStatusV1
     public let activeTransactionID: String?
+    public let recovery: HelperRecoveryStatusV1?
+    public let completion: HelperRecoveryCompletionStatusV1?
+    public let recoveryUnavailable: Bool
 
     public init(
         foreground: Bool,
@@ -259,7 +264,10 @@ public struct HelperStatusResponse: Codable, Equatable, Sendable {
         target: DCXTargetReference?,
         capabilities: [BridgeOperation],
         coreMIDI: CoreMIDIEndpointStatusV1,
-        activeTransactionID: String?
+        activeTransactionID: String?,
+        recovery: HelperRecoveryStatusV1? = nil,
+        completion: HelperRecoveryCompletionStatusV1? = nil,
+        recoveryUnavailable: Bool = false
     ) {
         self.foreground = foreground
         self.configured = configured
@@ -267,6 +275,90 @@ public struct HelperStatusResponse: Codable, Equatable, Sendable {
         self.capabilities = capabilities
         self.coreMIDI = coreMIDI
         self.activeTransactionID = activeTransactionID
+        self.recovery = recovery
+        self.completion = completion
+        self.recoveryUnavailable = recoveryUnavailable
+    }
+}
+
+/// The last exact-baseline terminal proof. An active recovery always
+/// supersedes this bounded history entry.
+public struct HelperRecoveryCompletionStatusV1: Codable, Equatable, Sendable {
+    public let transactionID: String
+    public let target: DCXTargetReference
+    public let baseline: SnapshotV1
+    public let verifiedBaseline: SnapshotV1
+    public let desiredSnapshotDigest: String
+    public let rollbackPlanDigest: String
+
+    public init(
+        transactionID: String,
+        target: DCXTargetReference,
+        baseline: SnapshotV1,
+        verifiedBaseline: SnapshotV1,
+        desiredSnapshotDigest: String,
+        rollbackPlanDigest: String
+    ) {
+        self.transactionID = transactionID
+        self.target = target
+        self.baseline = baseline
+        self.verifiedBaseline = verifiedBaseline
+        self.desiredSnapshotDigest = desiredSnapshotDigest
+        self.rollbackPlanDigest = rollbackPlanDigest
+    }
+
+    public func validate() throws {
+        try BridgeDigest.validate(transactionID)
+        try target.validate()
+        try baseline.validate()
+        try verifiedBaseline.validate()
+        try BridgeDigest.validate(desiredSnapshotDigest)
+        try BridgeDigest.validate(rollbackPlanDigest)
+        guard baseline.target == target,
+              verifiedBaseline.target == target,
+              verifiedBaseline.digest == baseline.digest else {
+            throw BridgeMessageError.invalidResponse
+        }
+    }
+}
+
+/// Durable mutation authority is distinct from the ephemeral child-process
+/// marker above so an AU recreated by Logic can rediscover its recovery path.
+public struct HelperRecoveryStatusV1: Codable, Equatable, Sendable {
+    public let transactionID: String
+    public let target: DCXTargetReference
+    public let capabilities: [BridgeOperation]
+    public let baseline: SnapshotV1
+    public let desiredSnapshotDigest: String
+    public let rollbackPlanDigest: String
+
+    public init(
+        transactionID: String,
+        target: DCXTargetReference,
+        capabilities: [BridgeOperation],
+        baseline: SnapshotV1,
+        desiredSnapshotDigest: String,
+        rollbackPlanDigest: String
+    ) {
+        self.transactionID = transactionID
+        self.target = target
+        self.capabilities = capabilities
+        self.baseline = baseline
+        self.desiredSnapshotDigest = desiredSnapshotDigest
+        self.rollbackPlanDigest = rollbackPlanDigest
+    }
+
+    public func validate() throws {
+        try BridgeDigest.validate(transactionID)
+        try target.validate()
+        try baseline.validate()
+        try BridgeDigest.validate(desiredSnapshotDigest)
+        try BridgeDigest.validate(rollbackPlanDigest)
+        guard baseline.target == target,
+              Set(capabilities) == BridgeOperation.recoveryCapabilities,
+              capabilities.count == BridgeOperation.recoveryCapabilities.count else {
+            throw BridgeMessageError.invalidResponse
+        }
     }
 }
 
@@ -394,10 +486,18 @@ public enum BridgeResponseBody: Equatable, Sendable {
         switch self {
         case let .helperStatus(value):
             try value.target?.validate()
+            try value.recovery?.validate()
+            try value.completion?.validate()
             let capabilities = Set(value.capabilities)
             guard capabilities.count == value.capabilities.count,
                   capabilities.contains(.helperStatus),
                   BridgeOperation.hasValidMutationCapabilities(capabilities),
+                  value.recovery == nil || capabilities == [.helperStatus],
+                  value.recovery == nil || value.completion == nil,
+                  !value.recoveryUnavailable
+                    || (value.recovery == nil
+                        && value.completion == nil
+                        && capabilities == [.helperStatus]),
                   value.configured == (value.target != nil),
                   value.coreMIDI.commandsName == "Tinyland DCX Commands",
                   value.coreMIDI.commandsUniqueID == 0x4443_5843,
@@ -475,6 +575,7 @@ public struct BridgeErrorPayload: Codable, Equatable, Sendable {
         case childTimedOut = "child_timed_out"
         case childFailed = "child_failed"
         case malformedChildResponse = "malformed_child_response"
+        case mutationNotAdmitted = "mutation_not_admitted"
         case ipcUnavailable = "ipc_unavailable"
         case internalFailure = "internal_failure"
     }

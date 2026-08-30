@@ -111,7 +111,7 @@ public final class DCXControlAudioUnit: AUAudioUnit {
                           from: data
                       ),
                       (try? controlState.restore(persisted)) != nil else {
-                    controlState.reset()
+                    try? controlState.reset()
                     return
                 }
                 return
@@ -125,7 +125,7 @@ public final class DCXControlAudioUnit: AUAudioUnit {
                (try? controlState.stage(staged)) != nil {
                 return
             }
-            controlState.reset()
+            try? controlState.reset()
         }
     }
 

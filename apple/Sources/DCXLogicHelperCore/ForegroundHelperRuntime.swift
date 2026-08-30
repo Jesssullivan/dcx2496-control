@@ -83,23 +83,26 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
     /// Atomically save one checked configuration at the fixed App Group path
     /// and install the exact reloaded value for subsequent requests.
     public func saveConfiguration(_ configuration: HelperConfigurationV1) throws {
-        try configuration.save(to: locations.helperConfigurationURL)
-        _ = try reloadConfiguration()
+        _ = try coordinator.installConfiguration(configuration) { [locations] in
+            try configuration.save(to: locations.helperConfigurationURL)
+            return try HelperConfigurationV1.load(from: locations.helperConfigurationURL)
+        }
     }
 
     /// Reload the fixed App Group configuration without restarting the app,
     /// socket, CoreMIDI presentation, or an already-running child transaction.
-    /// An active transaction retains the immutable configuration it captured;
-    /// the reloaded value applies to the next request.
+    /// A durable mutation recovery lease rejects replacement until an exact
+    /// rollback readback reaches the pinned baseline.
     @discardableResult
     public func reloadConfiguration() throws -> HelperConfigurationV1 {
-        do {
-            let loaded = try HelperConfigurationV1.load(from: locations.helperConfigurationURL)
-            coordinator.replaceConfiguration(.success(loaded))
-            return loaded
-        } catch {
-            coordinator.replaceConfiguration(.failure(error))
-            throw error
+        try coordinator.replaceConfiguration { [locations] in
+            do {
+                return .success(
+                    try HelperConfigurationV1.load(from: locations.helperConfigurationURL)
+                )
+            } catch {
+                return .failure(error)
+            }
         }
     }
 

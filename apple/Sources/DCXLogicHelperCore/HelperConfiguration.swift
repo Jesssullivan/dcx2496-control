@@ -286,4 +286,5 @@ public enum HelperConfigurationError: Error, Equatable, Sendable {
     case unsupportedSchema
     case targetNotAllowlisted
     case operationUnavailable
+    case recoveryConfigurationPinned
 }

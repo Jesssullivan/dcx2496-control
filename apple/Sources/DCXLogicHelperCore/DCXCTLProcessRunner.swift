@@ -29,7 +29,11 @@ struct DCXCTLProcessResult: Sendable {
 final class DCXCTLProcessRunner: @unchecked Sendable {
     static let maximumOutputBytes = 1_048_576
 
-    func run(_ invocation: DCXCTLInvocation, timeoutSeconds: UInt8) throws -> DCXCTLProcessResult {
+    func run(
+        _ invocation: DCXCTLInvocation,
+        timeoutSeconds: UInt8,
+        mutationLock: MutationRecoveryProcessLock? = nil
+    ) throws -> DCXCTLProcessResult {
         let process = Process()
         process.executableURL = invocation.executableURL
         process.arguments = invocation.arguments
@@ -41,7 +45,8 @@ final class DCXCTLProcessRunner: @unchecked Sendable {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.standardInput = FileHandle.nullDevice
+        let childLockInput = try mutationLock?.childStandardInput()
+        process.standardInput = childLockInput ?? FileHandle.nullDevice
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
@@ -63,17 +68,19 @@ final class DCXCTLProcessRunner: @unchecked Sendable {
         do {
             try process.run()
         } catch {
+            try? childLockInput?.close()
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             throw DCXCTLRunnerError.launchFailed
         }
+        try? childLockInput?.close()
 
         let deadline = DispatchTime.now() + .seconds(Int(timeoutSeconds))
         if completion.wait(timeout: deadline) == .timedOut {
             process.terminate()
             if completion.wait(timeout: .now() + .seconds(2)) == .timedOut {
-                Darwin.kill(process.processIdentifier, SIGKILL)
-                _ = completion.wait(timeout: .now() + .seconds(2))
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                completion.wait()
             }
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil

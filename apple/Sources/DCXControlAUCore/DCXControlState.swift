@@ -137,24 +137,30 @@ public final class DCXControlState: @unchecked Sendable {
     public func stage(_ state: StagedProjectStateV1?) throws {
         try state?.validate()
         lock.lock()
+        defer { lock.unlock() }
+        guard !recoveryActiveLocked else {
+            throw DCXControlStateError.recoveryInProgress
+        }
         projectState = state
         currentSnapshot = nil
         currentDiff = nil
         lastTransactionID = nil
         rollbackBaseline = nil
         deviceStateUncertain = false
-        lock.unlock()
     }
 
-    public func reset() {
+    public func reset() throws {
         lock.lock()
+        defer { lock.unlock() }
+        guard !recoveryActiveLocked else {
+            throw DCXControlStateError.recoveryInProgress
+        }
         projectState = nil
         currentSnapshot = nil
         currentDiff = nil
         lastTransactionID = nil
         rollbackBaseline = nil
         deviceStateUncertain = false
-        lock.unlock()
     }
 
     public func stagedProjectState() -> StagedProjectStateV1? {
@@ -167,14 +173,15 @@ public final class DCXControlState: @unchecked Sendable {
         let snapshot = try snapshot.reporting(validSearchResponses: validSearchResponses)
         lock.lock()
         defer { lock.unlock() }
+        guard !recoveryActiveLocked else {
+            throw DCXControlStateError.recoveryInProgress
+        }
         guard let projectState, snapshot.target == projectState.target else {
             throw DCXControlStateError.invalidSnapshotBinding
         }
         currentSnapshot = snapshot
-        if lastTransactionID == nil {
-            currentDiff = nil
-            rollbackBaseline = nil
-        }
+        currentDiff = nil
+        rollbackBaseline = nil
         deviceStateUncertain = false
     }
 
@@ -214,6 +221,30 @@ public final class DCXControlState: @unchecked Sendable {
         deviceStateUncertain = true
     }
 
+    /// A typed helper rejection can prove that Apply never crossed its durable
+    /// admission boundary. Only that proof may unwind the conservative local
+    /// uncertainty while retaining the reviewed diff for a later retry.
+    public func rejectApplyBeforeAdmission(
+        transactionID: String,
+        baseline: SnapshotV1
+    ) throws {
+        try baseline.validate()
+        lock.lock()
+        defer { lock.unlock() }
+        guard let currentDiff,
+              lastTransactionID == transactionID,
+              rollbackBaseline == baseline,
+              currentSnapshot == baseline,
+              transactionID == currentDiff.applyPlanDigest,
+              baseline.digest == currentDiff.baselineSnapshotDigest,
+              deviceStateUncertain else {
+            throw DCXControlStateError.invalidTransactionBinding
+        }
+        lastTransactionID = nil
+        rollbackBaseline = nil
+        deviceStateUncertain = false
+    }
+
     public func acceptApply(
         transactionID: String,
         baseline: SnapshotV1,
@@ -250,14 +281,20 @@ public final class DCXControlState: @unchecked Sendable {
         let snapshot = try snapshot.reporting(validSearchResponses: validSearchResponses)
         lock.lock()
         defer { lock.unlock() }
-        guard let projectState, let currentDiff,
+        guard let projectState, let currentDiff, let rollbackBaseline,
               transactionID == lastTransactionID,
               transactionID == currentDiff.applyPlanDigest,
+              rollbackBaseline.digest == currentDiff.baselineSnapshotDigest,
               snapshot.target == projectState.target else {
             throw DCXControlStateError.invalidTransactionBinding
         }
         currentSnapshot = snapshot
         deviceStateUncertain = false
+        if snapshot.digest == rollbackBaseline.digest {
+            self.currentDiff = nil
+            lastTransactionID = nil
+            self.rollbackBaseline = nil
+        }
     }
 
     /// A rollback can write before its response crosses IPC. Persist the
@@ -306,6 +343,37 @@ public final class DCXControlState: @unchecked Sendable {
         }
     }
 
+    /// Reconcile a terminal helper proof when the direct Readback/Rollback
+    /// response was lost. Only the exact locally persisted transaction,
+    /// original baseline, desired digest, and rollback carrier may clear it.
+    public func acceptRecoveryCompletion(
+        _ completion: HelperRecoveryCompletionStatusV1
+    ) throws {
+        try completion.validate()
+        lock.lock()
+        defer { lock.unlock() }
+        guard recoveryActiveLocked,
+              let projectState,
+              let currentDiff,
+              let rollbackBaseline,
+              completion.transactionID == lastTransactionID,
+              completion.transactionID == currentDiff.applyPlanDigest,
+              completion.target == projectState.target,
+              completion.baseline == rollbackBaseline,
+              completion.baseline.digest == currentDiff.baselineSnapshotDigest,
+              completion.desiredSnapshotDigest == currentDiff.desiredSnapshotDigest,
+              completion.rollbackPlanDigest == currentDiff.rollbackPlanDigest,
+              completion.verifiedBaseline.target == projectState.target,
+              completion.verifiedBaseline.digest == rollbackBaseline.digest else {
+            throw DCXControlStateError.invalidTransactionBinding
+        }
+        currentSnapshot = completion.verifiedBaseline
+        self.currentDiff = nil
+        lastTransactionID = nil
+        self.rollbackBaseline = nil
+        deviceStateUncertain = false
+    }
+
     public func persistedState() throws -> DCXControlPersistedStateV1 {
         let view = view()
         let state = DCXControlPersistedStateV1(
@@ -323,13 +391,16 @@ public final class DCXControlState: @unchecked Sendable {
     public func restore(_ state: DCXControlPersistedStateV1) throws {
         try state.validate()
         lock.lock()
+        defer { lock.unlock() }
+        guard !recoveryActiveLocked else {
+            throw DCXControlStateError.recoveryInProgress
+        }
         projectState = state.projectState
         currentSnapshot = state.currentSnapshot
         currentDiff = state.diff
         lastTransactionID = state.transactionID
         rollbackBaseline = state.rollbackBaseline
         deviceStateUncertain = state.deviceStateUncertain
-        lock.unlock()
     }
 
     public func view() -> DCXControlStateView {
@@ -344,6 +415,10 @@ public final class DCXControlState: @unchecked Sendable {
             deviceStateUncertain: deviceStateUncertain
         )
     }
+
+    private var recoveryActiveLocked: Bool {
+        lastTransactionID != nil || rollbackBaseline != nil || deviceStateUncertain
+    }
 }
 
 public struct DCXControlStateView: Sendable {
@@ -353,6 +428,10 @@ public struct DCXControlStateView: Sendable {
     public let transactionID: String?
     public let rollbackBaseline: SnapshotV1?
     public let deviceStateUncertain: Bool
+
+    public var recoveryActive: Bool {
+        transactionID != nil || rollbackBaseline != nil || deviceStateUncertain
+    }
 }
 
 public enum DCXControlStateError: Error, Equatable, Sendable {
@@ -362,6 +441,7 @@ public enum DCXControlStateError: Error, Equatable, Sendable {
     case invalidDiffBinding
     case invalidTransactionBinding
     case invalidRollbackBinding
+    case recoveryInProgress
 }
 
 private extension SnapshotV1 {

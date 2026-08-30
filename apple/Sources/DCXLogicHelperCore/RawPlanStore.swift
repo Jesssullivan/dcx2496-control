@@ -1,4 +1,5 @@
 import DCXLogicBridge
+import Darwin
 import Foundation
 
 enum RawPlanKind: String, Sendable {
@@ -138,6 +139,15 @@ final class RawPlanStore: @unchecked Sendable {
         return loaded.reference
     }
 
+    /// Admission-only durability barrier for a previously persisted immutable
+    /// plan. Ordinary reads remain side-effect free.
+    func makeDurable(_ reference: RawPlanReference) throws {
+        try synchronizeFile(reference.url)
+        try synchronizeDirectory(reference.url.deletingLastPathComponent())
+        try synchronizeDirectory(root)
+        try synchronizeDirectory(root.deletingLastPathComponent())
+    }
+
     private func persist(_ data: Data, digest: String, kind: RawPlanKind) throws -> RawPlanReference {
         guard data.count <= Self.maximumPlanBytes else {
             throw RawPlanStoreError.planTooLarge
@@ -151,14 +161,48 @@ final class RawPlanStore: @unchecked Sendable {
         )
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         let destination = directory.appendingPathComponent("\(leaf).json", isDirectory: false)
-        if fileManager.fileExists(atPath: destination.path) {
-            guard try Data(contentsOf: destination) == data else {
-                throw RawPlanStoreError.immutableCollision
+        if !fileManager.fileExists(atPath: destination.path) {
+            let temporary = directory.appendingPathComponent(
+                ".\(leaf).\(UUID().uuidString).tmp",
+                isDirectory: false
+            )
+            defer { try? fileManager.removeItem(at: temporary) }
+            guard fileManager.createFile(
+                atPath: temporary.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw RawPlanStoreError.missingPlan
             }
-        } else {
-            try data.write(to: destination, options: [.atomic, .completeFileProtection])
-            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            let handle = try FileHandle(forWritingTo: temporary)
+            do {
+                try handle.write(contentsOf: data)
+                try handle.synchronize()
+                guard Darwin.fcntl(handle.fileDescriptor, F_FULLFSYNC) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                try handle.close()
+            } catch {
+                try? handle.close()
+                throw error
+            }
+            if Darwin.link(temporary.path, destination.path) != 0 {
+                let code = errno
+                if code != EEXIST {
+                    throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+                }
+            }
+            guard Darwin.unlink(temporary.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
         }
+        guard try Data(contentsOf: destination) == data else {
+            throw RawPlanStoreError.immutableCollision
+        }
+        try synchronizeFile(destination)
+        try synchronizeDirectory(directory)
+        try synchronizeDirectory(root)
+        try synchronizeDirectory(root.deletingLastPathComponent())
         return .init(kind: kind, digest: digest, url: destination)
     }
 
@@ -189,6 +233,28 @@ final class RawPlanStore: @unchecked Sendable {
             reference: .init(kind: kind, digest: digest, url: url),
             data: try Data(contentsOf: url)
         )
+    }
+
+    private func synchronizeFile(_ url: URL) throws {
+        let descriptor = Darwin.open(url.path, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { Darwin.close(descriptor) }
+        guard Darwin.fcntl(descriptor, F_FULLFSYNC) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    private func synchronizeDirectory(_ url: URL) throws {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { Darwin.close(descriptor) }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 }
 

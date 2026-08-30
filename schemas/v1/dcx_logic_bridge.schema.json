@@ -363,7 +363,13 @@
     },
     "helperStatusResponse": {
       "type": "object",
-      "required": ["foreground", "configured", "capabilities", "coreMIDI"],
+      "required": [
+        "foreground",
+        "configured",
+        "capabilities",
+        "coreMIDI",
+        "recoveryUnavailable"
+      ],
       "properties": {
         "foreground": { "type": "boolean" },
         "configured": { "type": "boolean" },
@@ -390,7 +396,94 @@
           ]
         },
         "coreMIDI": { "$ref": "#/$defs/coreMIDIStatus" },
-        "activeTransactionID": { "$ref": "#/$defs/requestID" }
+        "activeTransactionID": { "$ref": "#/$defs/requestID" },
+        "recovery": { "$ref": "#/$defs/helperRecoveryStatus" },
+        "completion": { "$ref": "#/$defs/helperRecoveryCompletionStatus" },
+        "recoveryUnavailable": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["recovery"] },
+          "then": {
+            "properties": {
+              "capabilities": {
+                "maxItems": 1,
+                "contains": { "const": "helper.status" }
+              }
+            }
+          }
+        },
+        {
+          "not": { "required": ["recovery", "completion"] }
+        },
+        {
+          "if": {
+            "properties": { "recoveryUnavailable": { "const": true } },
+            "required": ["recoveryUnavailable"]
+          },
+          "then": {
+            "properties": {
+              "capabilities": {
+                "maxItems": 1,
+                "contains": { "const": "helper.status" }
+              }
+            },
+            "not": {
+              "anyOf": [
+                { "required": ["recovery"] },
+                { "required": ["completion"] }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "helperRecoveryStatus": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "target",
+        "capabilities",
+        "baseline",
+        "desiredSnapshotDigest",
+        "rollbackPlanDigest"
+      ],
+      "properties": {
+        "transactionID": { "$ref": "#/$defs/digest" },
+        "target": { "$ref": "#/$defs/target" },
+        "capabilities": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["device.readback", "device.rollback"]
+          }
+        },
+        "baseline": { "$ref": "#/$defs/snapshot" },
+        "desiredSnapshotDigest": { "$ref": "#/$defs/digest" },
+        "rollbackPlanDigest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "helperRecoveryCompletionStatus": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "target",
+        "baseline",
+        "verifiedBaseline",
+        "desiredSnapshotDigest",
+        "rollbackPlanDigest"
+      ],
+      "properties": {
+        "transactionID": { "$ref": "#/$defs/digest" },
+        "target": { "$ref": "#/$defs/target" },
+        "baseline": { "$ref": "#/$defs/snapshot" },
+        "verifiedBaseline": { "$ref": "#/$defs/snapshot" },
+        "desiredSnapshotDigest": { "$ref": "#/$defs/digest" },
+        "rollbackPlanDigest": { "$ref": "#/$defs/digest" }
       },
       "additionalProperties": false
     },
@@ -535,6 +628,7 @@
             "child_timed_out",
             "child_failed",
             "malformed_child_response",
+            "mutation_not_admitted",
             "ipc_unavailable",
             "internal_failure"
           ]
