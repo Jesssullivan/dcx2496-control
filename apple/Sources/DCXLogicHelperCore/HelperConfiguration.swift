@@ -15,6 +15,13 @@ public enum HelperFeature: String, CaseIterable, Hashable, Identifiable, Sendabl
     case readback = "device.readback"
     case rollback = "device.rollback"
 
+    public static let mutationFeatures: Set<HelperFeature> = Set(
+        BridgeOperation.mutationCapabilities.compactMap { HelperFeature(rawValue: $0.rawValue) }
+    )
+    public static let independentlyConfigurableCases: [HelperFeature] = allCases.filter {
+        !mutationFeatures.contains($0)
+    }
+
     public var id: String { rawValue }
 
     public var displayName: String {
@@ -85,12 +92,14 @@ public struct HelperConfigurationV1: Codable, Equatable, Sendable {
               !calloutSuffix.utf8.contains(0) else {
             throw HelperConfigurationError.invalidTTY
         }
+        let operations = Set(enabledOperations)
         let permitted = Set(BridgeOperation.allCases).subtracting([.helperStatus])
-        guard Set(enabledOperations).isSubset(of: permitted),
-              Set(enabledOperations).count == enabledOperations.count else {
+        guard operations.isSubset(of: permitted),
+              operations.count == enabledOperations.count,
+              BridgeOperation.hasValidMutationCapabilities(operations) else {
             throw HelperConfigurationError.invalidCapabilities
         }
-        let mutationEnabled = enabledOperations.contains(.apply) || enabledOperations.contains(.rollback)
+        let mutationEnabled = !operations.isDisjoint(with: BridgeOperation.mutationCapabilities)
         let minimumTimeout = mutationEnabled
             ? Self.minimumMutationChildTimeoutSeconds
             : Self.minimumReadOnlyChildTimeoutSeconds
@@ -148,8 +157,8 @@ public struct HelperConfigurationV1: Codable, Equatable, Sendable {
         // explicit save persists the normalized value without losing the target
         // or enabled capabilities.
         try decoded.target.validate()
-        let mutationEnabled = decoded.enabledOperations.contains(.apply)
-            || decoded.enabledOperations.contains(.rollback)
+        let mutationEnabled = !Set(decoded.enabledOperations)
+            .isDisjoint(with: BridgeOperation.mutationCapabilities)
         let legacyMinimum: UInt8 = mutationEnabled ? 90 : 60
         let legacyTimeout = (legacyMinimum...120).contains(decoded.childTimeoutSeconds)
         return try Self(

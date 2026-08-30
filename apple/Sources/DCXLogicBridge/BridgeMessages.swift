@@ -1,6 +1,6 @@
 import Foundation
 
-public enum BridgeOperation: String, Codable, CaseIterable, Sendable {
+public enum BridgeOperation: String, Codable, CaseIterable, Hashable, Sendable {
     case helperStatus = "helper.status"
     case identitySearch = "device.identity.search"
     case snapshotCapture = "device.snapshot.capture"
@@ -8,6 +8,14 @@ public enum BridgeOperation: String, Codable, CaseIterable, Sendable {
     case apply = "device.apply"
     case readback = "device.readback"
     case rollback = "device.rollback"
+
+    /// Device mutation is exposed only with both verification and recovery.
+    public static let mutationCapabilities: Set<BridgeOperation> = [.apply, .readback, .rollback]
+
+    public static func hasValidMutationCapabilities(_ capabilities: Set<BridgeOperation>) -> Bool {
+        let selected = capabilities.intersection(mutationCapabilities)
+        return selected.isEmpty || selected == mutationCapabilities
+    }
 }
 
 public struct HelperStatusRequest: Codable, Equatable, Sendable {
@@ -386,8 +394,10 @@ public enum BridgeResponseBody: Equatable, Sendable {
         switch self {
         case let .helperStatus(value):
             try value.target?.validate()
-            guard Set(value.capabilities).count == value.capabilities.count,
-                  value.capabilities.contains(.helperStatus),
+            let capabilities = Set(value.capabilities)
+            guard capabilities.count == value.capabilities.count,
+                  capabilities.contains(.helperStatus),
+                  BridgeOperation.hasValidMutationCapabilities(capabilities),
                   value.configured == (value.target != nil),
                   value.coreMIDI.commandsName == "Tinyland DCX Commands",
                   value.coreMIDI.commandsUniqueID == 0x4443_5843,

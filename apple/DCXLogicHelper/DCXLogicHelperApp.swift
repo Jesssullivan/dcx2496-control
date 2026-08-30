@@ -96,17 +96,31 @@ final class HelperAppModel: ObservableObject {
         enabledFeatures.contains(feature)
     }
 
+    var mutationCapabilitiesEnabled: Bool {
+        HelperFeature.mutationFeatures.isSubset(of: enabledFeatures)
+    }
+
     func setEnabled(_ feature: HelperFeature, _ enabled: Bool) {
+        if HelperFeature.mutationFeatures.contains(feature) {
+            setMutationCapabilitiesEnabled(enabled)
+            return
+        }
         if enabled {
             enabledFeatures.insert(feature)
-            if feature == .apply || feature == .rollback {
-                childTimeoutSeconds = max(
-                    childTimeoutSeconds,
-                    Int(HelperConfigurationV1.minimumMutationChildTimeoutSeconds)
-                )
-            }
         } else {
             enabledFeatures.remove(feature)
+        }
+    }
+
+    func setMutationCapabilitiesEnabled(_ enabled: Bool) {
+        if enabled {
+            enabledFeatures.formUnion(HelperFeature.mutationFeatures)
+            childTimeoutSeconds = max(
+                childTimeoutSeconds,
+                Int(HelperConfigurationV1.minimumMutationChildTimeoutSeconds)
+            )
+        } else {
+            enabledFeatures.subtract(HelperFeature.mutationFeatures)
         }
     }
 
@@ -207,7 +221,7 @@ private struct HelperContentView: View {
             Text("Enabled operations")
                 .font(.headline)
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading) {
-                ForEach(HelperFeature.allCases) { feature in
+                ForEach(HelperFeature.independentlyConfigurableCases) { feature in
                     Toggle(
                         feature.displayName,
                         isOn: Binding(
@@ -216,9 +230,16 @@ private struct HelperContentView: View {
                         )
                     )
                 }
+                Toggle(
+                    "Apply + Readback + Rollback",
+                    isOn: Binding(
+                        get: { model.mutationCapabilitiesEnabled },
+                        set: { model.setMutationCapabilitiesEnabled($0) }
+                    )
+                )
             }
-            if model.isEnabled(.apply) || model.isEnabled(.rollback) {
-                Text("Apply or rollback requires at least \(HelperConfigurationV1.minimumMutationChildTimeoutSeconds) seconds so the helper outlives dcxctl's bounded transaction.")
+            if model.mutationCapabilitiesEnabled {
+                Text("Apply is enabled only with complete readback and rollback recovery. The helper uses a bounded \(HelperConfigurationV1.minimumMutationChildTimeoutSeconds)-second child deadline.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

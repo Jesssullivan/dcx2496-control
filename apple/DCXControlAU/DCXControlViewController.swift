@@ -14,8 +14,12 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     private let diffTextView = NSTextView()
     private let workQueue = DispatchQueue(label: "io.tinyland.dcx2496.logic.au-ui", qos: .userInitiated)
     private var configuredTarget: DCXTargetReference?
+    private var helperCapabilities: Set<BridgeOperation> = []
+    private var helperForeground = false
     private var bridgeRequestInFlight = false
     private var actionButtons: [NSButton] = []
+    private var capabilityButtons: [BridgeOperation: NSButton] = [:]
+    private var localActionButtons: [NSButton] = []
 
     public override func loadView() {
         let root = NSView()
@@ -61,6 +65,16 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         mutation.orientation = .horizontal
         mutation.spacing = 8
         actionButtons = [refresh, identify, stage, snapshot, preview, apply, readback, rollback]
+        capabilityButtons = [
+            .helperStatus: refresh,
+            .identitySearch: identify,
+            .snapshotCapture: snapshot,
+            .diffPreview: preview,
+            .apply: apply,
+            .readback: readback,
+            .rollback: rollback,
+        ]
+        localActionButtons = [stage]
 
         let stack = NSStackView(views: [
             title,
@@ -87,6 +101,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         ])
         view = root
         refreshLabels()
+        refreshActionAvailability()
     }
 
     public func createAudioUnit(
@@ -106,12 +121,15 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     @objc private func helperStatus() {
         send(.helperStatus(.init())) { [weak self] body in
             guard let self, case let .helperStatus(status) = body else { return }
+            helperForeground = status.foreground
+            helperCapabilities = Set(status.capabilities)
             let targetChanged = configuredTarget != status.target
             configuredTarget = status.target
             if targetChanged {
                 identityLabel.stringValue = "Device: not identified"
                 refreshLabels()
             }
+            refreshActionAvailability()
             statusLabel.stringValue = status.foreground
                 ? "Helper foreground; \(status.capabilities.count) capability entries"
                 : "Helper is not foreground"
@@ -353,6 +371,10 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         _ body: BridgeRequestBody,
         accept: @escaping @MainActor (BridgeResponseBody) -> Void
     ) {
+        guard isOperationAvailable(body.operation) else {
+            report("\(body.operation.rawValue) is not available from the foreground helper")
+            return
+        }
         guard !bridgeRequestInFlight else {
             report("One bounded helper request is already in progress")
             return
@@ -369,15 +391,18 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 DispatchQueue.main.async {
                     self?.completeBridgeRequest()
                     if let error = response.error {
+                        self?.invalidateHelperAvailability()
                         self?.report(error.message)
                     } else if let body = response.body {
                         accept(body)
                     } else {
+                        self?.invalidateHelperAvailability()
                         self?.report("Helper returned an empty response")
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
+                    self?.invalidateHelperAvailability()
                     self?.completeBridgeRequest()
                     self?.report("Foreground helper is unavailable")
                 }
@@ -388,7 +413,38 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     @MainActor
     private func completeBridgeRequest() {
         bridgeRequestInFlight = false
-        actionButtons.forEach { $0.isEnabled = true }
+        refreshActionAvailability()
+    }
+
+    @MainActor
+    private func invalidateHelperAvailability() {
+        helperForeground = false
+        helperCapabilities = []
+        refreshActionAvailability()
+    }
+
+    @MainActor
+    private func isOperationAvailable(_ operation: BridgeOperation) -> Bool {
+        if operation == .helperStatus { return true }
+        guard helperForeground, configuredTarget != nil else { return false }
+        if BridgeOperation.mutationCapabilities.contains(operation) {
+            return BridgeOperation.mutationCapabilities.isSubset(of: helperCapabilities)
+        }
+        return helperCapabilities.contains(operation)
+    }
+
+    @MainActor
+    private func refreshActionAvailability() {
+        let mutationAvailable = isOperationAvailable(.apply)
+        for (operation, button) in capabilityButtons {
+            button.isEnabled = !bridgeRequestInFlight && isOperationAvailable(operation)
+            if BridgeOperation.mutationCapabilities.contains(operation) {
+                button.isHidden = !mutationAvailable
+            }
+        }
+        localActionButtons.forEach {
+            $0.isEnabled = !bridgeRequestInFlight && configuredTarget != nil
+        }
     }
 
     @MainActor

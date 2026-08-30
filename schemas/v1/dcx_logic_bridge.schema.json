@@ -371,7 +371,23 @@
         "capabilities": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "$ref": "#/$defs/operation" }
+          "items": { "$ref": "#/$defs/operation" },
+          "allOf": [
+            {
+              "if": {
+                "contains": {
+                  "enum": ["device.apply", "device.readback", "device.rollback"]
+                }
+              },
+              "then": {
+                "allOf": [
+                  { "contains": { "const": "device.apply" } },
+                  { "contains": { "const": "device.readback" } },
+                  { "contains": { "const": "device.rollback" } }
+                ]
+              }
+            }
+          ]
         },
         "coreMIDI": { "$ref": "#/$defs/coreMIDIStatus" },
         "activeTransactionID": { "$ref": "#/$defs/requestID" }
