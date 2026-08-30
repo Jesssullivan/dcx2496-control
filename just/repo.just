@@ -88,8 +88,9 @@ apple-project-generate:
 # Build the helper, embedded AUv3, and embedded dcxctl without signing or install.
 apple-bundle-check: apple-project-generate
     # Resolve the compiler from Xcode itself: inside a Nix shell, xcrun can return a wrapped Nix clang.
-    xcode_toolchain="$(/usr/bin/xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/bin"; \
-      xcodebuild -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CC="$xcode_toolchain/clang" CPLUSPLUS="$xcode_toolchain/clang++" LD="$xcode_toolchain/clang" LDPLUSPLUS="$xcode_toolchain/clang++" build
+    xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"; \
+      xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"; \
+      DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CC="$xcode_toolchain/clang" CPLUSPLUS="$xcode_toolchain/clang++" LD="$xcode_toolchain/clang" LDPLUSPLUS="$xcode_toolchain/clang++" build
 
 # Full product-source compile without signing, install, GUI launch, or hardware I/O.
 product-check: schema-check apple-bundle-check
