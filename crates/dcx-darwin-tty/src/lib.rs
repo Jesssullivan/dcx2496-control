@@ -808,12 +808,12 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. }) {
             self.attempt_count += 1;
         }
-        let read = read_snapshot_bounded(&mut self.backend, deadline, operation.response_limit())?;
-        if self.backend.monotonic_now().saturating_sub(start) > operation.timeout() {
-            return Err(DarwinCarrierError::Deadline {
-                stage: CarrierStage::Read,
-            });
-        }
+        let read = read_snapshot_bounded(
+            &mut self.backend,
+            deadline,
+            operation.response_limit(),
+            request.as_bytes(),
+        )?;
         Ok(read)
     }
 
@@ -1092,7 +1092,7 @@ fn read_bounded<B: SerialBackend>(
     receipt: &mut ReceiptBuilder,
 ) -> Result<SearchRead, DarwinCarrierError> {
     debug_assert_eq!(limit, SEARCH_RESPONSE_LIMIT);
-    let first = read_one_frame(backend, deadline, receipt)?;
+    let first = read_one_frame(backend, deadline, limit, receipt)?;
     let response = match first {
         FramedRead::TimedOut(partial) => {
             receipt.received(&partial);
@@ -1100,7 +1100,7 @@ fn read_bounded<B: SerialBackend>(
         }
         FramedRead::Complete(frame) if frame.as_slice() == request => {
             receipt.request_echo_bytes = frame.len();
-            match read_one_frame(backend, deadline, receipt)? {
+            match read_one_frame(backend, deadline, limit, receipt)? {
                 FramedRead::Complete(response) => response,
                 FramedRead::TimedOut(partial) => {
                     receipt.received(&partial);
@@ -1121,7 +1121,7 @@ fn read_bounded<B: SerialBackend>(
         return Ok(read);
     }
 
-    match read_one_frame(backend, deadline, receipt)? {
+    match read_one_frame(backend, deadline, limit, receipt)? {
         FramedRead::Complete(duplicate) if duplicate == response => {
             receipt.duplicate_response_count = 1;
         }
@@ -1147,10 +1147,34 @@ enum FramedRead {
     TimedOut(Vec<u8>),
 }
 
-fn read_one_frame<B: SerialBackend>(
+trait WireObserver {
+    fn consumed(&mut self, count: usize);
+    fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError;
+}
+
+impl WireObserver for ReceiptBuilder {
+    fn consumed(&mut self, count: usize) {
+        self.wire_bytes += count;
+    }
+
+    fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError {
+        ReceiptBuilder::overflow(self, received, queued)
+    }
+}
+
+impl WireObserver for () {
+    fn consumed(&mut self, _count: usize) {}
+
+    fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError {
+        DarwinCarrierError::Overflow { received, queued }
+    }
+}
+
+fn read_one_frame<B: SerialBackend, O: WireObserver>(
     backend: &mut B,
     deadline: Duration,
-    receipt: &mut ReceiptBuilder,
+    frame_limit: usize,
+    observer: &mut O,
 ) -> Result<FramedRead, DarwinCarrierError> {
     let mut frame = Vec::with_capacity(SEARCH_RESPONSE_LIMIT);
     loop {
@@ -1172,8 +1196,8 @@ fn read_one_frame<B: SerialBackend>(
             }
             continue;
         }
-        if frame.len() == MAX_FRAME_LEN {
-            return Err(receipt.overflow(frame.len(), queued));
+        if frame.len() == frame_limit.min(MAX_FRAME_LEN) {
+            return Err(observer.overflow(frame.len(), queued));
         }
         let mut byte = [0_u8; 1];
         match backend
@@ -1182,7 +1206,7 @@ fn read_one_frame<B: SerialBackend>(
         {
             ReadProgress::Bytes(1) => {
                 frame.push(byte[0]);
-                receipt.wire_bytes += 1;
+                observer.consumed(1);
             }
             ReadProgress::Bytes(_) | ReadProgress::EndOfFile => {
                 return Err(DarwinCarrierError::EndOfFile {
@@ -1201,63 +1225,51 @@ fn read_snapshot_bounded<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
     limit: usize,
+    request: &[u8],
 ) -> Result<SnapshotRead, DarwinCarrierError> {
-    let mut bytes = vec![0_u8; limit];
-    let mut received = 0;
-
-    loop {
-        let time_left = remaining(backend, deadline);
-        if time_left.is_zero() {
-            return SnapshotRead::timed_out(&bytes[..received]).map_err(Into::into);
+    let mut observer = ();
+    let first = read_one_frame(backend, deadline, limit, &mut observer)?;
+    let response = match first {
+        FramedRead::TimedOut(partial) => {
+            return SnapshotRead::timed_out(&partial).map_err(Into::into);
         }
-
-        let queued = backend
-            .bytes_available()
-            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-        if queued > limit.saturating_sub(received) {
-            return Err(DarwinCarrierError::Overflow { received, queued });
-        }
-
-        if queued == 0 {
-            let time_left = remaining(backend, deadline);
-            if time_left.is_zero()
-                || !backend
-                    .wait_readable(time_left)
-                    .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
-            {
-                return SnapshotRead::timed_out(&bytes[..received]).map_err(Into::into);
-            }
-            continue;
-        }
-
-        let end = received + queued;
-        match backend
-            .read_once(&mut bytes[received..end])
-            .map_err(|fault| system_error(CarrierStage::Read, fault))?
-        {
-            ReadProgress::Bytes(count) => {
-                if count == 0 || count > queued {
-                    return Err(DarwinCarrierError::EndOfFile { received });
+        FramedRead::Complete(frame) if frame.as_slice() == request => {
+            match read_one_frame(backend, deadline, limit, &mut observer)? {
+                FramedRead::Complete(response) => response,
+                FramedRead::TimedOut(partial) => {
+                    return SnapshotRead::timed_out(&partial).map_err(Into::into);
                 }
-                received += count;
-            }
-            ReadProgress::WouldBlock => continue,
-            ReadProgress::EndOfFile => {
-                return Err(DarwinCarrierError::EndOfFile { received });
             }
         }
-
-        if received == limit {
-            ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
-            let queued = backend
-                .bytes_available()
-                .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-            if queued != 0 {
-                return Err(DarwinCarrierError::Overflow { received, queued });
-            }
-            return SnapshotRead::complete(&bytes).map_err(Into::into);
+        FramedRead::Complete(response) => response,
+    };
+    let read = SnapshotRead::complete(&response)?;
+    ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+    let trailing = backend
+        .bytes_available()
+        .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+    if trailing == 0 {
+        return Ok(read);
+    }
+    match read_one_frame(backend, deadline, limit, &mut observer)? {
+        FramedRead::Complete(duplicate) if duplicate == response => {}
+        FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
+            return Err(DarwinCarrierError::UnexpectedTrailingFrame {
+                received: other.len(),
+            });
         }
     }
+    ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+    let trailing = backend
+        .bytes_available()
+        .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+    if trailing != 0 {
+        return Err(DarwinCarrierError::Overflow {
+            received: response.len().min(limit),
+            queued: trailing,
+        });
+    }
+    Ok(read)
 }
 
 const fn system_error(stage: CarrierStage, fault: SystemFault) -> DarwinCarrierError {

@@ -19,16 +19,24 @@ use dcx_core::{
 };
 use thiserror::Error;
 
-use crate::{REPEAT_SEARCH_BUDGET, REPEAT_SEARCH_GAP, RepeatPacer};
+use crate::{REPEAT_SEARCH_GAP, RepeatPacer};
 
 /// Total Search identities required in one persistent snapshot session.
 pub const PERSISTENT_SEARCH_COUNT: usize = 10;
+const SEARCH_ATTEMPTS_PER_REQUIRED_IDENTITY: usize = 2;
+/// Maximum attempts allowed to collect the ten persistent Search identities.
+pub const PERSISTENT_SEARCH_ATTEMPT_LIMIT: usize =
+    PERSISTENT_SEARCH_COUNT * SEARCH_ATTEMPTS_PER_REQUIRED_IDENTITY;
 /// Search count for post-mutation readback on the already-identified session.
 pub const READBACK_SEARCH_COUNT: usize = 1;
-/// Per-operation deadline enforced by the platform session.
+/// Per-Search deadline enforced by the platform session.
 pub const SNAPSHOT_OPERATION_TIMEOUT: Duration = Duration::from_millis(500);
+/// Dump deadline, sized for one maximum response plus one exact replay at 38400.
+pub const SNAPSHOT_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Whole ten-valid-identity plus Dump0/Dump1 snapshot budget.
+pub const PERSISTENT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(120);
 /// Whole stale-baseline-check plus typed-apply/readback budget.
-pub const APPLY_TRANSACTION_BUDGET: Duration = Duration::from_secs(60);
+pub const APPLY_TRANSACTION_BUDGET: Duration = Duration::from_secs(120);
 /// Whole identity-check plus typed-rollback/readback budget.
 pub const ROLLBACK_TRANSACTION_BUDGET: Duration = Duration::from_secs(5);
 /// Maximum encoded query length among Search, Dump0, and Dump1.
@@ -37,7 +45,7 @@ pub const SNAPSHOT_REQUEST_LIMIT: usize = 11;
 /// Closed operation kind in the persistent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotOperationKind {
-    /// One exact broadcast Search. `sequence` is one through ten.
+    /// One exact broadcast Search. `sequence` is the one-based attempt number.
     Search { sequence: usize },
     /// First complete dump query.
     Dump0,
@@ -133,7 +141,10 @@ impl SnapshotOperation {
 
     /// Total operation deadline the carrier must enforce.
     pub const fn timeout(self) -> Duration {
-        SNAPSHOT_OPERATION_TIMEOUT
+        match self.kind {
+            SnapshotOperationKind::Search { .. } => SNAPSHOT_OPERATION_TIMEOUT,
+            SnapshotOperationKind::Dump0 | SnapshotOperationKind::Dump1 => SNAPSHOT_DUMP_TIMEOUT,
+        }
     }
 
     /// Exact response byte limit for this response type.
@@ -335,6 +346,11 @@ enum CaptureBodyError<E: StdError + Send + Sync + 'static, P: StdError + Send + 
     BudgetExceeded {
         operation: SnapshotOperationKind,
     },
+    SearchQualificationIncomplete {
+        valid: usize,
+        required: usize,
+        attempts: usize,
+    },
     Transport {
         operation: SnapshotOperationKind,
         source: E,
@@ -367,7 +383,7 @@ pub enum SnapshotCaptureError<
     /// Pacing failed before a repeat Search.
     #[error("persistent Search pacing failed before trial {trial}")]
     Pacing {
-        /// One-based Search number.
+        /// One-based Search attempt number.
         trial: usize,
         /// Pacer-specific cause.
         #[source]
@@ -380,6 +396,20 @@ pub enum SnapshotCaptureError<
     BudgetExceeded {
         /// Operation that was not safely eligible.
         operation: SnapshotOperationKind,
+        /// Session close failure, when close also failed.
+        finish_error: Option<E>,
+    },
+    /// The bounded attempt window ended before enough valid identities arrived.
+    #[error(
+        "persistent Search qualification produced {valid} of {required} valid identities in {attempts} attempts"
+    )]
+    SearchQualificationIncomplete {
+        /// Valid exact identities observed.
+        valid: usize,
+        /// Required valid identities.
+        required: usize,
+        /// Total bounded Search attempts issued.
+        attempts: usize,
         /// Session close failure, when close also failed.
         finish_error: Option<E>,
     },
@@ -449,16 +479,19 @@ pub enum SnapshotCaptureError<
 
 /// Run ten Searches, transmit-enable, Dump0, and Dump1 on one 38400 session.
 ///
-/// Search one is immediate; Searches two through ten are each preceded by the
-/// existing five-second device cadence. Every response must have its exact
-/// part-specific length and expected device address. The executor always calls
-/// [`PersistentSnapshotSession::finish`], including after an earlier failure,
-/// and returns a snapshot only when finish succeeds.
+/// Search attempt one is immediate; every later attempt is preceded by the
+/// existing five-second device cadence. Empty Search timeouts may be replayed
+/// until ten valid identities arrive or twenty attempts are exhausted. Every
+/// non-empty response must have its exact part-specific length and expected
+/// device address. The executor always calls [`PersistentSnapshotSession::finish`],
+/// including after an earlier failure, and returns a snapshot only when finish
+/// succeeds.
 ///
 /// # Errors
 ///
-/// Stops on the first pacing, budget, transport, timeout, limit, protocol,
-/// identity, part, or verified-finish failure. No later operation is issued.
+/// Stops on the first pacing, budget, transport, partial timeout, limit,
+/// protocol, identity, part, qualification, or verified-finish failure. No
+/// later operation is issued.
 pub fn execute_persistent_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
     mut session: S,
     pacer: &mut P,
@@ -470,8 +503,9 @@ pub fn execute_persistent_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>
         pacer,
         expected_device,
         PERSISTENT_SEARCH_COUNT,
+        PERSISTENT_SEARCH_ATTEMPT_LIMIT,
         started,
-        REPEAT_SEARCH_BUDGET,
+        PERSISTENT_SNAPSHOT_BUDGET,
     );
     let finish = session.finish();
     finish_capture(body, finish, PERSISTENT_SEARCH_COUNT)
@@ -499,36 +533,19 @@ fn capture_body<S: PersistentSnapshotSession, P: RepeatPacer>(
     pacer: &mut P,
     expected_device: DeviceId,
     search_count: usize,
+    search_attempt_limit: usize,
     started: Duration,
     budget: Duration,
 ) -> Result<SnapshotV1, CaptureBodyError<S::Error, P::Error>> {
-    let first_operation = SnapshotOperation::search(1, expected_device).map_err(|source| {
-        CaptureBodyError::Validation {
-            operation: SnapshotOperationKind::Search { sequence: 1 },
-            source: SnapshotError::Protocol(source),
-        }
-    })?;
-    let identity_frame = exchange_validated(session, first_operation)?;
-    require_budget(pacer, started, budget, first_operation.kind())?;
-
-    for sequence in 2..=search_count {
-        pacer
-            .wait(REPEAT_SEARCH_GAP)
-            .map_err(|source| CaptureBodyError::Pacing {
-                trial: sequence,
-                source,
-            })?;
-        let kind = SnapshotOperationKind::Search { sequence };
-        require_budget(pacer, started, budget, kind)?;
-        let operation = SnapshotOperation::search(sequence, expected_device).map_err(|source| {
-            CaptureBodyError::Validation {
-                operation: kind,
-                source: SnapshotError::Protocol(source),
-            }
-        })?;
-        drop(exchange_validated(session, operation)?);
-        require_budget(pacer, started, budget, kind)?;
-    }
+    let identity_frame = capture_search_identities(
+        session,
+        pacer,
+        expected_device,
+        search_count,
+        search_attempt_limit,
+        started,
+        budget,
+    )?;
 
     let mode = RemoteMode::Transmit;
     require_budget(pacer, started, budget, SnapshotOperationKind::Dump0)?;
@@ -567,6 +584,69 @@ fn capture_body<S: PersistentSnapshotSession, P: RepeatPacer>(
     })
 }
 
+fn capture_search_identities<S: PersistentSnapshotSession, P: RepeatPacer>(
+    session: &mut S,
+    pacer: &mut P,
+    expected_device: DeviceId,
+    required: usize,
+    attempt_limit: usize,
+    started: Duration,
+    budget: Duration,
+) -> Result<Vec<u8>, CaptureBodyError<S::Error, P::Error>> {
+    debug_assert!(required > 0);
+    let mut valid = 0_usize;
+    let mut identity_frame = None;
+
+    for attempt in 1..=attempt_limit {
+        if attempt != 1 {
+            pacer
+                .wait(REPEAT_SEARCH_GAP)
+                .map_err(|source| CaptureBodyError::Pacing {
+                    trial: attempt,
+                    source,
+                })?;
+        }
+        let kind = SnapshotOperationKind::Search { sequence: attempt };
+        require_budget::<S::Error, P>(pacer, started, budget, kind)?;
+        let operation = SnapshotOperation::search(attempt, expected_device).map_err(|source| {
+            CaptureBodyError::Validation {
+                operation: kind,
+                source: SnapshotError::Protocol(source),
+            }
+        })?;
+        match exchange_validated(session, operation) {
+            Ok(frame) => {
+                if identity_frame.is_none() {
+                    identity_frame = Some(frame);
+                }
+                valid += 1;
+                if valid == required {
+                    require_budget::<S::Error, P>(pacer, started, budget, kind)?;
+                    return identity_frame.ok_or(CaptureBodyError::SearchQualificationIncomplete {
+                        valid,
+                        required,
+                        attempts: attempt,
+                    });
+                }
+            }
+            Err(error @ CaptureBodyError::Timeout { received: 0, .. })
+                if attempt_limit == required =>
+            {
+                return Err(error);
+            }
+            Err(CaptureBodyError::Timeout { received: 0, .. }) => {}
+            Err(error) => return Err(error),
+        }
+        require_budget::<S::Error, P>(pacer, started, budget, kind)?;
+    }
+
+    Err(CaptureBodyError::SearchQualificationIncomplete {
+        valid,
+        required,
+        attempts: attempt_limit,
+    })
+}
+
 fn require_budget<E: StdError + Send + Sync + 'static, P: RepeatPacer>(
     pacer: &mut P,
     started: Duration,
@@ -574,10 +654,17 @@ fn require_budget<E: StdError + Send + Sync + 'static, P: RepeatPacer>(
     operation: SnapshotOperationKind,
 ) -> Result<(), CaptureBodyError<E, P::Error>> {
     let elapsed = pacer.elapsed().saturating_sub(started);
-    if elapsed > budget.saturating_sub(SNAPSHOT_OPERATION_TIMEOUT) {
+    if elapsed > budget.saturating_sub(operation_timeout(operation)) {
         Err(CaptureBodyError::BudgetExceeded { operation })
     } else {
         Ok(())
+    }
+}
+
+const fn operation_timeout(operation: SnapshotOperationKind) -> Duration {
+    match operation {
+        SnapshotOperationKind::Search { .. } => SNAPSHOT_OPERATION_TIMEOUT,
+        SnapshotOperationKind::Dump0 | SnapshotOperationKind::Dump1 => SNAPSHOT_DUMP_TIMEOUT,
     }
 }
 
@@ -679,6 +766,16 @@ fn with_finish<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 
         },
         CaptureBodyError::BudgetExceeded { operation } => SnapshotCaptureError::BudgetExceeded {
             operation,
+            finish_error,
+        },
+        CaptureBodyError::SearchQualificationIncomplete {
+            valid,
+            required,
+            attempts,
+        } => SnapshotCaptureError::SearchQualificationIncomplete {
+            valid,
+            required,
+            attempts,
             finish_error,
         },
         CaptureBodyError::Transport { operation, source } => SnapshotCaptureError::Transport {
@@ -820,6 +917,7 @@ pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
         pacer,
         expected_device,
         PERSISTENT_SEARCH_COUNT,
+        PERSISTENT_SEARCH_ATTEMPT_LIMIT,
         started,
         APPLY_TRANSACTION_BUDGET,
     );
@@ -873,6 +971,7 @@ pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
         &mut session,
         pacer,
         expected_device,
+        READBACK_SEARCH_COUNT,
         READBACK_SEARCH_COUNT,
         started,
         APPLY_TRANSACTION_BUDGET,
@@ -969,6 +1068,7 @@ pub fn execute_rollback_readback<S: PersistentApplySession, P: RepeatPacer>(
         &mut session,
         pacer,
         device,
+        READBACK_SEARCH_COUNT,
         READBACK_SEARCH_COUNT,
         started,
         ROLLBACK_TRANSACTION_BUDGET,
@@ -1223,6 +1323,33 @@ mod tests {
             pacer.waits,
             [REPEAT_SEARCH_GAP; PERSISTENT_SEARCH_COUNT - 1]
         );
+    }
+
+    #[test]
+    fn empty_search_timeouts_are_replayed_until_ten_valid_identities_arrive() {
+        let mut steps = Vec::new();
+        for _ in 0..PERSISTENT_SEARCH_COUNT {
+            steps.push(Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
+            steps.push(Step::Read(SnapshotRead::complete(&identity(0)).unwrap()));
+        }
+        steps.push(Step::Read(SnapshotRead::complete(&dump(0, 0, 1)).unwrap()));
+        steps.push(Step::Read(SnapshotRead::complete(&dump(0, 1, 2)).unwrap()));
+        let (session, log) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+
+        let captured =
+            execute_persistent_snapshot(session, &mut pacer, DeviceId::new(0).unwrap()).unwrap();
+
+        assert_eq!(captured.valid_search_count(), PERSISTENT_SEARCH_COUNT);
+        assert_eq!(captured.snapshot(), &snapshot(0, 1, 2));
+        let log = log.borrow();
+        assert_eq!(log.operations.len(), PERSISTENT_SEARCH_ATTEMPT_LIMIT + 2);
+        assert_eq!(
+            log.operations[PERSISTENT_SEARCH_ATTEMPT_LIMIT].kind(),
+            SnapshotOperationKind::Dump0
+        );
+        assert_eq!(pacer.waits.len(), PERSISTENT_SEARCH_ATTEMPT_LIMIT - 1);
+        assert_eq!(log.finishes, 1);
     }
 
     #[test]

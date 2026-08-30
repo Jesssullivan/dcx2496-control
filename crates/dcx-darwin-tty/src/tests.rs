@@ -6,7 +6,8 @@ use dcx_core::{
 };
 use dcx_transport::{
     Known38400SearchOutcome, RepeatPacer, SearchExecutionError, SearchOperationKind, SearchOutcome,
-    execute_known_38400_search, execute_search, snapshot::execute_persistent_snapshot,
+    execute_known_38400_search, execute_search,
+    snapshot::{SNAPSHOT_OPERATION_TIMEOUT, execute_persistent_snapshot},
 };
 
 use super::*;
@@ -900,6 +901,60 @@ fn persistent_carrier_captures_exact_search_and_dump_lengths_before_verified_clo
     );
     assert_eq!(captured.snapshot().frame(SnapshotSection::Dump0), dump0);
     assert_eq!(captured.snapshot().frame(SnapshotSection::Dump1), dump1);
+}
+
+#[test]
+fn persistent_snapshot_replays_one_empty_carrier_timeout() {
+    let identity = synthetic_response(0);
+    let dump0 = synthetic_dump(0, 0);
+    let dump1 = synthetic_dump(0, 1);
+    let mut inbound = Vec::new();
+    for _ in 0..10 {
+        inbound.extend_from_slice(&identity);
+    }
+    inbound.extend_from_slice(&dump0);
+    inbound.extend_from_slice(&dump1);
+
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.available_script = [0, 0].into_iter().collect();
+    backend.wait_script = [(false, SNAPSHOT_OPERATION_TIMEOUT)].into_iter().collect();
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let mut pacer = FastPacer::default();
+
+    let captured =
+        execute_persistent_snapshot(carrier, &mut pacer, DeviceId::new(0).unwrap()).unwrap();
+
+    assert_eq!(captured.valid_search_count(), 10);
+    assert!(captured.close_verified());
+    assert_eq!(
+        captured.snapshot().frame(SnapshotSection::Identity),
+        identity
+    );
+}
+
+#[test]
+fn snapshot_reader_strips_one_request_echo_and_one_exact_response_replay() {
+    let request = synthetic_search_request();
+    let response = synthetic_response(0);
+    let mut inbound = request.to_vec();
+    inbound.extend_from_slice(&response);
+    inbound.extend_from_slice(&response);
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.written = true;
+    backend.read_goal = request.len() + response.len();
+    backend.post_response_input = response.len();
+
+    let read = read_snapshot_bounded(
+        &mut backend,
+        SNAPSHOT_OPERATION_TIMEOUT,
+        SEARCH_RESPONSE_LIMIT,
+        &request,
+    )
+    .unwrap();
+
+    assert_eq!(read, SnapshotRead::complete(&response).unwrap());
+    assert!(backend.inbound.is_empty());
+    assert_eq!(backend.post_response_input, 0);
 }
 
 #[test]
