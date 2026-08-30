@@ -256,17 +256,22 @@ apple-provisioned-bundle: apple-project-generate
       ."com.apple.security.inherit" == true
     ' >/dev/null
     verify_profile() {
-      local profile="$1" expected_identifier="$2" decoded decoded_json
+      local profile="$1" expected_identifier="$2" decoded entitlements_json
       test -f "$profile"
       decoded="$(/usr/bin/security cms -D -i "$profile")"
-      decoded_json="$(printf '%s' "$decoded" | /usr/bin/plutil -convert json -o - -)"
-      printf '%s' "$decoded_json" | /usr/bin/jq -e \
+      entitlements_json="$(
+        printf '%s' "$decoded" \
+          | /usr/bin/plutil -extract Entitlements xml1 -o - - \
+          | /usr/bin/plutil -convert json -o - -
+      )"
+      printf '%s' "$entitlements_json" | /usr/bin/jq -e \
         --arg team "$team_id" \
         --arg identifier "$expected_identifier" \
         --arg group "$app_group" '
-          .Entitlements["application-identifier"] == ($team + "." + $identifier) and
-          .Entitlements["com.apple.developer.team-identifier"] == $team and
-          .Entitlements["com.apple.security.application-groups"] == [$group]
+          .["com.apple.application-identifier"] == ($team + "." + $identifier) and
+          .["com.apple.developer.team-identifier"] == $team and
+          ([.["com.apple.security.application-groups"][]?
+            | select(. == $group or . == ($team + ".*"))] | length > 0)
         ' >/dev/null
     }
     verify_profile "$app/Contents/embedded.provisionprofile" io.tinyland.dcx2496.logic
