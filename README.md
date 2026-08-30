@@ -129,6 +129,7 @@ just bazel-check
 just live-package
 just apple-package-check
 just apple-bundle-check
+just apple-adhoc-bundle
 just apple-provisioned-bundle
 just product-check
 ```
@@ -146,6 +147,14 @@ The Swift package and unsigned arm64 helper/AUv3 bundle compile locally. That is
 build evidence only: signed PZM artifacts, `auval`, Logic discovery/insertion,
 named-device snapshot, live apply/readback/rollback, and audio flow remain
 separate runtime qualifications until their receipts exist.
+
+`just apple-adhoc-bundle` builds the Release carrier unsigned, then signs the
+bundled `dcxctl`, AUv3, and containing app from the inside out with ad-hoc
+signatures. It verifies arm64 binaries, signatures, entitlement separation,
+bundle/component identifiers, and the absence of provisioning profiles. This is
+the bounded carrier for helper-absent AU discovery and `auval`; because an ad-hoc
+signature has no team identifier, it does not qualify App Group access, helper
+IPC, installation, registration, Logic, or device behavior.
 
 `just apple-provisioned-bundle` is the non-installing production carrier. It
 requires an accessible Apple Development identity plus matching profiles for
