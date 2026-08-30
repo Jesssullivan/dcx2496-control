@@ -1,55 +1,53 @@
-# Darwin live discovery
+# Darwin live control
 
-The `live-discovery` feature adds a single macOS command:
+The macOS-only `live-control` feature adds explicit, bounded device operations.
+`live-discovery` remains a compatibility feature name. Discovery is still the
+smallest live command:
 
 ```sh
 dcxctl discovery live-search --tty /dev/cu.usbserial-EXACT_DEVICE --expected-device 0
 ```
 
-It is intentionally a product operation, not an authorization or evidence
-protocol. Legalab establishes the external hardware preconditions before
-invocation. This repository owns only the typed Search request, bounded serial
-execution, protocol validation, and compact runtime result.
+These are product operations, not authorization or evidence protocols. Legalab
+establishes physical mute, routing, named-device identity, and attended-stop
+preconditions before invocation. This repository owns typed requests, bounded
+serial execution, protocol validation, and sanitized results.
 
-## Behavior
+## Persistent session
 
-The command performs one uninterrupted Search-and-repeat transaction:
+Every live invocation validates one explicit `/dev/cu.usbserial-*` callout,
+opens it nonblocking and exclusively, snapshots terminal and modem-line state,
+configures fixed 38400 8N1 once, and reuses that descriptor for the complete
+operation. Consuming finish restores and verifies the original state before
+close. Setup failure performs the same bounded cleanup; a failed restore is a
+failed operation.
 
-1. Validate the explicit `/dev/cu.usbserial-*` callout path and expected DCX
-   address.
-2. Search at the MVP golden-path 38400 baud binding, 8N1, with a 500 ms
-   whole-attempt deadline.
-3. Require one exact 26-byte Behringer/DCX Search response at the expected
-   address.
-4. Wait at least five seconds before each of exactly nine same-baud repeats,
-   matching the cadence of the pinned behavioral reference and stopping on the
-   first timeout, identity failure, carrier failure, or 60-second repeat budget
-   overrun.
+Search requires one exact 26-byte identity and nine more validated responses,
+each repeat preceded by at least five seconds. Snapshot and readback use the
+same ten-search identity sequence followed by typed transmit remote mode,
+Dump0, and Dump1. Apply and rollback accept only immutable plans produced from
+the exact O1/channel 5/PEQ9 desired profile, verify a fresh baseline, issue one
+reviewed direct-parameter command when needed, and attempt complete readback.
 
-Success is JSON with `status: identified`, device address, selected baud,
-`validResponses: 10`, and sanitized carrier attempts. Failure also emits JSON
-before returning nonzero. Neither form includes the callout path or raw response
-payload.
+Queued input blocks a write. Each operation has an exact request type, response
+ceiling, and deadline. The caller cannot choose frame bytes, remote-mode bytes,
+baud, serial format, retry count, or timeout, and no generic write surface or
+port enumeration exists. Raw callout paths and payloads stay out of diagnostic
+output.
 
-## Carrier guarantees
-
-Each attempt opens the named callout nonblocking and exclusively, snapshots the
-terminal and modem-line state, rejects pre-existing queued input, writes only
-the fixed eight-byte Search frame, reads at most 26 bytes, restores and verifies
-the original state, and closes the descriptor. A failed restoration is a failed
-operation even if the response itself was valid.
-
-The command has no options for request bytes, retry count, baud rate,
-timeout, serial format, or arbitrary output. The feature-free `dcxctl` binary
-contains no serial-capable command.
+Offline `control diff` is available without a live feature. It validates one
+raw snapshot plus one strict desired profile and emits the immutable apply and
+rollback carriers consumed by the live commands.
 
 ## Build
 
-On an aarch64 Darwin builder:
+On the aarch64 Darwin builder:
 
 ```sh
 just live-package
+just product-check
 ```
 
-The resulting `dcxctl` is built with the `live-discovery` feature. The ordinary
-test suites use injected transports and never open a serial device.
+The live package uses the canonical `live-control` feature. Rust tests use
+injected transports, the Apple product check is unsigned, and neither command
+opens a serial device or launches a GUI.

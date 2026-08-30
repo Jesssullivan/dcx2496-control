@@ -1,20 +1,41 @@
 # dcx2496-control
 
-Typed, fail-closed building blocks for restoring Behringer ULTRADRIVE PRO
-DCX2496 control in Tinyland's Legacy Audio Lab.
+Typed, fail-closed control for the Behringer ULTRADRIVE PRO DCX2496 in
+Tinyland's Legacy Audio Lab.
 
-`dcxctl` is offline by default. It decodes fixture bytes, constructs known
-read-only query frames, validates and diffs complete profiles, plans discovery,
-and quantizes Room EQ Wizard Generic EQ text. The macOS-only `live-discovery`
-feature adds one hardware command: a typed Search followed by exactly nine
-same-baud repeats.
+The Rust core decodes bounded protocol frames, validates complete snapshots,
+imports Room EQ Wizard Generic EQ text, maps one reviewed O1/PEQ9 change, and
+builds immutable apply and rollback plans. `dcxctl` is offline by default. Its
+macOS `live-control` feature holds one exact 38400 8N1 callout session and
+exposes only typed discovery, remote-mode, Dump0/Dump1, and direct-parameter
+operations. `live-discovery` remains a compatibility feature name.
 
 There is no port enumeration, server, arbitrary-frame input, generic byte-write
-surface, or configuration command.
+surface, MIDI-to-device mapping, or automatic project-recall apply.
 
-## Live Search
+## Control flow
 
-The live command accepts one explicit FTDI callout node:
+The implemented product path is:
+
+```text
+REW export -> typed O1/PEQ9 desired document -> snapshot/diff plans
+           -> explicit apply -> complete readback -> explicit rollback
+
+Logic AUv3 UI -> App Group socket -> foreground DCXLogicHelper
+              -> exact bundled dcxctl -> RS-232 DCX2496
+```
+
+The AUv3 is a control-only MIDI FX with no audio buses. Its render block passes
+MIDI through and performs no IPC, process launch, filesystem access, or serial
+work. Project recall stages desired state only. The foreground helper owns one
+single-flight child transaction and is the only Apple process that can execute
+the bundled `dcxctl`. The separate CoreMIDI Commands and Status endpoints have
+no device-control packet mapping in bridge v1.
+
+## CLI
+
+Discovery uses one open descriptor for the initial Search and nine five-second
+paced repeats:
 
 ```sh
 dcxctl discovery live-search \
@@ -22,71 +43,108 @@ dcxctl discovery live-search \
   --expected-device 0
 ```
 
-One invocation performs the complete discovery milestone:
+A complete raw `SnapshotV1` contains one validated identity plus exact 1015-byte
+Dump0 and 911-byte Dump1 frames and their canonical digests:
 
-1. Open the named callout exclusively and issue the fixed Search query at the
-   MVP golden-path 38400 baud binding, 8N1.
-2. Validate the exact 26-byte Behringer/DCX response and expected device
-   address.
-3. Issue exactly nine more Searches at the same baud, paced five seconds apart.
-4. Print structured JSON with the parsed identity, selected baud, valid-response
-   count, and carrier diagnostics.
+```sh
+dcxctl control snapshot \
+  --tty /dev/cu.usbserial-EXACT_DEVICE \
+  --expected-device 0 > snapshot.json
+```
 
-The caller cannot choose a repeat baud, repeat count, request bytes, timeout, or
-initial-baud policy. Legalab owns physical readiness and operator authorization
-before this command is invoked; this repository does not mirror those records.
+REW import and slot mapping are offline. The MVP writable mapping is exactly
+physical output O1, PEQ9: channel 5 parameters `0x3b` through `0x3e`
+(frequency, Q, gain, and filter kind). It deliberately excludes EQ enable,
+editor selection, and shelf slope.
+
+```sh
+dcxctl rew plan-slot fixtures/rew/SYNTHETIC-cut-only.txt \
+  --target-output 1 --filter-index 1 --peq-slot 9
+
+dcxctl control diff --snapshot snapshot.json --profile desired-profile.json \
+  > transaction-plans.json
+```
+
+`desired-profile.json` is the strict `dcx.desired-profile/v1` bridge document;
+its `document` value is the unchanged `rew plan-slot` result. `control diff`
+derives the exact desired snapshot and inverse values from the immutable
+baseline and emits zero or one exact O1/PEQ9 semantic change plus strict raw
+`apply_plan` and `rollback_plan` carriers. Profile identity and revision are
+1–128 ASCII bytes, and every digest is `sha256/` plus 64 lowercase hexadecimal
+digits. The document is exactly O1, channel 5, PEQ9 with four ordered actions:
+frequency (`0x3b`), Q (`0x3c`), cut-only gain (`0x3d`), and peak kind (`0x3e`).
+
+The diff output is one envelope. Extract its two immutable carriers before a
+live command:
+
+```sh
+jq -e '.apply_plan' transaction-plans.json > apply-plan.json
+jq -e '.rollback_plan' transaction-plans.json > rollback-plan.json
+```
+
+Live mutation accepts only those carriers. Apply first captures and compares a
+fresh complete baseline on the same descriptor; a stale plan is rejected before
+the direct write. Apply and rollback then attempt complete readback. If that
+capture is unavailable, the Apple bridge returns an omitted or null `readback`
+or `restored` document with false equality and an explicit unresolved/rollback
+state; it never fabricates a successful snapshot.
+
+```sh
+dcxctl control apply \
+  --tty /dev/cu.usbserial-EXACT_DEVICE --expected-device 0 \
+  --plan apply-plan.json
+
+dcxctl control readback \
+  --tty /dev/cu.usbserial-EXACT_DEVICE --expected-device 0
+
+dcxctl control rollback \
+  --tty /dev/cu.usbserial-EXACT_DEVICE --expected-device 0 \
+  --plan rollback-plan.json
+```
+
+Legalab owns the physical mute, route, authorization, and attended-stop
+preconditions for every live invocation. This repository does not duplicate
+those records.
 
 ## Serial boundary
 
-- The only outbound frame is the eight-byte Search request.
-- Every attempt has a 500 ms total deadline and 26-byte input ceiling.
-- Partial input, invalid identity, overflow, timeout, or transport failure stops
-  immediately.
-- The Darwin carrier opens nonblocking with `O_NOCTTY`, obtains `TIOCEXCL`, and
-  performs one write syscall per attempt.
-- Existing queued input blocks a write; it is never flushed or consumed as a
-  response.
-- Termios and modem control lines are snapshotted, restored, read back exactly,
-  and the descriptor is closed on every opened path.
-- Raw callout paths and response payloads are omitted from diagnostic output.
-
-## Offline commands
-
-```sh
-just dcxctl query search
-just dcxctl discovery plan --expected-device 0
-just dcxctl discovery validate-response \
-  fixtures/protocol/SYNTHETIC-search-response-26.hex --expected-device 0
-just dcxctl decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex
-just dcxctl profile validate fixtures/profiles/safe-muted-v1.json
-just dcxctl profile diff \
-  fixtures/profiles/safe-muted-v1.json \
-  fixtures/profiles/SYNTHETIC-control-room-v1.json
-just dcxctl rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3
-```
+- The caller supplies one exact `/dev/cu.usbserial-*` callout; the program never
+  enumerates ports.
+- The tty opens nonblocking with `O_NOCTTY` and `TIOCEXCL`, snapshots termios and
+  modem lines, configures 38400 8N1 once, and reuses the descriptor.
+- Every request is a closed typed value. Dump capture sends the pinned transmit
+  remote mode before Dump0/Dump1; apply/rollback send receive-and-transmit mode
+  before the reviewed direct command. No disable frame is invented.
+- Queued input blocks a write. Reads have exact response ceilings and stop on
+  timeout, malformed framing, wrong address/part, overflow, or EOF.
+- Finish restores and reads back the original terminal and modem-line state,
+  then closes. Raw paths and response payloads stay out of diagnostics.
 
 ## Build and validation
-
-`just` is the operator front door and Bazel is the build graph:
 
 ```sh
 nix develop
 just check
 just bazel-check
 just live-package
+just apple-package-check
+just apple-bundle-check
+just product-check
 ```
 
-The Bazel graph exposes the default `//:dcxctl`, the macOS-only
-`//:dcxctl_live_discovery`, and the transport/carrier test suites. Tests use
-injected transports and synthetic fixtures; they never open a device. The live
-Nix package is available only for `aarch64-darwin`.
+Bazel exposes `//:dcxctl` and the macOS-only `//:dcxctl_live_control`; the old
+`//:dcxctl_live_discovery` label aliases the latter. Injected Rust tests never
+open a device. `//:apple_bundle_sources` and `//:dcx_logic_bridge_schema` make
+the native Apple and bridge-schema inputs traversable without duplicating the
+XcodeGen build in Bazel. XcodeGen is the checked-in Apple project source;
+generated projects and build products are ignored. `just check` stays on the
+portable Rust path; `just product-check` adds schema validation and the unsigned
+arm64 Apple bundle build.
 
-## Scope
-
-A valid Search response establishes protocol identity and address only. The
-remaining response payload stays opaque until observed behavior supports a
-typed interpretation. Snapshot, semantic diff, apply/readback, and rollback are
-the next product phases; no blind write is implemented here.
+The Swift package and unsigned arm64 helper/AUv3 bundle compile locally. That is
+build evidence only: signed PZM artifacts, `auval`, Logic discovery/insertion,
+named-device snapshot, live apply/readback/rollback, and audio flow remain
+separate runtime qualifications until their receipts exist.
 
 New work is licensed under either Apache-2.0 or MIT, at your option. See
 `NOTICE`, `LICENSE`, and `LICENSE-APACHE`.

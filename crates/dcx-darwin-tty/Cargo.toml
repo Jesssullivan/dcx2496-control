@@ -1,6 +1,6 @@
 [package]
 name = "dcx-darwin-tty"
-description = "Fail-closed Darwin tty carrier for the typed DCX2496 Search operation"
+description = "Fail-closed persistent Darwin tty carrier for bounded DCX2496 control"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

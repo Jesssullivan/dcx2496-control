@@ -1,5 +1,5 @@
 {
-  description = "Offline-first DCX2496 control with explicit Darwin live Search";
+  description = "Offline-first DCX2496 control with explicit bounded Darwin sessions";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -64,7 +64,7 @@
           dcxctl-live = packageFor {
             inherit pkgs;
             pname = "dcxctl-live";
-            features = ["live-discovery"];
+            features = ["live-control"];
           };
         }
     );
@@ -74,20 +74,22 @@
         pkgs = pkgsFor system;
       in {
         default = pkgs.mkShell {
-          packages = [
-            pkgs.actionlint
-            pkgs.bazelisk
-            pkgs.buildifier
-            pkgs.cargo-deny
-            pkgs.git
-            pkgs.gitleaks
-            pkgs.just
-            pkgs.jq
-            pkgs.alejandra
-            pkgs.ripgrep
-            (toolchainFor pkgs)
-            pkgs.shellcheck
-          ];
+          packages =
+            [
+              pkgs.actionlint
+              pkgs.bazelisk
+              pkgs.buildifier
+              pkgs.cargo-deny
+              pkgs.git
+              pkgs.gitleaks
+              pkgs.just
+              pkgs.jq
+              pkgs.alejandra
+              pkgs.ripgrep
+              (toolchainFor pkgs)
+              pkgs.shellcheck
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [pkgs.xcodegen];
           RUST_BACKTRACE = "1";
         };
       }

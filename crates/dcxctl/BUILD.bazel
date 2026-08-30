@@ -5,16 +5,19 @@ package(default_visibility = ["//visibility:public"])
 
 rust_binary(
     name = "dcxctl",
-    srcs = ["src/main.rs"],
+    srcs = [
+        "src/live_control.rs",
+        "src/main.rs",
+    ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = ["//crates/dcx-core:dcx_core"] + all_crate_deps(normal = True),
 )
 
 rust_binary(
-    name = "dcxctl_live_discovery",
+    name = "dcxctl_live_control",
     srcs = glob(["src/**/*.rs"]),
-    crate_features = ["live-discovery"],
+    crate_features = ["live-control"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     target_compatible_with = select({
@@ -26,4 +29,9 @@ rust_binary(
         "//crates/dcx-darwin-tty:dcx_darwin_tty",
         "//crates/dcx-transport:dcx_transport",
     ] + all_crate_deps(normal = True),
+)
+
+alias(
+    name = "dcxctl_live_discovery",
+    actual = ":dcxctl_live_control",
 )

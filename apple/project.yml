@@ -1,0 +1,95 @@
+name: DCXLogic
+options:
+  minimumXcodeGenVersion: 2.42.0
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  DCXApple:
+    path: .
+
+settings:
+  base:
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+    SWIFT_VERSION: 5.0
+    DEVELOPMENT_TEAM: QP994XQKNH
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  DCXLogicHelper:
+    type: application
+    platform: macOS
+    sources:
+      - path: DCXLogicHelper
+        excludes:
+          - Info.plist
+          - DCXLogicHelper.entitlements
+          - dcxctl.entitlements
+    dependencies:
+      - package: DCXApple
+        product: DCXLogicHelperCore
+      - target: DCXControlAU
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.tinyland.dcx2496.logic
+        PRODUCT_NAME: DCXLogicHelper
+        INFOPLIST_FILE: DCXLogicHelper/Info.plist
+        CODE_SIGN_ENTITLEMENTS: DCXLogicHelper/DCXLogicHelper.entitlements
+        ENABLE_HARDENED_RUNTIME: true
+    preBuildScripts:
+      - name: Build and embed bounded dcxctl
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${SRCROOT}/../target"
+          export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+          cargo_bin="$(command -v cargo || true)"
+          rustc_bin="$(command -v rustc || true)"
+          if [[ -z "${cargo_bin}" || -z "${rustc_bin}" ]]; then
+            echo "pinned cargo and rustc must be inherited from PATH" >&2
+            exit 1
+          fi
+          export RUSTC="${rustc_bin}"
+          "${cargo_bin}" build \
+            --manifest-path "${SRCROOT}/../Cargo.toml" \
+            --locked \
+            --release \
+            --package dcxctl \
+            --features live-control
+          helper_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
+          /bin/mkdir -p "${helper_dir}"
+          /usr/bin/ditto "${CARGO_TARGET_DIR}/release/dcxctl" "${helper_dir}/dcxctl"
+          /bin/chmod 0755 "${helper_dir}/dcxctl"
+          if [[ "${CODE_SIGNING_ALLOWED:-NO}" == "YES" && -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
+            /usr/bin/codesign \
+              --force \
+              --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --options runtime \
+              --entitlements "${SRCROOT}/DCXLogicHelper/dcxctl.entitlements" \
+              "${helper_dir}/dcxctl"
+          fi
+
+  DCXControlAU:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: DCXControlAU
+        excludes:
+          - Info.plist
+          - DCXControlAU.entitlements
+    dependencies:
+      - package: DCXApple
+        product: DCXControlAUCore
+      - package: DCXApple
+        product: DCXLogicBridge
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.tinyland.dcx2496.logic.midi
+        PRODUCT_NAME: DCXControlAU
+        INFOPLIST_FILE: DCXControlAU/Info.plist
+        CODE_SIGN_ENTITLEMENTS: DCXControlAU/DCXControlAU.entitlements
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true

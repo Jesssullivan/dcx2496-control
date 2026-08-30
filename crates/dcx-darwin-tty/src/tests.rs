@@ -1,7 +1,13 @@
 use std::{collections::VecDeque, path::PathBuf, time::Duration};
 
-use dcx_core::protocol::DeviceId;
-use dcx_transport::{SearchExecutionError, SearchOperationKind, SearchOutcome, execute_search};
+use dcx_core::{
+    SnapshotSection,
+    protocol::{DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DeviceId},
+};
+use dcx_transport::{
+    Known38400SearchOutcome, RepeatPacer, SearchExecutionError, SearchOperationKind, SearchOutcome,
+    execute_known_38400_search, execute_search, snapshot::execute_persistent_snapshot,
+};
 
 use super::*;
 
@@ -38,6 +44,9 @@ struct FakeBackend {
     advance_at: Option<(CarrierStage, Duration)>,
     opened: bool,
     written: bool,
+    read_since_write: usize,
+    read_goal: usize,
+    writes: Vec<Vec<u8>>,
     preexisting_input: usize,
     preexisting_script: VecDeque<usize>,
     termios_readback: FakeTermios,
@@ -57,6 +66,9 @@ impl FakeBackend {
             advance_at: None,
             opened: false,
             written: false,
+            read_since_write: 0,
+            read_goal: 0,
+            writes: Vec::new(),
             preexisting_input: 0,
             preexisting_script: VecDeque::new(),
             termios_readback: FakeTermios(8),
@@ -115,9 +127,17 @@ impl SerialBackend for FakeBackend {
 
     fn write_once(&mut self, bytes: &[u8]) -> Result<usize, SystemFault> {
         self.step(CarrierStage::Write, Call::Write(bytes.len()))?;
-        assert_eq!(bytes, &[0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7]);
+        self.writes.push(bytes.to_vec());
+        self.read_goal = match bytes.get(6).copied() {
+            Some(0x40) => SEARCH_RESPONSE_LIMIT,
+            Some(0x50) if bytes.get(9) == Some(&0) => DUMP0_RESPONSE_LEN,
+            Some(0x50) if bytes.get(9) == Some(&1) => DUMP1_RESPONSE_LEN,
+            Some(0x20 | 0x3f) => 0,
+            _ => panic!("test carrier received an unexpected typed request"),
+        };
         let written = self.short_write.unwrap_or(bytes.len());
-        self.written = true;
+        self.written = self.read_goal != 0;
+        self.read_since_write = 0;
         Ok(written)
     }
 
@@ -156,6 +176,10 @@ impl SerialBackend for FakeBackend {
         for slot in &mut bytes[..count] {
             *slot = self.inbound.pop_front().expect("length checked");
         }
+        self.read_since_write += count;
+        if self.read_since_write == self.read_goal {
+            self.written = false;
+        }
         Ok(ReadProgress::Bytes(count))
     }
 
@@ -192,6 +216,8 @@ impl SerialBackend for FakeBackend {
         self.calls.push(Call::Close);
         self.opened = false;
         self.written = false;
+        self.read_since_write = 0;
+        self.read_goal = 0;
     }
 }
 
@@ -201,6 +227,37 @@ fn synthetic_response(device: u8) -> [u8; SEARCH_RESPONSE_LIMIT] {
     frame[7..25].copy_from_slice(b"SYNTHETIC-IDENTITY");
     frame[25] = 0xf7;
     frame
+}
+
+fn synthetic_dump(device: u8, part: u8) -> Vec<u8> {
+    let length = match part {
+        0 => DUMP0_RESPONSE_LEN,
+        1 => DUMP1_RESPONSE_LEN,
+        _ => panic!("synthetic dump part must be zero or one"),
+    };
+    let mut frame = vec![0; length];
+    frame[..7].copy_from_slice(&[0xf0, 0, 0x20, 0x32, device, 0x0e, 0x10]);
+    frame[12] = part;
+    frame[length - 1] = 0xf7;
+    frame
+}
+
+#[derive(Default)]
+struct FastPacer {
+    elapsed: Duration,
+}
+
+impl RepeatPacer for FastPacer {
+    type Error = std::convert::Infallible;
+
+    fn elapsed(&mut self) -> Duration {
+        self.elapsed
+    }
+
+    fn wait(&mut self, minimum: Duration) -> Result<(), Self::Error> {
+        self.elapsed += minimum;
+        Ok(())
+    }
 }
 
 fn binding() -> PrivateTtyBinding {
@@ -430,7 +487,10 @@ fn a_short_write_is_never_retried_and_always_restores() {
     assert!(matches!(
         execute_search(&mut carrier, DeviceId::new(0).unwrap()),
         Err(SearchExecutionError::Transport {
-            source: DarwinCarrierError::ShortWrite { written: 7 },
+            source: DarwinCarrierError::ShortWrite {
+                written: 7,
+                expected: 8,
+            },
             ..
         })
     ));
@@ -660,4 +720,134 @@ fn draining_sanitized_receipts_does_not_retain_a_duplicate() {
     execute_search(&mut carrier, DeviceId::new(0).unwrap()).unwrap();
     assert_eq!(carrier.take_receipts().len(), 1);
     assert!(carrier.receipts().is_empty());
+}
+
+#[test]
+fn persistent_carrier_reuses_one_open_for_initial_search_and_nine_repeats() {
+    let response = synthetic_response(0);
+    let inbound = (0..10).flat_map(|_| response).collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.available_script = (0..10).map(|_| SEARCH_RESPONSE_LIMIT).collect();
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let expected = DeviceId::new(0).unwrap();
+
+    for _ in 0..10 {
+        assert!(matches!(
+            execute_known_38400_search(&mut carrier, expected).unwrap(),
+            Known38400SearchOutcome::Identified(_)
+        ));
+    }
+
+    assert_eq!(carrier.receipts().len(), 10);
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::Open)
+            .count(),
+        1
+    );
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Configure(38_400)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::Write(8))
+            .count(),
+        10
+    );
+    assert!(!carrier.backend.calls.contains(&Call::Close));
+    assert!(carrier.receipts().iter().all(|receipt| {
+        receipt.outcome == SanitizedAttemptOutcome::Complete
+            && receipt.termios_cleanup == CleanupDisposition::NotRequired
+            && receipt.control_lines_cleanup == CleanupDisposition::NotRequired
+            && !receipt.closed
+    }));
+
+    let attempts = carrier.take_receipts();
+    assert_eq!(attempts.len(), 10);
+    let session = carrier.finish().unwrap();
+    assert_eq!(session.baud, FALLBACK_BAUD);
+    assert_eq!(session.attempt_count, 10);
+    assert_eq!(
+        session.termios_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert_eq!(
+        session.control_lines_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert!(session.closed);
+}
+
+#[test]
+fn persistent_carrier_captures_exact_search_and_dump_lengths_before_verified_close() {
+    let identity = synthetic_response(0);
+    let dump0 = synthetic_dump(0, 0);
+    let dump1 = synthetic_dump(0, 1);
+    let mut inbound = Vec::new();
+    for _ in 0..10 {
+        inbound.extend_from_slice(&identity);
+    }
+    inbound.extend_from_slice(&dump0);
+    inbound.extend_from_slice(&dump1);
+
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.available_script = (0..10)
+        .map(|_| SEARCH_RESPONSE_LIMIT)
+        .chain([DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN])
+        .collect();
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let mut pacer = FastPacer::default();
+
+    let captured =
+        execute_persistent_snapshot(carrier, &mut pacer, DeviceId::new(0).unwrap()).unwrap();
+
+    assert_eq!(captured.valid_search_count(), 10);
+    assert!(captured.close_verified());
+    assert_eq!(
+        captured.snapshot().frame(SnapshotSection::Identity),
+        identity
+    );
+    assert_eq!(captured.snapshot().frame(SnapshotSection::Dump0), dump0);
+    assert_eq!(captured.snapshot().frame(SnapshotSection::Dump1), dump1);
+}
+
+#[test]
+fn persistent_carrier_rejects_a_different_baud_without_writing() {
+    let backend = FakeBackend::with_inbound([]);
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+
+    assert!(matches!(
+        execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+        Err(SearchExecutionError::Transport {
+            source: DarwinCarrierError::OperationMismatch {
+                expected_baud: FALLBACK_BAUD,
+                actual_baud: 115_200,
+            },
+            ..
+        })
+    ));
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Write(_)))
+    );
+    assert_eq!(
+        carrier.receipts()[0].outcome,
+        SanitizedAttemptOutcome::OperationRejected
+    );
+    carrier.finish().unwrap();
 }

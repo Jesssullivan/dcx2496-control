@@ -1,8 +1,10 @@
-//! Offline-by-default operator CLI. The explicit Darwin `live-discovery`
-//! feature adds one Search-only serial command.
+//! Offline-by-default operator CLI. The explicit Darwin `live-control`
+//! feature adds fixed-38400 discovery and complete typed control transactions.
 
-#[cfg(all(feature = "live-discovery", target_os = "macos"))]
+#[cfg(all(feature = "live-control", target_os = "macos"))]
 mod live_discovery;
+
+mod live_control;
 
 use std::{
     error::Error,
@@ -53,6 +55,11 @@ enum Command {
         #[command(subcommand)]
         command: RewCommand,
     },
+    /// Snapshot, diff, explicitly apply, read back, or roll back complete state.
+    Control {
+        #[command(subcommand)]
+        command: ControlCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -95,7 +102,7 @@ enum DiscoveryCommand {
         expected_device: u8,
     },
     /// Run one DCX Search and nine repeats at the MVP 38400 binding.
-    #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
     LiveSearch {
         /// Exact Darwin FTDI callout node; ports are never enumerated.
         #[arg(long)]
@@ -136,6 +143,97 @@ enum RewCommand {
         #[arg(long)]
         target_output: u8,
     },
+    /// Map one enabled REW filter into one explicit DCX output PEQ slot.
+    PlanSlot {
+        file: PathBuf,
+        /// Explicit physical DCX output, 1 through 6.
+        #[arg(long)]
+        target_output: u8,
+        /// Original enabled REW filter index.
+        #[arg(long)]
+        filter_index: u8,
+        /// Explicit destination PEQ slot, 1 through 9.
+        #[arg(long)]
+        peq_slot: u8,
+    },
+    /// Emit one digest-bound desired profile for Logic staging and control diff.
+    DesiredProfile {
+        file: PathBuf,
+        /// Stable operator-facing profile identity.
+        #[arg(long)]
+        profile_id: String,
+        /// Stable operator-facing profile revision.
+        #[arg(long)]
+        revision: String,
+        /// Explicit physical DCX output; the current vertical slice requires O1.
+        #[arg(long)]
+        target_output: u8,
+        /// Original enabled REW filter index.
+        #[arg(long)]
+        filter_index: u8,
+        /// Explicit destination slot; the current vertical slice requires PEQ9.
+        #[arg(long)]
+        peq_slot: u8,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlCommand {
+    /// Capture ten validated identities plus exact Dump0 and Dump1.
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    Snapshot {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+    },
+    /// Bind one strict O1/PEQ9 desired profile to snapshot, apply, and rollback plans.
+    Diff {
+        /// Complete raw `SnapshotV1` produced by `control snapshot`.
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Staged `dcx.desired-profile/v1` carrying one O1/PEQ9 plan-slot document.
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    /// Verify the live baseline, apply one strict plan, and read back completely.
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    Apply {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+        /// Strict raw `ApplyPlanV1` produced by `control diff`.
+        #[arg(long)]
+        plan: PathBuf,
+    },
+    /// Capture a fresh complete state document for explicit readback.
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    Readback {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+    },
+    /// Execute one strict inverse plan and verify complete baseline equality.
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    Rollback {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+        /// Strict standalone `RollbackPlanV1` produced by `control diff`.
+        #[arg(long)]
+        plan: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -145,8 +243,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Discovery { command } => discovery(command)?,
         Command::Profile { command } => profile(command)?,
         Command::Rew { command } => rew(command)?,
+        Command::Control { command } => control(command)?,
     }
     Ok(())
+}
+
+fn control(command: ControlCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        ControlCommand::Snapshot {
+            tty,
+            expected_device,
+        }
+        | ControlCommand::Readback {
+            tty,
+            expected_device,
+        } => live_control::capture(tty, expected_device),
+        ControlCommand::Diff { snapshot, profile } => live_control::diff(&snapshot, &profile),
+        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        ControlCommand::Apply {
+            tty,
+            expected_device,
+            plan,
+        } => live_control::apply(tty, expected_device, &plan),
+        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        ControlCommand::Rollback {
+            tty,
+            expected_device,
+            plan,
+        } => live_control::rollback(tty, expected_device, &plan),
+    }
 }
 
 fn discovery(command: DiscoveryCommand) -> Result<(), Box<dyn Error>> {
@@ -191,7 +317,7 @@ fn discovery(command: DiscoveryCommand) -> Result<(), Box<dyn Error>> {
             let response = discovery.accept_candidates(&[&bytes])?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        #[cfg(all(feature = "live-discovery", target_os = "macos"))]
+        #[cfg(all(feature = "live-control", target_os = "macos"))]
         DiscoveryCommand::LiveSearch {
             tty,
             expected_device,
@@ -266,13 +392,45 @@ fn rew(command: RewCommand) -> Result<(), Box<dyn Error>> {
             file,
             target_output,
         } => {
-            let bytes = read_bounded(&file, MAX_REW_BYTES, "REW export")?;
-            let text = std::str::from_utf8(&bytes)?;
-            let report = rew::import_rew(text, target_output)?;
+            let report = load_rew_report(&file, target_output)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        RewCommand::PlanSlot {
+            file,
+            target_output,
+            filter_index,
+            peq_slot,
+        } => {
+            let report = load_rew_report(&file, target_output)?;
+            let plan = report.map_filter_to_slot(filter_index, peq_slot)?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        RewCommand::DesiredProfile {
+            file,
+            profile_id,
+            revision,
+            target_output,
+            filter_index,
+            peq_slot,
+        } => {
+            let report = load_rew_report(&file, target_output)?;
+            let document = report.map_filter_to_slot(filter_index, peq_slot)?;
+            let profile = rew::DesiredPeqProfileV1::new(profile_id, revision, document)?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
         }
     }
     Ok(())
+}
+
+fn load_rew_report(
+    path: &Path,
+    target_output: u8,
+) -> Result<rew::RewImportReportV1, Box<dyn Error>> {
+    let bytes = read_bounded(path, MAX_REW_BYTES, "REW export")?;
+    Ok(rew::import_rew(
+        std::str::from_utf8(&bytes)?,
+        target_output,
+    )?)
 }
 
 fn load_profile(path: &Path) -> Result<LabProfileV1, Box<dyn Error>> {

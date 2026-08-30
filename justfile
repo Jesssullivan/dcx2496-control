@@ -19,5 +19,15 @@ darwin-carrier-check: repo::darwin-carrier-check
 
 live-package: repo::live-package
 
+apple-package-check: repo::apple-package-check
+
+schema-check: repo::schema-check
+
+apple-project-generate: repo::apple-project-generate
+
+apple-bundle-check: repo::apple-bundle-check
+
+product-check: repo::product-check
+
 dcxctl *args:
     cargo run --quiet --package dcxctl -- {{args}}

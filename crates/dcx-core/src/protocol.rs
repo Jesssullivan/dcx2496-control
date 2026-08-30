@@ -13,6 +13,10 @@ pub const MAX_FRAME_LEN: usize = 2_048;
 pub const SEARCH_RESPONSE_LEN: usize = 26;
 /// Exact opaque payload size inside a [`SearchResponse26`].
 pub const SEARCH_RESPONSE_PAYLOAD_LEN: usize = SEARCH_RESPONSE_LEN - 8;
+/// Exact total byte length of a complete Dump0 response frame.
+pub const DUMP0_RESPONSE_LEN: usize = 1_015;
+/// Exact total byte length of a complete Dump1 response frame.
+pub const DUMP1_RESPONSE_LEN: usize = 911;
 /// `SysEx` start byte.
 pub const START: u8 = 0xf0;
 /// `SysEx` terminator byte.
@@ -20,6 +24,8 @@ pub const END: u8 = 0xf7;
 const MANUFACTURER: [u8; 3] = [0x00, 0x20, 0x32];
 const MODEL: u8 = 0x0e;
 const BROADCAST_SEARCH: u8 = 0x20;
+/// Maximum seven-bit action count in one direct-parameter frame.
+pub const MAX_DIRECT_PARAMETER_ACTIONS: usize = 0x7f;
 
 /// A physical unit address. Valid device IDs are 0 through 15.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -107,8 +113,9 @@ impl Message {
         &self.data
     }
 
-    // Deliberately private: only the typed, read-only Query API may construct
-    // outbound bytes. Message exists solely as a bounded inbound parse result.
+    // Deliberately private: only closed typed query, remote-mode, and direct
+    // APIs may construct outbound bytes. Message otherwise exists solely as a
+    // bounded inbound parse result.
     fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         if self.function > 0x7f {
             return Err(ProtocolError::NonSevenBitData {
@@ -201,6 +208,71 @@ impl Query {
     }
 }
 
+/// Closed DCX remote mode from pinned MIT `DuinoDCX` revision `00b9d70`.
+///
+/// The protocol exposes receive-direct (`0x04`), transmit (`0x08`), and both
+/// (`0x0c`) capabilities. There is deliberately no guessed disable mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteMode {
+    /// Accept typed function-`0x20` direct-parameter writes.
+    ReceiveDirect,
+    /// Transmit complete Dump0/Dump1 responses.
+    Transmit,
+    /// Accept direct writes and transmit subsequent dump readback.
+    ReceiveAndTransmit,
+}
+
+impl RemoteMode {
+    const fn wire(self) -> u8 {
+        match self {
+            Self::ReceiveDirect => 0x04,
+            Self::Transmit => 0x08,
+            Self::ReceiveAndTransmit => 0x0c,
+        }
+    }
+}
+
+/// One checked function-`0x3f` remote-mode command for a physical device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteModeCommand {
+    device: DeviceId,
+    mode: RemoteMode,
+}
+
+impl RemoteModeCommand {
+    /// Bind one closed remote mode to a checked physical address.
+    pub const fn new(device: DeviceId, mode: RemoteMode) -> Self {
+        Self { device, mode }
+    }
+
+    /// Bound device address.
+    pub const fn device(self) -> DeviceId {
+        self.device
+    }
+
+    /// Exact closed mode.
+    pub const fn mode(self) -> RemoteMode {
+        self.mode
+    }
+
+    /// Encode the exact function-`0x3f` mode frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol invariant error only if the fixed typed frame cannot
+    /// be represented.
+    pub fn encode(self) -> Result<Vec<u8>, ProtocolError> {
+        Message {
+            address: Address::Device(self.device),
+            function: 0x3f,
+            data: vec![self.mode.wire(), 0],
+        }
+        .encode()
+    }
+}
+
 /// A four-byte direct-parameter tuple observed in inbound messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +283,135 @@ pub struct ParameterChange {
     pub parameter: u8,
     /// Fourteen-bit parameter value.
     pub value: u16,
+}
+
+/// One checked direct-parameter write tuple.
+///
+/// This type represents only the observed wire-level address and value shape;
+/// it does not assign a semantic meaning to any channel/parameter pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectParameterAction {
+    channel: u8,
+    parameter: u8,
+    value: u16,
+}
+
+impl DirectParameterAction {
+    /// Construct one bounded tuple.
+    ///
+    /// # Errors
+    ///
+    /// Rejects channels above 10, non-seven-bit parameter numbers, and values
+    /// above the fourteen-bit wire range.
+    pub fn new(channel: u8, parameter: u8, value: u16) -> Result<Self, ProtocolError> {
+        if channel > 10 {
+            return Err(ProtocolError::InvalidParameterChannel(channel));
+        }
+        if parameter > 0x7f {
+            return Err(ProtocolError::InvalidParameterNumber(parameter));
+        }
+        if value > 0x3fff {
+            return Err(ProtocolError::InvalidParameterValue(value));
+        }
+        Ok(Self {
+            channel,
+            parameter,
+            value,
+        })
+    }
+
+    /// Setup/input/output channel index, zero through ten.
+    pub const fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// Opaque seven-bit parameter number.
+    pub const fn parameter(self) -> u8 {
+        self.parameter
+    }
+
+    /// Opaque fourteen-bit parameter value.
+    pub const fn value(self) -> u16 {
+        self.value
+    }
+}
+
+/// One closed, bounded function-`0x20` direct-parameter command.
+///
+/// Callers can supply only checked typed tuples. Duplicate channel/parameter
+/// addresses are rejected so ordering cannot conceal conflicting final values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectParameterCommand {
+    device: DeviceId,
+    actions: Vec<DirectParameterAction>,
+}
+
+impl DirectParameterCommand {
+    /// Bind a non-empty bounded action set to one physical device address.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty command, more than 127 actions, or duplicate parameter
+    /// addresses. Individual actions are already checked by their constructor.
+    pub fn new(
+        device: DeviceId,
+        actions: Vec<DirectParameterAction>,
+    ) -> Result<Self, ProtocolError> {
+        if actions.is_empty() {
+            return Err(ProtocolError::EmptyDirectParameterCommand);
+        }
+        if actions.len() > MAX_DIRECT_PARAMETER_ACTIONS {
+            return Err(ProtocolError::TooManyDirectParameterActions(actions.len()));
+        }
+        let mut addresses = std::collections::BTreeSet::new();
+        for action in &actions {
+            if !addresses.insert((action.channel, action.parameter)) {
+                return Err(ProtocolError::DuplicateParameterAddress {
+                    channel: action.channel,
+                    parameter: action.parameter,
+                });
+            }
+        }
+        Ok(Self { device, actions })
+    }
+
+    /// Bound device address.
+    pub const fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// Checked actions in explicit execution order.
+    pub fn actions(&self) -> &[DirectParameterAction] {
+        &self.actions
+    }
+
+    /// Encode the exact bounded direct-parameter frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol invariant error if the checked representation cannot
+    /// be encoded.
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        let count = u8::try_from(self.actions.len())
+            .map_err(|_| ProtocolError::TooManyDirectParameterActions(self.actions.len()))?;
+        let mut data = Vec::with_capacity(1 + self.actions.len() * 4);
+        data.push(count);
+        for action in &self.actions {
+            let high = u8::try_from(action.value / 128)
+                .map_err(|_| ProtocolError::InvalidParameterValue(action.value))?;
+            let low = u8::try_from(action.value % 128)
+                .map_err(|_| ProtocolError::InvalidParameterValue(action.value))?;
+            data.extend_from_slice(&[action.channel, action.parameter, high, low]);
+        }
+        Message {
+            address: Address::Device(self.device),
+            function: 0x20,
+            data,
+        }
+        .encode()
+    }
 }
 
 /// Exact, bounded wire identity returned by a DCX2496 discovery search.
@@ -504,6 +705,21 @@ pub enum ProtocolError {
     /// Parameter channel was outside setup/input/output range.
     #[error("invalid parameter channel: {0}")]
     InvalidParameterChannel(u8),
+    /// Parameter numbers are seven-bit values.
+    #[error("invalid parameter number: {0}")]
+    InvalidParameterNumber(u8),
+    /// Direct values are fourteen-bit values.
+    #[error("invalid parameter value: {0}")]
+    InvalidParameterValue(u16),
+    /// Direct writes must contain at least one typed action.
+    #[error("direct-parameter command cannot be empty")]
+    EmptyDirectParameterCommand,
+    /// Direct action count must fit the seven-bit `SysEx` data field.
+    #[error("direct-parameter command has {0} actions; maximum is 127")]
+    TooManyDirectParameterActions(usize),
+    /// One command cannot write the same opaque address twice.
+    #[error("duplicate direct-parameter address channel {channel}, parameter {parameter}")]
+    DuplicateParameterAddress { channel: u8, parameter: u8 },
 }
 
 #[cfg(test)]
@@ -530,6 +746,21 @@ mod tests {
             .unwrap(),
             [0xf0, 0, 0x20, 0x32, 3, 0x0e, 0x50, 1, 0, 1, 0xf7]
         );
+    }
+
+    #[test]
+    fn remote_modes_encode_only_the_three_observed_closed_frames() {
+        let device = DeviceId::new(3).unwrap();
+        for (mode, value) in [
+            (RemoteMode::ReceiveDirect, 0x04),
+            (RemoteMode::Transmit, 0x08),
+            (RemoteMode::ReceiveAndTransmit, 0x0c),
+        ] {
+            assert_eq!(
+                RemoteModeCommand::new(device, mode).encode().unwrap(),
+                [0xf0, 0, 0x20, 0x32, 3, 0x0e, 0x3f, value, 0, 0xf7]
+            );
+        }
     }
 
     #[test]
@@ -602,6 +833,52 @@ mod tests {
                     value: 210,
                 }],
             }
+        );
+    }
+
+    #[test]
+    fn typed_direct_command_encodes_the_closed_observed_frame_shape() {
+        let command = DirectParameterCommand::new(
+            DeviceId::new(3).unwrap(),
+            vec![
+                DirectParameterAction::new(1, 2, 210).unwrap(),
+                DirectParameterAction::new(10, 0x7f, 0x3fff).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            command.encode().unwrap(),
+            [
+                0xf0, 0, 0x20, 0x32, 3, 0x0e, 0x20, 2, 1, 2, 1, 82, 10, 0x7f, 0x7f, 0x7f, 0xf7,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_command_rejects_unbounded_and_conflicting_tuples() {
+        assert_eq!(
+            DirectParameterAction::new(11, 0, 0),
+            Err(ProtocolError::InvalidParameterChannel(11))
+        );
+        assert_eq!(
+            DirectParameterAction::new(0, 0x80, 0),
+            Err(ProtocolError::InvalidParameterNumber(0x80))
+        );
+        assert_eq!(
+            DirectParameterAction::new(0, 0, 0x4000),
+            Err(ProtocolError::InvalidParameterValue(0x4000))
+        );
+        assert_eq!(
+            DirectParameterCommand::new(DeviceId::new(0).unwrap(), Vec::new()),
+            Err(ProtocolError::EmptyDirectParameterCommand)
+        );
+        let action = DirectParameterAction::new(1, 2, 3).unwrap();
+        assert_eq!(
+            DirectParameterCommand::new(DeviceId::new(0).unwrap(), vec![action, action]),
+            Err(ProtocolError::DuplicateParameterAddress {
+                channel: 1,
+                parameter: 2,
+            })
         );
     }
 

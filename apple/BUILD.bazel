@@ -1,0 +1,26 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Package.swift",
+    "project.yml",
+])
+
+filegroup(
+    name = "swift_package_sources",
+    srcs = ["Package.swift"] + glob(["Sources/**/*.swift"]),
+)
+
+filegroup(
+    name = "bundle_sources",
+    srcs = [
+        "project.yml",
+        ":swift_package_sources",
+    ] + glob([
+        "DCXControlAU/*.entitlements",
+        "DCXControlAU/*.plist",
+        "DCXControlAU/*.swift",
+        "DCXLogicHelper/*.entitlements",
+        "DCXLogicHelper/*.plist",
+        "DCXLogicHelper/*.swift",
+    ]),
+)

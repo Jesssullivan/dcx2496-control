@@ -3,13 +3,30 @@
 This repository owns the typed, deterministic DCX2496 protocol and profile
 runtime. Legalab owns the cross-repository studio ontology and PZM activation.
 
-- Use `just` as the operator entrypoint and Bazel labels as the build graph.
-- `dcxctl` is offline-only by default. Its sole exception is the explicit
-  macOS-only `live-discovery` feature, whose `discovery live-search` command
-  accepts one named callout path, sends only the typed Search query, and runs
-  exactly nine repeats at the MVP 38400 binding. It never enumerates ports or
-  exposes arbitrary frames, generic writes, or configuration commands.
-- Legalab owns physical/operator readiness before invoking live Search. Do not
+- Use `just` as the operator entrypoint. Bazel labels own the Rust build graph
+  and index the Apple/schema product sources; SwiftPM and the checked-in
+  XcodeGen specification own the native Apple build.
+- `dcxctl` is offline-only by default. The explicit macOS-only `live-control`
+  feature (`live-discovery` remains a compatibility alias) accepts one exact
+  `/dev/cu.usbserial-*` callout and holds one fixed 38400 8N1 session. Its
+  closed operations are Search plus nine paced repeats, typed remote mode,
+  exact Dump0/Dump1 snapshot/readback, and reviewed direct-parameter plans.
+  It never enumerates ports or accepts caller-supplied frames, baud, retry,
+  timeout, remote-mode bytes, or generic writes.
+- Mutation is snapshot -> strict O1/PEQ9 semantic diff -> immutable apply and
+  inverse plans -> stale-baseline check -> typed apply -> complete readback ->
+  rollback. Every other output, slot, address, or opaque dump mapping fails
+  closed. No server or automatic apply path belongs in the MVP.
+- The desired profile is exactly O1/channel 5/PEQ9 with four ordered actions
+  (`0x3b` through `0x3e`), and its semantic diff contains zero or one complete
+  PEQ-slot change. Missing post-write capture remains explicit uncertainty:
+  apply `readback` and rollback `restored` may be omitted or null, never
+  synthesized.
+- The AUv3 MIDI FX owns staged desired state and MIDI pass-through only. It has
+  no serial, filesystem, process, or socket work in its render path. The
+  foreground helper is the only Apple process allowed to invoke its bundled
+  exact `dcxctl`; incoming CoreMIDI never causes device activity.
+- Legalab owns physical/operator readiness before invoking any live command. Do not
   duplicate Legalab decisions, evidence schemas, or authorization ceremonies in
   this device repository.
 - Unknown identity, state, route, or value is an error. Never infer that an

@@ -10,7 +10,9 @@ use std::{
 };
 
 use dcx_core::protocol::DeviceId;
-use dcx_darwin_tty::{DarwinSearchTransport, PrivateTtyBinding};
+use dcx_darwin_tty::{
+    DarwinSearchSession, PrivateTtyBinding, SanitizedAttemptReceipt, SanitizedSessionReceipt,
+};
 use dcx_transport::{
     Known38400SearchOutcome, REPEAT_SEARCH_COUNT, RepeatPacer, RepeatSearchBinding,
     SEARCH_RESPONSE_LIMIT, execute_known_38400_search, execute_search_repeat,
@@ -64,31 +66,34 @@ impl RepeatPacer for SystemPacer {
 pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     let binding = PrivateTtyBinding::new(tty)?;
-    let mut transport = DarwinSearchTransport::new(binding);
+    let mut transport = DarwinSearchSession::open_known_38400(binding)?;
 
     let first = match execute_known_38400_search(&mut transport, expected) {
         Ok(Known38400SearchOutcome::Identified(identity)) => identity,
         Ok(Known38400SearchOutcome::TimedOut) => {
             let attempts = transport.take_receipts();
+            let session = finish_session(transport, &attempts, expected_device)?;
             return fail(
                 "initial_search",
                 "no response at the MVP 38400 baud binding",
-                serde_json::json!({
+                &serde_json::json!({
                     "schemaVersion": RESULT_SCHEMA,
                     "status": "not_found",
                     "searchBinding": "known_38400",
                     "expectedDevice": expected_device,
                     "attempts": attempts,
+                    "session": session,
                 }),
             );
         }
         Err(error) => {
             let detail = error.to_string();
             let attempts = transport.take_receipts();
+            let session = finish_session(transport, &attempts, expected_device)?;
             return fail(
                 "initial_search",
                 &detail,
-                serde_json::json!({
+                &serde_json::json!({
                     "schemaVersion": RESULT_SCHEMA,
                     "status": "failed",
                     "phase": "initial_search",
@@ -96,6 +101,7 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
                     "expectedDevice": expected_device,
                     "error": &detail,
                     "attempts": attempts,
+                    "session": session,
                 }),
             );
         }
@@ -109,6 +115,7 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
         Ok(repeated) => {
             let attempts = transport.take_receipts();
             let attempt_count = attempts.len();
+            let session = finish_session(transport, &attempts, expected_device)?;
             emit(&serde_json::json!({
                 "schemaVersion": RESULT_SCHEMA,
                 "status": "identified",
@@ -126,16 +133,18 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
                 "requiredRepeatResponses": REPEAT_SEARCH_COUNT,
                 "carrierAttempts": attempt_count,
                 "attempts": attempts,
+                "session": session,
             }))?;
             Ok(())
         }
         Err(error) => {
             let detail = error.to_string();
             let attempts = transport.take_receipts();
+            let session = finish_session(transport, &attempts, expected_device)?;
             fail(
                 "repeat_search",
                 &detail,
-                serde_json::json!({
+                &serde_json::json!({
                     "schemaVersion": RESULT_SCHEMA,
                     "status": "failed",
                     "phase": "repeat_search",
@@ -151,8 +160,35 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
                     "requiredRepeatResponses": REPEAT_SEARCH_COUNT,
                     "error": &detail,
                     "attempts": attempts,
+                    "session": session,
                 }),
             )
+        }
+    }
+}
+
+fn finish_session(
+    transport: DarwinSearchSession,
+    attempts: &[SanitizedAttemptReceipt],
+    expected_device: u8,
+) -> Result<SanitizedSessionReceipt, Box<dyn Error>> {
+    match transport.finish() {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            let detail = error.to_string();
+            emit(&serde_json::json!({
+                "schemaVersion": RESULT_SCHEMA,
+                "status": "failed",
+                "phase": "session_finish",
+                "searchBinding": "known_38400",
+                "expectedDevice": expected_device,
+                "error": &detail,
+                "attempts": attempts,
+            }))?;
+            Err(Box::new(LiveSearchFailed {
+                phase: "session_finish",
+                detail,
+            }))
         }
     }
 }
@@ -162,8 +198,12 @@ fn emit(value: &serde_json::Value) -> Result<(), serde_json::Error> {
     Ok(())
 }
 
-fn fail(phase: &'static str, detail: &str, value: serde_json::Value) -> Result<(), Box<dyn Error>> {
-    emit(&value)?;
+fn fail(
+    phase: &'static str,
+    detail: &str,
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    emit(value)?;
     Err(Box::new(LiveSearchFailed {
         phase,
         detail: detail.to_owned(),

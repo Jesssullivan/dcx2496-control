@@ -26,7 +26,7 @@ lint:
 test:
     cargo test --workspace --all-targets --all-features
 
-# Exercise only the injected, no-device Search transport contract.
+# Exercise the injected, no-device discovery/snapshot/apply transport contract.
 transport-check:
     cargo test --locked --package dcx-transport --all-targets --all-features
 
@@ -61,7 +61,7 @@ bazel-check:
     build_targets=(//:dcxctl //crates/dcx-darwin-tty:dcx_darwin_tty)
     if [[ $(uname -s) == Darwin ]]; then
         repo_env=(--repo_env=CC=/usr/bin/clang --repo_env=CXX=/usr/bin/clang++)
-        build_targets+=(//:dcxctl_live_discovery)
+        build_targets+=(//:dcxctl_live_control)
     fi
     bazelisk test "${repo_env[@]}" //:check
     bazelisk build "${repo_env[@]}" "${build_targets[@]}"
@@ -69,9 +69,28 @@ bazel-check:
 nix-check:
     nix flake check
 
-# Materialize the aarch64-darwin live binary without profile activation.
+# Materialize the aarch64-darwin live control binary without profile activation.
 live-package:
     nix build .#dcxctl-live --no-link
+
+# Compile the shared Swift bridge/helper/AU libraries without launching a GUI.
+apple-package-check:
+    swift build --package-path apple --jobs 1
+
+# Parse the checked-in bridge schema without introducing another validator stack.
+schema-check:
+    jq -e . schemas/v1/dcx_logic_bridge.schema.json >/dev/null
+
+# Regenerate the ignored Xcode project from the checked-in XcodeGen source.
+apple-project-generate:
+    xcodegen generate --spec apple/project.yml
+
+# Build the helper, embedded AUv3, and embedded dcxctl without signing or install.
+apple-bundle-check: apple-project-generate
+    xcodebuild -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
+
+# Full product-source compile without signing, install, GUI launch, or hardware I/O.
+product-check: schema-check apple-bundle-check
 
 security:
     cargo deny check

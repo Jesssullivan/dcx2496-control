@@ -1,10 +1,10 @@
-//! Darwin-only, Search-only tty carrier for the DCX2496 discovery boundary.
+//! Darwin-only persistent tty carrier for the bounded DCX2496 control boundary.
 //!
 //! The public carrier exists only on macOS. It accepts one explicit, validated
-//! callout-device path and implements only [`SearchTransport`]. There is no
-//! port enumeration, CLI, generic byte-write method, retry loop, or retained
-//! raw capture. Tests exercise the same state machine through injected fake
-//! syscalls without opening any device.
+//! callout-device path and exposes only typed Search, remote-mode, Dump, and
+//! direct-parameter operations. There is no port enumeration, generic
+//! byte-write method, retry loop, or retained raw capture. Tests exercise the
+//! same state machine through injected fake syscalls without opening a device.
 
 use std::{
     fmt,
@@ -13,9 +13,17 @@ use std::{
     time::Duration,
 };
 
+use dcx_core::{
+    discovery::FALLBACK_BAUD,
+    protocol::{DirectParameterCommand, ProtocolError, RemoteModeCommand},
+};
 use dcx_transport::{
-    SEARCH_RESPONSE_LIMIT, SearchOperation, SearchOperationKind, SearchRead, SearchReadEnd,
-    SearchReadError, SearchTransport,
+    SEARCH_ATTEMPT_TIMEOUT, SEARCH_RESPONSE_LIMIT, SearchOperation, SearchOperationKind,
+    SearchRead, SearchReadEnd, SearchReadError, SearchTransport,
+    snapshot::{
+        PersistentApplySession, PersistentSnapshotSession, SnapshotOperation,
+        SnapshotOperationKind, SnapshotRead, SnapshotReadError,
+    },
 };
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -58,7 +66,7 @@ impl Serialize for Sha256Digest {
     }
 }
 
-/// One explicit Darwin callout path for the Search-only carrier.
+/// One explicit Darwin callout path for the persistent control carrier.
 ///
 /// The path is validated at construction and again immediately before every
 /// open. It is intentionally omitted from `Debug` and carrier receipts.
@@ -123,6 +131,8 @@ pub enum BindingError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CarrierStage {
+    /// Reject an operation that does not match the open session binding.
+    VerifyOperation,
     /// Revalidate the explicit callout path.
     VerifyBinding,
     /// Open the callout with the declared nonblocking/no-controlling-tty policy.
@@ -135,7 +145,7 @@ pub enum CarrierStage {
     Configure,
     /// Check queued input before configuration or the sole outbound write.
     CheckPreexistingInput,
-    /// Perform the sole eight-byte write syscall.
+    /// Perform one exact typed request write syscall.
     Write,
     /// Query queued input without consuming bytes.
     BytesAvailable,
@@ -159,17 +169,19 @@ pub enum CarrierStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CarrierFailureKind {
+    /// An operation did not match the fixed session binding.
+    Operation,
     /// Private binding did not revalidate.
     Binding,
     /// The monotonic attempt budget was exhausted outside the read timeout.
     Deadline,
     /// A system call failed.
     System,
-    /// The sole write did not accept exactly eight bytes.
+    /// One typed write did not accept its complete frame.
     ShortWrite,
-    /// Input was already queued before the Search write.
+    /// Input was already queued before a typed write.
     PreexistingInput,
-    /// More than 26 input bytes were pending.
+    /// More input was pending than the current typed response permits.
     Overflow,
     /// The tty reached end-of-file.
     EndOfFile,
@@ -177,14 +189,24 @@ pub enum CarrierFailureKind {
     ReadInvariant,
 }
 
-/// Error from one Darwin Search attempt.
+/// Error from one bounded Darwin tty operation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DarwinCarrierError {
+    /// A typed operation did not match the fixed baud of an open session.
+    #[error(
+        "Search operation baud {actual_baud} does not match persistent session baud {expected_baud}"
+    )]
+    OperationMismatch {
+        /// Baud configured once when the session opened.
+        expected_baud: u32,
+        /// Baud requested by the rejected typed operation.
+        actual_baud: u32,
+    },
     /// Exact callout-path validation failed before any open.
     #[error(transparent)]
     Binding(#[from] BindingError),
-    /// The monotonic 500 ms attempt deadline expired.
-    #[error("Search attempt exceeded its monotonic deadline at {stage:?}")]
+    /// The monotonic 500 ms operation deadline expired.
+    #[error("typed tty operation exceeded its monotonic deadline at {stage:?}")]
     Deadline {
         /// Operation that was about to run or had just completed.
         stage: CarrierStage,
@@ -197,20 +219,22 @@ pub enum DarwinCarrierError {
         /// Stable numeric Darwin errno.
         errno: i32,
     },
-    /// The one write syscall accepted fewer than all eight Search bytes.
-    #[error("sole Search write accepted {written} bytes; expected exactly 8")]
+    /// One typed write did not accept its complete frame.
+    #[error("typed tty write accepted {written} bytes; expected exactly {expected}")]
     ShortWrite {
         /// Number accepted by the single syscall.
         written: usize,
+        /// Exact encoded request length.
+        expected: usize,
     },
-    /// Input was queued before configuration or the Search write.
-    #[error("Search blocked because {queued} pre-existing input bytes were queued")]
+    /// Input was queued before configuration or a typed write.
+    #[error("typed tty operation blocked because {queued} pre-existing input bytes were queued")]
     PreexistingInput {
         /// Bytes observed without consuming or flushing them.
         queued: usize,
     },
     /// More bytes were queued than the exact response budget permits.
-    #[error("Search response overflow: {received} received and {queued} additional queued")]
+    #[error("typed response overflow: {received} received and {queued} additional queued")]
     Overflow {
         /// Bytes already consumed, always at most 26.
         received: usize,
@@ -218,7 +242,7 @@ pub enum DarwinCarrierError {
         queued: usize,
     },
     /// The tty returned EOF before an exact response or timeout.
-    #[error("Search tty reached EOF after {received} bytes")]
+    #[error("tty reached EOF after {received} response bytes")]
     EndOfFile {
         /// Bytes received before EOF.
         received: usize,
@@ -226,9 +250,15 @@ pub enum DarwinCarrierError {
     /// The bounded result constructor rejected internal state.
     #[error(transparent)]
     ReadInvariant(#[from] SearchReadError),
+    /// The bounded snapshot result constructor rejected internal state.
+    #[error(transparent)]
+    SnapshotReadInvariant(#[from] SnapshotReadError),
+    /// A checked typed command failed its final protocol encoding invariant.
+    #[error("checked typed command failed to encode: {0}")]
+    ProtocolEncoding(#[from] ProtocolError),
     /// One or both mandatory restoration operations failed; close still ran.
     #[error(
-        "Search cleanup failed (primary={primary:?}, termios_failed={termios_failed}, control_lines_failed={control_lines_failed})"
+        "tty cleanup failed (primary={primary:?}, termios_failed={termios_failed}, control_lines_failed={control_lines_failed})"
     )]
     Cleanup {
         /// Broad primary failure, if cleanup followed an earlier failure.
@@ -243,6 +273,9 @@ pub enum DarwinCarrierError {
 impl DarwinCarrierError {
     const fn kind(&self) -> CarrierFailureKind {
         match self {
+            Self::OperationMismatch { .. } | Self::ProtocolEncoding(_) => {
+                CarrierFailureKind::Operation
+            }
             Self::Binding(_) => CarrierFailureKind::Binding,
             Self::Deadline { .. } => CarrierFailureKind::Deadline,
             Self::System { .. } | Self::Cleanup { .. } => CarrierFailureKind::System,
@@ -250,7 +283,9 @@ impl DarwinCarrierError {
             Self::PreexistingInput { .. } => CarrierFailureKind::PreexistingInput,
             Self::Overflow { .. } => CarrierFailureKind::Overflow,
             Self::EndOfFile { .. } => CarrierFailureKind::EndOfFile,
-            Self::ReadInvariant(_) => CarrierFailureKind::ReadInvariant,
+            Self::ReadInvariant(_) | Self::SnapshotReadInvariant(_) => {
+                CarrierFailureKind::ReadInvariant
+            }
         }
     }
 }
@@ -271,6 +306,8 @@ pub enum CleanupDisposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SanitizedAttemptOutcome {
+    /// The typed operation did not match the fixed open-session binding.
+    OperationRejected,
     /// Exactly 26 bytes were received.
     Complete,
     /// The deadline elapsed with zero to 25 bytes.
@@ -346,6 +383,26 @@ pub struct SanitizedAttemptReceipt {
     /// Modem control-line restoration result.
     pub control_lines_cleanup: CleanupDisposition,
     /// True after the owned descriptor was dropped on every opened path.
+    pub closed: bool,
+}
+
+/// Sanitized cleanup result for one persistent serial session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SanitizedSessionReceipt {
+    /// Digest of the validated callout path; the path itself is never emitted.
+    pub binding_digest: Sha256Digest,
+    /// Line rate configured exactly once for the session.
+    pub baud: u32,
+    /// Number of typed Search operations attempted while the descriptor was held.
+    pub attempt_count: usize,
+    /// Total session lifetime, rounded up to microseconds.
+    pub elapsed_micros: u64,
+    /// Termios restoration result.
+    pub termios_cleanup: CleanupDisposition,
+    /// Modem control-line restoration result.
+    pub control_lines_cleanup: CleanupDisposition,
+    /// True after the owned descriptor was closed.
     pub closed: bool,
 }
 
@@ -460,12 +517,14 @@ fn duration_micros_ceil(duration: Duration) -> u64 {
     u64::try_from(micros).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 struct Carrier<B> {
     binding: PrivateTtyBinding,
     backend: B,
     receipts: Vec<SanitizedAttemptReceipt>,
 }
 
+#[cfg(test)]
 impl<B> Carrier<B> {
     fn new(binding: PrivateTtyBinding, backend: B) -> Self {
         Self {
@@ -484,6 +543,314 @@ impl<B> Carrier<B> {
     }
 }
 
+/// One descriptor held across a sequence of fixed-baud typed control operations.
+///
+/// Construction opens, snapshots, and configures the tty exactly once. Callers
+/// must consume the session with [`Self::finish`] to obtain verified restoration;
+/// the native backend retains a best-effort `Drop` fallback for abnormal exits.
+struct PersistentCarrier<B: SerialBackend> {
+    binding: PrivateTtyBinding,
+    backend: B,
+    receipts: Vec<SanitizedAttemptReceipt>,
+    attempt_count: usize,
+    baud: u32,
+    started: Duration,
+    termios_snapshot: B::TermiosSnapshot,
+    control_lines_snapshot: i32,
+}
+
+impl<B: SerialBackend> PersistentCarrier<B> {
+    fn open(
+        binding: PrivateTtyBinding,
+        mut backend: B,
+        baud: u32,
+    ) -> Result<Self, DarwinCarrierError> {
+        let started = backend.monotonic_now();
+        let deadline = active_io_deadline(started, SEARCH_ATTEMPT_TIMEOUT);
+        let mut opened = false;
+        let mut configuration_attempted = false;
+        let mut termios_snapshot = None;
+        let mut control_lines_snapshot = None;
+
+        let setup = (|| {
+            binding.verify()?;
+            ensure_before_deadline(&mut backend, deadline, CarrierStage::OpenExclusive)?;
+            backend
+                .open_exclusive_noctty(&binding.path)
+                .map_err(|fault| system_error(CarrierStage::OpenExclusive, fault))?;
+            opened = true;
+
+            ensure_before_deadline(&mut backend, deadline, CarrierStage::SnapshotTermios)?;
+            let snapshot = backend
+                .snapshot_termios()
+                .map_err(|fault| system_error(CarrierStage::SnapshotTermios, fault))?;
+            termios_snapshot = Some(snapshot.clone());
+            ensure_before_deadline(&mut backend, deadline, CarrierStage::SnapshotControlLines)?;
+            control_lines_snapshot = Some(
+                backend
+                    .snapshot_control_lines()
+                    .map_err(|fault| system_error(CarrierStage::SnapshotControlLines, fault))?,
+            );
+
+            reject_preexisting_input(&mut backend, deadline)?;
+            ensure_before_deadline(&mut backend, deadline, CarrierStage::Configure)?;
+            configuration_attempted = true;
+            backend
+                .configure(&snapshot, baud)
+                .map_err(|fault| system_error(CarrierStage::Configure, fault))?;
+            reject_preexisting_input(&mut backend, deadline)
+        })();
+
+        if let Err(error) = setup {
+            let primary = Some(error.kind());
+            let mut termios_failed = false;
+            let mut control_lines_failed = false;
+            if configuration_attempted {
+                termios_failed = termios_snapshot.as_ref().is_none_or(|snapshot| {
+                    backend.restore_termios(snapshot).is_err()
+                        || backend.verify_termios_restore(snapshot) != Ok(true)
+                });
+                control_lines_failed = control_lines_snapshot.is_none_or(|state| {
+                    backend.restore_control_lines(state).is_err()
+                        || backend.verify_control_lines_restore(state) != Ok(true)
+                });
+            }
+            if opened {
+                backend.close();
+            }
+            if termios_failed || control_lines_failed {
+                return Err(DarwinCarrierError::Cleanup {
+                    primary,
+                    termios_failed,
+                    control_lines_failed,
+                });
+            }
+            return Err(error);
+        }
+
+        let termios_snapshot = termios_snapshot.ok_or(DarwinCarrierError::Cleanup {
+            primary: Some(CarrierFailureKind::System),
+            termios_failed: true,
+            control_lines_failed: false,
+        })?;
+        let control_lines_snapshot = control_lines_snapshot.ok_or(DarwinCarrierError::Cleanup {
+            primary: Some(CarrierFailureKind::System),
+            termios_failed: false,
+            control_lines_failed: true,
+        })?;
+
+        Ok(Self {
+            binding,
+            backend,
+            receipts: Vec::new(),
+            attempt_count: 0,
+            baud,
+            started,
+            termios_snapshot,
+            control_lines_snapshot,
+        })
+    }
+
+    fn receipts(&self) -> &[SanitizedAttemptReceipt] {
+        &self.receipts
+    }
+
+    fn take_receipts(&mut self) -> Vec<SanitizedAttemptReceipt> {
+        std::mem::take(&mut self.receipts)
+    }
+
+    fn finish(mut self) -> Result<SanitizedSessionReceipt, DarwinCarrierError> {
+        let termios_cleanup = if self.backend.restore_termios(&self.termios_snapshot).is_ok()
+            && self.backend.verify_termios_restore(&self.termios_snapshot) == Ok(true)
+        {
+            CleanupDisposition::VerifiedRestored
+        } else {
+            CleanupDisposition::Failed
+        };
+        let control_lines_cleanup = if self
+            .backend
+            .restore_control_lines(self.control_lines_snapshot)
+            .is_ok()
+            && self
+                .backend
+                .verify_control_lines_restore(self.control_lines_snapshot)
+                == Ok(true)
+        {
+            CleanupDisposition::VerifiedRestored
+        } else {
+            CleanupDisposition::Failed
+        };
+        self.backend.close();
+        let receipt = SanitizedSessionReceipt {
+            binding_digest: self.binding.digest(),
+            baud: self.baud,
+            attempt_count: self.attempt_count,
+            elapsed_micros: duration_micros_ceil(
+                self.backend.monotonic_now().saturating_sub(self.started),
+            ),
+            termios_cleanup,
+            control_lines_cleanup,
+            closed: true,
+        };
+        if termios_cleanup == CleanupDisposition::Failed
+            || control_lines_cleanup == CleanupDisposition::Failed
+        {
+            return Err(DarwinCarrierError::Cleanup {
+                primary: None,
+                termios_failed: termios_cleanup == CleanupDisposition::Failed,
+                control_lines_failed: control_lines_cleanup == CleanupDisposition::Failed,
+            });
+        }
+        Ok(receipt)
+    }
+
+    fn run_search(&mut self, operation: SearchOperation) -> AttemptResult {
+        let start = self.backend.monotonic_now();
+        let active_io_deadline = active_io_deadline(start, operation.timeout());
+        let mut receipt = ReceiptBuilder::new(&self.binding, operation);
+        let result = (|| {
+            if operation.settings().baud() != self.baud {
+                return Err(DarwinCarrierError::OperationMismatch {
+                    expected_baud: self.baud,
+                    actual_baud: operation.settings().baud(),
+                });
+            }
+            ensure_before_deadline(
+                &mut self.backend,
+                active_io_deadline,
+                CarrierStage::VerifyOperation,
+            )?;
+            reject_preexisting_input(&mut self.backend, active_io_deadline)?;
+            ensure_before_deadline(&mut self.backend, active_io_deadline, CarrierStage::Write)?;
+            let written = self
+                .backend
+                .write_once(operation.request().as_bytes())
+                .map_err(|fault| system_error(CarrierStage::Write, fault))?;
+            receipt.tx_bytes = written;
+            if written != operation.request().as_bytes().len() {
+                return Err(DarwinCarrierError::ShortWrite {
+                    written,
+                    expected: operation.request().as_bytes().len(),
+                });
+            }
+            read_bounded(
+                &mut self.backend,
+                active_io_deadline,
+                operation.response_limit(),
+                &mut receipt,
+            )
+        })();
+        let elapsed = self.backend.monotonic_now().saturating_sub(start);
+        let result = if elapsed > operation.timeout() {
+            Err(DarwinCarrierError::Deadline {
+                stage: CarrierStage::Read,
+            })
+        } else {
+            result
+        };
+        let outcome = classify_outcome(&result);
+        (result, receipt.finish(elapsed, outcome))
+    }
+
+    fn run_snapshot_exchange(
+        &mut self,
+        operation: SnapshotOperation,
+    ) -> Result<SnapshotRead, DarwinCarrierError> {
+        let start = self.backend.monotonic_now();
+        let deadline = active_io_deadline(start, operation.timeout());
+        reject_preexisting_input(&mut self.backend, deadline)?;
+        ensure_before_deadline(&mut self.backend, deadline, CarrierStage::Write)?;
+        let request = operation.request();
+        let expected = request.as_bytes().len();
+        let written = self
+            .backend
+            .write_once(request.as_bytes())
+            .map_err(|fault| system_error(CarrierStage::Write, fault))?;
+        if written != expected {
+            return Err(DarwinCarrierError::ShortWrite { written, expected });
+        }
+        if matches!(operation.kind(), SnapshotOperationKind::Search { .. }) {
+            self.attempt_count += 1;
+        }
+        let read = read_snapshot_bounded(&mut self.backend, deadline, operation.response_limit())?;
+        if self.backend.monotonic_now().saturating_sub(start) > operation.timeout() {
+            return Err(DarwinCarrierError::Deadline {
+                stage: CarrierStage::Read,
+            });
+        }
+        Ok(read)
+    }
+
+    fn write_direct_command(
+        &mut self,
+        command: &DirectParameterCommand,
+    ) -> Result<(), DarwinCarrierError> {
+        self.write_typed_frame(&command.encode()?)
+    }
+
+    fn write_remote_mode_command(
+        &mut self,
+        command: RemoteModeCommand,
+    ) -> Result<(), DarwinCarrierError> {
+        self.write_typed_frame(&command.encode()?)
+    }
+
+    fn write_typed_frame(&mut self, frame: &[u8]) -> Result<(), DarwinCarrierError> {
+        let start = self.backend.monotonic_now();
+        let deadline = active_io_deadline(start, SEARCH_ATTEMPT_TIMEOUT);
+        reject_preexisting_input(&mut self.backend, deadline)?;
+        ensure_before_deadline(&mut self.backend, deadline, CarrierStage::Write)?;
+        let expected = frame.len();
+        let written = self
+            .backend
+            .write_once(frame)
+            .map_err(|fault| system_error(CarrierStage::Write, fault))?;
+        if written != expected {
+            return Err(DarwinCarrierError::ShortWrite { written, expected });
+        }
+        if self.backend.monotonic_now().saturating_sub(start) > SEARCH_ATTEMPT_TIMEOUT {
+            return Err(DarwinCarrierError::Deadline {
+                stage: CarrierStage::Write,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<B: SerialBackend> SearchTransport for PersistentCarrier<B> {
+    type Error = DarwinCarrierError;
+
+    fn search(&mut self, operation: SearchOperation) -> Result<SearchRead, Self::Error> {
+        let (result, receipt) = self.run_search(operation);
+        self.attempt_count += 1;
+        self.receipts.push(receipt);
+        result
+    }
+}
+
+impl<B: SerialBackend> PersistentSnapshotSession for PersistentCarrier<B> {
+    type Error = DarwinCarrierError;
+
+    fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
+        self.run_snapshot_exchange(operation)
+    }
+
+    fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
+        self.write_remote_mode_command(*command)
+    }
+
+    fn finish(self) -> Result<(), Self::Error> {
+        PersistentCarrier::finish(self).map(drop)
+    }
+}
+
+impl<B: SerialBackend> PersistentApplySession for PersistentCarrier<B> {
+    fn write_direct(&mut self, command: &DirectParameterCommand) -> Result<(), Self::Error> {
+        self.write_direct_command(command)
+    }
+}
+
+#[cfg(test)]
 impl<B: SerialBackend> SearchTransport for Carrier<B> {
     type Error = DarwinCarrierError;
 
@@ -499,6 +866,7 @@ type AttemptResult = (
     SanitizedAttemptReceipt,
 );
 
+#[cfg(test)]
 fn run_attempt<B: SerialBackend>(
     binding: &PrivateTtyBinding,
     backend: &mut B,
@@ -550,7 +918,10 @@ fn run_attempt<B: SerialBackend>(
             .map_err(|fault| system_error(CarrierStage::Write, fault))?;
         receipt.tx_bytes = written;
         if written != operation.request().as_bytes().len() {
-            return Err(DarwinCarrierError::ShortWrite { written });
+            return Err(DarwinCarrierError::ShortWrite {
+                written,
+                expected: operation.request().as_bytes().len(),
+            });
         }
         ensure_before_deadline(backend, active_io_deadline, CarrierStage::BytesAvailable)?;
 
@@ -563,37 +934,15 @@ fn run_attempt<B: SerialBackend>(
     })();
 
     let primary_kind = primary.as_ref().err().map(DarwinCarrierError::kind);
-    let mut termios_failed = false;
-    let mut control_lines_failed = false;
-
-    if configuration_attempted {
-        receipt.termios_cleanup = match termios_snapshot.as_ref() {
-            Some(snapshot)
-                if backend.restore_termios(snapshot).is_ok()
-                    && backend.verify_termios_restore(snapshot) == Ok(true) =>
-            {
-                CleanupDisposition::VerifiedRestored
-            }
-            Some(_) => {
-                termios_failed = true;
-                CleanupDisposition::Failed
-            }
-            None => CleanupDisposition::NotRequired,
-        };
-        receipt.control_lines_cleanup = match control_lines_snapshot {
-            Some(state)
-                if backend.restore_control_lines(state).is_ok()
-                    && backend.verify_control_lines_restore(state) == Ok(true) =>
-            {
-                CleanupDisposition::VerifiedRestored
-            }
-            Some(_) => {
-                control_lines_failed = true;
-                CleanupDisposition::Failed
-            }
-            None => CleanupDisposition::NotRequired,
-        };
-    }
+    let (termios_cleanup, control_lines_cleanup, termios_failed, control_lines_failed) =
+        restore_attempt_state(
+            backend,
+            termios_snapshot.as_ref(),
+            control_lines_snapshot,
+            configuration_attempted,
+        );
+    receipt.termios_cleanup = termios_cleanup;
+    receipt.control_lines_cleanup = control_lines_cleanup;
 
     if opened {
         backend.close();
@@ -618,6 +967,49 @@ fn run_attempt<B: SerialBackend>(
     }
     let outcome = classify_outcome(&result);
     (result, receipt.finish(elapsed, outcome))
+}
+
+#[cfg(test)]
+fn restore_attempt_state<B: SerialBackend>(
+    backend: &mut B,
+    termios_snapshot: Option<&B::TermiosSnapshot>,
+    control_lines_snapshot: Option<i32>,
+    configuration_attempted: bool,
+) -> (CleanupDisposition, CleanupDisposition, bool, bool) {
+    if !configuration_attempted {
+        return (
+            CleanupDisposition::NotRequired,
+            CleanupDisposition::NotRequired,
+            false,
+            false,
+        );
+    }
+    let termios_cleanup = match termios_snapshot {
+        Some(snapshot)
+            if backend.restore_termios(snapshot).is_ok()
+                && backend.verify_termios_restore(snapshot) == Ok(true) =>
+        {
+            CleanupDisposition::VerifiedRestored
+        }
+        Some(_) => CleanupDisposition::Failed,
+        None => CleanupDisposition::NotRequired,
+    };
+    let control_lines_cleanup = match control_lines_snapshot {
+        Some(state)
+            if backend.restore_control_lines(state).is_ok()
+                && backend.verify_control_lines_restore(state) == Ok(true) =>
+        {
+            CleanupDisposition::VerifiedRestored
+        }
+        Some(_) => CleanupDisposition::Failed,
+        None => CleanupDisposition::NotRequired,
+    };
+    (
+        termios_cleanup,
+        control_lines_cleanup,
+        termios_cleanup == CleanupDisposition::Failed,
+        control_lines_cleanup == CleanupDisposition::Failed,
+    )
 }
 
 fn active_io_deadline(start: Duration, timeout: Duration) -> Duration {
@@ -721,6 +1113,69 @@ fn read_bounded<B: SerialBackend>(
     }
 }
 
+fn read_snapshot_bounded<B: SerialBackend>(
+    backend: &mut B,
+    deadline: Duration,
+    limit: usize,
+) -> Result<SnapshotRead, DarwinCarrierError> {
+    let mut bytes = vec![0_u8; limit];
+    let mut received = 0;
+
+    loop {
+        let time_left = remaining(backend, deadline);
+        if time_left.is_zero() {
+            return SnapshotRead::timed_out(&bytes[..received]).map_err(Into::into);
+        }
+
+        let queued = backend
+            .bytes_available()
+            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+        if queued > limit.saturating_sub(received) {
+            return Err(DarwinCarrierError::Overflow { received, queued });
+        }
+
+        if queued == 0 {
+            let time_left = remaining(backend, deadline);
+            if time_left.is_zero()
+                || !backend
+                    .wait_readable(time_left)
+                    .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
+            {
+                return SnapshotRead::timed_out(&bytes[..received]).map_err(Into::into);
+            }
+            continue;
+        }
+
+        let end = received + queued;
+        match backend
+            .read_once(&mut bytes[received..end])
+            .map_err(|fault| system_error(CarrierStage::Read, fault))?
+        {
+            ReadProgress::Bytes(count) => {
+                if count == 0 || count > queued {
+                    return Err(DarwinCarrierError::EndOfFile { received });
+                }
+                received += count;
+            }
+            ReadProgress::WouldBlock => continue,
+            ReadProgress::EndOfFile => {
+                return Err(DarwinCarrierError::EndOfFile { received });
+            }
+        }
+
+        if received == limit {
+            ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+            let queued = backend
+                .bytes_available()
+                .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+            if queued != 0 {
+                return Err(DarwinCarrierError::Overflow { received, queued });
+            }
+            return SnapshotRead::complete(&bytes).map_err(Into::into);
+        }
+    }
+}
+
 const fn system_error(stage: CarrierStage, fault: SystemFault) -> DarwinCarrierError {
     DarwinCarrierError::System {
         stage,
@@ -732,6 +1187,9 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
     match result {
         Ok(read) if read.end() == SearchReadEnd::Complete => SanitizedAttemptOutcome::Complete,
         Ok(_) => SanitizedAttemptOutcome::TimedOut,
+        Err(DarwinCarrierError::OperationMismatch { .. }) => {
+            SanitizedAttemptOutcome::OperationRejected
+        }
         Err(DarwinCarrierError::Binding(_)) => SanitizedAttemptOutcome::BindingRejected,
         Err(DarwinCarrierError::System { .. }) => SanitizedAttemptOutcome::SystemError,
         Err(DarwinCarrierError::Deadline { .. }) => SanitizedAttemptOutcome::DeadlineExceeded,
@@ -741,58 +1199,104 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         }
         Err(DarwinCarrierError::Overflow { .. }) => SanitizedAttemptOutcome::Overflow,
         Err(DarwinCarrierError::EndOfFile { .. }) => SanitizedAttemptOutcome::EndOfFile,
-        Err(DarwinCarrierError::ReadInvariant(_)) => SanitizedAttemptOutcome::ReadInvariant,
+        Err(
+            DarwinCarrierError::ReadInvariant(_) | DarwinCarrierError::SnapshotReadInvariant(_),
+        ) => SanitizedAttemptOutcome::ReadInvariant,
+        Err(DarwinCarrierError::ProtocolEncoding(_)) => SanitizedAttemptOutcome::OperationRejected,
         Err(DarwinCarrierError::Cleanup { .. }) => SanitizedAttemptOutcome::CleanupFailed,
     }
 }
 
-/// macOS implementation of the typed Search-only transport.
+/// Persistent macOS implementation of fixed-38400 typed DCX control.
 ///
-/// Construction does not open a descriptor. Each `search` call revalidates the
-/// callout path, opens one descriptor, performs one bounded attempt, restores
-/// prior state, and closes. Legalab owns any external operator authorization.
+/// [`Self::open_known_38400`] opens and configures one exact callout descriptor.
+/// Search, snapshot, remote-mode, and direct calls reuse that descriptor. Callers must
+/// consume the session with [`Self::finish`] to restore and verify the original
+/// terminal and modem-line state before close.
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
-pub struct DarwinSearchTransport {
-    inner: Carrier<macos::MacOsBackend>,
+#[must_use = "the persistent tty session must be consumed with finish()"]
+pub struct DarwinSearchSession {
+    inner: PersistentCarrier<macos::MacOsBackend>,
 }
 
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
-impl DarwinSearchTransport {
-    /// Create an inert carrier for one already validated callout path.
-    pub fn new(binding: PrivateTtyBinding) -> Self {
-        Self {
-            inner: Carrier::new(binding, macos::MacOsBackend::new()),
-        }
+impl DarwinSearchSession {
+    /// Open one exact callout and configure the ratified 38400 8N1 binding once.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on binding, open, snapshot, configuration, queued-input, or
+    /// cleanup failure. No Search bytes are written while opening the session.
+    pub fn open_known_38400(binding: PrivateTtyBinding) -> Result<Self, DarwinCarrierError> {
+        Ok(Self {
+            inner: PersistentCarrier::open(binding, macos::MacOsBackend::new(), FALLBACK_BAUD)?,
+        })
     }
 
-    /// Borrow sanitized attempt receipts; raw paths and bytes are never stored.
+    /// Borrow sanitized per-operation receipts.
     pub fn receipts(&self) -> &[SanitizedAttemptReceipt] {
         self.inner.receipts()
     }
 
-    /// Drain sanitized receipts for a caller-controlled evidence sink.
+    /// Drain sanitized per-operation receipts before consuming the session.
     pub fn take_receipts(&mut self) -> Vec<SanitizedAttemptReceipt> {
         self.inner.take_receipts()
+    }
+
+    /// Restore and verify original tty state, close, and return session cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a terminal cleanup error after close when either exact readback
+    /// does not match the saved state.
+    pub fn finish(self) -> Result<SanitizedSessionReceipt, DarwinCarrierError> {
+        self.inner.finish()
     }
 }
 
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
-impl fmt::Debug for DarwinSearchTransport {
+impl fmt::Debug for DarwinSearchSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DarwinSearchTransport")
+            .debug_struct("DarwinSearchSession")
             .field("binding", &self.inner.binding)
-            .field("receipt_count", &self.inner.receipts.len())
+            .field("baud", &self.inner.baud)
+            .field("attempt_count", &self.inner.attempt_count)
+            .field("retained_receipt_count", &self.inner.receipts.len())
             .finish()
     }
 }
 
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
-impl SearchTransport for DarwinSearchTransport {
+impl SearchTransport for DarwinSearchSession {
     type Error = DarwinCarrierError;
 
     fn search(&mut self, operation: SearchOperation) -> Result<SearchRead, Self::Error> {
         self.inner.search(operation)
+    }
+}
+
+#[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
+impl PersistentSnapshotSession for DarwinSearchSession {
+    type Error = DarwinCarrierError;
+
+    fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
+        self.inner.run_snapshot_exchange(operation)
+    }
+
+    fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
+        self.inner.write_remote_mode_command(*command)
+    }
+
+    fn finish(self) -> Result<(), Self::Error> {
+        self.inner.finish().map(drop)
+    }
+}
+
+#[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
+impl PersistentApplySession for DarwinSearchSession {
+    fn write_direct(&mut self, command: &DirectParameterCommand) -> Result<(), Self::Error> {
+        self.inner.write_direct_command(command)
     }
 }
 

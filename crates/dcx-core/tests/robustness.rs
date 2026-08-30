@@ -1,9 +1,12 @@
 //! Deterministic generated-property coverage suitable for ordinary CI.
 
 use dcx_core::{
-    LabProfileV1,
+    DirectParameterAction, DirectParameterCommand, LabProfileV1, SnapshotSection, SnapshotV1,
     discovery::{DiscoveryError, QueryOnlyDiscovery},
-    protocol::{DeviceId, FrameDecoder, MAX_FRAME_LEN, Query, parse_frame},
+    protocol::{
+        DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, FrameDecoder,
+        MAX_FRAME_LEN, Query, decode, parse_frame,
+    },
     rew::{RewParseError, import_rew},
 };
 
@@ -173,6 +176,80 @@ fn generated_positive_gains_have_no_import_lane() {
             import_rew(&text, 1),
             Err(RewParseError::PositiveGain { .. })
         ));
+    }
+}
+
+fn synthetic_dump(device: u8, part: u8) -> Vec<u8> {
+    let length = match part {
+        0 => DUMP0_RESPONSE_LEN,
+        1 => DUMP1_RESPONSE_LEN,
+        _ => panic!("synthetic part must be zero or one"),
+    };
+    let mut frame = vec![0; length];
+    frame[..7].copy_from_slice(&[0xf0, 0, 0x20, 0x32, device, 0x0e, 0x10]);
+    frame[12] = part;
+    frame[length - 1] = 0xf7;
+    frame
+}
+
+fn synthetic_snapshot() -> SnapshotV1 {
+    SnapshotV1::from_frames(
+        &synthetic_search_response(),
+        &synthetic_dump(0, 0),
+        &synthetic_dump(0, 1),
+    )
+    .unwrap()
+}
+
+#[test]
+fn every_fourteen_bit_direct_value_round_trips_through_the_closed_frame() {
+    for value in 0..=0x3fff {
+        let action = DirectParameterAction::new(5, 0x3b, value).unwrap();
+        let command = DirectParameterCommand::new(DeviceId::new(0).unwrap(), vec![action]).unwrap();
+        assert_eq!(
+            decode(parse_frame(&command.encode().unwrap()).unwrap()).unwrap(),
+            DecodedMessage::DirectParameters {
+                device: DeviceId::new(0).unwrap(),
+                changes: vec![dcx_core::protocol::ParameterChange {
+                    channel: 5,
+                    parameter: 0x3b,
+                    value,
+                }],
+            }
+        );
+    }
+}
+
+#[test]
+fn every_fourteen_bit_value_projects_through_the_reviewed_split_layout() {
+    let baseline = synthetic_snapshot();
+    for (parameter, low, middle, bit, high) in [(0x3b, 843, 844, 6, 845), (0x3d, 848, 852, 3, 849)]
+    {
+        for value in 0..=0x3fff {
+            let action = DirectParameterAction::new(5, parameter, value).unwrap();
+            let desired = baseline.project_direct_actions(&[action]).unwrap();
+            let dump = desired.frame(SnapshotSection::Dump0);
+            let reconstructed = u16::from(dump[low])
+                | (u16::from((dump[middle] >> bit) & 1) << 7)
+                | (u16::from(dump[high]) << 8);
+            assert_eq!(reconstructed, value);
+        }
+    }
+}
+
+#[test]
+fn every_unreviewed_direct_address_is_rejected_by_snapshot_projection() {
+    let baseline = synthetic_snapshot();
+    for channel in 0..=10 {
+        for parameter in 0..=0x7f {
+            let action = DirectParameterAction::new(channel, parameter, 0).unwrap();
+            let projected = baseline.project_direct_actions(&[action]);
+            if channel == 5 && (0x3b..=0x3e).contains(&parameter) {
+                assert!(projected.is_ok());
+            } else {
+                assert!(projected.is_err());
+            }
+        }
     }
 }
 
