@@ -87,7 +87,7 @@ apple-project-generate:
 
 # Build the helper, embedded AUv3, and embedded dcxctl without signing or install.
 apple-bundle-check: apple-project-generate
-    xcodebuild -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
+    xcodebuild -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CC="$(/usr/bin/xcrun --find clang)" CPLUSPLUS="$(/usr/bin/xcrun --find clang++)" LD="$(/usr/bin/xcrun --find clang)" LDPLUSPLUS="$(/usr/bin/xcrun --find clang++)" build
 
 # Full product-source compile without signing, install, GUI launch, or hardware I/O.
 product-check: schema-check apple-bundle-check
