@@ -744,7 +744,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
                 &mut self.backend,
                 active_io_deadline,
                 operation.response_limit(),
-                operation.request().as_bytes(),
+                *operation.request().as_bytes(),
                 &mut receipt,
             )
         })();
@@ -937,7 +937,7 @@ fn run_attempt<B: SerialBackend>(
             backend,
             active_io_deadline,
             operation.response_limit(),
-            operation.request().as_bytes(),
+            *operation.request().as_bytes(),
             &mut receipt,
         )
     })();
@@ -1060,7 +1060,7 @@ fn read_bounded<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
     limit: usize,
-    request: &[u8; SEARCH_REQUEST_LEN],
+    request: [u8; SEARCH_REQUEST_LEN],
     receipt: &mut ReceiptBuilder,
 ) -> Result<SearchRead, DarwinCarrierError> {
     let mut wire = [0_u8; SEARCH_WIRE_LIMIT];
@@ -1146,10 +1146,10 @@ fn read_bounded<B: SerialBackend>(
 
 fn search_response_candidate<'a>(
     wire: &'a [u8],
-    request: &[u8; SEARCH_REQUEST_LEN],
+    request: [u8; SEARCH_REQUEST_LEN],
     receipt: &mut ReceiptBuilder,
 ) -> &'a [u8] {
-    if let Some(response) = wire.strip_prefix(request) {
+    if let Some(response) = wire.strip_prefix(&request) {
         receipt.request_echo_bytes = SEARCH_REQUEST_LEN;
         response
     } else {

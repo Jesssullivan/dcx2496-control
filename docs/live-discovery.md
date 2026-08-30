@@ -25,8 +25,11 @@ failed operation.
 Search accepts either one exact 26-byte identity or one byte-for-byte copy of
 the eight-byte Search immediately followed by that identity. The optional
 exact request-prefix echo is removed inside a 34-byte wire bound and recorded
-only as a byte count. Nine more validated responses follow, each preceded by at
-least five seconds. Snapshot and readback use the same ten-search identity sequence
+only as a byte count. Qualification always executes ten Searches on the same
+descriptor, each after the first preceded by at least five seconds. Empty
+timeouts are counted and do not suppress later trials; malformed, partial, or
+transport failures remain terminal. Success still requires ten valid matching
+identities. Snapshot and readback use the same ten-search identity sequence
 followed by typed transmit remote mode, Dump0, and Dump1. Apply and rollback
 accept only immutable plans produced from the exact O1/channel 5/PEQ9 desired
 profile, verify a fresh baseline, issue one reviewed direct-parameter command
