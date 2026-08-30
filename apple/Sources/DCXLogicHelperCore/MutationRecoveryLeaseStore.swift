@@ -3,6 +3,11 @@ import Darwin
 import DCXLogicBridge
 import Foundation
 
+// Darwin also exports `struct flock`; bind the libc function under an
+// unambiguous Swift name while retaining open-file-description semantics.
+@_silgen_name("flock")
+private func systemFlock(_ descriptor: CInt, _ operation: CInt) -> CInt
+
 /// Durable authority for one admitted mutation ceremony. The lease is written
 /// before dcxctl can start, so its absence means this helper did not admit a
 /// potentially-writing Apply. Recovery always reconstructs the exact checked
@@ -165,7 +170,7 @@ final class MutationRecoveryProcessLock: @unchecked Sendable {
 
     func release() {
         guard descriptor >= 0 else { return }
-        _ = Darwin.flock(descriptor, LOCK_UN)
+        _ = systemFlock(descriptor, LOCK_UN)
         Darwin.close(descriptor)
         descriptor = -1
     }
@@ -221,7 +226,7 @@ final class MutationRecoveryLeaseStore: @unchecked Sendable {
             Darwin.close(descriptor)
             throw MutationRecoveryLeaseError.invalidLease
         }
-        guard Darwin.flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        guard systemFlock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             let code = errno
             Darwin.close(descriptor)
             if code == EWOULDBLOCK || code == EAGAIN {

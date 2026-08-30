@@ -1,6 +1,11 @@
 import Darwin
 import Foundation
 
+// Darwin also exports `struct flock`; bind the libc function under an
+// unambiguous Swift name while retaining open-file-description semantics.
+@_silgen_name("flock")
+private func systemFlock(_ descriptor: CInt, _ operation: CInt) -> CInt
+
 public struct AppGroupLocations: Sendable {
     public let containerURL: URL
     public let socketURL: URL
@@ -180,7 +185,7 @@ public final class AppGroupSocketServer: @unchecked Sendable {
         var ownsListenerLock = true
         defer {
             if ownsListenerLock {
-                _ = Darwin.flock(listenerLock, LOCK_UN)
+                _ = systemFlock(listenerLock, LOCK_UN)
                 Darwin.close(listenerLock)
             }
         }
@@ -191,7 +196,7 @@ public final class AppGroupSocketServer: @unchecked Sendable {
               lockMetadata.st_mode & 0o077 == 0 else {
             throw AppGroupBoundaryError.socketFailure(EACCES)
         }
-        guard Darwin.flock(listenerLock, LOCK_EX | LOCK_NB) == 0 else {
+        guard systemFlock(listenerLock, LOCK_EX | LOCK_NB) == 0 else {
             if errno == EWOULDBLOCK || errno == EAGAIN {
                 throw AppGroupBoundaryError.alreadyListening
             }
@@ -251,7 +256,7 @@ public final class AppGroupSocketServer: @unchecked Sendable {
             _ = Darwin.unlink(socketURL.path)
         }
         if listenerLock >= 0 {
-            _ = Darwin.flock(listenerLock, LOCK_UN)
+            _ = systemFlock(listenerLock, LOCK_UN)
             Darwin.close(listenerLock)
         }
     }
