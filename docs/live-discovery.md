@@ -29,11 +29,12 @@ frame and is recorded as a byte count. The reader stops at the first frame
 terminator under the protocol hard bound, then still requires an exact 26-byte
 identity. At most one immediately trailing frame is consumed, and only a
 byte-for-byte duplicate response is tolerated and counted; partial, different,
-or further trailing input remains terminal. Qualification always executes ten
-Searches on the same descriptor, each after the first preceded by at least five
-seconds. Empty timeouts are counted and do not suppress later trials;
-malformed, partial, or transport failures remain terminal. Success still
-requires ten valid matching identities. Snapshot and readback use the same ten-search identity sequence
+or further trailing input remains terminal. Qualification collects ten valid
+matching identities on the same descriptor and permits at most ten empty-timeout
+replays, for a hard ceiling of twenty Search attempts and 120 seconds. Every
+attempt after the first is preceded by at least five seconds. Empty timeouts are
+counted; malformed, partial, or transport failures remain terminal. Snapshot
+and readback use the same ten-search identity sequence
 followed by typed transmit remote mode, Dump0, and Dump1. Apply and rollback
 accept only immutable plans produced from the exact O1/channel 5/PEQ9 desired
 profile, verify a fresh baseline, issue one reviewed direct-parameter command

@@ -34,8 +34,8 @@ no device-control packet mapping in bridge v1.
 
 ## CLI
 
-Discovery uses one open descriptor for the initial Search and nine five-second
-paced repeats:
+Discovery uses one open descriptor to collect ten validated Search identities,
+with five-second pacing and at most ten empty-timeout replays:
 
 ```sh
 dcxctl discovery live-search \

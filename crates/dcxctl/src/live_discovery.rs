@@ -1,18 +1,26 @@
 //! Thin macOS runner for one known-38400 Search and nine repeats.
 
-use std::{error::Error, fmt, path::PathBuf, thread, time::Instant};
+use std::{
+    error::Error,
+    fmt,
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use dcx_core::{discovery::FALLBACK_BAUD, protocol::DeviceId};
 use dcx_darwin_tty::{
     DarwinSearchSession, PrivateTtyBinding, SanitizedAttemptReceipt, SanitizedSessionReceipt,
 };
 use dcx_transport::{
-    Known38400SearchOutcome, REPEAT_SEARCH_BUDGET, REPEAT_SEARCH_COUNT, REPEAT_SEARCH_GAP,
-    SEARCH_ATTEMPT_TIMEOUT, SEARCH_RESPONSE_LIMIT, execute_known_38400_search,
+    Known38400SearchOutcome, REPEAT_SEARCH_COUNT, REPEAT_SEARCH_GAP, SEARCH_ATTEMPT_TIMEOUT,
+    SEARCH_RESPONSE_LIMIT, execute_known_38400_search,
 };
 
 const RESULT_SCHEMA: &str = "dcx.live-search-result/v2";
 const REQUIRED_VALID_RESPONSES: usize = REPEAT_SEARCH_COUNT + 1;
+const MAX_QUALIFICATION_ATTEMPTS: usize = REQUIRED_VALID_RESPONSES * 2;
+const QUALIFICATION_BUDGET: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 struct LiveSearchFailed {
@@ -40,11 +48,14 @@ pub fn run(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
     let mut valid_responses = 0_usize;
     let mut empty_timeouts = 0_usize;
 
-    for attempt_index in 0..REQUIRED_VALID_RESPONSES {
+    for attempt_index in 0..MAX_QUALIFICATION_ATTEMPTS {
+        if valid_responses == REQUIRED_VALID_RESPONSES {
+            break;
+        }
         if attempt_index != 0 {
             thread::sleep(REPEAT_SEARCH_GAP);
         }
-        if started.elapsed() > REPEAT_SEARCH_BUDGET.saturating_sub(SEARCH_ATTEMPT_TIMEOUT) {
+        if started.elapsed() > QUALIFICATION_BUDGET.saturating_sub(SEARCH_ATTEMPT_TIMEOUT) {
             let attempts = transport.take_receipts();
             let session = finish_session(transport, &attempts, expected_device)?;
             return fail(
@@ -136,6 +147,7 @@ fn qualification_result(
         "validResponses": valid_responses,
         "emptyTimeouts": empty_timeouts,
         "requiredValidResponses": REQUIRED_VALID_RESPONSES,
+        "maximumAttempts": MAX_QUALIFICATION_ATTEMPTS,
         "carrierAttempts": attempts.len(),
         "attempts": attempts,
         "session": session,
