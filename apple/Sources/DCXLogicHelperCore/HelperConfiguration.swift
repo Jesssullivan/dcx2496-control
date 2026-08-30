@@ -54,10 +54,13 @@ public enum HelperFeature: String, CaseIterable, Hashable, Identifiable, Sendabl
 
 public struct HelperConfigurationV1: Codable, Equatable, Sendable {
     public static let schemaVersion = "dcx.helper-configuration/v1"
-    public static let defaultChildTimeoutSeconds: UInt8 = 90
-    public static let minimumReadOnlyChildTimeoutSeconds: UInt8 = 60
-    public static let minimumMutationChildTimeoutSeconds: UInt8 = 90
-    public static let maximumChildTimeoutSeconds: UInt8 = 120
+    // The Rust live-control transaction owns a 120-second internal budget.
+    // Give it five seconds to start and report a bounded result before the
+    // helper terminates the child; the AU socket retains a separate margin.
+    public static let defaultChildTimeoutSeconds: UInt8 = 125
+    public static let minimumReadOnlyChildTimeoutSeconds: UInt8 = 125
+    public static let minimumMutationChildTimeoutSeconds: UInt8 = 125
+    public static let maximumChildTimeoutSeconds: UInt8 = 125
 
     private static let maximumConfigurationBytes = 32 * 1024
 
@@ -140,13 +143,22 @@ public struct HelperConfigurationV1: Codable, Equatable, Sendable {
             throw HelperConfigurationError.unsupportedSchema
         }
         // Re-enter the checked initializer because Codable synthesis does not
-        // execute it while decoding.
+        // execute it while decoding. Previously valid v1 timeouts are migrated
+        // in memory to the current 125-second transaction envelope; the next
+        // explicit save persists the normalized value without losing the target
+        // or enabled capabilities.
         try decoded.target.validate()
+        let mutationEnabled = decoded.enabledOperations.contains(.apply)
+            || decoded.enabledOperations.contains(.rollback)
+        let legacyMinimum: UInt8 = mutationEnabled ? 90 : 60
+        let legacyTimeout = (legacyMinimum...120).contains(decoded.childTimeoutSeconds)
         return try Self(
             target: decoded.target,
             ttyPath: decoded.ttyPath,
             enabledOperations: decoded.enabledOperations,
-            childTimeoutSeconds: decoded.childTimeoutSeconds
+            childTimeoutSeconds: legacyTimeout
+                ? Self.defaultChildTimeoutSeconds
+                : decoded.childTimeoutSeconds
         )
     }
 

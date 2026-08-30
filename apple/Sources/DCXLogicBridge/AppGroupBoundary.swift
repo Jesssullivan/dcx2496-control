@@ -93,8 +93,8 @@ public final class AppGroupSocketClient: @unchecked Sendable {
     private let socketURL: URL
     private let timeoutSeconds: Int
 
-    public init(socketURL: URL, timeoutSeconds: Int = 125) throws {
-        guard (1...130).contains(timeoutSeconds) else {
+    public init(socketURL: URL, timeoutSeconds: Int = 135) throws {
+        guard (1...135).contains(timeoutSeconds) else {
             throw AppGroupBoundaryError.invalidTimeout
         }
         _ = try UnixSocketAddress(path: socketURL.path)

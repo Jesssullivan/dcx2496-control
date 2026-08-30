@@ -40,7 +40,10 @@ final class HelperAppModel: ObservableObject {
     @Published var ttyPath = "/dev/cu.usbserial-"
     @Published var expectedDeviceAddress = 0
     @Published var childTimeoutSeconds = Int(HelperConfigurationV1.defaultChildTimeoutSeconds)
-    @Published private(set) var enabledFeatures = Set(HelperFeature.allCases)
+    @Published private(set) var enabledFeatures: Set<HelperFeature> = [
+        .identitySearch,
+        .snapshotCapture,
+    ]
 
     private let runtime: ForegroundHelperRuntime?
 
@@ -198,11 +201,7 @@ private struct HelperContentView: View {
                 }
                 GridRow {
                     Text("Child timeout")
-                    Stepper(
-                        "\(model.childTimeoutSeconds) seconds",
-                        value: $model.childTimeoutSeconds,
-                        in: Int(HelperConfigurationV1.minimumReadOnlyChildTimeoutSeconds)...Int(HelperConfigurationV1.maximumChildTimeoutSeconds)
-                    )
+                    Text("\(model.childTimeoutSeconds) seconds (bounded)")
                 }
             }
             Text("Enabled operations")

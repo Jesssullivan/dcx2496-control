@@ -8,11 +8,14 @@ import UniformTypeIdentifiers
 public final class DCXControlViewController: AUViewController, AUAudioUnitFactory {
     private var dcxAudioUnit: DCXControlAudioUnit?
     private let statusLabel = NSTextField(labelWithString: "Project recall is staged; no helper contact has occurred.")
+    private let identityLabel = NSTextField(labelWithString: "Device: not identified")
     private let currentLabel = NSTextField(labelWithString: "Current: not captured")
     private let desiredLabel = NSTextField(labelWithString: "Desired: not staged")
     private let diffTextView = NSTextView()
     private let workQueue = DispatchQueue(label: "io.tinyland.dcx2496.logic.au-ui", qos: .userInitiated)
     private var configuredTarget: DCXTargetReference?
+    private var bridgeRequestInFlight = false
+    private var actionButtons: [NSButton] = []
 
     public override func loadView() {
         let root = NSView()
@@ -22,6 +25,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         title.font = .systemFont(ofSize: 20, weight: .semibold)
         statusLabel.maximumNumberOfLines = 2
         statusLabel.textColor = .secondaryLabelColor
+        identityLabel.maximumNumberOfLines = 2
         currentLabel.maximumNumberOfLines = 2
         desiredLabel.maximumNumberOfLines = 2
 
@@ -43,22 +47,25 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         diffScrollView.borderType = .bezelBorder
 
         let refresh = button("Helper Status", action: #selector(helperStatus))
+        let identify = button("Identify", action: #selector(identifyDevice))
         let stage = button("Stage Desired Profile…", action: #selector(stageDesiredProfile))
         let snapshot = button("Snapshot", action: #selector(captureSnapshot))
         let preview = button("Preview Diff", action: #selector(previewDiff))
         let apply = button("Apply", action: #selector(applyDesired))
         let readback = button("Readback", action: #selector(readback))
         let rollback = button("Rollback", action: #selector(rollback))
-        let preparation = NSStackView(views: [refresh, stage, snapshot, preview])
+        let preparation = NSStackView(views: [refresh, identify, stage, snapshot, preview])
         preparation.orientation = .horizontal
         preparation.spacing = 8
         let mutation = NSStackView(views: [apply, readback, rollback])
         mutation.orientation = .horizontal
         mutation.spacing = 8
+        actionButtons = [refresh, identify, stage, snapshot, preview, apply, readback, rollback]
 
         let stack = NSStackView(views: [
             title,
             statusLabel,
+            identityLabel,
             currentLabel,
             desiredLabel,
             diffScrollView,
@@ -98,11 +105,33 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
 
     @objc private func helperStatus() {
         send(.helperStatus(.init())) { [weak self] body in
-            guard case let .helperStatus(status) = body else { return }
-            self?.configuredTarget = status.target
-            self?.statusLabel.stringValue = status.foreground
+            guard let self, case let .helperStatus(status) = body else { return }
+            let targetChanged = configuredTarget != status.target
+            configuredTarget = status.target
+            if targetChanged {
+                identityLabel.stringValue = "Device: not identified"
+                refreshLabels()
+            }
+            statusLabel.stringValue = status.foreground
                 ? "Helper foreground; \(status.capabilities.count) capability entries"
                 : "Helper is not foreground"
+        }
+    }
+
+    @objc private func identifyDevice() {
+        guard let target = configuredTarget else {
+            report("Request Helper Status before identifying the configured DCX target")
+            return
+        }
+        send(.identitySearch(.init(target: target))) { [weak self] body in
+            guard let self, case let .identitySearch(result) = body else { return }
+            guard configuredTarget == target else {
+                report("Helper target changed while identity search was in progress")
+                return
+            }
+            let identity = result.identity
+            identityLabel.stringValue = "Device: \(identity.manufacturer) \(identity.model) · address \(identity.deviceAddress) · \(identity.selectedBaud) baud · \(identity.validSearchResponses) responses"
+            report("Named DCX identity confirmed")
         }
     }
 
@@ -143,21 +172,37 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @objc private func captureSnapshot() {
-        guard let target = dcxAudioUnit?.controlState.view().projectState?.target else {
-            report("Stage a desired project state before requesting a snapshot")
+        let state = dcxAudioUnit?.controlState.view()
+        guard let target = state?.projectState?.target ?? configuredTarget else {
+            report("Request Helper Status before capturing the configured DCX target")
             return
         }
         send(.snapshotCapture(.init(target: target))) { [weak self] body in
-            guard case let .snapshotCapture(result) = body else { return }
+            guard let self, case let .snapshotCapture(result) = body else { return }
             do {
-                try self?.dcxAudioUnit?.controlState.accept(
-                    snapshot: result.snapshot,
-                    validSearchResponses: 10
-                )
-                self?.report("Complete snapshot captured")
-                self?.refreshLabels()
+                if let project = dcxAudioUnit?.controlState.view().projectState {
+                    guard project.target == target else {
+                        report("Staged target changed while snapshot capture was in progress")
+                        return
+                    }
+                    try dcxAudioUnit?.controlState.accept(
+                        snapshot: result.snapshot,
+                        validSearchResponses: 10
+                    )
+                    report("Complete snapshot captured and bound to the staged profile")
+                    refreshLabels()
+                } else {
+                    guard configuredTarget == target else {
+                        report("Helper target changed while snapshot capture was in progress")
+                        return
+                    }
+                    currentLabel.stringValue = "Current: \(result.snapshot.digest) (read-only; not stored in project state)"
+                    report("Complete read-only snapshot captured; stage a profile before previewing a diff")
+                }
+                let identity = result.snapshot.identity
+                identityLabel.stringValue = "Device: \(identity.manufacturer) \(identity.model) · address \(identity.deviceAddress) · \(identity.selectedBaud) baud · \(identity.validSearchResponses) responses"
             } catch {
-                self?.report("Snapshot no longer matches the staged project target")
+                report("Snapshot no longer matches the staged project target")
             }
         }
     }
@@ -308,6 +353,12 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         _ body: BridgeRequestBody,
         accept: @escaping @MainActor (BridgeResponseBody) -> Void
     ) {
+        guard !bridgeRequestInFlight else {
+            report("One bounded helper request is already in progress")
+            return
+        }
+        bridgeRequestInFlight = true
+        actionButtons.forEach { $0.isEnabled = false }
         report("Request in progress")
         workQueue.async { [weak self] in
             do {
@@ -316,6 +367,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 let request = try BridgeRequest(body: body)
                 let response = try client.exchange(request)
                 DispatchQueue.main.async {
+                    self?.completeBridgeRequest()
                     if let error = response.error {
                         self?.report(error.message)
                     } else if let body = response.body {
@@ -325,9 +377,18 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                     }
                 }
             } catch {
-                DispatchQueue.main.async { self?.report("Foreground helper is unavailable") }
+                DispatchQueue.main.async {
+                    self?.completeBridgeRequest()
+                    self?.report("Foreground helper is unavailable")
+                }
             }
         }
+    }
+
+    @MainActor
+    private func completeBridgeRequest() {
+        bridgeRequestInFlight = false
+        actionButtons.forEach { $0.isEnabled = true }
     }
 
     @MainActor
