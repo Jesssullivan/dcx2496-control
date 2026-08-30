@@ -1,6 +1,6 @@
 [package]
 name = "dcxctl"
-description = "Offline-by-default DCX2496 fixture, profile, REW, and live Search CLI"
+description = "Offline-by-default DCX2496 profile, REW, snapshot, and typed control CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,10 +10,12 @@ repository.workspace = true
 
 [features]
 default = []
-live-discovery = [
+live-control = [
     "dep:dcx-darwin-tty",
     "dep:dcx-transport",
 ]
+# Compatibility for callers pinned to the first live Search feature name.
+live-discovery = ["live-control"]
 
 [dependencies]
 clap.workspace = true

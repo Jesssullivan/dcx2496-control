@@ -17,8 +17,23 @@ alias(
 )
 
 alias(
+    name = "dcxctl_live_control",
+    actual = "//crates/dcxctl:dcxctl_live_control",
+)
+
+alias(
     name = "dcxctl_live_discovery",
-    actual = "//crates/dcxctl:dcxctl_live_discovery",
+    actual = ":dcxctl_live_control",
+)
+
+alias(
+    name = "apple_bundle_sources",
+    actual = "//apple:bundle_sources",
+)
+
+alias(
+    name = "dcx_logic_bridge_schema",
+    actual = "//schemas/v1:dcx_logic_bridge_schema",
 )
 
 filegroup(

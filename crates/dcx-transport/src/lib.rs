@@ -16,6 +16,8 @@ use dcx_core::{
 };
 use thiserror::Error;
 
+pub mod snapshot;
+
 /// Exact outbound byte count for the only operation this boundary exposes.
 pub const SEARCH_REQUEST_LEN: usize = 8;
 /// Maximum inbound byte count for one Search attempt.
@@ -30,7 +32,7 @@ pub const SEARCH_DISCOVERY_BUDGET: Duration = Duration::from_millis(1_000);
 pub const REPEAT_SEARCH_COUNT: usize = 9;
 /// Minimum delay before every repeat Search.
 ///
-/// The pinned DuinoDCX behavioral reference searches on a five-second cadence.
+/// The pinned `DuinoDCX` behavioral reference searches on a five-second cadence.
 /// Keeping the same cadence avoids overrunning the legacy device's discovery
 /// response path.
 pub const REPEAT_SEARCH_GAP: Duration = Duration::from_secs(5);

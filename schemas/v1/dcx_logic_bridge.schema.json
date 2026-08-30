@@ -1,0 +1,550 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tinyland.io/schemas/dcx.logic-bridge/v1",
+  "title": "DCX Logic bridge v1 request or response",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" }
+  ],
+  "$defs": {
+    "operation": {
+      "enum": [
+        "helper.status",
+        "device.identity.search",
+        "device.snapshot.capture",
+        "profile.diff.preview",
+        "device.apply",
+        "device.readback",
+        "device.rollback"
+      ]
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256/[0-9a-f]{64}$"
+    },
+    "requestID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "target": {
+      "type": "object",
+      "required": ["bindingID", "expectedDeviceAddress"],
+      "properties": {
+        "bindingID": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "expectedDeviceAddress": { "type": "integer", "minimum": 0, "maximum": 15 }
+      },
+      "additionalProperties": false
+    },
+    "identity": {
+      "type": "object",
+      "required": [
+        "manufacturer",
+        "model",
+        "deviceAddress",
+        "selectedBaud",
+        "validSearchResponses"
+      ],
+      "properties": {
+        "manufacturer": { "const": "Behringer" },
+        "model": { "const": "DCX2496" },
+        "deviceAddress": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "selectedBaud": { "const": 38400 },
+        "validSearchResponses": { "type": "integer", "minimum": 1, "maximum": 10 }
+      },
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "target",
+        "identity",
+        "capturedAt",
+        "digest",
+        "complete",
+        "sectionDigests"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "dcx.snapshot/v1" },
+        "target": { "$ref": "#/$defs/target" },
+        "identity": { "$ref": "#/$defs/identity" },
+        "capturedAt": { "type": "string", "format": "date-time" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "complete": { "const": true },
+        "sectionDigests": {
+          "type": "object",
+          "required": ["identity", "dump0", "dump1"],
+          "properties": {
+            "identity": { "$ref": "#/$defs/digest" },
+            "dump0": { "$ref": "#/$defs/digest" },
+            "dump1": { "$ref": "#/$defs/digest" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "desiredProfile": {
+      "type": "object",
+      "required": ["schemaVersion", "profileID", "revision", "digest", "document"],
+      "properties": {
+        "schemaVersion": { "const": "dcx.desired-profile/v1" },
+        "profileID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        },
+        "digest": { "$ref": "#/$defs/digest" },
+        "document": { "$ref": "#/$defs/desiredPeqDocument" }
+      },
+      "additionalProperties": false
+    },
+    "desiredPeqDocument": {
+      "type": "object",
+      "required": ["target_output", "parameter_channel", "slot", "actions"],
+      "properties": {
+        "target_output": { "const": 1 },
+        "parameter_channel": { "const": 5 },
+        "slot": { "const": 9 },
+        "actions": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            { "$ref": "#/$defs/frequencyAction" },
+            { "$ref": "#/$defs/qAction" },
+            { "$ref": "#/$defs/gainAction" },
+            { "$ref": "#/$defs/filterKindAction" }
+          ],
+          "items": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "frequencyAction": {
+      "type": "object",
+      "required": ["channel", "parameter", "value"],
+      "properties": {
+        "channel": { "const": 5 },
+        "parameter": { "const": 59 },
+        "value": { "type": "integer", "minimum": 0, "maximum": 320 }
+      },
+      "additionalProperties": false
+    },
+    "qAction": {
+      "type": "object",
+      "required": ["channel", "parameter", "value"],
+      "properties": {
+        "channel": { "const": 5 },
+        "parameter": { "const": 60 },
+        "value": { "type": "integer", "minimum": 0, "maximum": 40 }
+      },
+      "additionalProperties": false
+    },
+    "gainAction": {
+      "type": "object",
+      "required": ["channel", "parameter", "value"],
+      "properties": {
+        "channel": { "const": 5 },
+        "parameter": { "const": 61 },
+        "value": { "type": "integer", "minimum": 0, "maximum": 150 }
+      },
+      "additionalProperties": false
+    },
+    "filterKindAction": {
+      "type": "object",
+      "required": ["channel", "parameter", "value"],
+      "properties": {
+        "channel": { "const": 5 },
+        "parameter": { "const": 62 },
+        "value": { "const": 1 }
+      },
+      "additionalProperties": false
+    },
+    "semanticChange": {
+      "type": "object",
+      "required": ["path", "before", "after"],
+      "properties": {
+        "path": { "const": "$.outputs[0].peq[8]" },
+        "before": { "$ref": "#/$defs/peqSlotState" },
+        "after": { "$ref": "#/$defs/peqSlotState" }
+      },
+      "additionalProperties": false
+    },
+    "peqSlotState": {
+      "type": "object",
+      "required": ["frequencyCode", "qCode", "gainCode", "filterKindCode"],
+      "properties": {
+        "frequencyCode": { "type": "integer", "minimum": 0, "maximum": 320 },
+        "qCode": { "type": "integer", "minimum": 0, "maximum": 40 },
+        "gainCode": { "type": "integer", "minimum": 0, "maximum": 150 },
+        "filterKindCode": { "const": 1 }
+      },
+      "additionalProperties": false
+    },
+    "semanticDiff": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "baselineSnapshotDigest",
+        "desiredProfileDigest",
+        "desiredSnapshotDigest",
+        "applyPlanDigest",
+        "rollbackPlanDigest",
+        "changes"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "dcx.semantic-diff/v1" },
+        "baselineSnapshotDigest": { "$ref": "#/$defs/digest" },
+        "desiredProfileDigest": { "$ref": "#/$defs/digest" },
+        "desiredSnapshotDigest": { "$ref": "#/$defs/digest" },
+        "applyPlanDigest": { "$ref": "#/$defs/digest" },
+        "rollbackPlanDigest": { "$ref": "#/$defs/digest" },
+        "changes": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/semanticChange" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "applyPlan": {
+      "type": "object",
+      "required": ["schemaVersion", "baseline", "desired", "diff"],
+      "properties": {
+        "schemaVersion": { "const": "dcx.apply-plan/v1" },
+        "baseline": { "$ref": "#/$defs/snapshot" },
+        "desired": { "$ref": "#/$defs/desiredProfile" },
+        "diff": { "$ref": "#/$defs/semanticDiff" }
+      },
+      "additionalProperties": false
+    },
+    "rollbackPlan": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "transactionID",
+        "baseline",
+        "rollbackPlanDigest"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "dcx.rollback-plan/v1" },
+        "transactionID": { "$ref": "#/$defs/requestID" },
+        "baseline": { "$ref": "#/$defs/snapshot" },
+        "rollbackPlanDigest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "helperStatusRequest": {
+      "type": "object",
+      "maxProperties": 0
+    },
+    "identitySearchRequest": {
+      "type": "object",
+      "required": ["target"],
+      "properties": { "target": { "$ref": "#/$defs/target" } },
+      "additionalProperties": false
+    },
+    "snapshotCaptureRequest": {
+      "type": "object",
+      "required": ["target"],
+      "properties": { "target": { "$ref": "#/$defs/target" } },
+      "additionalProperties": false
+    },
+    "diffPreviewRequest": {
+      "type": "object",
+      "required": ["target", "baseline", "desired"],
+      "properties": {
+        "target": { "$ref": "#/$defs/target" },
+        "baseline": { "$ref": "#/$defs/snapshot" },
+        "desired": { "$ref": "#/$defs/desiredProfile" }
+      },
+      "additionalProperties": false
+    },
+    "applyRequest": {
+      "type": "object",
+      "required": ["target", "plan"],
+      "properties": {
+        "target": { "$ref": "#/$defs/target" },
+        "plan": { "$ref": "#/$defs/applyPlan" }
+      },
+      "additionalProperties": false
+    },
+    "readbackRequest": {
+      "type": "object",
+      "required": ["target", "transactionID", "expectedDesiredDigest"],
+      "properties": {
+        "target": { "$ref": "#/$defs/target" },
+        "transactionID": { "$ref": "#/$defs/requestID" },
+        "expectedDesiredDigest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "rollbackRequest": {
+      "type": "object",
+      "required": ["target", "plan"],
+      "properties": {
+        "target": { "$ref": "#/$defs/target" },
+        "plan": { "$ref": "#/$defs/rollbackPlan" }
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "required": ["schemaVersion", "requestID", "operation", "payload"],
+      "properties": {
+        "schemaVersion": { "const": "dcx.logic-bridge/v1" },
+        "requestID": { "$ref": "#/$defs/requestID" },
+        "operation": { "$ref": "#/$defs/operation" },
+        "payload": {}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "helper.status" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/helperStatusRequest" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.identity.search" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/identitySearchRequest" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.snapshot.capture" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/snapshotCaptureRequest" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "profile.diff.preview" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/diffPreviewRequest" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.apply" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/applyRequest" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.readback" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/readbackRequest" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.rollback" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/rollbackRequest" } } }
+        }
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "required": ["operation", "exitCode", "durationMilliseconds", "stdoutDigest"],
+      "properties": {
+        "operation": { "$ref": "#/$defs/operation" },
+        "exitCode": { "const": 0 },
+        "durationMilliseconds": { "type": "integer", "minimum": 0 },
+        "stdoutDigest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "coreMIDIStatus": {
+      "type": "object",
+      "required": ["commandsName", "commandsUniqueID", "statusName", "statusUniqueID", "online"],
+      "properties": {
+        "commandsName": { "const": "Tinyland DCX Commands" },
+        "commandsUniqueID": { "const": 1145264195 },
+        "statusName": { "const": "Tinyland DCX Status" },
+        "statusUniqueID": { "const": 1145264211 },
+        "online": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "helperStatusResponse": {
+      "type": "object",
+      "required": ["foreground", "configured", "capabilities", "coreMIDI"],
+      "properties": {
+        "foreground": { "type": "boolean" },
+        "configured": { "type": "boolean" },
+        "target": { "$ref": "#/$defs/target" },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "coreMIDI": { "$ref": "#/$defs/coreMIDIStatus" },
+        "activeTransactionID": { "$ref": "#/$defs/requestID" }
+      },
+      "additionalProperties": false
+    },
+    "identitySearchResponse": {
+      "type": "object",
+      "required": ["identity", "receipt"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/identity" },
+        "receipt": { "$ref": "#/$defs/receipt" }
+      },
+      "additionalProperties": false
+    },
+    "snapshotCaptureResponse": {
+      "type": "object",
+      "required": ["snapshot", "receipt"],
+      "properties": {
+        "snapshot": { "$ref": "#/$defs/snapshot" },
+        "receipt": { "$ref": "#/$defs/receipt" }
+      },
+      "additionalProperties": false
+    },
+    "diffPreviewResponse": {
+      "type": "object",
+      "required": ["diff", "receipt"],
+      "properties": {
+        "diff": { "$ref": "#/$defs/semanticDiff" },
+        "receipt": { "$ref": "#/$defs/receipt" }
+      },
+      "additionalProperties": false
+    },
+    "applyResponse": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "baselineDigest",
+        "desiredSnapshotDigest",
+        "readbackMatchesDesired",
+        "rollbackRequired",
+        "rollbackAvailable",
+        "receipt"
+      ],
+      "properties": {
+        "transactionID": { "$ref": "#/$defs/requestID" },
+        "baselineDigest": { "$ref": "#/$defs/digest" },
+        "desiredSnapshotDigest": { "$ref": "#/$defs/digest" },
+        "readback": {
+          "oneOf": [
+            { "$ref": "#/$defs/snapshot" },
+            { "type": "null" }
+          ]
+        },
+        "readbackMatchesDesired": { "type": "boolean" },
+        "rollbackRequired": { "type": "boolean" },
+        "rollbackAvailable": { "type": "boolean" },
+        "receipt": { "$ref": "#/$defs/receipt" }
+      },
+      "additionalProperties": false
+    },
+    "readbackResponse": {
+      "type": "object",
+      "required": ["transactionID", "matchesDesired", "snapshot", "receipt"],
+      "properties": {
+        "transactionID": { "$ref": "#/$defs/requestID" },
+        "matchesDesired": { "type": "boolean" },
+        "snapshot": { "$ref": "#/$defs/snapshot" },
+        "receipt": { "$ref": "#/$defs/receipt" }
+      },
+      "additionalProperties": false
+    },
+    "rollbackResponse": {
+      "type": "object",
+      "required": ["transactionID", "baselineDigest", "equalsBaseline", "receipt"],
+      "properties": {
+        "transactionID": { "$ref": "#/$defs/requestID" },
+        "baselineDigest": { "$ref": "#/$defs/digest" },
+        "restored": {
+          "oneOf": [
+            { "$ref": "#/$defs/snapshot" },
+            { "type": "null" }
+          ]
+        },
+        "equalsBaseline": { "type": "boolean" },
+        "receipt": { "$ref": "#/$defs/receipt" }
+      },
+      "additionalProperties": false
+    },
+    "successResponse": {
+      "type": "object",
+      "required": ["schemaVersion", "requestID", "operation", "status", "payload"],
+      "properties": {
+        "schemaVersion": { "const": "dcx.logic-bridge/v1" },
+        "requestID": { "$ref": "#/$defs/requestID" },
+        "operation": { "$ref": "#/$defs/operation" },
+        "status": { "const": "ok" },
+        "payload": {}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "helper.status" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/helperStatusResponse" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.identity.search" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/identitySearchResponse" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.snapshot.capture" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/snapshotCaptureResponse" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "profile.diff.preview" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/diffPreviewResponse" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.apply" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/applyResponse" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.readback" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/readbackResponse" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "device.rollback" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/rollbackResponse" } } }
+        }
+      ]
+    },
+    "errorPayload": {
+      "type": "object",
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request",
+            "unsupported_schema",
+            "helper_not_foreground",
+            "helper_not_configured",
+            "target_not_allowlisted",
+            "operation_unavailable",
+            "operation_in_flight",
+            "child_timed_out",
+            "child_failed",
+            "malformed_child_response",
+            "ipc_unavailable",
+            "internal_failure"
+          ]
+        },
+        "message": { "type": "string", "maxLength": 512 },
+        "retryable": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "errorResponse": {
+      "type": "object",
+      "required": ["schemaVersion", "requestID", "status", "error"],
+      "properties": {
+        "schemaVersion": { "const": "dcx.logic-bridge/v1" },
+        "requestID": { "$ref": "#/$defs/requestID" },
+        "operation": { "$ref": "#/$defs/operation" },
+        "status": { "const": "error" },
+        "error": { "$ref": "#/$defs/errorPayload" }
+      },
+      "additionalProperties": false
+    },
+    "response": {
+      "oneOf": [
+        { "$ref": "#/$defs/successResponse" },
+        { "$ref": "#/$defs/errorResponse" }
+      ]
+    }
+  }
+}

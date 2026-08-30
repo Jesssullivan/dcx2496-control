@@ -35,16 +35,18 @@ Useful behavioral references reviewed for this offline foundation include:
 
 Synthetic fixtures in fixtures/ are original test data. They are clearly
 marked and establish deterministic behavior only; they must not be cited as
-hardware evidence. The 115200-first/one-38400-fallback sequence is a bounded
-Legalab probe policy combining the official line-rate documentation with a
-legacy behavioral hypothesis. All hardware claims remain unverified pending a
-separately reviewed, query-only named-device receipt.
+hardware evidence. The 115200-first/one-38400-fallback sequence is retained as
+an offline discovery plan combining the official line-rate documentation with
+a legacy behavioral hypothesis; the live-control path does not execute it.
+Named-device observations and live authorization remain owned by Legalab.
 
-The transport boundary's 500 ms per-attempt timeout and 26-byte input ceiling
-are fail-closed Legalab engineering limits, not vendor timing claims. The
-OS-neutral boundary is injected and does not enumerate or open ports. The
-Darwin carrier below supplies the explicit Search-only serial implementation;
-Legalab owns live hardware readiness.
+The Search boundary's 500 ms operation timeout and 26-byte input ceiling are
+fail-closed Legalab engineering limits, not vendor timing claims. Dump and
+typed mutation operations have their own exact frame ceilings. The OS-neutral
+boundaries are injected and do not enumerate or open ports. The Darwin carrier
+supplies one persistent fixed-38400 session for the closed typed Search,
+remote-mode, Dump, and direct-parameter operations; Legalab owns live hardware
+readiness.
 
 The Darwin carrier follows Apple's documented BSD serial-device interface and
 the macOS SDK ABI; these are operating-system interface references, not DCX

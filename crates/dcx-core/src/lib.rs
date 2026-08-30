@@ -7,9 +7,21 @@ pub mod discovery;
 pub mod profile;
 pub mod protocol;
 pub mod rew;
+pub mod snapshot;
 pub mod state_machine;
 
 pub use profile::{LabProfileV1, ProfileBinding, ProfileDiff, ProfileError};
-pub use protocol::{DecodedMessage, Message, ProtocolError, Query, SearchResponse26};
-pub use rew::{RewImportReportV1, RewParseError};
+pub use protocol::{
+    DecodedMessage, DirectParameterAction, DirectParameterCommand, Message, ProtocolError, Query,
+    RemoteMode, RemoteModeCommand, SearchResponse26,
+};
+pub use rew::{
+    DirectPeqSlotPlanV1, RewImportReportV1, RewMappingError, RewParseError,
+    map_filter_to_output_slot,
+};
+pub use snapshot::{
+    ApplyPlanError, ApplyPlanV1, ApplyTransactionError, ApplyTransactionState, ApplyTransactionV1,
+    PlanCarrierError, ReadbackVerificationV1, RollbackPlanV1, SnapshotDiffError, SnapshotDiffV1,
+    SnapshotError, SnapshotProjectionError, SnapshotSection, SnapshotSectionChange, SnapshotV1,
+};
 pub use state_machine::{ControllerMachine, ControllerState, Event, TransitionError};

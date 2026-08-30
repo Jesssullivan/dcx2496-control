@@ -1,6 +1,6 @@
 [package]
 name = "dcx-transport"
-description = "Injected, bounded, Search-only DCX2496 serial transport contract"
+description = "Injected, bounded DCX2496 discovery, snapshot, and typed apply transport contract"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
