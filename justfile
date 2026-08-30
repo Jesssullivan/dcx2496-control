@@ -27,6 +27,8 @@ apple-project-generate: repo::apple-project-generate
 
 apple-bundle-check: repo::apple-bundle-check
 
+apple-provisioned-bundle: repo::apple-provisioned-bundle
+
 product-check: repo::product-check
 
 dcxctl *args:
