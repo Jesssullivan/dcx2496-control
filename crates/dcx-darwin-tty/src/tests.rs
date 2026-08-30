@@ -48,6 +48,7 @@ struct FakeBackend {
     read_goal: usize,
     writes: Vec<Vec<u8>>,
     preexisting_input: usize,
+    post_response_input: usize,
     preexisting_script: VecDeque<usize>,
     termios_readback: FakeTermios,
     control_lines_readback: i32,
@@ -70,6 +71,7 @@ impl FakeBackend {
             read_goal: 0,
             writes: Vec::new(),
             preexisting_input: 0,
+            post_response_input: 0,
             preexisting_script: VecDeque::new(),
             termios_readback: FakeTermios(8),
             control_lines_readback: 0x2496,
@@ -129,6 +131,16 @@ impl SerialBackend for FakeBackend {
         self.step(CarrierStage::Write, Call::Write(bytes.len()))?;
         self.writes.push(bytes.to_vec());
         self.read_goal = match bytes.get(6).copied() {
+            Some(0x40)
+                if self
+                    .inbound
+                    .iter()
+                    .take(bytes.len())
+                    .copied()
+                    .eq(bytes.iter().copied()) =>
+            {
+                SEARCH_REQUEST_LEN + SEARCH_RESPONSE_LIMIT
+            }
             Some(0x40) => SEARCH_RESPONSE_LIMIT,
             Some(0x50) if bytes.get(9) == Some(&0) => DUMP0_RESPONSE_LEN,
             Some(0x50) if bytes.get(9) == Some(&1) => DUMP1_RESPONSE_LEN,
@@ -154,10 +166,15 @@ impl SerialBackend for FakeBackend {
                 .pop_front()
                 .unwrap_or(self.preexisting_input));
         }
+        let remaining = self.read_goal.saturating_sub(self.read_since_write);
+        if remaining == 0 {
+            return Ok(self.post_response_input);
+        }
         Ok(self
             .available_script
             .pop_front()
-            .unwrap_or(self.inbound.len()))
+            .unwrap_or(self.inbound.len())
+            .min(remaining))
     }
 
     fn wait_readable(&mut self, remaining: Duration) -> Result<bool, SystemFault> {
@@ -177,8 +194,8 @@ impl SerialBackend for FakeBackend {
             *slot = self.inbound.pop_front().expect("length checked");
         }
         self.read_since_write += count;
-        if self.read_since_write >= self.read_goal {
-            self.written = false;
+        if self.read_since_write > self.read_goal {
+            self.post_response_input = self.post_response_input.saturating_sub(count);
         }
         Ok(ReadProgress::Bytes(count))
     }
@@ -282,25 +299,39 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
     assert_eq!(identity.kind(), SearchOperationKind::Primary);
     assert_eq!(carrier.backend.inbound.len(), 0);
     assert_eq!(
-        carrier.backend.calls,
-        [
-            Call::Open,
-            Call::SnapshotTermios,
-            Call::SnapshotControlLines,
-            Call::BytesAvailable,
-            Call::Configure(115_200),
-            Call::BytesAvailable,
-            Call::Write(8),
-            Call::BytesAvailable,
-            Call::Read(26),
-            Call::BytesAvailable,
-            Call::RestoreTermios,
-            Call::VerifyTermiosRestore,
-            Call::RestoreControlLines,
-            Call::VerifyControlLinesRestore,
-            Call::Close,
-        ]
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::Write(8))
+            .count(),
+        1
     );
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::Read(1))
+            .count(),
+        SEARCH_RESPONSE_LIMIT
+    );
+    assert!(carrier.backend.calls.starts_with(&[
+        Call::Open,
+        Call::SnapshotTermios,
+        Call::SnapshotControlLines,
+        Call::BytesAvailable,
+        Call::Configure(115_200),
+        Call::BytesAvailable,
+        Call::Write(8),
+    ]));
+    assert!(carrier.backend.calls.ends_with(&[
+        Call::RestoreTermios,
+        Call::VerifyTermiosRestore,
+        Call::RestoreControlLines,
+        Call::VerifyControlLinesRestore,
+        Call::Close,
+    ]));
 
     let receipt = &carrier.receipts()[0];
     assert_eq!(receipt.attempt, SanitizedAttemptKind::Primary);
@@ -437,7 +468,7 @@ fn two_empty_timeouts_use_only_the_typed_fallback_and_close_twice() {
 #[test]
 fn partial_timeout_stops_without_fallback_and_keeps_only_a_digest() {
     let mut backend = FakeBackend::with_inbound(synthetic_response(0)[..5].iter().copied());
-    backend.available_script = [5, 0].into_iter().collect();
+    backend.available_script = (1..=5).rev().chain([0]).collect();
     let mut carrier = Carrier::new(binding(), backend);
 
     assert!(matches!(
@@ -463,7 +494,10 @@ fn one_exact_request_echo_is_removed_before_response_validation() {
     assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
     assert!(carrier.backend.inbound.is_empty());
     assert_eq!(carrier.receipts()[0].request_echo_bytes, SEARCH_REQUEST_LEN);
-    assert_eq!(carrier.receipts()[0].wire_bytes, SEARCH_WIRE_LIMIT);
+    assert_eq!(
+        carrier.receipts()[0].wire_bytes,
+        SEARCH_REQUEST_LEN + SEARCH_RESPONSE_LIMIT
+    );
     assert_eq!(carrier.receipts()[0].rx_bytes, SEARCH_RESPONSE_LIMIT);
     assert_eq!(
         carrier.receipts()[0].outcome,
@@ -477,8 +511,10 @@ fn chunked_request_echo_and_response_preserve_one_typed_identity() {
     let mut inbound = synthetic_search_request().to_vec();
     inbound.extend_from_slice(&response);
     let mut backend = FakeBackend::with_inbound(inbound);
-    backend.available_script = [SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, 0]
-        .into_iter()
+    backend.available_script = (1..=SEARCH_REQUEST_LEN)
+        .rev()
+        .chain((1..=SEARCH_RESPONSE_LIMIT).rev())
+        .chain([0])
         .collect();
     let mut carrier = Carrier::new(binding(), backend);
 
@@ -490,7 +526,7 @@ fn chunked_request_echo_and_response_preserve_one_typed_identity() {
 #[test]
 fn exact_request_echo_without_a_response_is_an_empty_timeout() {
     let mut backend = FakeBackend::with_inbound(synthetic_search_request());
-    backend.available_script = [SEARCH_REQUEST_LEN, 0].into_iter().collect();
+    backend.available_script = (1..=SEARCH_REQUEST_LEN).rev().chain([0]).collect();
     let mut carrier = Carrier::new(binding(), backend);
 
     assert!(matches!(
@@ -506,34 +542,37 @@ fn exact_request_echo_without_a_response_is_an_empty_timeout() {
 }
 
 #[test]
-fn input_above_one_echo_and_one_response_is_rejected_without_consuming() {
-    let backend = FakeBackend::with_inbound([0_u8; SEARCH_WIRE_LIMIT + 1]);
+fn a_partial_trailing_frame_is_rejected_after_bounded_consumption() {
+    let mut inbound = synthetic_response(0).to_vec();
+    inbound.push(0);
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.post_response_input = 1;
     let mut carrier = Carrier::new(binding(), backend);
 
     assert!(matches!(
         execute_search(&mut carrier, DeviceId::new(0).unwrap()),
         Err(SearchExecutionError::Transport {
-            source: DarwinCarrierError::Overflow {
-                received: 0,
-                queued,
-            },
+            source: DarwinCarrierError::UnexpectedTrailingFrame { received: 1 },
             ..
-        }) if queued == SEARCH_WIRE_LIMIT + 1
+        })
     ));
-    assert_eq!(carrier.backend.inbound.len(), SEARCH_WIRE_LIMIT + 1);
-    assert_eq!(carrier.receipts()[0].wire_bytes, 0);
-    assert_eq!(carrier.receipts()[0].overflow_received_bytes, 0);
-    assert_eq!(
-        carrier.receipts()[0].overflow_queued_bytes,
-        SEARCH_WIRE_LIMIT + 1
-    );
-    assert!(
-        !carrier
-            .backend
-            .calls
-            .iter()
-            .any(|call| matches!(call, Call::Read(_)))
-    );
+    assert!(carrier.backend.inbound.is_empty());
+    assert_eq!(carrier.receipts()[0].wire_bytes, SEARCH_RESPONSE_LIMIT + 1);
+    assert_eq!(carrier.receipts()[0].unexpected_trailing_bytes, 1);
+}
+
+#[test]
+fn one_exact_duplicate_response_is_consumed_and_reported() {
+    let response = synthetic_response(0);
+    let inbound = response.into_iter().chain(response).collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.post_response_input = SEARCH_RESPONSE_LIMIT;
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
+    assert!(carrier.backend.inbound.is_empty());
+    assert_eq!(carrier.receipts()[0].wire_bytes, SEARCH_RESPONSE_LIMIT * 2);
+    assert_eq!(carrier.receipts()[0].duplicate_response_count, 1);
 }
 
 #[test]
@@ -709,42 +748,22 @@ fn cleanup_readback_mismatch_is_terminal_and_never_reports_verified_restore() {
 }
 
 #[test]
-fn generated_read_partitions_never_cross_the_26_byte_ceiling() {
+fn framed_reader_consumes_one_byte_at_a_time_through_the_terminator() {
     let response = synthetic_response(0);
-    for maximum_chunk in 1..=SEARCH_RESPONSE_LIMIT {
-        let mut backend = FakeBackend::with_inbound(response);
-        let mut remaining = SEARCH_RESPONSE_LIMIT;
-        while remaining != 0 {
-            let chunk = remaining.min(maximum_chunk);
-            backend.available_script.push_back(chunk);
-            remaining -= chunk;
-        }
-        backend.available_script.push_back(0);
-        let mut carrier = Carrier::new(binding(), backend);
+    let backend = FakeBackend::with_inbound(response);
+    let mut carrier = Carrier::new(binding(), backend);
 
-        assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
-        let read_total: usize = carrier
-            .backend
-            .calls
-            .iter()
-            .filter_map(|call| match call {
-                Call::Read(count) => Some(*count),
-                _ => None,
-            })
-            .sum();
-        assert_eq!(read_total, SEARCH_RESPONSE_LIMIT);
-        assert!(
-            carrier
-                .backend
-                .calls
-                .iter()
-                .filter_map(|call| match call {
-                    Call::Read(count) => Some(*count),
-                    _ => None,
-                })
-                .all(|count| count <= maximum_chunk)
-        );
-    }
+    assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
+    let reads = carrier
+        .backend
+        .calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::Read(count) => Some(*count),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reads, vec![1; SEARCH_RESPONSE_LIMIT]);
 }
 
 #[test]

@@ -15,7 +15,7 @@ use std::{
 
 use dcx_core::{
     discovery::FALLBACK_BAUD,
-    protocol::{DirectParameterCommand, ProtocolError, RemoteModeCommand},
+    protocol::{DirectParameterCommand, MAX_FRAME_LEN, ProtocolError, RemoteModeCommand},
 };
 use dcx_transport::{
     SEARCH_ATTEMPT_TIMEOUT, SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, SearchOperation,
@@ -33,8 +33,6 @@ const PRIVATE_CALLOUT_PREFIX: &[u8] = b"/dev/cu.usbserial-";
 const SHA256_PREFIX: &str = "sha256/";
 /// Portion of the 500 ms whole-attempt budget reserved for restoration/close.
 pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
-/// One exact request-prefix echo plus one exact Search response.
-const SEARCH_WIRE_LIMIT: usize = SEARCH_REQUEST_LEN + SEARCH_RESPONSE_LIMIT;
 
 /// A lower-case, prefixed SHA-256 digest safe for sanitized receipts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -238,7 +236,7 @@ pub enum DarwinCarrierError {
     /// More bytes were queued than the exact response budget permits.
     #[error("typed response overflow: {received} received and {queued} additional queued")]
     Overflow {
-        /// Bytes already consumed within the 34-byte echo-plus-response bound.
+        /// Bytes already consumed within the bounded frame reader.
         received: usize,
         /// Bytes observed pending without consuming them.
         queued: usize,
@@ -247,6 +245,12 @@ pub enum DarwinCarrierError {
     #[error("tty reached EOF after {received} response bytes")]
     EndOfFile {
         /// Bytes received before EOF.
+        received: usize,
+    },
+    /// One trailing frame was partial or differed from the accepted response.
+    #[error("typed response had an unexpected trailing frame of {received} bytes")]
+    UnexpectedTrailingFrame {
+        /// Bytes consumed from the unexpected trailing candidate.
         received: usize,
     },
     /// The bounded result constructor rejected internal state.
@@ -285,9 +289,9 @@ impl DarwinCarrierError {
             Self::PreexistingInput { .. } => CarrierFailureKind::PreexistingInput,
             Self::Overflow { .. } => CarrierFailureKind::Overflow,
             Self::EndOfFile { .. } => CarrierFailureKind::EndOfFile,
-            Self::ReadInvariant(_) | Self::SnapshotReadInvariant(_) => {
-                CarrierFailureKind::ReadInvariant
-            }
+            Self::UnexpectedTrailingFrame { .. }
+            | Self::ReadInvariant(_)
+            | Self::SnapshotReadInvariant(_) => CarrierFailureKind::ReadInvariant,
         }
     }
 }
@@ -386,6 +390,10 @@ pub struct SanitizedAttemptReceipt {
     pub overflow_received_bytes: usize,
     /// Bytes left queued when overflow was detected, or zero for another outcome.
     pub overflow_queued_bytes: usize,
+    /// One exact duplicate response was consumed after the accepted response.
+    pub duplicate_response_count: usize,
+    /// Bytes consumed from a partial or different trailing frame.
+    pub unexpected_trailing_bytes: usize,
     /// Sanitized carrier result.
     pub outcome: SanitizedAttemptOutcome,
     /// Termios restoration result.
@@ -471,6 +479,8 @@ struct ReceiptBuilder {
     rx_hasher: Sha256,
     overflow_received_bytes: usize,
     overflow_queued_bytes: usize,
+    duplicate_response_count: usize,
+    unexpected_trailing_bytes: usize,
     termios_cleanup: CleanupDisposition,
     control_lines_cleanup: CleanupDisposition,
     closed: bool,
@@ -491,6 +501,8 @@ impl ReceiptBuilder {
             rx_hasher: Sha256::new(),
             overflow_received_bytes: 0,
             overflow_queued_bytes: 0,
+            duplicate_response_count: 0,
+            unexpected_trailing_bytes: 0,
             termios_cleanup: CleanupDisposition::NotRequired,
             control_lines_cleanup: CleanupDisposition::NotRequired,
             closed: false,
@@ -527,6 +539,8 @@ impl ReceiptBuilder {
             rx_digest: (self.rx_bytes != 0).then(|| Sha256Digest(self.rx_hasher.finalize().into())),
             overflow_received_bytes: self.overflow_received_bytes,
             overflow_queued_bytes: self.overflow_queued_bytes,
+            duplicate_response_count: self.duplicate_response_count,
+            unexpected_trailing_bytes: self.unexpected_trailing_bytes,
             outcome,
             termios_cleanup: self.termios_cleanup,
             control_lines_cleanup: self.control_lines_cleanup,
@@ -770,13 +784,6 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             )
         })();
         let elapsed = self.backend.monotonic_now().saturating_sub(start);
-        let result = if elapsed > operation.timeout() {
-            Err(DarwinCarrierError::Deadline {
-                stage: CarrierStage::Read,
-            })
-        } else {
-            result
-        };
         let outcome = classify_outcome(&result);
         (result, receipt.finish(elapsed, outcome))
     }
@@ -1084,25 +1091,76 @@ fn read_bounded<B: SerialBackend>(
     request: [u8; SEARCH_REQUEST_LEN],
     receipt: &mut ReceiptBuilder,
 ) -> Result<SearchRead, DarwinCarrierError> {
-    let mut wire = [0_u8; SEARCH_WIRE_LIMIT];
-    let mut wire_received = 0;
     debug_assert_eq!(limit, SEARCH_RESPONSE_LIMIT);
+    let first = read_one_frame(backend, deadline, receipt)?;
+    let response = match first {
+        FramedRead::TimedOut(partial) => {
+            receipt.received(&partial);
+            return SearchRead::timed_out(&partial).map_err(Into::into);
+        }
+        FramedRead::Complete(frame) if frame.as_slice() == request => {
+            receipt.request_echo_bytes = frame.len();
+            match read_one_frame(backend, deadline, receipt)? {
+                FramedRead::Complete(response) => response,
+                FramedRead::TimedOut(partial) => {
+                    receipt.received(&partial);
+                    return SearchRead::timed_out(&partial).map_err(Into::into);
+                }
+            }
+        }
+        FramedRead::Complete(response) => response,
+    };
 
+    let read = SearchRead::complete(&response)?;
+    receipt.received(&response);
+    ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+    let trailing = backend
+        .bytes_available()
+        .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+    if trailing == 0 {
+        return Ok(read);
+    }
+
+    match read_one_frame(backend, deadline, receipt)? {
+        FramedRead::Complete(duplicate) if duplicate == response => {
+            receipt.duplicate_response_count = 1;
+        }
+        FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
+            receipt.unexpected_trailing_bytes = other.len();
+            return Err(DarwinCarrierError::UnexpectedTrailingFrame {
+                received: other.len(),
+            });
+        }
+    }
+    ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+    let trailing = backend
+        .bytes_available()
+        .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+    if trailing != 0 {
+        return Err(receipt.overflow(response.len(), trailing));
+    }
+    Ok(read)
+}
+
+enum FramedRead {
+    Complete(Vec<u8>),
+    TimedOut(Vec<u8>),
+}
+
+fn read_one_frame<B: SerialBackend>(
+    backend: &mut B,
+    deadline: Duration,
+    receipt: &mut ReceiptBuilder,
+) -> Result<FramedRead, DarwinCarrierError> {
+    let mut frame = Vec::with_capacity(SEARCH_RESPONSE_LIMIT);
     loop {
         let time_left = remaining(backend, deadline);
         if time_left.is_zero() {
-            let response = search_response_candidate(&wire[..wire_received], request, receipt);
-            receipt.received(response);
-            return SearchRead::timed_out(response).map_err(Into::into);
+            return Ok(FramedRead::TimedOut(frame));
         }
-
         let queued = backend
             .bytes_available()
             .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-        if queued > SEARCH_WIRE_LIMIT - wire_received {
-            return Err(receipt.overflow(wire_received, queued));
-        }
-
         if queued == 0 {
             let time_left = remaining(backend, deadline);
             if time_left.is_zero()
@@ -1110,63 +1168,32 @@ fn read_bounded<B: SerialBackend>(
                     .wait_readable(time_left)
                     .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
             {
-                let response = search_response_candidate(&wire[..wire_received], request, receipt);
-                receipt.received(response);
-                return SearchRead::timed_out(response).map_err(Into::into);
+                return Ok(FramedRead::TimedOut(frame));
             }
             continue;
         }
-
-        let end = wire_received + queued;
+        if frame.len() == MAX_FRAME_LEN {
+            return Err(receipt.overflow(frame.len(), queued));
+        }
+        let mut byte = [0_u8; 1];
         match backend
-            .read_once(&mut wire[wire_received..end])
+            .read_once(&mut byte)
             .map_err(|fault| system_error(CarrierStage::Read, fault))?
         {
-            ReadProgress::Bytes(count) => {
-                if count == 0 || count > queued {
-                    return Err(DarwinCarrierError::EndOfFile {
-                        received: wire_received,
-                    });
-                }
-                wire_received += count;
-                receipt.wire_bytes = wire_received;
+            ReadProgress::Bytes(1) => {
+                frame.push(byte[0]);
+                receipt.wire_bytes += 1;
             }
-            ReadProgress::WouldBlock => continue,
-            ReadProgress::EndOfFile => {
+            ReadProgress::Bytes(_) | ReadProgress::EndOfFile => {
                 return Err(DarwinCarrierError::EndOfFile {
-                    received: wire_received,
+                    received: frame.len(),
                 });
             }
+            ReadProgress::WouldBlock => continue,
         }
-
-        let response = search_response_candidate(&wire[..wire_received], request, receipt);
-        if response.len() > limit {
-            return Err(receipt.overflow(response.len(), 0));
+        if byte[0] == 0xf7 {
+            return Ok(FramedRead::Complete(frame));
         }
-        if response.len() == limit {
-            receipt.received(response);
-            ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
-            let queued = backend
-                .bytes_available()
-                .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-            if queued != 0 {
-                return Err(receipt.overflow(response.len(), queued));
-            }
-            return SearchRead::complete(response).map_err(Into::into);
-        }
-    }
-}
-
-fn search_response_candidate<'a>(
-    wire: &'a [u8],
-    request: [u8; SEARCH_REQUEST_LEN],
-    receipt: &mut ReceiptBuilder,
-) -> &'a [u8] {
-    if let Some(response) = wire.strip_prefix(&request) {
-        receipt.request_echo_bytes = SEARCH_REQUEST_LEN;
-        response
-    } else {
-        wire
     }
 }
 
@@ -1257,7 +1284,9 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         Err(DarwinCarrierError::Overflow { .. }) => SanitizedAttemptOutcome::Overflow,
         Err(DarwinCarrierError::EndOfFile { .. }) => SanitizedAttemptOutcome::EndOfFile,
         Err(
-            DarwinCarrierError::ReadInvariant(_) | DarwinCarrierError::SnapshotReadInvariant(_),
+            DarwinCarrierError::UnexpectedTrailingFrame { .. }
+            | DarwinCarrierError::ReadInvariant(_)
+            | DarwinCarrierError::SnapshotReadInvariant(_),
         ) => SanitizedAttemptOutcome::ReadInvariant,
         Err(DarwinCarrierError::ProtocolEncoding(_)) => SanitizedAttemptOutcome::OperationRejected,
         Err(DarwinCarrierError::Cleanup { .. }) => SanitizedAttemptOutcome::CleanupFailed,
