@@ -1,4 +1,7 @@
 /target/
+/apple/.derived/
+/apple/.derived-provisioned/
+/apple/DCXLogic.xcodeproj/
 /bazel-*
 /.direnv/
 /.env

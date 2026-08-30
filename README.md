@@ -129,6 +129,7 @@ just bazel-check
 just live-package
 just apple-package-check
 just apple-bundle-check
+just apple-provisioned-bundle
 just product-check
 ```
 
@@ -145,6 +146,14 @@ The Swift package and unsigned arm64 helper/AUv3 bundle compile locally. That is
 build evidence only: signed PZM artifacts, `auval`, Logic discovery/insertion,
 named-device snapshot, live apply/readback/rollback, and audio flow remain
 separate runtime qualifications until their receipts exist.
+
+`just apple-provisioned-bundle` is the non-installing production carrier. It
+requires an accessible Apple Development identity plus matching profiles for
+`io.tinyland.dcx2496.logic` and `io.tinyland.dcx2496.logic.midi`, both granting
+App Group `QP994XQKNH.io.tinyland.dcx2496`. It verifies the nested signatures,
+team, entitlement split, and `aumi/DcxC/TnLd` metadata, but deliberately does
+not authorize provisioning updates, install or register the app, launch a GUI,
+or run `auval`.
 
 New work is licensed under either Apache-2.0 or MIT, at your option. See
 `NOTICE`, `LICENSE`, and `LICENSE-APACHE`.
