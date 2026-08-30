@@ -186,9 +186,10 @@ final class RawPlanStore: @unchecked Sendable {
                 try? handle.close()
                 throw error
             }
-            guard Darwin.link(temporary.path, destination.path) == 0 else {
-                if errno != EEXIST {
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            if Darwin.link(temporary.path, destination.path) != 0 {
+                let code = errno
+                if code != EEXIST {
+                    throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
                 }
             }
             guard Darwin.unlink(temporary.path) == 0 else {

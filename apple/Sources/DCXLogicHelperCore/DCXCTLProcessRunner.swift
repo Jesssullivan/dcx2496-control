@@ -80,7 +80,7 @@ final class DCXCTLProcessRunner: @unchecked Sendable {
             process.terminate()
             if completion.wait(timeout: .now() + .seconds(2)) == .timedOut {
                 _ = Darwin.kill(process.processIdentifier, SIGKILL)
-                _ = completion.wait()
+                completion.wait()
             }
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
