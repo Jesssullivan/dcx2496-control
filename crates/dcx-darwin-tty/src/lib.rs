@@ -376,10 +376,16 @@ pub struct SanitizedAttemptReceipt {
     pub tx_bytes: usize,
     /// Exact request-echo bytes consumed before the response, either zero or eight.
     pub request_echo_bytes: usize,
+    /// Total wire bytes consumed, including an exact matched request echo.
+    pub wire_bytes: usize,
     /// Accepted response bytes retained, never more than 26.
     pub rx_bytes: usize,
     /// Digest of the accepted response only, omitted for empty reads.
     pub rx_digest: Option<Sha256Digest>,
+    /// Consumed bytes reported by an overflow, or zero for another outcome.
+    pub overflow_received_bytes: usize,
+    /// Bytes left queued when overflow was detected, or zero for another outcome.
+    pub overflow_queued_bytes: usize,
     /// Sanitized carrier result.
     pub outcome: SanitizedAttemptOutcome,
     /// Termios restoration result.
@@ -460,8 +466,11 @@ struct ReceiptBuilder {
     cleanup_reserve_millis: u64,
     tx_bytes: usize,
     request_echo_bytes: usize,
+    wire_bytes: usize,
     rx_bytes: usize,
     rx_hasher: Sha256,
+    overflow_received_bytes: usize,
+    overflow_queued_bytes: usize,
     termios_cleanup: CleanupDisposition,
     control_lines_cleanup: CleanupDisposition,
     closed: bool,
@@ -477,8 +486,11 @@ impl ReceiptBuilder {
             cleanup_reserve_millis: duration_millis(SEARCH_CLEANUP_RESERVE),
             tx_bytes: 0,
             request_echo_bytes: 0,
+            wire_bytes: 0,
             rx_bytes: 0,
             rx_hasher: Sha256::new(),
+            overflow_received_bytes: 0,
+            overflow_queued_bytes: 0,
             termios_cleanup: CleanupDisposition::NotRequired,
             control_lines_cleanup: CleanupDisposition::NotRequired,
             closed: false,
@@ -488,6 +500,12 @@ impl ReceiptBuilder {
     fn received(&mut self, bytes: &[u8]) {
         self.rx_bytes += bytes.len();
         self.rx_hasher.update(bytes);
+    }
+
+    fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError {
+        self.overflow_received_bytes = received;
+        self.overflow_queued_bytes = queued;
+        DarwinCarrierError::Overflow { received, queued }
     }
 
     fn finish(
@@ -504,8 +522,11 @@ impl ReceiptBuilder {
             elapsed_micros: duration_micros_ceil(elapsed),
             tx_bytes: self.tx_bytes,
             request_echo_bytes: self.request_echo_bytes,
+            wire_bytes: self.wire_bytes,
             rx_bytes: self.rx_bytes,
             rx_digest: (self.rx_bytes != 0).then(|| Sha256Digest(self.rx_hasher.finalize().into())),
+            overflow_received_bytes: self.overflow_received_bytes,
+            overflow_queued_bytes: self.overflow_queued_bytes,
             outcome,
             termios_cleanup: self.termios_cleanup,
             control_lines_cleanup: self.control_lines_cleanup,
@@ -1079,10 +1100,7 @@ fn read_bounded<B: SerialBackend>(
             .bytes_available()
             .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
         if queued > SEARCH_WIRE_LIMIT - wire_received {
-            return Err(DarwinCarrierError::Overflow {
-                received: wire_received,
-                queued,
-            });
+            return Err(receipt.overflow(wire_received, queued));
         }
 
         if queued == 0 {
@@ -1111,6 +1129,7 @@ fn read_bounded<B: SerialBackend>(
                     });
                 }
                 wire_received += count;
+                receipt.wire_bytes = wire_received;
             }
             ReadProgress::WouldBlock => continue,
             ReadProgress::EndOfFile => {
@@ -1122,10 +1141,7 @@ fn read_bounded<B: SerialBackend>(
 
         let response = search_response_candidate(&wire[..wire_received], request, receipt);
         if response.len() > limit {
-            return Err(DarwinCarrierError::Overflow {
-                received: response.len(),
-                queued: 0,
-            });
+            return Err(receipt.overflow(response.len(), 0));
         }
         if response.len() == limit {
             receipt.received(response);
@@ -1134,10 +1150,7 @@ fn read_bounded<B: SerialBackend>(
                 .bytes_available()
                 .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
             if queued != 0 {
-                return Err(DarwinCarrierError::Overflow {
-                    received: response.len(),
-                    queued,
-                });
+                return Err(receipt.overflow(response.len(), queued));
             }
             return SearchRead::complete(response).map_err(Into::into);
         }

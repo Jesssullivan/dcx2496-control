@@ -463,6 +463,7 @@ fn one_exact_request_echo_is_removed_before_response_validation() {
     assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
     assert!(carrier.backend.inbound.is_empty());
     assert_eq!(carrier.receipts()[0].request_echo_bytes, SEARCH_REQUEST_LEN);
+    assert_eq!(carrier.receipts()[0].wire_bytes, SEARCH_WIRE_LIMIT);
     assert_eq!(carrier.receipts()[0].rx_bytes, SEARCH_RESPONSE_LIMIT);
     assert_eq!(
         carrier.receipts()[0].outcome,
@@ -520,6 +521,12 @@ fn input_above_one_echo_and_one_response_is_rejected_without_consuming() {
         }) if queued == SEARCH_WIRE_LIMIT + 1
     ));
     assert_eq!(carrier.backend.inbound.len(), SEARCH_WIRE_LIMIT + 1);
+    assert_eq!(carrier.receipts()[0].wire_bytes, 0);
+    assert_eq!(carrier.receipts()[0].overflow_received_bytes, 0);
+    assert_eq!(
+        carrier.receipts()[0].overflow_queued_bytes,
+        SEARCH_WIRE_LIMIT + 1
+    );
     assert!(
         !carrier
             .backend
@@ -754,6 +761,8 @@ fn binding_and_receipt_debug_output_never_expose_the_path_or_payload() {
     assert!(!json.contains(SYNTHETIC_PATH));
     assert!(!json.contains("SYNTHETIC-IDENTITY"));
     assert!(json.contains("rxDigest"));
+    assert!(json.contains("wireBytes"));
+    assert!(json.contains("overflowQueuedBytes"));
 }
 
 #[test]

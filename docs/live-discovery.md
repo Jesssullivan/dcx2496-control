@@ -39,7 +39,8 @@ Queued input blocks a write. Each operation has an exact request type, response
 ceiling, and deadline. The caller cannot choose frame bytes, remote-mode bytes,
 baud, serial format, retry count, or timeout, and no generic write surface or
 port enumeration exists. Raw callout paths and payloads stay out of diagnostic
-output.
+output. Sanitized Search receipts distinguish total consumed wire bytes from
+accepted response bytes and retain only overflow byte counts, never content.
 
 Offline `control diff` is available without a live feature. It validates one
 raw snapshot plus one strict desired profile and emits the immutable apply and
