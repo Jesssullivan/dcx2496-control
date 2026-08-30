@@ -5,7 +5,6 @@ import DCXControlAUCore
 import DCXLogicBridge
 import UniformTypeIdentifiers
 
-@objc(DCXControlViewController)
 public final class DCXControlViewController: AUViewController, AUAudioUnitFactory {
     private var dcxAudioUnit: DCXControlAudioUnit?
     private let statusLabel = NSTextField(labelWithString: "Project recall is staged; no helper contact has occurred.")
