@@ -18,8 +18,8 @@ use dcx_core::{
     protocol::{DirectParameterCommand, ProtocolError, RemoteModeCommand},
 };
 use dcx_transport::{
-    SEARCH_ATTEMPT_TIMEOUT, SEARCH_RESPONSE_LIMIT, SearchOperation, SearchOperationKind,
-    SearchRead, SearchReadEnd, SearchReadError, SearchTransport,
+    SEARCH_ATTEMPT_TIMEOUT, SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, SearchOperation,
+    SearchOperationKind, SearchRead, SearchReadEnd, SearchReadError, SearchTransport,
     snapshot::{
         PersistentApplySession, PersistentSnapshotSession, SnapshotOperation,
         SnapshotOperationKind, SnapshotRead, SnapshotReadError,
@@ -33,6 +33,8 @@ const PRIVATE_CALLOUT_PREFIX: &[u8] = b"/dev/cu.usbserial-";
 const SHA256_PREFIX: &str = "sha256/";
 /// Portion of the 500 ms whole-attempt budget reserved for restoration/close.
 pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
+/// One exact local request echo plus one exact Search response.
+const SEARCH_WIRE_LIMIT: usize = SEARCH_REQUEST_LEN + SEARCH_RESPONSE_LIMIT;
 
 /// A lower-case, prefixed SHA-256 digest safe for sanitized receipts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -236,7 +238,7 @@ pub enum DarwinCarrierError {
     /// More bytes were queued than the exact response budget permits.
     #[error("typed response overflow: {received} received and {queued} additional queued")]
     Overflow {
-        /// Bytes already consumed, always at most 26.
+        /// Bytes already consumed within the 34-byte echo-plus-response bound.
         received: usize,
         /// Bytes observed pending without consuming them.
         queued: usize,
@@ -322,7 +324,7 @@ pub enum SanitizedAttemptOutcome {
     ShortWrite,
     /// Input was already queued before any Search byte was transmitted.
     PreexistingInput,
-    /// Additional input was detected without crossing the 26-byte ceiling.
+    /// Input exceeded one exact optional request echo plus one response.
     Overflow,
     /// The tty reached EOF.
     EndOfFile,
@@ -372,7 +374,9 @@ pub struct SanitizedAttemptReceipt {
     pub elapsed_micros: u64,
     /// Bytes accepted by the sole write syscall.
     pub tx_bytes: usize,
-    /// Bytes consumed, never more than 26.
+    /// Exact request-echo bytes consumed before the response, either zero or eight.
+    pub request_echo_bytes: usize,
+    /// Response bytes consumed, never more than 26.
     pub rx_bytes: usize,
     /// Digest of consumed input, omitted for empty reads.
     pub rx_digest: Option<Sha256Digest>,
@@ -455,6 +459,7 @@ struct ReceiptBuilder {
     deadline_millis: u64,
     cleanup_reserve_millis: u64,
     tx_bytes: usize,
+    request_echo_bytes: usize,
     rx_bytes: usize,
     rx_hasher: Sha256,
     termios_cleanup: CleanupDisposition,
@@ -471,6 +476,7 @@ impl ReceiptBuilder {
             deadline_millis: duration_millis(operation.timeout()),
             cleanup_reserve_millis: duration_millis(SEARCH_CLEANUP_RESERVE),
             tx_bytes: 0,
+            request_echo_bytes: 0,
             rx_bytes: 0,
             rx_hasher: Sha256::new(),
             termios_cleanup: CleanupDisposition::NotRequired,
@@ -497,6 +503,7 @@ impl ReceiptBuilder {
             cleanup_reserve_millis: self.cleanup_reserve_millis,
             elapsed_micros: duration_micros_ceil(elapsed),
             tx_bytes: self.tx_bytes,
+            request_echo_bytes: self.request_echo_bytes,
             rx_bytes: self.rx_bytes,
             rx_digest: (self.rx_bytes != 0).then(|| Sha256Digest(self.rx_hasher.finalize().into())),
             outcome,
@@ -737,6 +744,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
                 &mut self.backend,
                 active_io_deadline,
                 operation.response_limit(),
+                operation.request().as_bytes(),
                 &mut receipt,
             )
         })();
@@ -929,6 +937,7 @@ fn run_attempt<B: SerialBackend>(
             backend,
             active_io_deadline,
             operation.response_limit(),
+            operation.request().as_bytes(),
             &mut receipt,
         )
     })();
@@ -1051,23 +1060,29 @@ fn read_bounded<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
     limit: usize,
+    request: &[u8; SEARCH_REQUEST_LEN],
     receipt: &mut ReceiptBuilder,
 ) -> Result<SearchRead, DarwinCarrierError> {
-    let mut bytes = [0_u8; SEARCH_RESPONSE_LIMIT];
-    let mut received = 0;
+    let mut wire = [0_u8; SEARCH_WIRE_LIMIT];
+    let mut wire_received = 0;
     debug_assert_eq!(limit, SEARCH_RESPONSE_LIMIT);
 
     loop {
         let time_left = remaining(backend, deadline);
         if time_left.is_zero() {
-            return SearchRead::timed_out(&bytes[..received]).map_err(Into::into);
+            let response = search_response_candidate(&wire[..wire_received], request, receipt);
+            receipt.received(response);
+            return SearchRead::timed_out(response).map_err(Into::into);
         }
 
         let queued = backend
             .bytes_available()
             .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-        if queued > limit - received {
-            return Err(DarwinCarrierError::Overflow { received, queued });
+        if queued > SEARCH_WIRE_LIMIT - wire_received {
+            return Err(DarwinCarrierError::Overflow {
+                received: wire_received,
+                queued,
+            });
         }
 
         if queued == 0 {
@@ -1077,39 +1092,69 @@ fn read_bounded<B: SerialBackend>(
                     .wait_readable(time_left)
                     .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
             {
-                return SearchRead::timed_out(&bytes[..received]).map_err(Into::into);
+                let response =
+                    search_response_candidate(&wire[..wire_received], request, receipt);
+                receipt.received(response);
+                return SearchRead::timed_out(response).map_err(Into::into);
             }
             continue;
         }
 
-        let end = received + queued;
+        let end = wire_received + queued;
         match backend
-            .read_once(&mut bytes[received..end])
+            .read_once(&mut wire[wire_received..end])
             .map_err(|fault| system_error(CarrierStage::Read, fault))?
         {
             ReadProgress::Bytes(count) => {
                 if count == 0 || count > queued {
-                    return Err(DarwinCarrierError::EndOfFile { received });
+                    return Err(DarwinCarrierError::EndOfFile {
+                        received: wire_received,
+                    });
                 }
-                receipt.received(&bytes[received..received + count]);
-                received += count;
+                wire_received += count;
             }
             ReadProgress::WouldBlock => continue,
             ReadProgress::EndOfFile => {
-                return Err(DarwinCarrierError::EndOfFile { received });
+                return Err(DarwinCarrierError::EndOfFile {
+                    received: wire_received,
+                });
             }
         }
 
-        if received == limit {
+        let response = search_response_candidate(&wire[..wire_received], request, receipt);
+        if response.len() > limit {
+            return Err(DarwinCarrierError::Overflow {
+                received: response.len(),
+                queued: 0,
+            });
+        }
+        if response.len() == limit {
+            receipt.received(response);
             ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
             let queued = backend
                 .bytes_available()
                 .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
             if queued != 0 {
-                return Err(DarwinCarrierError::Overflow { received, queued });
+                return Err(DarwinCarrierError::Overflow {
+                    received: response.len(),
+                    queued,
+                });
             }
-            return SearchRead::complete(&bytes).map_err(Into::into);
+            return SearchRead::complete(response).map_err(Into::into);
         }
+    }
+}
+
+fn search_response_candidate<'a>(
+    wire: &'a [u8],
+    request: &[u8; SEARCH_REQUEST_LEN],
+    receipt: &mut ReceiptBuilder,
+) -> &'a [u8] {
+    if let Some(response) = wire.strip_prefix(request) {
+        receipt.request_echo_bytes = SEARCH_REQUEST_LEN;
+        response
+    } else {
+        wire
     }
 }
 

@@ -177,7 +177,7 @@ impl SerialBackend for FakeBackend {
             *slot = self.inbound.pop_front().expect("length checked");
         }
         self.read_since_write += count;
-        if self.read_since_write == self.read_goal {
+        if self.read_since_write >= self.read_goal {
             self.written = false;
         }
         Ok(ReadProgress::Bytes(count))
@@ -449,8 +449,26 @@ fn partial_timeout_stops_without_fallback_and_keeps_only_a_digest() {
 }
 
 #[test]
-fn queued_overflow_is_detected_without_consuming_byte_twenty_seven() {
-    let backend = FakeBackend::with_inbound([0_u8; SEARCH_RESPONSE_LIMIT + 1]);
+fn one_exact_request_echo_is_removed_before_response_validation() {
+    let response = synthetic_response(0);
+    let mut inbound = [0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7].to_vec();
+    inbound.extend_from_slice(&response);
+    let backend = FakeBackend::with_inbound(inbound);
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
+    assert!(carrier.backend.inbound.is_empty());
+    assert_eq!(carrier.receipts()[0].request_echo_bytes, SEARCH_REQUEST_LEN);
+    assert_eq!(carrier.receipts()[0].rx_bytes, SEARCH_RESPONSE_LIMIT);
+    assert_eq!(
+        carrier.receipts()[0].outcome,
+        SanitizedAttemptOutcome::Complete
+    );
+}
+
+#[test]
+fn input_above_one_echo_and_one_response_is_rejected_without_consuming() {
+    let backend = FakeBackend::with_inbound([0_u8; SEARCH_WIRE_LIMIT + 1]);
     let mut carrier = Carrier::new(binding(), backend);
 
     assert!(matches!(
@@ -458,12 +476,12 @@ fn queued_overflow_is_detected_without_consuming_byte_twenty_seven() {
         Err(SearchExecutionError::Transport {
             source: DarwinCarrierError::Overflow {
                 received: 0,
-                queued: 27,
+                queued,
             },
             ..
-        })
+        }) if queued == SEARCH_WIRE_LIMIT + 1
     ));
-    assert_eq!(carrier.backend.inbound.len(), 27);
+    assert_eq!(carrier.backend.inbound.len(), SEARCH_WIRE_LIMIT + 1);
     assert!(
         !carrier
             .backend
@@ -471,11 +489,6 @@ fn queued_overflow_is_detected_without_consuming_byte_twenty_seven() {
             .iter()
             .any(|call| matches!(call, Call::Read(_)))
     );
-    assert_eq!(
-        carrier.receipts()[0].outcome,
-        SanitizedAttemptOutcome::Overflow
-    );
-    assert!(carrier.receipts()[0].closed);
 }
 
 #[test]

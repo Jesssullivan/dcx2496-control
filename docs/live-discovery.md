@@ -22,12 +22,15 @@ operation. Consuming finish restores and verifies the original state before
 close. Setup failure performs the same bounded cleanup; a failed restore is a
 failed operation.
 
-Search requires one exact 26-byte identity and nine more validated responses,
-each repeat preceded by at least five seconds. Snapshot and readback use the
-same ten-search identity sequence followed by typed transmit remote mode,
-Dump0, and Dump1. Apply and rollback accept only immutable plans produced from
-the exact O1/channel 5/PEQ9 desired profile, verify a fresh baseline, issue one
-reviewed direct-parameter command when needed, and attempt complete readback.
+Search accepts either one exact 26-byte identity or one byte-for-byte copy of
+the eight-byte Search immediately followed by that identity. The optional
+request echo is removed inside a 34-byte wire bound and recorded only as a byte
+count. Nine more validated responses follow, each preceded by at least five
+seconds. Snapshot and readback use the same ten-search identity sequence
+followed by typed transmit remote mode, Dump0, and Dump1. Apply and rollback
+accept only immutable plans produced from the exact O1/channel 5/PEQ9 desired
+profile, verify a fresh baseline, issue one reviewed direct-parameter command
+when needed, and attempt complete readback.
 
 Queued input blocks a write. Each operation has an exact request type, response
 ceiling, and deadline. The caller cannot choose frame bytes, remote-mode bytes,
