@@ -229,6 +229,10 @@ fn synthetic_response(device: u8) -> [u8; SEARCH_RESPONSE_LIMIT] {
     frame
 }
 
+const fn synthetic_search_request() -> [u8; SEARCH_REQUEST_LEN] {
+    [0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7]
+}
+
 fn synthetic_dump(device: u8, part: u8) -> Vec<u8> {
     let length = match part {
         0 => DUMP0_RESPONSE_LEN,
@@ -451,7 +455,7 @@ fn partial_timeout_stops_without_fallback_and_keeps_only_a_digest() {
 #[test]
 fn one_exact_request_echo_is_removed_before_response_validation() {
     let response = synthetic_response(0);
-    let mut inbound = [0xf0, 0x00, 0x20, 0x32, 0x20, 0x0e, 0x40, 0xf7].to_vec();
+    let mut inbound = synthetic_search_request().to_vec();
     inbound.extend_from_slice(&response);
     let backend = FakeBackend::with_inbound(inbound);
     let mut carrier = Carrier::new(binding(), backend);
@@ -463,6 +467,40 @@ fn one_exact_request_echo_is_removed_before_response_validation() {
     assert_eq!(
         carrier.receipts()[0].outcome,
         SanitizedAttemptOutcome::Complete
+    );
+}
+
+#[test]
+fn chunked_request_echo_and_response_preserve_one_typed_identity() {
+    let response = synthetic_response(0);
+    let mut inbound = synthetic_search_request().to_vec();
+    inbound.extend_from_slice(&response);
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.available_script = [SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, 0]
+        .into_iter()
+        .collect();
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
+    assert_eq!(carrier.receipts()[0].request_echo_bytes, SEARCH_REQUEST_LEN);
+    assert_eq!(carrier.receipts()[0].rx_bytes, SEARCH_RESPONSE_LIMIT);
+}
+
+#[test]
+fn exact_request_echo_without_a_response_is_an_empty_timeout() {
+    let mut backend = FakeBackend::with_inbound(synthetic_search_request());
+    backend.available_script = [SEARCH_REQUEST_LEN, 0].into_iter().collect();
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, DeviceId::new(0).unwrap()).unwrap(),
+        Known38400SearchOutcome::TimedOut
+    ));
+    assert_eq!(carrier.receipts()[0].request_echo_bytes, SEARCH_REQUEST_LEN);
+    assert_eq!(carrier.receipts()[0].rx_bytes, 0);
+    assert_eq!(
+        carrier.receipts()[0].outcome,
+        SanitizedAttemptOutcome::TimedOut
     );
 }
 

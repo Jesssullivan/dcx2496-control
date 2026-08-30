@@ -33,7 +33,7 @@ const PRIVATE_CALLOUT_PREFIX: &[u8] = b"/dev/cu.usbserial-";
 const SHA256_PREFIX: &str = "sha256/";
 /// Portion of the 500 ms whole-attempt budget reserved for restoration/close.
 pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
-/// One exact local request echo plus one exact Search response.
+/// One exact request-prefix echo plus one exact Search response.
 const SEARCH_WIRE_LIMIT: usize = SEARCH_REQUEST_LEN + SEARCH_RESPONSE_LIMIT;
 
 /// A lower-case, prefixed SHA-256 digest safe for sanitized receipts.
@@ -376,9 +376,9 @@ pub struct SanitizedAttemptReceipt {
     pub tx_bytes: usize,
     /// Exact request-echo bytes consumed before the response, either zero or eight.
     pub request_echo_bytes: usize,
-    /// Response bytes consumed, never more than 26.
+    /// Accepted response bytes retained, never more than 26.
     pub rx_bytes: usize,
-    /// Digest of consumed input, omitted for empty reads.
+    /// Digest of the accepted response only, omitted for empty reads.
     pub rx_digest: Option<Sha256Digest>,
     /// Sanitized carrier result.
     pub outcome: SanitizedAttemptOutcome,
@@ -1092,8 +1092,7 @@ fn read_bounded<B: SerialBackend>(
                     .wait_readable(time_left)
                     .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
             {
-                let response =
-                    search_response_candidate(&wire[..wire_received], request, receipt);
+                let response = search_response_candidate(&wire[..wire_received], request, receipt);
                 receipt.received(response);
                 return SearchRead::timed_out(response).map_err(Into::into);
             }

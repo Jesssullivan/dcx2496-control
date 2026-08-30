@@ -24,9 +24,9 @@ failed operation.
 
 Search accepts either one exact 26-byte identity or one byte-for-byte copy of
 the eight-byte Search immediately followed by that identity. The optional
-request echo is removed inside a 34-byte wire bound and recorded only as a byte
-count. Nine more validated responses follow, each preceded by at least five
-seconds. Snapshot and readback use the same ten-search identity sequence
+exact request-prefix echo is removed inside a 34-byte wire bound and recorded
+only as a byte count. Nine more validated responses follow, each preceded by at
+least five seconds. Snapshot and readback use the same ten-search identity sequence
 followed by typed transmit remote mode, Dump0, and Dump1. Apply and rollback
 accept only immutable plans produced from the exact O1/channel 5/PEQ9 desired
 profile, verify a fresh baseline, issue one reviewed direct-parameter command
