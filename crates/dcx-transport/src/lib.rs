@@ -259,8 +259,11 @@ pub enum SearchReadError {
 /// [`SearchOperation::request`], read at most
 /// [`SearchOperation::response_limit`] bytes, and return by
 /// [`SearchOperation::timeout`]. It must not enumerate ports, retry internally,
-/// issue another query type, or retain raw response bytes. The executor owns
-/// attempt ordering and fallback policy.
+/// issue another query type, or durably retain raw response bytes. A persistent
+/// session adapter may retain exactly one fixed-size accepted Search response
+/// only while its descriptor is open, solely to compare a possible late replay;
+/// it must never log, serialize, or expose that value. The executor owns attempt
+/// ordering and fallback policy.
 pub trait SearchTransport {
     /// Adapter-specific error. Errors always stop discovery without fallback.
     type Error: StdError + Send + Sync + 'static;

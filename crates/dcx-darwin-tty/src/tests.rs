@@ -53,6 +53,7 @@ struct FakeBackend {
     writes: Vec<Vec<u8>>,
     preexisting_input: usize,
     post_response_input: usize,
+    post_response_input_after_wait: Option<usize>,
     preexisting_script: VecDeque<usize>,
     termios_readback: FakeTermios,
     control_lines_readback: i32,
@@ -77,6 +78,7 @@ impl FakeBackend {
             writes: Vec::new(),
             preexisting_input: 0,
             post_response_input: 0,
+            post_response_input_after_wait: None,
             preexisting_script: VecDeque::new(),
             termios_readback: FakeTermios(8),
             control_lines_readback: 0x2496,
@@ -199,6 +201,9 @@ impl SerialBackend for FakeBackend {
         self.step(CarrierStage::WaitReadable, Call::WaitReadable)?;
         let (ready, advance) = self.wait_script.pop_front().unwrap_or((false, remaining));
         self.now += advance.min(remaining);
+        if ready && let Some(queued) = self.post_response_input_after_wait.take() {
+            self.post_response_input = queued;
+        }
         Ok(ready)
     }
 
@@ -698,6 +703,60 @@ fn one_exact_duplicate_response_is_consumed_and_reported() {
 }
 
 #[test]
+fn one_late_exact_duplicate_is_settled_inside_the_search_deadline() {
+    let response = synthetic_response(0);
+    let inbound = response.into_iter().chain(response).collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.post_response_input_after_wait = Some(SEARCH_RESPONSE_LIMIT);
+    backend.wait_script = [
+        (true, Duration::from_millis(10)),
+        (false, Duration::from_millis(465)),
+    ]
+    .into_iter()
+    .collect();
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
+    assert!(carrier.backend.inbound.is_empty());
+    assert_eq!(carrier.receipts()[0].wire_bytes, SEARCH_RESPONSE_LIMIT * 2);
+    assert_eq!(carrier.receipts()[0].duplicate_response_count, 1);
+    assert_eq!(carrier.receipts()[0].elapsed_micros, 475_000);
+}
+
+#[test]
+fn a_second_duplicate_inside_the_search_deadline_is_terminal() {
+    let response = synthetic_response(0);
+    let inbound = response
+        .into_iter()
+        .chain(response)
+        .chain(response)
+        .collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.post_response_input = SEARCH_RESPONSE_LIMIT * 2;
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(matches!(
+        execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+        Err(SearchExecutionError::Transport {
+            source: DarwinCarrierError::Overflow {
+                received: SEARCH_RESPONSE_LIMIT,
+                queued: SEARCH_RESPONSE_LIMIT,
+            },
+            ..
+        })
+    ));
+    assert_eq!(carrier.receipts()[0].duplicate_response_count, 1);
+    assert_eq!(
+        carrier.receipts()[0].overflow_received_bytes,
+        SEARCH_RESPONSE_LIMIT
+    );
+    assert_eq!(
+        carrier.receipts()[0].overflow_queued_bytes,
+        SEARCH_RESPONSE_LIMIT
+    );
+}
+
+#[test]
 fn a_short_write_is_never_retried_and_always_restores() {
     let mut backend = FakeBackend::with_inbound([]);
     backend.short_write = Some(7);
@@ -1039,6 +1098,105 @@ fn post_write_failure_taints_every_persistent_operation_until_consuming_cleanup(
 }
 
 #[test]
+fn persistent_carrier_reconciles_one_late_duplicate_before_the_next_search() {
+    let response = synthetic_response(0);
+    let backend = FakeBackend::with_inbound(response);
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let expected = DeviceId::new(0).unwrap();
+
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, expected).unwrap(),
+        Known38400SearchOutcome::Identified(_)
+    ));
+    carrier.backend.inbound.extend(response);
+    carrier.backend.inbound.extend(response);
+    carrier.backend.post_response_input = SEARCH_RESPONSE_LIMIT;
+
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, expected).unwrap(),
+        Known38400SearchOutcome::Identified(_)
+    ));
+    assert!(carrier.backend.inbound.is_empty());
+    assert_eq!(carrier.receipts().len(), 2);
+    assert_eq!(carrier.receipts()[1].duplicate_response_count, 1);
+    assert_eq!(carrier.receipts()[1].wire_bytes, SEARCH_RESPONSE_LIMIT * 2);
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::Write(SEARCH_REQUEST_LEN))
+            .count(),
+        2
+    );
+    carrier.finish().unwrap();
+}
+
+#[test]
+fn persistent_carrier_reconciles_the_final_search_duplicate_before_remote_mode() {
+    let response = synthetic_response(0);
+    let backend = FakeBackend::with_inbound(response);
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let expected = DeviceId::new(0).unwrap();
+
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, expected).unwrap(),
+        Known38400SearchOutcome::Identified(_)
+    ));
+    carrier.backend.inbound.extend(response);
+    carrier.backend.post_response_input = SEARCH_RESPONSE_LIMIT;
+
+    carrier
+        .write_remote_mode_command(RemoteModeCommand::new(expected, RemoteMode::Transmit))
+        .unwrap();
+    assert!(carrier.backend.inbound.is_empty());
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Write(_)))
+            .count(),
+        2
+    );
+    carrier.finish().unwrap();
+}
+
+#[test]
+fn persistent_carrier_rejects_surplus_late_search_input_before_remote_mode() {
+    let response = synthetic_response(0);
+    let backend = FakeBackend::with_inbound(response);
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let expected = DeviceId::new(0).unwrap();
+
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, expected).unwrap(),
+        Known38400SearchOutcome::Identified(_)
+    ));
+    carrier.backend.inbound.extend(response);
+    carrier.backend.inbound.extend(response);
+    carrier.backend.post_response_input = SEARCH_RESPONSE_LIMIT * 2;
+
+    assert!(matches!(
+        carrier.write_remote_mode_command(RemoteModeCommand::new(expected, RemoteMode::Transmit,)),
+        Err(DarwinCarrierError::Overflow {
+            received: SEARCH_RESPONSE_LIMIT,
+            queued: SEARCH_RESPONSE_LIMIT,
+        })
+    ));
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Write(_)))
+            .count(),
+        1
+    );
+    carrier.finish().unwrap();
+}
+
+#[test]
 fn persistent_carrier_reuses_one_open_for_initial_search_and_nine_repeats() {
     let response = synthetic_response(0);
     let inbound = (0..10).flat_map(|_| response).collect::<Vec<_>>();
@@ -1180,17 +1338,51 @@ fn snapshot_reader_strips_one_request_echo_and_one_exact_response_replay() {
     backend.read_goal = request.len() + response.len();
     backend.post_response_input = response.len();
 
-    let read = read_snapshot_bounded(
+    let bounded = read_snapshot_bounded(
         &mut backend,
         SNAPSHOT_OPERATION_TIMEOUT,
         SEARCH_RESPONSE_LIMIT,
         &request,
+        true,
     )
     .unwrap();
 
-    assert_eq!(read, SnapshotRead::complete(&response).unwrap());
+    assert_eq!(bounded.read, SnapshotRead::complete(&response).unwrap());
+    assert!(bounded.duplicate_consumed);
     assert!(backend.inbound.is_empty());
     assert_eq!(backend.post_response_input, 0);
+}
+
+#[test]
+fn snapshot_reader_settles_a_late_search_replay_before_returning() {
+    let request = synthetic_search_request();
+    let response = synthetic_response(0);
+    let inbound = response.into_iter().chain(response).collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.written = true;
+    backend.read_goal = response.len();
+    backend.post_response_input_after_wait = Some(response.len());
+    backend.wait_script = [
+        (true, Duration::from_millis(10)),
+        (false, Duration::from_millis(465)),
+    ]
+    .into_iter()
+    .collect();
+
+    let bounded = read_snapshot_bounded(
+        &mut backend,
+        SNAPSHOT_OPERATION_TIMEOUT,
+        SEARCH_RESPONSE_LIMIT,
+        &request,
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(bounded.read, SnapshotRead::complete(&response).unwrap());
+    assert!(bounded.duplicate_consumed);
+    assert!(backend.inbound.is_empty());
+    assert_eq!(backend.post_response_input, 0);
+    assert_eq!(backend.now, Duration::from_millis(475));
 }
 
 #[test]
