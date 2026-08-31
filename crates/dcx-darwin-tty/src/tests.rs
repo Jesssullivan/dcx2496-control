@@ -1,12 +1,14 @@
-use std::{collections::VecDeque, path::PathBuf, time::Duration};
+use std::{cell::RefCell, collections::VecDeque, path::PathBuf, rc::Rc, time::Duration};
 
 use dcx_core::{
     SnapshotSection,
-    protocol::{DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DeviceId},
+    protocol::{
+        DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DeviceId, DirectParameterAction, RemoteMode,
+    },
 };
 use dcx_transport::{
-    Known38400SearchOutcome, RepeatPacer, SearchExecutionError, SearchOperationKind, SearchOutcome,
-    execute_known_38400_search, execute_search,
+    Known38400SearchError, Known38400SearchOutcome, RepeatPacer, SearchExecutionError,
+    SearchOperationKind, SearchOutcome, execute_known_38400_search, execute_search,
     snapshot::{SNAPSHOT_OPERATION_TIMEOUT, execute_persistent_snapshot},
 };
 
@@ -24,6 +26,7 @@ enum Call {
     BytesAvailable,
     WaitReadable,
     Read(usize),
+    DiscardInput,
     RestoreTermios,
     VerifyTermiosRestore,
     RestoreControlLines,
@@ -53,6 +56,7 @@ struct FakeBackend {
     preexisting_script: VecDeque<usize>,
     termios_readback: FakeTermios,
     control_lines_readback: i32,
+    shared_calls: Option<Rc<RefCell<Vec<Call>>>>,
 }
 
 impl FakeBackend {
@@ -76,11 +80,24 @@ impl FakeBackend {
             preexisting_script: VecDeque::new(),
             termios_readback: FakeTermios(8),
             control_lines_readback: 0x2496,
+            shared_calls: None,
+        }
+    }
+
+    fn with_shared_calls(mut self, shared_calls: Rc<RefCell<Vec<Call>>>) -> Self {
+        self.shared_calls = Some(shared_calls);
+        self
+    }
+
+    fn record(&mut self, call: Call) {
+        self.calls.push(call);
+        if let Some(shared_calls) = &self.shared_calls {
+            shared_calls.borrow_mut().push(call);
         }
     }
 
     fn step(&mut self, stage: CarrierStage, call: Call) -> Result<(), SystemFault> {
-        self.calls.push(call);
+        self.record(call);
         if let Some((advance_stage, duration)) = self.advance_at
             && advance_stage == stage
         {
@@ -201,6 +218,19 @@ impl SerialBackend for FakeBackend {
         Ok(ReadProgress::Bytes(count))
     }
 
+    fn discard_input(&mut self) -> Result<(), SystemFault> {
+        self.step(CarrierStage::DiscardInput, Call::DiscardInput)?;
+        self.inbound.clear();
+        self.available_script.clear();
+        self.preexisting_script.clear();
+        self.preexisting_input = 0;
+        self.post_response_input = 0;
+        self.written = false;
+        self.read_since_write = 0;
+        self.read_goal = 0;
+        Ok(())
+    }
+
     fn restore_termios(&mut self, snapshot: &Self::TermiosSnapshot) -> Result<(), SystemFault> {
         assert_eq!(snapshot, &FakeTermios(8));
         self.step(CarrierStage::RestoreTermios, Call::RestoreTermios)
@@ -231,7 +261,7 @@ impl SerialBackend for FakeBackend {
     }
 
     fn close(&mut self) {
-        self.calls.push(Call::Close);
+        self.record(Call::Close);
         self.opened = false;
         self.written = false;
         self.read_since_write = 0;
@@ -354,7 +384,7 @@ fn primary_search_is_one_write_bounded_read_restore_and_close() {
 }
 
 #[test]
-fn preexisting_input_blocks_write_without_consuming_and_restores() {
+fn preexisting_input_blocks_write_then_discards_only_during_terminal_cleanup() {
     let mut backend = FakeBackend::with_inbound([]);
     backend.preexisting_input = 3;
     let mut carrier = Carrier::new(binding(), backend);
@@ -389,6 +419,35 @@ fn preexisting_input_blocks_write_without_consuming_and_restores() {
         receipt.control_lines_cleanup,
         CleanupDisposition::NotRequired
     );
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count(),
+        1
+    );
+    assert!(
+        carrier
+            .backend
+            .calls
+            .windows(2)
+            .any(|calls| calls == [Call::DiscardInput, Call::BytesAvailable])
+    );
+    let discard = carrier
+        .backend
+        .calls
+        .iter()
+        .position(|call| *call == Call::DiscardInput)
+        .unwrap();
+    let close = carrier
+        .backend
+        .calls
+        .iter()
+        .position(|call| *call == Call::Close)
+        .unwrap();
+    assert!(discard < close);
     assert!(receipt.closed);
 }
 
@@ -425,6 +484,59 @@ fn input_arriving_during_configuration_blocks_write_and_restores() {
         CleanupDisposition::VerifiedRestored
     );
     assert!(receipt.closed);
+}
+
+#[test]
+fn input_discard_is_one_call_one_readback_and_reserve_bounded() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.preexisting_input = 7;
+    assert_eq!(
+        recover_input_state(&mut backend, true),
+        CleanupDisposition::VerifiedRestored
+    );
+    assert_eq!(backend.calls, [Call::DiscardInput, Call::BytesAvailable]);
+
+    let mut expired = FakeBackend::with_inbound([]);
+    expired.preexisting_input = 7;
+    expired.advance_at = Some((CarrierStage::DiscardInput, SEARCH_CLEANUP_RESERVE));
+    assert_eq!(
+        recover_input_state(&mut expired, true),
+        CleanupDisposition::Failed
+    );
+    assert_eq!(expired.calls, [Call::DiscardInput]);
+}
+
+#[test]
+fn failed_input_discard_is_terminal_but_still_closes() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.preexisting_script = [0, 7].into_iter().collect();
+    backend.fail_at = Some(CarrierStage::DiscardInput);
+    let mut carrier = Carrier::new(binding(), backend);
+
+    assert!(matches!(
+        execute_search(&mut carrier, DeviceId::new(0).unwrap()),
+        Err(SearchExecutionError::Transport {
+            source: DarwinCarrierError::Cleanup {
+                primary: Some(CarrierFailureKind::PreexistingInput),
+                input_failed: true,
+                termios_failed: false,
+                control_lines_failed: false,
+            },
+            ..
+        })
+    ));
+    assert!(carrier.backend.calls.ends_with(&[
+        Call::DiscardInput,
+        Call::RestoreTermios,
+        Call::VerifyTermiosRestore,
+        Call::RestoreControlLines,
+        Call::VerifyControlLinesRestore,
+        Call::Close,
+    ]));
+    assert_eq!(
+        carrier.receipts()[0].outcome,
+        SanitizedAttemptOutcome::CleanupFailed
+    );
 }
 
 #[test]
@@ -560,6 +672,15 @@ fn a_partial_trailing_frame_is_rejected_after_bounded_consumption() {
     assert!(carrier.backend.inbound.is_empty());
     assert_eq!(carrier.receipts()[0].wire_bytes, SEARCH_RESPONSE_LIMIT + 1);
     assert_eq!(carrier.receipts()[0].unexpected_trailing_bytes, 1);
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -800,6 +921,121 @@ fn draining_sanitized_receipts_does_not_retain_a_duplicate() {
     execute_search(&mut carrier, DeviceId::new(0).unwrap()).unwrap();
     assert_eq!(carrier.take_receipts().len(), 1);
     assert!(carrier.receipts().is_empty());
+}
+
+#[test]
+fn persistent_open_discards_preexisting_input_after_rejection_and_preserves_primary_error() {
+    let shared_calls = Rc::new(RefCell::new(Vec::new()));
+    let mut backend = FakeBackend::with_inbound([]).with_shared_calls(Rc::clone(&shared_calls));
+    backend.preexisting_input = 7;
+
+    assert!(matches!(
+        PersistentCarrier::open(binding(), backend, FALLBACK_BAUD),
+        Err(DarwinCarrierError::PreexistingInput { queued: 7 })
+    ));
+
+    let calls = shared_calls.borrow();
+    assert_eq!(
+        calls.as_slice(),
+        [
+            Call::Open,
+            Call::SnapshotTermios,
+            Call::SnapshotControlLines,
+            Call::BytesAvailable,
+            Call::DiscardInput,
+            Call::BytesAvailable,
+            Call::Close,
+        ]
+    );
+    assert!(!calls.iter().any(|call| matches!(call, Call::Write(_))));
+}
+
+#[test]
+fn post_write_failure_taints_every_persistent_operation_until_consuming_cleanup() {
+    let shared_calls = Rc::new(RefCell::new(Vec::new()));
+    let mut backend = FakeBackend::with_inbound([]).with_shared_calls(Rc::clone(&shared_calls));
+    backend.short_write = Some(1);
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let expected = DeviceId::new(0).unwrap();
+
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, expected),
+        Err(Known38400SearchError::Transport {
+            source: DarwinCarrierError::ShortWrite {
+                written: 1,
+                expected: 8
+            },
+        })
+    ));
+    carrier.backend.short_write = None;
+    let calls_after_fault = shared_calls.borrow().len();
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, expected),
+        Err(Known38400SearchError::Transport {
+            source: DarwinCarrierError::InputRecoveryRequired,
+        })
+    ));
+    assert!(matches!(
+        carrier.write_remote_mode_command(RemoteModeCommand::new(
+            expected,
+            RemoteMode::ReceiveAndTransmit,
+        )),
+        Err(DarwinCarrierError::InputRecoveryRequired)
+    ));
+    let direct = DirectParameterCommand::new(
+        expected,
+        vec![DirectParameterAction::new(5, 0x3c, 40).unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        carrier.write_direct_command(&direct),
+        Err(DarwinCarrierError::InputRecoveryRequired)
+    ));
+    assert_eq!(shared_calls.borrow().len(), calls_after_fault);
+    assert_eq!(
+        shared_calls
+            .borrow()
+            .iter()
+            .filter(|call| matches!(call, Call::Write(_)))
+            .count(),
+        1
+    );
+
+    carrier.finish().unwrap();
+    let calls = shared_calls.borrow();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count(),
+        1
+    );
+    let discard = calls
+        .iter()
+        .position(|call| *call == Call::DiscardInput)
+        .unwrap();
+    let close = calls.iter().position(|call| *call == Call::Close).unwrap();
+    assert!(discard < close);
+
+    let snapshot_calls = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend::with_inbound([]).with_shared_calls(Rc::clone(&snapshot_calls));
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    carrier.input_discard_required = true;
+    let writes_before = snapshot_calls
+        .borrow()
+        .iter()
+        .filter(|call| matches!(call, Call::Write(_)))
+        .count();
+    let mut pacer = FastPacer::default();
+    assert!(execute_persistent_snapshot(carrier, &mut pacer, expected).is_err());
+    assert_eq!(
+        snapshot_calls
+            .borrow()
+            .iter()
+            .filter(|call| matches!(call, Call::Write(_)))
+            .count(),
+        writes_before
+    );
 }
 
 #[test]

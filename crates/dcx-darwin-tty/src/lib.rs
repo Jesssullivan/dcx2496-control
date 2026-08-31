@@ -22,7 +22,7 @@ use dcx_transport::{
     SearchOperationKind, SearchRead, SearchReadEnd, SearchReadError, SearchTransport,
     snapshot::{
         PersistentApplySession, PersistentSnapshotSession, SnapshotOperation,
-        SnapshotOperationKind, SnapshotRead, SnapshotReadError,
+        SnapshotOperationKind, SnapshotRead, SnapshotReadEnd, SnapshotReadError,
     },
 };
 use serde::{Serialize, Serializer};
@@ -153,6 +153,8 @@ pub enum CarrierStage {
     WaitReadable,
     /// Consume no more than the remaining response allowance.
     Read,
+    /// Discard queued input after the current operation has failed terminally.
+    DiscardInput,
     /// Restore the saved termios structure.
     RestoreTermios,
     /// Read termios back and compare every represented field with the snapshot.
@@ -202,6 +204,9 @@ pub enum DarwinCarrierError {
         /// Baud requested by the rejected typed operation.
         actual_baud: u32,
     },
+    /// An earlier queued/trailing-input failure made this session terminal.
+    #[error("tty session requires input cleanup and close before another operation")]
+    InputRecoveryRequired,
     /// Exact callout-path validation failed before any open.
     #[error(transparent)]
     Binding(#[from] BindingError),
@@ -230,7 +235,7 @@ pub enum DarwinCarrierError {
     /// Input was queued before configuration or a typed write.
     #[error("typed tty operation blocked because {queued} pre-existing input bytes were queued")]
     PreexistingInput {
-        /// Bytes observed without consuming or flushing them.
+        /// Bytes observed without consuming them during operation admission.
         queued: usize,
     },
     /// More bytes were queued than the exact response budget permits.
@@ -262,13 +267,15 @@ pub enum DarwinCarrierError {
     /// A checked typed command failed its final protocol encoding invariant.
     #[error("checked typed command failed to encode: {0}")]
     ProtocolEncoding(#[from] ProtocolError),
-    /// One or both mandatory restoration operations failed; close still ran.
+    /// Input cleanup or mandatory state restoration failed; close still ran.
     #[error(
-        "tty cleanup failed (primary={primary:?}, termios_failed={termios_failed}, control_lines_failed={control_lines_failed})"
+        "tty cleanup failed (primary={primary:?}, input_failed={input_failed}, termios_failed={termios_failed}, control_lines_failed={control_lines_failed})"
     )]
     Cleanup {
         /// Broad primary failure, if cleanup followed an earlier failure.
         primary: Option<CarrierFailureKind>,
+        /// Whether the one-shot input discard/readback cleanup failed.
+        input_failed: bool,
         /// Whether restoring termios failed.
         termios_failed: bool,
         /// Whether restoring modem control lines failed.
@@ -279,9 +286,9 @@ pub enum DarwinCarrierError {
 impl DarwinCarrierError {
     const fn kind(&self) -> CarrierFailureKind {
         match self {
-            Self::OperationMismatch { .. } | Self::ProtocolEncoding(_) => {
-                CarrierFailureKind::Operation
-            }
+            Self::OperationMismatch { .. }
+            | Self::InputRecoveryRequired
+            | Self::ProtocolEncoding(_) => CarrierFailureKind::Operation,
             Self::Binding(_) => CarrierFailureKind::Binding,
             Self::Deadline { .. } => CarrierFailureKind::Deadline,
             Self::System { .. } | Self::Cleanup { .. } => CarrierFailureKind::System,
@@ -456,6 +463,7 @@ trait SerialBackend {
     fn bytes_available(&mut self) -> Result<usize, SystemFault>;
     fn wait_readable(&mut self, remaining: Duration) -> Result<bool, SystemFault>;
     fn read_once(&mut self, bytes: &mut [u8]) -> Result<ReadProgress, SystemFault>;
+    fn discard_input(&mut self) -> Result<(), SystemFault>;
     fn restore_termios(&mut self, snapshot: &Self::TermiosSnapshot) -> Result<(), SystemFault>;
     fn verify_termios_restore(
         &mut self,
@@ -599,6 +607,7 @@ struct PersistentCarrier<B: SerialBackend> {
     started: Duration,
     termios_snapshot: B::TermiosSnapshot,
     control_lines_snapshot: i32,
+    input_discard_required: bool,
 }
 
 impl<B: SerialBackend> PersistentCarrier<B> {
@@ -645,6 +654,9 @@ impl<B: SerialBackend> PersistentCarrier<B> {
 
         if let Err(error) = setup {
             let primary = Some(error.kind());
+            let input_cleanup =
+                recover_input_state(&mut backend, opened && requires_input_discard(&error));
+            let input_failed = input_cleanup == CleanupDisposition::Failed;
             let mut termios_failed = false;
             let mut control_lines_failed = false;
             if configuration_attempted {
@@ -660,9 +672,10 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             if opened {
                 backend.close();
             }
-            if termios_failed || control_lines_failed {
+            if input_failed || termios_failed || control_lines_failed {
                 return Err(DarwinCarrierError::Cleanup {
                     primary,
+                    input_failed,
                     termios_failed,
                     control_lines_failed,
                 });
@@ -672,11 +685,13 @@ impl<B: SerialBackend> PersistentCarrier<B> {
 
         let termios_snapshot = termios_snapshot.ok_or(DarwinCarrierError::Cleanup {
             primary: Some(CarrierFailureKind::System),
+            input_failed: false,
             termios_failed: true,
             control_lines_failed: false,
         })?;
         let control_lines_snapshot = control_lines_snapshot.ok_or(DarwinCarrierError::Cleanup {
             primary: Some(CarrierFailureKind::System),
+            input_failed: false,
             termios_failed: false,
             control_lines_failed: true,
         })?;
@@ -690,6 +705,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             started,
             termios_snapshot,
             control_lines_snapshot,
+            input_discard_required: false,
         })
     }
 
@@ -701,7 +717,26 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         std::mem::take(&mut self.receipts)
     }
 
+    fn require_usable_input(&self) -> Result<(), DarwinCarrierError> {
+        if self.input_discard_required {
+            Err(DarwinCarrierError::InputRecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remember_input_uncertainty<T>(
+        &mut self,
+        result: &Result<T, DarwinCarrierError>,
+        post_write_uncertain: bool,
+    ) {
+        if post_write_uncertain || result.as_ref().is_err_and(requires_input_discard) {
+            self.input_discard_required = true;
+        }
+    }
+
     fn finish(mut self) -> Result<SanitizedSessionReceipt, DarwinCarrierError> {
+        let input_cleanup = recover_input_state(&mut self.backend, self.input_discard_required);
         let termios_cleanup = if self.backend.restore_termios(&self.termios_snapshot).is_ok()
             && self.backend.verify_termios_restore(&self.termios_snapshot) == Ok(true)
         {
@@ -734,11 +769,13 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             control_lines_cleanup,
             closed: true,
         };
-        if termios_cleanup == CleanupDisposition::Failed
+        if input_cleanup == CleanupDisposition::Failed
+            || termios_cleanup == CleanupDisposition::Failed
             || control_lines_cleanup == CleanupDisposition::Failed
         {
             return Err(DarwinCarrierError::Cleanup {
                 primary: None,
+                input_failed: input_cleanup == CleanupDisposition::Failed,
                 termios_failed: termios_cleanup == CleanupDisposition::Failed,
                 control_lines_failed: control_lines_cleanup == CleanupDisposition::Failed,
             });
@@ -750,7 +787,9 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         let start = self.backend.monotonic_now();
         let active_io_deadline = active_io_deadline(start, operation.timeout());
         let mut receipt = ReceiptBuilder::new(&self.binding, operation);
+        let mut write_attempted = false;
         let result = (|| {
+            self.require_usable_input()?;
             if operation.settings().baud() != self.baud {
                 return Err(DarwinCarrierError::OperationMismatch {
                     expected_baud: self.baud,
@@ -764,6 +803,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             )?;
             reject_preexisting_input(&mut self.backend, active_io_deadline)?;
             ensure_before_deadline(&mut self.backend, active_io_deadline, CarrierStage::Write)?;
+            write_attempted = true;
             let written = self
                 .backend
                 .write_once(operation.request().as_bytes())
@@ -783,6 +823,12 @@ impl<B: SerialBackend> PersistentCarrier<B> {
                 &mut receipt,
             )
         })();
+        let post_write_uncertain = write_attempted
+            && (result.is_err()
+                || result.as_ref().is_ok_and(|read| {
+                    read.end() == SearchReadEnd::TimedOut && read.received_len() != 0
+                }));
+        self.remember_input_uncertainty(&result, post_write_uncertain);
         let elapsed = self.backend.monotonic_now().saturating_sub(start);
         let outcome = classify_outcome(&result);
         (result, receipt.finish(elapsed, outcome))
@@ -792,12 +838,33 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         &mut self,
         operation: SnapshotOperation,
     ) -> Result<SnapshotRead, DarwinCarrierError> {
+        self.require_usable_input()?;
+        let mut write_attempted = false;
+        let result = self.run_snapshot_exchange_usable(operation, &mut write_attempted);
+        let terminal_timeout = result.as_ref().is_ok_and(|read| {
+            read.end() == SnapshotReadEnd::TimedOut
+                && (read.received_len() != 0
+                    || !matches!(operation.kind(), SnapshotOperationKind::Search { .. }))
+        });
+        self.remember_input_uncertainty(
+            &result,
+            write_attempted && (result.is_err() || terminal_timeout),
+        );
+        result
+    }
+
+    fn run_snapshot_exchange_usable(
+        &mut self,
+        operation: SnapshotOperation,
+        write_attempted: &mut bool,
+    ) -> Result<SnapshotRead, DarwinCarrierError> {
         let start = self.backend.monotonic_now();
         let deadline = active_io_deadline(start, operation.timeout());
         reject_preexisting_input(&mut self.backend, deadline)?;
         ensure_before_deadline(&mut self.backend, deadline, CarrierStage::Write)?;
         let request = operation.request();
         let expected = request.as_bytes().len();
+        *write_attempted = true;
         let written = self
             .backend
             .write_once(request.as_bytes())
@@ -808,13 +875,12 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. }) {
             self.attempt_count += 1;
         }
-        let read = read_snapshot_bounded(
+        read_snapshot_bounded(
             &mut self.backend,
             deadline,
             operation.response_limit(),
             request.as_bytes(),
-        )?;
-        Ok(read)
+        )
     }
 
     fn write_direct_command(
@@ -832,11 +898,24 @@ impl<B: SerialBackend> PersistentCarrier<B> {
     }
 
     fn write_typed_frame(&mut self, frame: &[u8]) -> Result<(), DarwinCarrierError> {
+        self.require_usable_input()?;
+        let mut write_attempted = false;
+        let result = self.write_typed_frame_usable(frame, &mut write_attempted);
+        self.remember_input_uncertainty(&result, write_attempted && result.is_err());
+        result
+    }
+
+    fn write_typed_frame_usable(
+        &mut self,
+        frame: &[u8],
+        write_attempted: &mut bool,
+    ) -> Result<(), DarwinCarrierError> {
         let start = self.backend.monotonic_now();
         let deadline = active_io_deadline(start, SEARCH_ATTEMPT_TIMEOUT);
         reject_preexisting_input(&mut self.backend, deadline)?;
         ensure_before_deadline(&mut self.backend, deadline, CarrierStage::Write)?;
         let expected = frame.len();
+        *write_attempted = true;
         let written = self
             .backend
             .write_once(frame)
@@ -971,6 +1050,9 @@ fn run_attempt<B: SerialBackend>(
     })();
 
     let primary_kind = primary.as_ref().err().map(DarwinCarrierError::kind);
+    let input_cleanup =
+        recover_input_state(backend, primary.as_ref().is_err_and(requires_input_discard));
+    let input_failed = input_cleanup == CleanupDisposition::Failed;
     let (termios_cleanup, control_lines_cleanup, termios_failed, control_lines_failed) =
         restore_attempt_state(
             backend,
@@ -986,10 +1068,11 @@ fn run_attempt<B: SerialBackend>(
         receipt.closed = true;
     }
 
-    let cleanup_failed = termios_failed || control_lines_failed;
+    let cleanup_failed = input_failed || termios_failed || control_lines_failed;
     let mut result = if cleanup_failed {
         Err(DarwinCarrierError::Cleanup {
             primary: primary_kind,
+            input_failed,
             termios_failed,
             control_lines_failed,
         })
@@ -1052,6 +1135,37 @@ fn restore_attempt_state<B: SerialBackend>(
 fn active_io_deadline(start: Duration, timeout: Duration) -> Duration {
     let whole = start.checked_add(timeout).unwrap_or(Duration::MAX);
     whole.saturating_sub(SEARCH_CLEANUP_RESERVE)
+}
+
+fn requires_input_discard(error: &DarwinCarrierError) -> bool {
+    matches!(
+        error,
+        DarwinCarrierError::PreexistingInput { .. }
+            | DarwinCarrierError::Overflow { .. }
+            | DarwinCarrierError::UnexpectedTrailingFrame { .. }
+    )
+}
+
+/// Perform one input-only discard and one empty-queue verification.
+///
+/// This is cleanup after a terminal operation failure, never operation recovery:
+/// callers either consume/close the session immediately or fail construction.
+/// The fixed call count and cleanup reserve keep the cleanup bounded.
+fn recover_input_state<B: SerialBackend>(backend: &mut B, required: bool) -> CleanupDisposition {
+    if !required {
+        return CleanupDisposition::NotRequired;
+    }
+    let started = backend.monotonic_now();
+    let deadline = started
+        .checked_add(SEARCH_CLEANUP_RESERVE)
+        .unwrap_or(Duration::MAX);
+    if backend.discard_input().is_err() || backend.monotonic_now() >= deadline {
+        return CleanupDisposition::Failed;
+    }
+    match backend.bytes_available() {
+        Ok(0) if backend.monotonic_now() < deadline => CleanupDisposition::VerifiedRestored,
+        Ok(_) | Err(_) => CleanupDisposition::Failed,
+    }
 }
 
 fn reject_preexisting_input<B: SerialBackend>(
@@ -1283,9 +1397,11 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
     match result {
         Ok(read) if read.end() == SearchReadEnd::Complete => SanitizedAttemptOutcome::Complete,
         Ok(_) => SanitizedAttemptOutcome::TimedOut,
-        Err(DarwinCarrierError::OperationMismatch { .. }) => {
-            SanitizedAttemptOutcome::OperationRejected
-        }
+        Err(
+            DarwinCarrierError::OperationMismatch { .. }
+            | DarwinCarrierError::InputRecoveryRequired
+            | DarwinCarrierError::ProtocolEncoding(_),
+        ) => SanitizedAttemptOutcome::OperationRejected,
         Err(DarwinCarrierError::Binding(_)) => SanitizedAttemptOutcome::BindingRejected,
         Err(DarwinCarrierError::System { .. }) => SanitizedAttemptOutcome::SystemError,
         Err(DarwinCarrierError::Deadline { .. }) => SanitizedAttemptOutcome::DeadlineExceeded,
@@ -1300,7 +1416,6 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
             | DarwinCarrierError::ReadInvariant(_)
             | DarwinCarrierError::SnapshotReadInvariant(_),
         ) => SanitizedAttemptOutcome::ReadInvariant,
-        Err(DarwinCarrierError::ProtocolEncoding(_)) => SanitizedAttemptOutcome::OperationRejected,
         Err(DarwinCarrierError::Cleanup { .. }) => SanitizedAttemptOutcome::CleanupFailed,
     }
 }
@@ -1410,7 +1525,7 @@ mod macos {
     use rustix::{
         fs::{self, FileType, Mode, OFlags},
         io::{self, Errno},
-        termios::{self, ControlModes, OptionalActions, SpecialCodeIndex, Termios},
+        termios::{self, ControlModes, OptionalActions, QueueSelector, SpecialCodeIndex, Termios},
     };
 
     use super::{ReadProgress, SerialBackend, SystemFault};
@@ -1545,6 +1660,10 @@ mod macos {
                 Err(Errno::AGAIN) => Ok(ReadProgress::WouldBlock),
                 Err(error) => Err(fault(error)),
             }
+        }
+
+        fn discard_input(&mut self) -> Result<(), SystemFault> {
+            termios::tcflush(self.fd()?, QueueSelector::IFlush).map_err(fault)
         }
 
         fn restore_termios(&mut self, snapshot: &Self::TermiosSnapshot) -> Result<(), SystemFault> {
