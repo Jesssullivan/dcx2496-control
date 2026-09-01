@@ -7,7 +7,10 @@ exports_files([
 
 filegroup(
     name = "swift_package_sources",
-    srcs = ["Package.swift"] + glob(["Sources/**/*.swift"]),
+    srcs = ["Package.swift"] + glob([
+        "Sources/**/*.swift",
+        "Tests/**/*.swift",
+    ]),
 )
 
 filegroup(

@@ -73,9 +73,12 @@ nix-check:
 live-package:
     nix build .#dcxctl-live --no-link
 
-# Compile the shared Swift bridge/helper/AU libraries without launching a GUI.
+# Compile and test the shared Swift bridge/helper/AU libraries without launching a GUI.
 apple-package-check:
-    swift build --package-path apple --jobs 1
+    xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"; \
+      /usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" \
+      "$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift" \
+      test --package-path apple --jobs 1
 
 # Parse the checked-in bridge schema without introducing another validator stack.
 schema-check:

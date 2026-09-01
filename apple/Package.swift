@@ -22,5 +22,9 @@ let package = Package(
             name: "DCXControlAUCore",
             dependencies: ["DCXLogicBridge"]
         ),
+        .testTarget(
+            name: "DCXControlAUCoreTests",
+            dependencies: ["DCXControlAUCore"]
+        ),
     ]
 )

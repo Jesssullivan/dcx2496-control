@@ -1,4 +1,5 @@
 import AudioToolbox
+import AVFoundation
 import DCXLogicBridge
 import Foundation
 
@@ -18,17 +19,32 @@ public final class DCXControlAudioUnit: AUAudioUnit {
         busType: .input,
         busses: []
     )
-    private lazy var emptyOutputBusses = AUAudioUnitBusArray(
-        audioUnit: self,
-        busType: .output,
-        busses: []
-    )
+    private var midiOutputBus: AUAudioUnitBus!
+    private var midiOutputBusses: AUAudioUnitBusArray!
 
     public override init(
         componentDescription: AudioComponentDescription,
         options: AudioComponentInstantiationOptions = []
     ) throws {
         try super.init(componentDescription: componentDescription, options: options)
+
+        guard let format = AVAudioFormat(
+            standardFormatWithSampleRate: 44_100,
+            channels: 2
+        ) else {
+            throw NSError(
+                domain: NSOSStatusErrorDomain,
+                code: Int(kAudioUnitErr_FailedInitialization),
+                userInfo: nil
+            )
+        }
+        midiOutputBus = try AUAudioUnitBus(format: format)
+        midiOutputBus.maximumChannelCount = 2
+        midiOutputBusses = AUAudioUnitBusArray(
+            audioUnit: self,
+            busType: .output,
+            busses: [midiOutputBus]
+        )
 
         let staged = AUParameterTree.createParameter(
             withIdentifier: "desiredStateStaged",
@@ -88,7 +104,7 @@ public final class DCXControlAudioUnit: AUAudioUnit {
     }
 
     public override var inputBusses: AUAudioUnitBusArray { emptyInputBusses }
-    public override var outputBusses: AUAudioUnitBusArray { emptyOutputBusses }
+    public override var outputBusses: AUAudioUnitBusArray { midiOutputBusses }
     public override var midiOutputNames: [String] { ["MIDI Thru"] }
 
     public override var fullState: [String: Any]? {
