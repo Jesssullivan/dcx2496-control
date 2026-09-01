@@ -1,6 +1,6 @@
 /target/
 /apple/.derived/
-/apple/.derived-team-development/
+/apple/.derived-team-signed/
 /apple/DCXLogic.xcodeproj/
 /bazel-*
 /.direnv/

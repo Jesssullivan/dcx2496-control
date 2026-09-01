@@ -195,15 +195,16 @@ apple-adhoc-bundle: apple-project-generate
     printf 'adhoc_bundle=ready\n'
 
 # Build the containing app unsigned, then sign the app, AUv3, and dcxctl with
-# one exact Apple Development identity from the fixed team. macOS team-prefixed
-# App Groups do not require embedded provisioning profiles.
+# one exact Apple Development or Developer ID Application identity from the
+# fixed team. macOS team-prefixed App Groups do not require embedded
+# provisioning profiles.
 #
 # Set DCX_CODESIGN_IDENTITY to one exact certificate SHA-1 or full identity
 # label when more than one valid team identity is visible. Set
 # DCX_CODESIGN_KEYCHAIN to restrict discovery and signing to one temporary
 # host-owned keychain. This recipe never imports credentials, installs/registers,
 # or launches a GUI.
-apple-team-development-bundle: apple-project-generate
+apple-team-signed-bundle: apple-project-generate
     #!/usr/bin/env bash
     set -euo pipefail
     team_id="QP994XQKNH"
@@ -220,8 +221,12 @@ apple-team-development-bundle: apple-project-generate
     team_signers="$(
       printf '%s\n' "$identity_lines" \
         | /usr/bin/awk -v team="$team_id" '
-            $0 ~ /"Apple Development:/ && index($0, "(" team ")") {
-              print $2
+            $0 ~ /"(Apple Development|Developer ID Application):/ && index($0, "(" team ")") {
+              hash = toupper($2)
+              label = $0
+              sub(/^[^"]*"/, "", label)
+              sub(/"[^"]*$/, "", label)
+              print hash "\t" label
             }
           '
     )"
@@ -233,34 +238,37 @@ apple-team-development-bundle: apple-project-generate
     )"
     if [[ -z "$requested_signer" ]]; then
       test "$team_signer_count" = 1
-      signer="$team_signers"
+      signer_record="$team_signers"
     else
-      signer="$(
-        printf '%s\n' "$identity_lines" \
-          | /usr/bin/awk -v requested="$requested_signer" -v team="$team_id" '
-              $0 ~ /"Apple Development:/ && index($0, "(" team ")") {
-                hash = toupper($2)
-                label = $0
-                sub(/^[^"]*"/, "", label)
-                sub(/"[^"]*$/, "", label)
-                if (toupper(requested) == hash || requested == label) {
-                  print hash
-                }
+      signer_record="$(
+        printf '%s\n' "$team_signers" \
+          | /usr/bin/awk -F '\t' -v requested="$requested_signer" '
+              toupper(requested) == $1 || requested == $2 {
+                print $0
               }
             '
       )"
+      signer_match_count="$(
+        printf '%s\n' "$signer_record" \
+          | /usr/bin/sed '/^$/d' \
+          | /usr/bin/wc -l \
+          | /usr/bin/tr -d ' '
+      )"
+      test "$signer_match_count" = 1
     fi
+    signer="${signer_record%%$'\t'*}"
+    signer_label="${signer_record#*$'\t'}"
     [[ "$signer" =~ ^[0-9A-F]{40}$ ]]
-    signer_matches="$(
-      printf '%s\n' "$team_signers" \
-        | /usr/bin/awk -v signer="$signer" '$0 == signer { count += 1 } END { print count + 0 }'
-    )"
-    test "$signer_matches" = 1
+    case "$signer_label" in
+      "Apple Development:"*|"Developer ID Application:"*) ;;
+      *) exit 1 ;;
+    esac
+    [[ "$signer_label" == *"($team_id)" ]]
     xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"
     xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"
     dcx_cargo_bin="$(command -v cargo)"
     dcx_rustc_bin="$(command -v rustc)"
-    derived_data="apple/.derived-team-development"
+    derived_data="apple/.derived-team-signed"
     archive_path="$derived_data/DCXLogicHelper.xcarchive"
     DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" \
       -project apple/DCXLogic.xcodeproj \
@@ -315,7 +323,12 @@ apple-team-development-bundle: apple-project-generate
       signature="$(/usr/bin/codesign -dvvv "$artifact" 2>&1)"
       observed_team="$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "TeamIdentifier" {print $2}')"
       test "$observed_team" = "$team_id"
-      printf '%s\n' "$signature" | /usr/bin/grep -q '^Authority=Apple Development:'
+      leaf_authority="$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "Authority" {print $2; exit}')"
+      case "$leaf_authority" in
+        "Apple Development:"*|"Developer ID Application:"*) ;;
+        *) exit 1 ;;
+      esac
+      test "$leaf_authority" = "$signer_label"
     done
     /usr/bin/codesign --verify --deep --strict --verbose=2 "$app"
     test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = io.tinyland.dcx2496.logic
@@ -359,7 +372,7 @@ apple-team-development-bundle: apple-project-generate
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:type' "$info")" = aumi
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:subtype' "$info")" = DcxC
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:manufacturer' "$info")" = TnLd
-    printf 'team_development_bundle=ready\n'
+    printf 'team_signed_bundle=ready\n'
 
 # Full product-source compile without signing, install, GUI launch, or hardware I/O.
 product-check: schema-check apple-bundle-check

@@ -154,7 +154,7 @@ just live-package
 just apple-package-check
 just apple-bundle-check
 just apple-adhoc-bundle
-just apple-team-development-bundle
+just apple-team-signed-bundle
 just product-check
 ```
 
@@ -182,16 +182,18 @@ entitlements that omit the production App Group and serial access. It does not
 qualify App Group access, helper IPC, installation, registration, Logic, or
 device behavior.
 
-`just apple-team-development-bundle` builds Release unsigned and then manually
-signs the bundled `dcxctl`, AUv3, and containing app from the inside out with
-one exact Apple Development identity from team `QP994XQKNH`. It uses the
-production entitlement split, including the team-prefixed macOS App Group
-`QP994XQKNH.io.tinyland.dcx2496` and helper-only serial access, while requiring
-that the app and extension contain no provisioning profiles. When multiple
-valid team identities are visible, set `DCX_CODESIGN_IDENTITY` to one exact
-certificate SHA-1 or full identity label; set `DCX_CODESIGN_KEYCHAIN` to bind
-discovery and signing to one host-owned temporary keychain. The recipe verifies
-arm64 binaries, nested signatures, team, authorities, exact entitlements, and
+`just apple-team-signed-bundle` builds Release unsigned and then manually signs
+the bundled `dcxctl`, AUv3, and containing app from the inside out with one exact
+Apple Development or Developer ID Application identity from team
+`QP994XQKNH`. It uses the production entitlement split, including the
+team-prefixed macOS App Group `QP994XQKNH.io.tinyland.dcx2496` and helper-only
+serial access, while requiring that the app and extension contain no
+provisioning profiles. Exactly one valid same-team identity must be visible by
+default. Set `DCX_CODESIGN_IDENTITY` to one exact certificate SHA-1 or full
+identity label to select among multiple valid identities; set
+`DCX_CODESIGN_KEYCHAIN` to bind discovery and signing to one host-owned
+temporary keychain. The recipe verifies arm64 binaries, nested signatures, the
+exact team and selected leaf authority, exact entitlements, and
 `aumi/DcxC/TnLd` metadata. It never reads or imports credentials and does not
 install or register the app, launch a GUI, or run `auval`.
 
