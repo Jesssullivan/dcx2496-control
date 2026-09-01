@@ -38,15 +38,10 @@ pub const SNAPSHOT_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PERSISTENT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(120);
 /// Whole stale-baseline-check plus typed-apply/readback budget.
 ///
-/// This includes the maximum twenty paced baseline Search attempts, the final
-/// replay-settle cadence, complete dumps, one typed mutation, and its complete
-/// readback with another final cadence.
+/// This includes the maximum twenty paced baseline Search attempts, complete
+/// dumps, one typed mutation, and its complete readback.
 pub const APPLY_TRANSACTION_BUDGET: Duration = Duration::from_secs(150);
 /// Whole identity-check plus typed-rollback/readback budget.
-///
-/// Both the pre-rollback identity and complete rollback readback retain one
-/// final device-cadence interval so a late exact Search replay is reconciled
-/// before the following write.
 pub const ROLLBACK_TRANSACTION_BUDGET: Duration = Duration::from_secs(20);
 /// Maximum encoded query length among Search, Dump0, and Dump1.
 pub const SNAPSHOT_REQUEST_LIMIT: usize = 11;
@@ -389,10 +384,10 @@ pub enum SnapshotCaptureError<
     E: StdError + Send + Sync + 'static,
     P: StdError + Send + Sync + 'static,
 > {
-    /// Pacing failed before a repeat Search or at the final settle boundary.
-    #[error("persistent Search cadence failed at boundary {trial}")]
+    /// Pacing failed before a repeat Search.
+    #[error("persistent Search cadence failed before trial {trial}")]
     Pacing {
-        /// One-based Search attempt or final-settle boundary number.
+        /// One-based Search attempt number.
         trial: usize,
         /// Pacer-specific cause.
         #[source]
@@ -490,13 +485,13 @@ pub enum SnapshotCaptureError<
 /// 38400 session.
 ///
 /// Search attempt one is immediate; every later attempt is preceded by the
-/// existing five-second device cadence. One final cadence interval is retained
-/// before remote mode so the carrier can reconcile a late exact replay at the
-/// next write boundary. Empty Search timeouts may be replayed until ten valid
-/// identities arrive or twenty attempts are exhausted. Every non-empty response
-/// must have its exact part-specific length and expected device address. The
-/// executor always calls [`PersistentSnapshotSession::finish`], including after
-/// an earlier failure, and returns a snapshot only when finish succeeds.
+/// existing five-second device cadence. Remote mode and Dump0 follow the final
+/// bounded Search settlement immediately. Empty Search timeouts may be replayed
+/// until ten valid identities arrive or twenty attempts are exhausted. Every
+/// non-empty response must have its exact part-specific length and expected
+/// device address. The executor always calls [`PersistentSnapshotSession::finish`],
+/// including after an earlier failure, and returns a snapshot only when finish
+/// succeeds.
 ///
 /// # Errors
 ///
@@ -632,13 +627,6 @@ fn capture_search_identities<S: PersistentSnapshotSession, P: RepeatPacer>(
                 }
                 valid += 1;
                 if valid == required {
-                    require_search_settle_budget::<S::Error, P>(pacer, started, budget, kind)?;
-                    pacer
-                        .wait(REPEAT_SEARCH_GAP)
-                        .map_err(|source| CaptureBodyError::Pacing {
-                            trial: attempt.saturating_add(1),
-                            source,
-                        })?;
                     require_budget::<S::Error, P>(pacer, started, budget, kind)?;
                     return identity_frame.ok_or(CaptureBodyError::SearchQualificationIncomplete {
                         valid,
@@ -673,20 +661,6 @@ fn require_budget<E: StdError + Send + Sync + 'static, P: RepeatPacer>(
 ) -> Result<(), CaptureBodyError<E, P::Error>> {
     let elapsed = pacer.elapsed().saturating_sub(started);
     if elapsed > budget.saturating_sub(operation_timeout(operation)) {
-        Err(CaptureBodyError::BudgetExceeded { operation })
-    } else {
-        Ok(())
-    }
-}
-
-fn require_search_settle_budget<E: StdError + Send + Sync + 'static, P: RepeatPacer>(
-    pacer: &mut P,
-    started: Duration,
-    budget: Duration,
-    operation: SnapshotOperationKind,
-) -> Result<(), CaptureBodyError<E, P::Error>> {
-    let elapsed = pacer.elapsed().saturating_sub(started);
-    if elapsed > budget.saturating_sub(REPEAT_SEARCH_GAP) {
         Err(CaptureBodyError::BudgetExceeded { operation })
     } else {
         Ok(())
@@ -1060,15 +1034,6 @@ pub fn execute_rollback_readback<S: PersistentApplySession, P: RepeatPacer>(
         })?;
         require_budget::<S::Error, P>(pacer, started, ROLLBACK_TRANSACTION_BUDGET, identity_kind)?;
         drop(exchange_validated::<S, P::Error>(&mut session, operation)?);
-        require_search_settle_budget::<S::Error, P>(
-            pacer,
-            started,
-            ROLLBACK_TRANSACTION_BUDGET,
-            identity_kind,
-        )?;
-        pacer
-            .wait(REPEAT_SEARCH_GAP)
-            .map_err(|source| CaptureBodyError::Pacing { trial: 2, source })?;
         require_budget::<S::Error, P>(pacer, started, ROLLBACK_TRANSACTION_BUDGET, identity_kind)
     })();
     if let Err(error) = identity_body {
@@ -1360,7 +1325,10 @@ mod tests {
         let dump1 = log.operations[PERSISTENT_SEARCH_COUNT + 1];
         assert_eq!(dump1.kind(), SnapshotOperationKind::Dump1);
         assert_eq!(dump1.response_limit(), DUMP1_RESPONSE_LEN);
-        assert_eq!(pacer.waits, [REPEAT_SEARCH_GAP; PERSISTENT_SEARCH_COUNT]);
+        assert_eq!(
+            pacer.waits,
+            [REPEAT_SEARCH_GAP; PERSISTENT_SEARCH_COUNT - 1]
+        );
     }
 
     #[test]
@@ -1386,7 +1354,7 @@ mod tests {
             log.operations[PERSISTENT_SEARCH_ATTEMPT_LIMIT].kind(),
             SnapshotOperationKind::Dump0
         );
-        assert_eq!(pacer.waits.len(), PERSISTENT_SEARCH_ATTEMPT_LIMIT);
+        assert_eq!(pacer.waits.len(), PERSISTENT_SEARCH_ATTEMPT_LIMIT - 1);
         assert_eq!(log.finishes, 1);
     }
 
@@ -1529,7 +1497,7 @@ mod tests {
             execute_rollback_readback(session, &mut rollback_pacer, &mut transaction).unwrap(),
             RollbackReadbackOutcome::RolledBack(_)
         ));
-        assert_eq!(rollback_pacer.waits, [REPEAT_SEARCH_GAP; 2]);
+        assert!(rollback_pacer.waits.is_empty());
         assert_eq!(transaction.state(), ApplyTransactionState::RolledBack);
         assert_eq!(rollback_log.borrow().writes.len(), 1);
         assert_eq!(rollback_log.borrow().writes[0].actions(), [inverse]);

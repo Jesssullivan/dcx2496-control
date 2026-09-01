@@ -33,12 +33,12 @@ byte-for-byte duplicate response. After each five-second device-cadence
 interval, the persistent carrier also reconciles all queued complete frames
 against the previous accepted Search response before the next write; it never
 counts those replays as new identities. The final valid Search retains one
-cadence interval before remote mode so the same reconciliation covers the
-Search-to-Dump boundary. Each frame remains bounded to 26 bytes and the whole
-operation remains bounded by its existing deadline; partial or different input
-is terminal. Qualification collects ten valid
-matching identities on the same descriptor and permits at most ten empty-timeout
-replays, for a hard ceiling of twenty Search attempts and 120 seconds. Every
+bounded settlement window, then remote mode and Dump0 follow immediately. The
+carrier still reconciles any already-queued exact replay at each write boundary.
+Each frame remains bounded to 26 bytes and the whole operation remains bounded
+by its existing deadline; partial or different input is terminal. Qualification
+collects ten valid matching identities on the same descriptor and permits at
+most ten empty-timeout replays, for a hard ceiling of twenty Search attempts and 120 seconds. Every
 attempt after the first is preceded by at least five seconds. Empty timeouts are
 counted; malformed, partial, or transport failures remain terminal. Snapshot
 and readback use the same ten-search identity sequence followed by the pinned
@@ -46,8 +46,8 @@ receive-and-transmit remote mode, Dump0, and Dump1. Apply and rollback
 accept only immutable plans produced from the exact O1/channel 5/PEQ9 desired
 profile, verify a fresh baseline, issue one reviewed direct-parameter command
 when needed, and attempt complete readback. The full apply envelope is 150
-seconds so the maximum qualified baseline path plus mutation readback cannot
-exhaust the budget merely because both required replay-settle cadences ran.
+seconds so the maximum qualified baseline path plus mutation readback remains
+bounded with room for complete cleanup.
 
 Unrecognized queued input blocks a write. Each operation has an exact request
 type, response ceiling, and deadline. The caller cannot choose frame bytes, remote-mode bytes,
