@@ -30,6 +30,11 @@ pub const PERSISTENT_SEARCH_ATTEMPT_LIMIT: usize =
     PERSISTENT_SEARCH_COUNT * SEARCH_ATTEMPTS_PER_REQUIRED_IDENTITY;
 /// Search count for post-mutation readback on the already-identified session.
 pub const READBACK_SEARCH_COUNT: usize = 1;
+/// Maximum Search attempts for post-mutation readback.
+///
+/// One empty timeout may be followed by one read-only Search replay. Partial,
+/// invalid, or transport-failed responses remain terminal.
+pub const READBACK_SEARCH_ATTEMPT_LIMIT: usize = READBACK_SEARCH_COUNT + 1;
 /// Per-Search deadline enforced by the platform session.
 pub const SNAPSHOT_OPERATION_TIMEOUT: Duration = Duration::from_millis(500);
 /// Dump deadline, sized for one maximum response plus one exact replay at 38400.
@@ -913,9 +918,10 @@ pub enum MutationPhase {
 /// The command is drawn only from the already-staged [`dcx_core::ApplyPlanV1`].
 /// Snapshot/profile mapping is out of this executor: no arbitrary bytes enter
 /// the transport. The complete ten-Search baseline check, typed write, and
-/// one-Search readback all use the same already-open descriptor. A stale
-/// baseline is rejected before mutation. Any post-mutation capture or close
-/// uncertainty moves the pure transaction to `RollbackRequired`.
+/// one-valid-Search readback all use the same already-open descriptor. That
+/// readback may replay one empty Search timeout without repeating the mutation.
+/// A stale baseline is rejected before mutation. Any post-mutation capture or
+/// close uncertainty moves the pure transaction to `RollbackRequired`.
 ///
 /// # Errors
 ///
@@ -987,7 +993,7 @@ pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
         pacer,
         expected_device,
         READBACK_SEARCH_COUNT,
-        READBACK_SEARCH_COUNT,
+        READBACK_SEARCH_ATTEMPT_LIMIT,
         started,
         APPLY_TRANSACTION_BUDGET,
     );
@@ -1018,9 +1024,10 @@ pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
 
 /// Verify identity, execute one typed inverse command, then read back.
 ///
-/// The pre-write identity, typed inverse, and one-Search complete readback all
-/// use the same already-open descriptor. No caller-controlled bytes enter the
-/// transport.
+/// The pre-write identity, typed inverse, and one-valid-Search complete readback
+/// all use the same already-open descriptor. That readback may replay one empty
+/// Search timeout without repeating the inverse. No caller-controlled bytes
+/// enter the transport.
 ///
 /// # Errors
 ///
@@ -1084,7 +1091,7 @@ pub fn execute_rollback_readback<S: PersistentApplySession, P: RepeatPacer>(
         pacer,
         device,
         READBACK_SEARCH_COUNT,
-        READBACK_SEARCH_COUNT,
+        READBACK_SEARCH_ATTEMPT_LIMIT,
         started,
         ROLLBACK_TRANSACTION_BUDGET,
     );
@@ -1595,6 +1602,94 @@ mod tests {
         assert_eq!(captured.valid_search_count(), READBACK_SEARCH_COUNT);
         assert_eq!(transaction.state(), ApplyTransactionState::Verified);
         assert_eq!(log.borrow().operations.len(), PERSISTENT_SEARCH_COUNT + 5);
+    }
+
+    #[test]
+    fn post_apply_readback_replays_one_empty_search_without_repeating_mutation() {
+        let baseline = snapshot(0, 0, 0);
+        let apply = DirectParameterAction::new(5, 0x3c, 40).unwrap();
+        let desired = baseline.project_direct_actions(&[apply]).unwrap();
+        let inverse = baseline.inverse_actions_for(&[apply]).unwrap();
+        let mut transaction =
+            ApplyTransactionV1::stage(baseline.clone(), desired.clone(), vec![apply], inverse)
+                .unwrap();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.push(Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
+        steps.extend(snapshot_steps(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+
+        let outcome = execute_apply_readback(session, &mut pacer, &mut transaction).unwrap();
+        let ApplyReadbackOutcome::Verified(captured) = outcome else {
+            panic!("read-only Search replay must preserve exact apply verification")
+        };
+
+        assert_eq!(captured.snapshot(), &desired);
+        assert_eq!(captured.valid_search_count(), READBACK_SEARCH_COUNT);
+        assert_eq!(transaction.state(), ApplyTransactionState::Verified);
+        let log = log.borrow();
+        assert_eq!(log.writes.len(), 1);
+        assert_eq!(log.writes[0].actions(), [apply]);
+        let readback_start = PERSISTENT_SEARCH_COUNT + 2;
+        assert_eq!(
+            log.operations[readback_start..]
+                .iter()
+                .map(|operation| operation.kind())
+                .collect::<Vec<_>>(),
+            [
+                SnapshotOperationKind::Search { sequence: 1 },
+                SnapshotOperationKind::Search { sequence: 2 },
+                SnapshotOperationKind::Dump0,
+                SnapshotOperationKind::Dump1,
+            ]
+        );
+        assert_eq!(pacer.waits.len(), PERSISTENT_SEARCH_COUNT);
+    }
+
+    #[test]
+    fn post_rollback_readback_replays_one_empty_search_without_repeating_inverse() {
+        let baseline = snapshot(0, 0, 0);
+        let apply = DirectParameterAction::new(5, 0x3c, 40).unwrap();
+        let inverse = DirectParameterAction::new(5, 0x3c, 0).unwrap();
+        let desired = baseline.project_direct_actions(&[apply]).unwrap();
+        let staged =
+            ApplyTransactionV1::stage(baseline.clone(), desired, vec![apply], vec![inverse])
+                .unwrap();
+        let rollback_plan = staged.rollback_plan().clone();
+        let mut transaction = ApplyTransactionV1::resume_rollback(&rollback_plan).unwrap();
+        let mut steps = vec![Step::Read(
+            SnapshotRead::complete(baseline.frame(SnapshotSection::Identity)).unwrap(),
+        )];
+        steps.push(Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
+        steps.extend(snapshot_steps(&baseline, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+
+        let outcome = execute_rollback_readback(session, &mut pacer, &mut transaction).unwrap();
+        let RollbackReadbackOutcome::RolledBack(captured) = outcome else {
+            panic!("read-only Search replay must preserve exact rollback verification")
+        };
+
+        assert_eq!(captured.snapshot(), &baseline);
+        assert_eq!(captured.valid_search_count(), READBACK_SEARCH_COUNT);
+        assert_eq!(transaction.state(), ApplyTransactionState::RolledBack);
+        let log = log.borrow();
+        assert_eq!(log.writes.len(), 1);
+        assert_eq!(log.writes[0].actions(), [inverse]);
+        assert_eq!(
+            log.operations
+                .iter()
+                .map(|operation| operation.kind())
+                .collect::<Vec<_>>(),
+            [
+                SnapshotOperationKind::Search { sequence: 1 },
+                SnapshotOperationKind::Search { sequence: 1 },
+                SnapshotOperationKind::Search { sequence: 2 },
+                SnapshotOperationKind::Dump0,
+                SnapshotOperationKind::Dump1,
+            ]
+        );
+        assert_eq!(pacer.waits, [REPEAT_SEARCH_GAP]);
     }
 
     #[test]

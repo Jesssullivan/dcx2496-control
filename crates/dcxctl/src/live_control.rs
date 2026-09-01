@@ -195,7 +195,7 @@ pub fn rollback(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Bo
                     "failure": "post_rollback_state_uncertain",
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
-                return Ok(());
+                return Err(io::Error::other("post_rollback_state_uncertain").into());
             }
             Err(error) => return Err(error.into()),
         };
