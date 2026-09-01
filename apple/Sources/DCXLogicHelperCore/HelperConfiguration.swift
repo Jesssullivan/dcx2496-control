@@ -61,13 +61,14 @@ public enum HelperFeature: String, CaseIterable, Hashable, Identifiable, Sendabl
 
 public struct HelperConfigurationV1: Codable, Equatable, Sendable {
     public static let schemaVersion = "dcx.helper-configuration/v1"
-    // The Rust live-control transaction owns a 120-second internal budget.
-    // Give it five seconds to start and report a bounded result before the
-    // helper terminates the child; the AU socket retains a separate margin.
-    public static let defaultChildTimeoutSeconds: UInt8 = 125
+    // Snapshot owns a 120-second Rust budget while Apply owns 150 seconds.
+    // The helper must leave either transaction five seconds to start and
+    // report its bounded result before terminating the child. The AU socket
+    // retains a separate ten-second framing margin over this maximum.
+    public static let defaultChildTimeoutSeconds: UInt8 = 155
     public static let minimumReadOnlyChildTimeoutSeconds: UInt8 = 125
-    public static let minimumMutationChildTimeoutSeconds: UInt8 = 125
-    public static let maximumChildTimeoutSeconds: UInt8 = 125
+    public static let minimumMutationChildTimeoutSeconds: UInt8 = 155
+    public static let maximumChildTimeoutSeconds: UInt8 = 155
 
     private static let maximumConfigurationBytes = 32 * 1024
 
@@ -153,14 +154,18 @@ public struct HelperConfigurationV1: Codable, Equatable, Sendable {
         }
         // Re-enter the checked initializer because Codable synthesis does not
         // execute it while decoding. Previously valid v1 timeouts are migrated
-        // in memory to the current 125-second transaction envelope; the next
-        // explicit save persists the normalized value without losing the target
-        // or enabled capabilities.
+        // in memory to the current operation envelope; the next explicit save
+        // persists the normalized value without losing the target or enabled
+        // capabilities. Mutation-enabled configurations written by the prior
+        // carrier used 125 seconds and must migrate to the 155-second Apply
+        // envelope rather than becoming unreadable after upgrade.
         try decoded.target.validate()
         let mutationEnabled = !Set(decoded.enabledOperations)
             .isDisjoint(with: BridgeOperation.mutationCapabilities)
         let legacyMinimum: UInt8 = mutationEnabled ? 90 : 60
-        let legacyTimeout = (legacyMinimum...120).contains(decoded.childTimeoutSeconds)
+        let legacyMaximum: UInt8 = mutationEnabled ? 125 : 120
+        let legacyTimeout = (legacyMinimum...legacyMaximum)
+            .contains(decoded.childTimeoutSeconds)
         return try Self(
             target: decoded.target,
             ttyPath: decoded.ttyPath,
