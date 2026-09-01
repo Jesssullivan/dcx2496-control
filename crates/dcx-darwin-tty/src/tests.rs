@@ -724,7 +724,7 @@ fn one_late_exact_duplicate_is_settled_inside_the_search_deadline() {
 }
 
 #[test]
-fn a_second_duplicate_inside_the_search_deadline_is_terminal() {
+fn multiple_duplicates_inside_the_search_deadline_are_consumed_and_reported() {
     let response = synthetic_response(0);
     let inbound = response
         .into_iter()
@@ -735,23 +735,36 @@ fn a_second_duplicate_inside_the_search_deadline_is_terminal() {
     backend.post_response_input = SEARCH_RESPONSE_LIMIT * 2;
     let mut carrier = Carrier::new(binding(), backend);
 
+    assert!(execute_search(&mut carrier, DeviceId::new(0).unwrap()).is_ok());
+    assert!(carrier.backend.inbound.is_empty());
+    assert_eq!(carrier.receipts()[0].wire_bytes, SEARCH_RESPONSE_LIMIT * 3);
+    assert_eq!(carrier.receipts()[0].duplicate_response_count, 2);
+}
+
+#[test]
+fn a_different_frame_after_an_exact_duplicate_remains_terminal() {
+    let response = synthetic_response(0);
+    let inbound = response
+        .into_iter()
+        .chain(response)
+        .chain(synthetic_response(1))
+        .collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.post_response_input = SEARCH_RESPONSE_LIMIT * 2;
+    let mut carrier = Carrier::new(binding(), backend);
+
     assert!(matches!(
         execute_search(&mut carrier, DeviceId::new(0).unwrap()),
         Err(SearchExecutionError::Transport {
-            source: DarwinCarrierError::Overflow {
+            source: DarwinCarrierError::UnexpectedTrailingFrame {
                 received: SEARCH_RESPONSE_LIMIT,
-                queued: SEARCH_RESPONSE_LIMIT,
             },
             ..
         })
     ));
     assert_eq!(carrier.receipts()[0].duplicate_response_count, 1);
     assert_eq!(
-        carrier.receipts()[0].overflow_received_bytes,
-        SEARCH_RESPONSE_LIMIT
-    );
-    assert_eq!(
-        carrier.receipts()[0].overflow_queued_bytes,
+        carrier.receipts()[0].unexpected_trailing_bytes,
         SEARCH_RESPONSE_LIMIT
     );
 }
@@ -1163,7 +1176,7 @@ fn persistent_carrier_reconciles_the_final_search_duplicate_before_remote_mode()
 }
 
 #[test]
-fn persistent_carrier_rejects_surplus_late_search_input_before_remote_mode() {
+fn persistent_carrier_reconciles_multiple_late_duplicates_before_remote_mode() {
     let response = synthetic_response(0);
     let backend = FakeBackend::with_inbound(response);
     let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
@@ -1177,13 +1190,10 @@ fn persistent_carrier_rejects_surplus_late_search_input_before_remote_mode() {
     carrier.backend.inbound.extend(response);
     carrier.backend.post_response_input = SEARCH_RESPONSE_LIMIT * 2;
 
-    assert!(matches!(
-        carrier.write_remote_mode_command(RemoteModeCommand::new(expected, RemoteMode::Transmit,)),
-        Err(DarwinCarrierError::Overflow {
-            received: SEARCH_RESPONSE_LIMIT,
-            queued: SEARCH_RESPONSE_LIMIT,
-        })
-    ));
+    carrier
+        .write_remote_mode_command(RemoteModeCommand::new(expected, RemoteMode::Transmit))
+        .unwrap();
+    assert!(carrier.backend.inbound.is_empty());
     assert_eq!(
         carrier
             .backend
@@ -1191,7 +1201,7 @@ fn persistent_carrier_rejects_surplus_late_search_input_before_remote_mode() {
             .iter()
             .filter(|call| matches!(call, Call::Write(_)))
             .count(),
-        1
+        2
     );
     carrier.finish().unwrap();
 }
@@ -1327,16 +1337,17 @@ fn persistent_snapshot_replays_one_empty_carrier_timeout() {
 }
 
 #[test]
-fn snapshot_reader_strips_one_request_echo_and_one_exact_response_replay() {
+fn snapshot_reader_strips_one_request_echo_and_exact_response_replays() {
     let request = synthetic_search_request();
     let response = synthetic_response(0);
     let mut inbound = request.to_vec();
     inbound.extend_from_slice(&response);
     inbound.extend_from_slice(&response);
+    inbound.extend_from_slice(&response);
     let mut backend = FakeBackend::with_inbound(inbound);
     backend.written = true;
     backend.read_goal = request.len() + response.len();
-    backend.post_response_input = response.len();
+    backend.post_response_input = response.len() * 2;
 
     let bounded = read_snapshot_bounded(
         &mut backend,
@@ -1348,7 +1359,6 @@ fn snapshot_reader_strips_one_request_echo_and_one_exact_response_replay() {
     .unwrap();
 
     assert_eq!(bounded.read, SnapshotRead::complete(&response).unwrap());
-    assert!(bounded.duplicate_consumed);
     assert!(backend.inbound.is_empty());
     assert_eq!(backend.post_response_input, 0);
 }
@@ -1379,7 +1389,6 @@ fn snapshot_reader_settles_a_late_search_replay_before_returning() {
     .unwrap();
 
     assert_eq!(bounded.read, SnapshotRead::complete(&response).unwrap());
-    assert!(bounded.duplicate_consumed);
     assert!(backend.inbound.is_empty());
     assert_eq!(backend.post_response_input, 0);
     assert_eq!(backend.now, Duration::from_millis(475));
