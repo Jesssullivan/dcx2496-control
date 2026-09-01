@@ -25,12 +25,14 @@ Logic AUv3 UI -> App Group socket -> foreground DCXLogicHelper
               -> exact bundled dcxctl -> RS-232 DCX2496
 ```
 
-The AUv3 is a control-only MIDI FX with no audio buses. Its render block passes
-MIDI through and performs no IPC, process launch, filesystem access, or serial
-work. Project recall stages desired state only. The foreground helper owns one
-single-flight child transaction and is the only Apple process that can execute
-the bundled `dcxctl`. The separate CoreMIDI Commands and Status endpoints have
-no device-control packet mapping in bridge v1.
+The AUv3 is a control-only MIDI FX with no audio input or audio DSP. It exposes
+one stable stereo output bus required by the host's MIDI-processor lifecycle;
+its render block passes MIDI through and performs no IPC, process launch,
+filesystem access, or serial work. Project recall stages desired state only.
+The foreground helper owns one single-flight child transaction and is the only
+Apple process that can execute the bundled `dcxctl`. The separate CoreMIDI
+Commands and Status endpoints have no device-control packet mapping in bridge
+v1.
 
 ## CLI
 
@@ -152,7 +154,7 @@ just live-package
 just apple-package-check
 just apple-bundle-check
 just apple-adhoc-bundle
-just apple-provisioned-bundle
+just apple-team-signed-bundle
 just product-check
 ```
 
@@ -180,13 +182,24 @@ entitlements that omit the production App Group and serial access. It does not
 qualify App Group access, helper IPC, installation, registration, Logic, or
 device behavior.
 
-`just apple-provisioned-bundle` is the non-installing production carrier. It
-requires an accessible Apple Development identity plus matching profiles for
-`io.tinyland.dcx2496.logic` and `io.tinyland.dcx2496.logic.midi`, both granting
-App Group `QP994XQKNH.io.tinyland.dcx2496`. It verifies the nested signatures,
-team, entitlement split, and `aumi/DcxC/TnLd` metadata, but deliberately does
-not authorize provisioning updates, install or register the app, launch a GUI,
-or run `auval`.
+`just apple-team-signed-bundle` builds Release unsigned and then manually signs
+the bundled `dcxctl`, AUv3, and containing app from the inside out with one exact
+Apple Development or Developer ID Application identity from team
+`QP994XQKNH`. It uses the production entitlement split, including the
+team-prefixed macOS App Group `QP994XQKNH.io.tinyland.dcx2496` and helper-only
+serial access, while requiring that the app and extension contain no
+provisioning profiles. Exactly one valid same-team identity must be visible by
+default. Set `DCX_CODESIGN_IDENTITY` to one exact certificate SHA-1 or full
+identity label to select among multiple valid identities; set
+`DCX_CODESIGN_KEYCHAIN` to bind discovery and signing to one host-owned
+temporary keychain. A noninteractive caller can additionally set
+`DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE` to a caller-owned password file; the
+recipe uses it only to unlock that selected keychain before discovery and again
+after the unsigned archive, immediately before signing. The recipe verifies
+arm64 binaries, nested signatures, the exact team and selected leaf authority,
+exact entitlements, and `aumi/DcxC/TnLd` metadata. It never imports the signing
+credential and does not install or register the app, launch a GUI, or run
+`auval`.
 
 New work is licensed under either Apache-2.0 or MIT, at your option. See
 `NOTICE`, `LICENSE`, and `LICENSE-APACHE`.

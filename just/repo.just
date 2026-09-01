@@ -194,31 +194,113 @@ apple-adhoc-bundle: apple-project-generate
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:manufacturer' "$info")" = TnLd
     printf 'adhoc_bundle=ready\n'
 
-# Build and verify the provisioned containing app, embedded AUv3, and dcxctl.
-# This does not authorize provisioning updates, install/register, or launch a GUI.
-apple-provisioned-bundle: apple-project-generate
+# Build the containing app unsigned, then sign the app, AUv3, and dcxctl with
+# one exact Apple Development or Developer ID Application identity from the
+# fixed team. macOS team-prefixed App Groups do not require embedded
+# provisioning profiles.
+#
+# Set DCX_CODESIGN_IDENTITY to one exact certificate SHA-1 or full identity
+# label when more than one valid team identity is visible. Set
+# DCX_CODESIGN_KEYCHAIN to restrict discovery and signing to one temporary
+# host-owned keychain. For a noninteractive file keychain, set
+# DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE to a caller-owned password file so the
+# recipe can restore the keychain's unlocked state after the unsigned archive.
+# This recipe never imports a signing credential, installs/registers, or
+# launches a GUI.
+apple-team-signed-bundle: apple-project-generate
     #!/usr/bin/env bash
     set -euo pipefail
     team_id="QP994XQKNH"
     app_group="QP994XQKNH.io.tinyland.dcx2496"
+    requested_signer="${DCX_CODESIGN_IDENTITY:-}"
+    keychain="${DCX_CODESIGN_KEYCHAIN:-}"
+    keychain_password_file="${DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE:-}"
+    unset DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE
+    security_args=(find-identity -v -p codesigning)
+    codesign_keychain_args=()
+    if [[ -n "$keychain" ]]; then
+      security_args+=("$keychain")
+      codesign_keychain_args=(--keychain "$keychain")
+    fi
+    if [[ -n "$keychain_password_file" ]]; then
+      test -n "$keychain"
+      test -r "$keychain_password_file"
+    fi
+    unlock_selected_keychain() {
+      if [[ -n "$keychain_password_file" ]]; then
+        local unlock_token
+        unlock_token="$(<"$keychain_password_file")"
+        test -n "$unlock_token"
+        /usr/bin/security unlock-keychain -p "$unlock_token" "$keychain"
+        unset unlock_token
+      fi
+    }
+    unlock_selected_keychain
+    identity_lines="$(/usr/bin/security "${security_args[@]}")"
+    team_signers="$(
+      printf '%s\n' "$identity_lines" \
+        | /usr/bin/awk -v team="$team_id" '
+            $0 ~ /"(Apple Development|Developer ID Application):/ && index($0, "(" team ")") {
+              hash = toupper($2)
+              label = $0
+              sub(/^[^"]*"/, "", label)
+              sub(/"[^"]*$/, "", label)
+              print hash "\t" label
+            }
+          '
+    )"
+    team_signer_count="$(
+      printf '%s\n' "$team_signers" \
+        | /usr/bin/sed '/^$/d' \
+        | /usr/bin/wc -l \
+        | /usr/bin/tr -d ' '
+    )"
+    if [[ -z "$requested_signer" ]]; then
+      test "$team_signer_count" = 1
+      signer_record="$team_signers"
+    else
+      signer_record="$(
+        printf '%s\n' "$team_signers" \
+          | /usr/bin/awk -F '\t' -v requested="$requested_signer" '
+              toupper(requested) == $1 || requested == $2 {
+                print $0
+              }
+            '
+      )"
+      signer_match_count="$(
+        printf '%s\n' "$signer_record" \
+          | /usr/bin/sed '/^$/d' \
+          | /usr/bin/wc -l \
+          | /usr/bin/tr -d ' '
+      )"
+      test "$signer_match_count" = 1
+    fi
+    signer="${signer_record%%$'\t'*}"
+    signer_label="${signer_record#*$'\t'}"
+    [[ "$signer" =~ ^[0-9A-F]{40}$ ]]
+    case "$signer_label" in
+      "Apple Development:"*|"Developer ID Application:"*) ;;
+      *) exit 1 ;;
+    esac
+    [[ "$signer_label" == *"($team_id)" ]]
     xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"
     xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"
     dcx_cargo_bin="$(command -v cargo)"
     dcx_rustc_bin="$(command -v rustc)"
-    derived_data="apple/.derived-provisioned"
+    derived_data="apple/.derived-team-signed"
+    archive_path="$derived_data/DCXLogicHelper.xcarchive"
     DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" \
       -project apple/DCXLogic.xcodeproj \
       -scheme DCXLogicHelper \
       -configuration Release \
       -destination 'generic/platform=macOS' \
       -derivedDataPath "$derived_data" \
+      -archivePath "$archive_path" \
       -jobs 1 \
       ARCHS=arm64 \
       ONLY_ACTIVE_ARCH=YES \
-      CODE_SIGNING_ALLOWED=YES \
-      CODE_SIGNING_REQUIRED=YES \
-      CODE_SIGN_STYLE=Automatic \
-      CODE_SIGN_IDENTITY="Apple Development" \
+      CODE_SIGNING_ALLOWED=NO \
+      CODE_SIGN_STYLE=Manual \
       DEVELOPMENT_TEAM="$team_id" \
       CC="$xcode_toolchain/clang" \
       CPLUSPLUS="$xcode_toolchain/clang++" \
@@ -226,14 +308,32 @@ apple-provisioned-bundle: apple-project-generate
       LDPLUSPLUS="$xcode_toolchain/clang++" \
       DCX_CARGO_BIN="$dcx_cargo_bin" \
       DCX_RUSTC_BIN="$dcx_rustc_bin" \
-      build
-    app="$derived_data/Build/Products/Release/DCXLogicHelper.app"
+      archive
+    unlock_selected_keychain
+    app="$archive_path/Products/Applications/DCXLogicHelper.app"
     au="$app/Contents/PlugIns/DCXControlAU.appex"
     child="$app/Contents/Helpers/dcxctl"
     app_binary="$app/Contents/MacOS/DCXLogicHelper"
     au_binary="$au/Contents/MacOS/DCXControlAU"
     test -d "$app"
     test -d "$au"
+    test ! -e "$app/Contents/embedded.provisionprofile"
+    test ! -e "$au/Contents/embedded.provisionprofile"
+    /usr/bin/codesign \
+      --force --sign "$signer" "${codesign_keychain_args[@]}" \
+      --options runtime --timestamp=none \
+      --entitlements apple/DCXLogicHelper/dcxctl.entitlements \
+      "$child"
+    /usr/bin/codesign \
+      --force --sign "$signer" "${codesign_keychain_args[@]}" \
+      --options runtime --timestamp=none \
+      --entitlements apple/DCXControlAU/DCXControlAU.entitlements \
+      "$au"
+    /usr/bin/codesign \
+      --force --sign "$signer" "${codesign_keychain_args[@]}" \
+      --options runtime --timestamp=none \
+      --entitlements apple/DCXLogicHelper/DCXLogicHelper.entitlements \
+      "$app"
     for binary in "$app_binary" "$au_binary" "$child"; do
       test -x "$binary"
       test "$(/usr/bin/lipo -archs "$binary")" = arm64
@@ -243,7 +343,12 @@ apple-provisioned-bundle: apple-project-generate
       signature="$(/usr/bin/codesign -dvvv "$artifact" 2>&1)"
       observed_team="$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "TeamIdentifier" {print $2}')"
       test "$observed_team" = "$team_id"
-      printf '%s\n' "$signature" | /usr/bin/grep -q '^Authority=Apple Development:'
+      leaf_authority="$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "Authority" {print $2; exit}')"
+      case "$leaf_authority" in
+        "Apple Development:"*|"Developer ID Application:"*) ;;
+        *) exit 1 ;;
+      esac
+      test "$leaf_authority" = "$signer_label"
     done
     /usr/bin/codesign --verify --deep --strict --verbose=2 "$app"
     test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = io.tinyland.dcx2496.logic
@@ -256,45 +361,38 @@ apple-provisioned-bundle: apple-project-generate
     au_entitlements="$(extract_entitlements_json "$au")"
     child_entitlements="$(extract_entitlements_json "$child")"
     printf '%s' "$app_entitlements" | /usr/bin/jq -e --arg group "$app_group" '
+      (keys | sort) == ([
+        "com.apple.security.app-sandbox",
+        "com.apple.security.application-groups",
+        "com.apple.security.device.serial"
+      ] | sort) and
       ."com.apple.security.app-sandbox" == true and
       ."com.apple.security.device.serial" == true and
       ."com.apple.security.application-groups" == [$group]
     ' >/dev/null
     printf '%s' "$au_entitlements" | /usr/bin/jq -e --arg group "$app_group" '
+      (keys | sort) == ([
+        "com.apple.security.app-sandbox",
+        "com.apple.security.application-groups",
+        "com.apple.security.files.user-selected.read-only"
+      ] | sort) and
       ."com.apple.security.app-sandbox" == true and
       ."com.apple.security.application-groups" == [$group] and
-      (has("com.apple.security.device.serial") | not)
+      ."com.apple.security.files.user-selected.read-only" == true
     ' >/dev/null
     printf '%s' "$child_entitlements" | /usr/bin/jq -e '
+      (keys | sort) == ([
+        "com.apple.security.app-sandbox",
+        "com.apple.security.inherit"
+      ] | sort) and
       ."com.apple.security.app-sandbox" == true and
       ."com.apple.security.inherit" == true
     ' >/dev/null
-    verify_profile() {
-      local profile="$1" expected_identifier="$2" decoded entitlements_json
-      test -f "$profile"
-      decoded="$(/usr/bin/security cms -D -i "$profile")"
-      entitlements_json="$(
-        printf '%s' "$decoded" \
-          | /usr/bin/plutil -extract Entitlements xml1 -o - - \
-          | /usr/bin/plutil -convert json -o - -
-      )"
-      printf '%s' "$entitlements_json" | /usr/bin/jq -e \
-        --arg team "$team_id" \
-        --arg identifier "$expected_identifier" \
-        --arg group "$app_group" '
-          .["com.apple.application-identifier"] == ($team + "." + $identifier) and
-          .["com.apple.developer.team-identifier"] == $team and
-          ([.["com.apple.security.application-groups"][]?
-            | select(. == $group or . == ($team + ".*"))] | length > 0)
-        ' >/dev/null
-    }
-    verify_profile "$app/Contents/embedded.provisionprofile" io.tinyland.dcx2496.logic
-    verify_profile "$au/Contents/embedded.provisionprofile" io.tinyland.dcx2496.logic.midi
     info="$au/Contents/Info.plist"
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:type' "$info")" = aumi
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:subtype' "$info")" = DcxC
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:manufacturer' "$info")" = TnLd
-    printf 'provisioned_bundle=ready\n'
+    printf 'team_signed_bundle=ready\n'
 
 # Full product-source compile without signing, install, GUI launch, or hardware I/O.
 product-check: schema-check apple-bundle-check

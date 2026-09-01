@@ -96,8 +96,21 @@ On the aarch64 Darwin builder:
 ```sh
 just live-package
 just product-check
+just apple-team-signed-bundle
 ```
 
 The live package uses the canonical `live-control` feature. Rust tests use
 injected transports, the Apple product check is unsigned, and neither command
 opens a serial device or launches a GUI.
+
+The team-signed Apple carrier is also non-installing and device-free. It builds
+Release unsigned, then signs the child, AUv3, and containing app inside-out with
+one exact team `QP994XQKNH` Apple Development or Developer ID Application
+identity. It retains the production App Group and helper serial entitlements,
+requires no embedded provisioning profile, and accepts an optional host-owned
+temporary keychain through `DCX_CODESIGN_KEYCHAIN`. A noninteractive caller may
+provide its caller-owned unlock file through
+`DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE`; the recipe re-unlocks only that selected
+keychain after the unsigned archive and before signing. The AU remains a
+control-only MIDI FX: its single stable stereo output bus satisfies the host
+lifecycle but performs no audio DSP and accepts no audio input.
