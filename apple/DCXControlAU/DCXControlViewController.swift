@@ -7,7 +7,8 @@ import UniformTypeIdentifiers
 
 public final class DCXControlViewController: AUViewController, AUAudioUnitFactory {
     private var dcxAudioUnit: DCXControlAudioUnit?
-    private let statusLabel = NSTextField(labelWithString: "Project recall is staged; no helper contact has occurred.")
+    private var stateObservation: NSKeyValueObservation?
+    private let statusLabel = NSTextField(labelWithString: "No desired profile is staged; helper contact requires an explicit action.")
     private let identityLabel = NSTextField(labelWithString: "Device: not identified")
     private let currentLabel = NSTextField(labelWithString: "Current: not captured")
     private let desiredLabel = NSTextField(labelWithString: "Desired: not staged")
@@ -112,6 +113,16 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     ) throws -> AUAudioUnit {
         let audioUnit = try DCXControlAudioUnit(componentDescription: componentDescription)
         dcxAudioUnit = audioUnit
+        stateObservation?.invalidate()
+        stateObservation = audioUnit.observe(\.allParameterValues, options: [.initial, .new]) {
+            [weak self, weak audioUnit] observed, _ in
+            DispatchQueue.main.async {
+                guard let self, let audioUnit,
+                      self.dcxAudioUnit === audioUnit,
+                      observed === audioUnit else { return }
+                self.refreshLabels()
+            }
+        }
         return audioUnit
     }
 
@@ -145,9 +156,11 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                status.recovery == nil,
                let completion = status.completion,
                dcxAudioUnit?.controlState.view().recoveryActive == true {
-                if let controlState = dcxAudioUnit?.controlState {
+                if let audioUnit = dcxAudioUnit {
                     do {
-                        try controlState.acceptRecoveryCompletion(completion)
+                        try audioUnit.performControlStateMutation {
+                            try $0.acceptRecoveryCompletion(completion)
+                        }
                         acceptedCompletion = true
                     } catch {
                         rejectedCompletion = true
@@ -232,7 +245,9 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 try profile.validate()
                 let staged = StagedProjectStateV1(target: target, desired: profile)
                 try staged.validate()
-                try self?.dcxAudioUnit?.controlState.stage(staged)
+                try self?.dcxAudioUnit?.performControlStateMutation {
+                    try $0.stage(staged)
+                }
                 self?.report("Desired profile staged in Logic project state; no device call occurred")
                 self?.refreshLabels()
             } catch DCXControlStateError.recoveryInProgress {
@@ -258,10 +273,12 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                         report("Staged target changed while snapshot capture was in progress")
                         return
                     }
-                    try dcxAudioUnit?.controlState.accept(
-                        snapshot: result.snapshot,
-                        validSearchResponses: 10
-                    )
+                    try dcxAudioUnit?.performControlStateMutation {
+                        try $0.accept(
+                            snapshot: result.snapshot,
+                            validSearchResponses: 10
+                        )
+                    }
                     report("Complete snapshot captured and bound to the staged profile")
                     refreshLabels()
                 } else {
@@ -291,7 +308,9 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             [weak self] body in
             guard case let .diffPreview(result) = body else { return }
             do {
-                try self?.dcxAudioUnit?.controlState.accept(diff: result.diff)
+                try self?.dcxAudioUnit?.performControlStateMutation {
+                    try $0.accept(diff: result.diff)
+                }
                 self?.report("Semantic diff previewed")
                 self?.refreshLabels()
             } catch {
@@ -318,10 +337,12 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 desired: project.desired,
                 diff: diff
             )
-            try dcxAudioUnit?.controlState.beginApplyAttempt(
-                transactionID: diff.applyPlanDigest,
-                baseline: baseline
-            )
+            try dcxAudioUnit?.performControlStateMutation {
+                try $0.beginApplyAttempt(
+                    transactionID: diff.applyPlanDigest,
+                    baseline: baseline
+                )
+            }
             refreshLabels()
             send(
                 .apply(.init(target: project.target, plan: plan)),
@@ -332,10 +353,12 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                         return
                     }
                     do {
-                        try dcxAudioUnit?.controlState.rejectApplyBeforeAdmission(
-                            transactionID: diff.applyPlanDigest,
-                            baseline: baseline
-                        )
+                        try dcxAudioUnit?.performControlStateMutation {
+                            try $0.rejectApplyBeforeAdmission(
+                                transactionID: diff.applyPlanDigest,
+                                baseline: baseline
+                            )
+                        }
                         report("Apply was rejected before mutation admission; the reviewed diff remains staged")
                         refreshLabels()
                     } catch {
@@ -345,13 +368,15 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             ) { [weak self] body in
                 guard case let .apply(result) = body else { return }
                 do {
-                    try self?.dcxAudioUnit?.controlState.acceptApply(
-                        transactionID: result.transactionID,
-                        baseline: baseline,
-                        desiredSnapshotDigest: result.desiredSnapshotDigest,
-                        readback: result.readback,
-                        validSearchResponses: 1
-                    )
+                    try self?.dcxAudioUnit?.performControlStateMutation {
+                        try $0.acceptApply(
+                            transactionID: result.transactionID,
+                            baseline: baseline,
+                            desiredSnapshotDigest: result.desiredSnapshotDigest,
+                            readback: result.readback,
+                            validSearchResponses: 1
+                        )
+                    }
                     self?.report(result.readback == nil
                         ? "Apply may have written; device state is unknown and rollback is required"
                         : result.rollbackRequired
@@ -400,11 +425,13 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 guard case let .readback(result) = body else { return }
                 do {
                     if updatesLocalState {
-                        try self?.dcxAudioUnit?.controlState.acceptReadback(
-                            transactionID: result.transactionID,
-                            snapshot: result.snapshot,
-                            validSearchResponses: 10
-                        )
+                        try self?.dcxAudioUnit?.performControlStateMutation {
+                            try $0.acceptReadback(
+                                transactionID: result.transactionID,
+                                snapshot: result.snapshot,
+                                validSearchResponses: 10
+                            )
+                        }
                     } else {
                         guard result.transactionID == request.transactionID,
                               result.snapshot.target == request.target else {
@@ -460,23 +487,27 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 rollbackPlanDigest: rollbackPlanDigest
             )
             if updatesLocalState {
-                try dcxAudioUnit?.controlState.beginRollbackAttempt(
-                    transactionID: transactionID,
-                    baseline: baseline
-                )
+                try dcxAudioUnit?.performControlStateMutation {
+                    try $0.beginRollbackAttempt(
+                        transactionID: transactionID,
+                        baseline: baseline
+                    )
+                }
             }
             refreshLabels()
             send(.rollback(.init(target: target, plan: plan))) { [weak self] body in
                 guard case let .rollback(result) = body else { return }
                 do {
                     if updatesLocalState {
-                        try self?.dcxAudioUnit?.controlState.acceptRollback(
-                            transactionID: result.transactionID,
-                            baselineDigest: result.baselineDigest,
-                            restored: result.restored,
-                            equalsBaseline: result.equalsBaseline,
-                            validSearchResponses: 1
-                        )
+                        try self?.dcxAudioUnit?.performControlStateMutation {
+                            try $0.acceptRollback(
+                                transactionID: result.transactionID,
+                                baselineDigest: result.baselineDigest,
+                                restored: result.restored,
+                                equalsBaseline: result.equalsBaseline,
+                                validSearchResponses: 1
+                            )
+                        }
                     } else {
                         guard result.transactionID == transactionID,
                               result.baselineDigest == baseline.digest,
