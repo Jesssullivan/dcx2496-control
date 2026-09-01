@@ -434,6 +434,23 @@ public struct DCXControlStateView: Sendable {
     }
 }
 
+public enum DCXControlPresentation {
+    public static let unstagedStatus = "No desired profile is staged; helper contact requires an explicit action."
+    public static let restoredStatus = "Desired profile restored from Logic project state; no device call occurred."
+
+    /// Replace only the untouched launch summary after host restoration so an
+    /// explicit helper or device result remains visible across state refreshes.
+    public static func statusAfterStateRefresh(
+        _ currentStatus: String,
+        state: DCXControlStateView
+    ) -> String {
+        guard state.projectState != nil, currentStatus == unstagedStatus else {
+            return currentStatus
+        }
+        return restoredStatus
+    }
+}
+
 public enum DCXControlStateError: Error, Equatable, Sendable {
     case unsupportedSchema
     case invalidProjectBinding

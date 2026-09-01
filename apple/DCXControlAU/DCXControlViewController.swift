@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 public final class DCXControlViewController: AUViewController, AUAudioUnitFactory {
     private var dcxAudioUnit: DCXControlAudioUnit?
     private var stateObservation: NSKeyValueObservation?
-    private let statusLabel = NSTextField(labelWithString: "No desired profile is staged; helper contact requires an explicit action.")
+    private let statusLabel = NSTextField(labelWithString: DCXControlPresentation.unstagedStatus)
     private let identityLabel = NSTextField(labelWithString: "Device: not identified")
     private let currentLabel = NSTextField(labelWithString: "Current: not captured")
     private let desiredLabel = NSTextField(labelWithString: "Desired: not staged")
@@ -703,6 +703,10 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             refreshActionAvailability()
             return
         }
+        statusLabel.stringValue = DCXControlPresentation.statusAfterStateRefresh(
+            statusLabel.stringValue,
+            state: state
+        )
         currentLabel.stringValue = state.deviceStateUncertain
             ? "Current: unresolved after a device write"
             : "Current: " + (state.currentSnapshot?.digest ?? "not captured")
