@@ -112,9 +112,9 @@ those records.
   enumerates ports.
 - The tty opens nonblocking with `O_NOCTTY` and `TIOCEXCL`, snapshots termios and
   modem lines, configures 38400 8N1 once, and reuses the descriptor.
-- Every request is a closed typed value. Dump capture sends the pinned transmit
-  remote mode before Dump0/Dump1; apply/rollback send receive-and-transmit mode
-  before the reviewed direct command. No disable frame is invented.
+- Every request is a closed typed value. Dump capture, apply, and rollback send
+  the pinned receive-and-transmit remote mode before Dump0/Dump1 or the reviewed
+  direct command. No disable frame is invented.
 - Queued input blocks a write. Reads have exact response ceilings and stop on
   timeout, malformed framing, wrong address/part, overflow, or EOF.
 - Finish restores and reads back the original terminal and modem-line state,
