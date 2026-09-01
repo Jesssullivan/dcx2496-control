@@ -41,11 +41,12 @@ collects ten valid matching identities on the same descriptor and permits at
 most ten empty-timeout replays, for a hard ceiling of twenty Search attempts and 120 seconds. Every
 attempt after the first is preceded by at least five seconds. Empty timeouts are
 counted; malformed, partial, or transport failures remain terminal. Snapshot
-and readback use the same ten-search identity sequence followed by the pinned
-receive-and-transmit remote mode, Dump0, and Dump1. Apply and rollback
-accept only immutable plans produced from the exact O1/channel 5/PEQ9 desired
-profile, verify a fresh baseline, issue one reviewed direct-parameter command
-when needed, and attempt complete readback. The full apply envelope is 150
+and readback use the same ten-search identity sequence followed by the
+named-device-qualified transmit-only remote mode, Dump0, and Dump1. Apply and
+rollback switch to receive-and-transmit only immediately before the typed
+direct-parameter command. They accept only immutable plans produced from the
+exact O1/channel 5/PEQ9 desired profile, verify a fresh baseline, issue one
+reviewed direct-parameter command when needed, and attempt complete readback. The full apply envelope is 150
 seconds so the maximum qualified baseline path plus mutation readback remains
 bounded with room for complete cleanup.
 

@@ -2,10 +2,9 @@
 //!
 //! A platform carrier opens and configures one exact 38400 session before
 //! handing it to this executor. Snapshot execution owns a closed request
-//! sequence: ten validated Search identities, closed receive-and-transmit
-//! enable, Dump0, Dump1, and consuming verified close. Mutation accepts only
-//! closed remote modes plus [`DirectParameterCommand`]; there is no arbitrary
-//! frame operation.
+//! sequence: ten validated Search identities, closed transmit enable, Dump0,
+//! Dump1, and consuming verified close. Mutation accepts only closed remote
+//! modes plus [`DirectParameterCommand`]; there is no arbitrary frame operation.
 
 use std::{error::Error as StdError, fmt, time::Duration};
 
@@ -481,8 +480,7 @@ pub enum SnapshotCaptureError<
     },
 }
 
-/// Run ten Searches, receive-and-transmit-enable, Dump0, and Dump1 on one
-/// 38400 session.
+/// Run ten Searches, transmit-enable, Dump0, and Dump1 on one 38400 session.
 ///
 /// Search attempt one is immediate; every later attempt is preceded by the
 /// existing five-second device cadence. Remote mode and Dump0 follow the final
@@ -553,7 +551,7 @@ fn capture_body<S: PersistentSnapshotSession, P: RepeatPacer>(
         budget,
     )?;
 
-    let mode = RemoteMode::ReceiveAndTransmit;
+    let mode = RemoteMode::Transmit;
     require_budget(pacer, started, budget, SnapshotOperationKind::Dump0)?;
     session
         .write_remote_mode(&RemoteModeCommand::new(expected_device, mode))
@@ -1298,7 +1296,7 @@ mod tests {
             log.modes,
             [RemoteModeCommand::new(
                 DeviceId::new(0).unwrap(),
-                RemoteMode::ReceiveAndTransmit,
+                RemoteMode::Transmit,
             )]
         );
         assert_eq!(log.operations.len(), PERSISTENT_SEARCH_COUNT + 2);
@@ -1481,9 +1479,9 @@ mod tests {
                 .map(|command| command.mode())
                 .collect::<Vec<_>>(),
             [
+                RemoteMode::Transmit,
                 RemoteMode::ReceiveAndTransmit,
-                RemoteMode::ReceiveAndTransmit,
-                RemoteMode::ReceiveAndTransmit,
+                RemoteMode::Transmit,
             ]
         );
 
@@ -1508,10 +1506,7 @@ mod tests {
                 .iter()
                 .map(|command| command.mode())
                 .collect::<Vec<_>>(),
-            [
-                RemoteMode::ReceiveAndTransmit,
-                RemoteMode::ReceiveAndTransmit,
-            ]
+            [RemoteMode::ReceiveAndTransmit, RemoteMode::Transmit,]
         );
     }
 
