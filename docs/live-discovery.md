@@ -28,15 +28,15 @@ exact request-prefix echo is removed only when it arrives as its own complete
 frame and is recorded as a byte count. The reader stops at the first frame
 terminator under the protocol hard bound, then still requires an exact 26-byte
 identity. The Search reader settles through the existing bounded receive
-deadline so at most one trailing frame—including one that becomes readable just
-after the first terminator—is consumed, and only a byte-for-byte duplicate
-response is tolerated. After each five-second device-cadence interval, the
-persistent carrier also reconciles at most one still-later queued frame against
-the previous accepted Search response before the next write; it never counts
-that replay as a new identity. The final valid Search retains one cadence
-interval before remote mode so the same reconciliation covers the
-Search-to-Dump boundary. Partial, different, already-replayed, or surplus input
-remains terminal. Qualification collects ten valid
+deadline and consumes every complete trailing frame only when it is a
+byte-for-byte duplicate response. After each five-second device-cadence
+interval, the persistent carrier also reconciles all queued complete frames
+against the previous accepted Search response before the next write; it never
+counts those replays as new identities. The final valid Search retains one
+cadence interval before remote mode so the same reconciliation covers the
+Search-to-Dump boundary. Each frame remains bounded to 26 bytes and the whole
+operation remains bounded by its existing deadline; partial or different input
+is terminal. Qualification collects ten valid
 matching identities on the same descriptor and permits at most ten empty-timeout
 replays, for a hard ceiling of twenty Search attempts and 120 seconds. Every
 attempt after the first is preceded by at least five seconds. Empty timeouts are
@@ -49,8 +49,8 @@ when needed, and attempt complete readback. The full apply envelope is 150
 seconds so the maximum qualified baseline path plus mutation readback cannot
 exhaust the budget merely because both required replay-settle cadences ran.
 
-Queued input blocks a write. Each operation has an exact request type, response
-ceiling, and deadline. The caller cannot choose frame bytes, remote-mode bytes,
+Unrecognized queued input blocks a write. Each operation has an exact request
+type, response ceiling, and deadline. The caller cannot choose frame bytes, remote-mode bytes,
 baud, serial format, retry count, or timeout, and no generic write surface or
 port enumeration exists. Raw callout paths and payloads stay out of diagnostic
 output. Sanitized Search receipts distinguish total consumed wire bytes from

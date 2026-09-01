@@ -339,7 +339,7 @@ pub enum SanitizedAttemptOutcome {
     ShortWrite,
     /// Input was already queued before any Search byte was transmitted.
     PreexistingInput,
-    /// Input exceeded one exact optional request echo plus one response.
+    /// Input exceeded the bounded frame shape.
     Overflow,
     /// The tty reached EOF.
     EndOfFile,
@@ -401,7 +401,7 @@ pub struct SanitizedAttemptReceipt {
     pub overflow_received_bytes: usize,
     /// Bytes left queued when overflow was detected, or zero for another outcome.
     pub overflow_queued_bytes: usize,
-    /// One exact duplicate response was consumed after the accepted response.
+    /// Exact duplicate responses consumed after the accepted response.
     pub duplicate_response_count: usize,
     /// Bytes consumed from a partial or different trailing frame.
     pub unexpected_trailing_bytes: usize,
@@ -613,7 +613,6 @@ struct PersistentCarrier<B: SerialBackend> {
     control_lines_snapshot: i32,
     input_discard_required: bool,
     last_search_response: Option<[u8; SEARCH_RESPONSE_LIMIT]>,
-    last_search_duplicate_consumed: bool,
 }
 
 impl<B: SerialBackend> PersistentCarrier<B> {
@@ -713,7 +712,6 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             control_lines_snapshot,
             input_discard_required: false,
             last_search_response: None,
-            last_search_duplicate_consumed: false,
         })
     }
 
@@ -743,53 +741,43 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         }
     }
 
-    /// Reconcile one late replay of the previous accepted Search response.
+    /// Reconcile queued late replays of the previous accepted Search response.
     ///
     /// This runs only at a closed operation boundary, before the next write.
-    /// It never flushes or counts the replay as a new identity. Partial,
-    /// different, already-replayed, or surplus input remains terminal.
+    /// It never flushes or counts a replay as a new identity. Only complete,
+    /// byte-identical frames are accepted; partial or different input remains
+    /// terminal under the existing operation deadline.
     fn reconcile_late_search_response<O: WireObserver>(
         &mut self,
         deadline: Duration,
         observer: &mut O,
     ) -> Result<(), DarwinCarrierError> {
-        ensure_before_deadline(
-            &mut self.backend,
-            deadline,
-            CarrierStage::CheckPreexistingInput,
-        )?;
-        let queued = self
-            .backend
-            .bytes_available()
-            .map_err(|fault| system_error(CarrierStage::CheckPreexistingInput, fault))?;
-        if queued == 0 {
-            return Ok(());
-        }
-        let Some(expected) = self.last_search_response else {
-            return Err(DarwinCarrierError::PreexistingInput { queued });
-        };
-        if self.last_search_duplicate_consumed {
-            return Err(DarwinCarrierError::PreexistingInput { queued });
-        }
+        loop {
+            ensure_before_deadline(
+                &mut self.backend,
+                deadline,
+                CarrierStage::CheckPreexistingInput,
+            )?;
+            let queued = self
+                .backend
+                .bytes_available()
+                .map_err(|fault| system_error(CarrierStage::CheckPreexistingInput, fault))?;
+            if queued == 0 {
+                return Ok(());
+            }
+            let Some(expected) = self.last_search_response else {
+                return Err(DarwinCarrierError::PreexistingInput { queued });
+            };
 
-        match read_one_frame(&mut self.backend, deadline, SEARCH_RESPONSE_LIMIT, observer)? {
-            FramedRead::Complete(candidate) if candidate.as_slice() == expected.as_slice() => {
-                observer.duplicate();
-            }
-            FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
-                return Err(observer.unexpected(other.len()));
+            match read_one_frame(&mut self.backend, deadline, SEARCH_RESPONSE_LIMIT, observer)? {
+                FramedRead::Complete(candidate) if candidate.as_slice() == expected.as_slice() => {
+                    observer.duplicate();
+                }
+                FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
+                    return Err(observer.unexpected(other.len()));
+                }
             }
         }
-        ensure_before_deadline(&mut self.backend, deadline, CarrierStage::BytesAvailable)?;
-        let queued = self
-            .backend
-            .bytes_available()
-            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-        if queued != 0 {
-            return Err(observer.overflow(expected.len(), queued));
-        }
-        self.last_search_duplicate_consumed = true;
-        Ok(())
     }
 
     fn finish(mut self) -> Result<SanitizedSessionReceipt, DarwinCarrierError> {
@@ -883,7 +871,6 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         let result = bounded_result.and_then(|bounded| {
             if let Some(response) = bounded.response {
                 self.last_search_response = Some(fixed_search_response(response)?);
-                self.last_search_duplicate_consumed = bounded.duplicate_consumed;
             }
             Ok(bounded.read)
         });
@@ -951,7 +938,6 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             && let Some(response) = bounded.response
         {
             self.last_search_response = Some(fixed_search_response(response)?);
-            self.last_search_duplicate_consumed = bounded.duplicate_consumed;
         }
         Ok(bounded.read)
     }
@@ -1288,7 +1274,6 @@ fn read_bounded<B: SerialBackend>(
             return Ok(BoundedRead {
                 read: SearchRead::timed_out(&partial)?,
                 response: None,
-                duplicate_consumed: false,
             });
         }
         FramedRead::Complete(frame) if frame.as_slice() == request => {
@@ -1300,7 +1285,6 @@ fn read_bounded<B: SerialBackend>(
                     return Ok(BoundedRead {
                         read: SearchRead::timed_out(&partial)?,
                         response: None,
-                        duplicate_consumed: false,
                     });
                 }
             }
@@ -1310,12 +1294,10 @@ fn read_bounded<B: SerialBackend>(
 
     let read = SearchRead::complete(&response)?;
     receipt.received(&response);
-    let duplicate_consumed =
-        finish_bounded_response(backend, deadline, limit, &response, receipt, true)?;
+    finish_bounded_response(backend, deadline, limit, &response, receipt, true)?;
     Ok(BoundedRead {
         read,
         response: Some(response),
-        duplicate_consumed,
     })
 }
 
@@ -1327,7 +1309,6 @@ enum FramedRead {
 struct BoundedRead<T> {
     read: T,
     response: Option<Vec<u8>>,
-    duplicate_consumed: bool,
 }
 
 fn fixed_search_response(
@@ -1352,7 +1333,7 @@ impl WireObserver for ReceiptBuilder {
     }
 
     fn duplicate(&mut self) {
-        self.duplicate_response_count = 1;
+        self.duplicate_response_count = self.duplicate_response_count.saturating_add(1);
     }
 
     fn unexpected(&mut self, received: usize) -> DarwinCarrierError {
@@ -1379,13 +1360,14 @@ impl WireObserver for () {
     }
 }
 
-/// Consume at most one byte-identical response replay before the operation ends.
+/// Consume byte-identical response replays before the operation ends.
 ///
 /// Search responses settle through their existing bounded receive deadline so a
 /// replay that becomes readable just after the first frame terminator cannot
 /// escape into the next paced operation. Dump handling retains the immediate
-/// trailing-input check because its larger deadline is sized for wire transfer,
-/// not an added settle delay. Partial, different, or further input is terminal.
+/// trailing-input check and accepts at most one queued exact replay because its
+/// larger deadline is sized for wire transfer, not an added settle delay. Every
+/// replay is independently frame-bounded; partial or different input is terminal.
 fn finish_bounded_response<B: SerialBackend, O: WireObserver>(
     backend: &mut B,
     deadline: Duration,
@@ -1393,68 +1375,41 @@ fn finish_bounded_response<B: SerialBackend, O: WireObserver>(
     response: &[u8],
     observer: &mut O,
     settle_until_deadline: bool,
-) -> Result<bool, DarwinCarrierError> {
-    let trailing = if settle_until_deadline {
-        read_one_frame(backend, deadline, frame_limit, observer)?
-    } else {
+) -> Result<(), DarwinCarrierError> {
+    if !settle_until_deadline {
         ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
         let queued = backend
             .bytes_available()
             .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
         if queued == 0 {
-            return Ok(false);
+            return Ok(());
         }
-        read_one_frame(backend, deadline, frame_limit, observer)?
-    };
-
-    match trailing {
-        FramedRead::TimedOut(partial) if partial.is_empty() => return Ok(false),
-        FramedRead::Complete(duplicate) if duplicate == response => observer.duplicate(),
-        FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
-            return Err(observer.unexpected(other.len()));
-        }
+        return match read_one_frame(backend, deadline, frame_limit, observer)? {
+            FramedRead::Complete(duplicate) if duplicate == response => {
+                observer.duplicate();
+                ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+                let queued = backend
+                    .bytes_available()
+                    .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+                if queued == 0 {
+                    Ok(())
+                } else {
+                    Err(observer.overflow(response.len(), queued))
+                }
+            }
+            FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
+                Err(observer.unexpected(other.len()))
+            }
+        };
     }
 
-    if settle_until_deadline {
-        let queued = wait_for_input(backend, deadline)?;
-        if queued == 0 {
-            Ok(true)
-        } else {
-            Err(observer.overflow(response.len(), queued))
-        }
-    } else {
-        ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
-        let queued = backend
-            .bytes_available()
-            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-        if queued == 0 {
-            Ok(true)
-        } else {
-            Err(observer.overflow(response.len(), queued))
-        }
-    }
-}
-
-fn wait_for_input<B: SerialBackend>(
-    backend: &mut B,
-    deadline: Duration,
-) -> Result<usize, DarwinCarrierError> {
     loop {
-        let time_left = remaining(backend, deadline);
-        if time_left.is_zero() {
-            return Ok(0);
-        }
-        let queued = backend
-            .bytes_available()
-            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-        if queued != 0 {
-            return Ok(queued);
-        }
-        if !backend
-            .wait_readable(time_left)
-            .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
-        {
-            return Ok(0);
+        match read_one_frame(backend, deadline, frame_limit, observer)? {
+            FramedRead::TimedOut(partial) if partial.is_empty() => return Ok(()),
+            FramedRead::Complete(duplicate) if duplicate == response => observer.duplicate(),
+            FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
+                return Err(observer.unexpected(other.len()));
+            }
         }
     }
 }
@@ -1524,7 +1479,6 @@ fn read_snapshot_bounded<B: SerialBackend>(
             return Ok(BoundedRead {
                 read: SnapshotRead::timed_out(&partial)?,
                 response: None,
-                duplicate_consumed: false,
             });
         }
         FramedRead::Complete(frame) if frame.as_slice() == request => {
@@ -1534,7 +1488,6 @@ fn read_snapshot_bounded<B: SerialBackend>(
                     return Ok(BoundedRead {
                         read: SnapshotRead::timed_out(&partial)?,
                         response: None,
-                        duplicate_consumed: false,
                     });
                 }
             }
@@ -1542,7 +1495,7 @@ fn read_snapshot_bounded<B: SerialBackend>(
         FramedRead::Complete(response) => response,
     };
     let read = SnapshotRead::complete(&response)?;
-    let duplicate_consumed = finish_bounded_response(
+    finish_bounded_response(
         backend,
         deadline,
         limit,
@@ -1553,7 +1506,6 @@ fn read_snapshot_bounded<B: SerialBackend>(
     Ok(BoundedRead {
         read,
         response: Some(response),
-        duplicate_consumed,
     })
 }
 
