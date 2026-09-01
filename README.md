@@ -52,6 +52,19 @@ dcxctl control snapshot \
   --expected-device 0 > snapshot.json
 ```
 
+If an earlier interrupted session left the device transmitting unsolicited
+direct-parameter traffic, recovery is a separate explicit state write. It
+discards input without parsing it, writes exactly one typed ReceiveDirect
+command, observes a bounded quiet window, restores the tty, and closes. Its
+receipt proves write acceptance and observed quiet, not a device acknowledgement;
+a normal complete snapshot must establish identity and state afterward.
+
+```sh
+dcxctl control recover-receive-direct \
+  --tty /dev/cu.usbserial-EXACT_DEVICE \
+  --expected-device 0
+```
+
 REW import and slot mapping are offline. The MVP writable mapping is exactly
 physical output O1, PEQ9: channel 5 parameters `0x3b` through `0x3e`
 (frequency, Q, gain, and filter kind). It deliberately excludes EQ enable,
@@ -119,6 +132,9 @@ those records.
   unobserved disable frame is invented.
 - Queued input blocks a write. Reads have exact response ceilings and stop on
   timeout, malformed framing, wrong address/part, overflow, or EOF.
+- The separate `recover-receive-direct` operation is the sole exception to
+  queued-input refusal: it discards rather than accepts pending input and can
+  write only the closed, named-device ReceiveDirect command at fixed 38400.
 - Finish restores and reads back the original terminal and modem-line state,
   then closes. Raw paths and response payloads stay out of diagnostics.
 

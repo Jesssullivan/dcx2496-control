@@ -13,6 +13,20 @@ establishes physical mute, routing, named-device identity, and attended-stop
 preconditions before invocation. This repository owns typed requests, bounded
 serial execution, protocol validation, and sanitized results.
 
+Interrupted operation recovery is a separate explicit write surface:
+
+```sh
+dcxctl control recover-receive-direct \
+  --tty /dev/cu.usbserial-EXACT_DEVICE --expected-device 0
+```
+
+It configures the same fixed 38400 binding, discards pending input without
+parsing it, accepts only one typed ReceiveDirect command, discards input again,
+and observes a 25 ms quiet window before verified tty restoration and close.
+The sanitized receipt proves one complete kernel write and observed quiet, not
+device acknowledgement or durable mode state. A normal complete snapshot must
+reacquire identity and exact baseline state after recovery.
+
 ## Persistent session
 
 Every live invocation validates one explicit `/dev/cu.usbserial-*` callout,
@@ -51,9 +65,11 @@ command when needed, and attempt complete readback. The full apply envelope is 1
 seconds so the maximum qualified baseline path plus mutation readback remains
 bounded with room for complete cleanup.
 
-Unrecognized queued input blocks a write. The post-capture ReceiveDirect
-transition is part of a successful complete capture; failure to send it fails
-the capture. Each operation has an exact request type, response ceiling, and deadline. The caller
+Unrecognized queued input blocks every normal operation write; the separate
+recovery command discards it without parsing before its sole closed write. The
+post-capture ReceiveDirect transition is part of a successful complete capture;
+failure to send it fails the capture. Each operation has an exact request type,
+response ceiling, and deadline. The caller
 cannot choose frame bytes, remote-mode bytes,
 baud, serial format, retry count, or timeout, and no generic write surface or
 port enumeration exists. Raw callout paths and payloads stay out of diagnostic
