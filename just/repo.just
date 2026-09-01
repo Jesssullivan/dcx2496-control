@@ -202,8 +202,11 @@ apple-adhoc-bundle: apple-project-generate
 # Set DCX_CODESIGN_IDENTITY to one exact certificate SHA-1 or full identity
 # label when more than one valid team identity is visible. Set
 # DCX_CODESIGN_KEYCHAIN to restrict discovery and signing to one temporary
-# host-owned keychain. This recipe never imports credentials, installs/registers,
-# or launches a GUI.
+# host-owned keychain. For a noninteractive file keychain, set
+# DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE to a caller-owned password file so the
+# recipe can restore the keychain's unlocked state after the unsigned archive.
+# This recipe never imports a signing credential, installs/registers, or
+# launches a GUI.
 apple-team-signed-bundle: apple-project-generate
     #!/usr/bin/env bash
     set -euo pipefail
@@ -211,12 +214,28 @@ apple-team-signed-bundle: apple-project-generate
     app_group="QP994XQKNH.io.tinyland.dcx2496"
     requested_signer="${DCX_CODESIGN_IDENTITY:-}"
     keychain="${DCX_CODESIGN_KEYCHAIN:-}"
+    keychain_password_file="${DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE:-}"
+    unset DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE
     security_args=(find-identity -v -p codesigning)
     codesign_keychain_args=()
     if [[ -n "$keychain" ]]; then
       security_args+=("$keychain")
       codesign_keychain_args=(--keychain "$keychain")
     fi
+    if [[ -n "$keychain_password_file" ]]; then
+      test -n "$keychain"
+      test -r "$keychain_password_file"
+    fi
+    unlock_selected_keychain() {
+      if [[ -n "$keychain_password_file" ]]; then
+        local unlock_token
+        unlock_token="$(<"$keychain_password_file")"
+        test -n "$unlock_token"
+        /usr/bin/security unlock-keychain -p "$unlock_token" "$keychain"
+        unset unlock_token
+      fi
+    }
+    unlock_selected_keychain
     identity_lines="$(/usr/bin/security "${security_args[@]}")"
     team_signers="$(
       printf '%s\n' "$identity_lines" \
@@ -290,6 +309,7 @@ apple-team-signed-bundle: apple-project-generate
       DCX_CARGO_BIN="$dcx_cargo_bin" \
       DCX_RUSTC_BIN="$dcx_rustc_bin" \
       archive
+    unlock_selected_keychain
     app="$archive_path/Products/Applications/DCXLogicHelper.app"
     au="$app/Contents/PlugIns/DCXControlAU.appex"
     child="$app/Contents/Helpers/dcxctl"

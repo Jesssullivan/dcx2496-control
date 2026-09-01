@@ -192,10 +192,14 @@ provisioning profiles. Exactly one valid same-team identity must be visible by
 default. Set `DCX_CODESIGN_IDENTITY` to one exact certificate SHA-1 or full
 identity label to select among multiple valid identities; set
 `DCX_CODESIGN_KEYCHAIN` to bind discovery and signing to one host-owned
-temporary keychain. The recipe verifies arm64 binaries, nested signatures, the
-exact team and selected leaf authority, exact entitlements, and
-`aumi/DcxC/TnLd` metadata. It never reads or imports credentials and does not
-install or register the app, launch a GUI, or run `auval`.
+temporary keychain. A noninteractive caller can additionally set
+`DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE` to a caller-owned password file; the
+recipe uses it only to unlock that selected keychain before discovery and again
+after the unsigned archive, immediately before signing. The recipe verifies
+arm64 binaries, nested signatures, the exact team and selected leaf authority,
+exact entitlements, and `aumi/DcxC/TnLd` metadata. It never imports the signing
+credential and does not install or register the app, launch a GUI, or run
+`auval`.
 
 New work is licensed under either Apache-2.0 or MIT, at your option. See
 `NOTICE`, `LICENSE`, and `LICENSE-APACHE`.
