@@ -58,6 +58,7 @@ struct FakeBackend {
     termios_readback: FakeTermios,
     control_lines_readback: i32,
     shared_calls: Option<Rc<RefCell<Vec<Call>>>>,
+    shared_writes: Option<Rc<RefCell<Vec<Vec<u8>>>>>,
 }
 
 impl FakeBackend {
@@ -83,11 +84,17 @@ impl FakeBackend {
             termios_readback: FakeTermios(8),
             control_lines_readback: 0x2496,
             shared_calls: None,
+            shared_writes: None,
         }
     }
 
     fn with_shared_calls(mut self, shared_calls: Rc<RefCell<Vec<Call>>>) -> Self {
         self.shared_calls = Some(shared_calls);
+        self
+    }
+
+    fn with_shared_writes(mut self, shared_writes: Rc<RefCell<Vec<Vec<u8>>>>) -> Self {
+        self.shared_writes = Some(shared_writes);
         self
     }
 
@@ -150,6 +157,9 @@ impl SerialBackend for FakeBackend {
     fn write_once(&mut self, bytes: &[u8]) -> Result<usize, SystemFault> {
         self.step(CarrierStage::Write, Call::Write(bytes.len()))?;
         self.writes.push(bytes.to_vec());
+        if let Some(shared_writes) = &self.shared_writes {
+            shared_writes.borrow_mut().push(bytes.to_vec());
+        }
         self.read_goal = match bytes.get(6).copied() {
             Some(0x40)
                 if self
@@ -1076,16 +1086,18 @@ fn receive_direct_recovery_discards_without_reading_and_writes_one_closed_frame(
 }
 
 #[test]
-fn receive_direct_recovery_fails_on_resumed_input_and_still_restores_and_closes() {
+fn receive_direct_recovery_drains_resumed_input_until_quiet_then_restores_and_closes() {
     let mut backend = FakeBackend::with_inbound([]);
-    backend
-        .wait_script
-        .push_back((true, Duration::from_millis(1)));
+    backend.wait_script = [
+        (true, Duration::from_millis(1)),
+        (false, RECOVERY_QUIET_WINDOW),
+    ]
+    .into_iter()
+    .collect();
 
-    assert_eq!(
-        run_receive_direct_recovery(&binding(), &mut backend, DeviceId::new(0).unwrap()),
-        Err(DarwinCarrierError::PostWriteInput)
-    );
+    let receipt =
+        run_receive_direct_recovery(&binding(), &mut backend, DeviceId::new(0).unwrap()).unwrap();
+
     assert_eq!(backend.writes.len(), 1);
     assert_eq!(
         backend
@@ -1094,6 +1106,40 @@ fn receive_direct_recovery_fails_on_resumed_input_and_still_restores_and_closes(
             .filter(|call| **call == Call::DiscardInput)
             .count(),
         3
+    );
+    assert_eq!(receipt.input_discard_count, 3);
+    assert!(
+        !backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Read(_)))
+    );
+    assert!(backend.calls.contains(&Call::RestoreTermios));
+    assert!(backend.calls.contains(&Call::VerifyTermiosRestore));
+    assert!(backend.calls.contains(&Call::RestoreControlLines));
+    assert!(backend.calls.contains(&Call::VerifyControlLinesRestore));
+    assert_eq!(backend.calls.last(), Some(&Call::Close));
+}
+
+#[test]
+fn receive_direct_recovery_fails_when_resumed_input_never_reaches_quiet() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.wait_script = (0..19).map(|_| (true, RECOVERY_QUIET_WINDOW)).collect();
+
+    assert_eq!(
+        run_receive_direct_recovery(&binding(), &mut backend, DeviceId::new(0).unwrap()),
+        Err(DarwinCarrierError::Deadline {
+            stage: CarrierStage::WaitReadable,
+        })
+    );
+    assert_eq!(backend.writes.len(), 1);
+    assert!(
+        backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count()
+            > 2
     );
     assert!(
         !backend
@@ -1215,7 +1261,14 @@ fn post_write_failure_taints_every_persistent_operation_until_consuming_cleanup(
             .iter()
             .filter(|call| **call == Call::DiscardInput)
             .count(),
-        1
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, Call::Write(_)))
+            .count(),
+        2
     );
     let discard = calls
         .iter()
@@ -1243,6 +1296,279 @@ fn post_write_failure_taints_every_persistent_operation_until_consuming_cleanup(
             .count(),
         writes_before
     );
+}
+
+#[test]
+fn receive_direct_quiescence_bypasses_taint_and_writes_once_without_reading() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.wait_script = [
+        (true, Duration::from_millis(1)),
+        (false, RECOVERY_QUIET_WINDOW),
+    ]
+    .into_iter()
+    .collect();
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    carrier.input_discard_required = true;
+    let device = DeviceId::new(0).unwrap();
+
+    carrier
+        .quiesce_receive_direct_command(RemoteModeCommand::new(device, RemoteMode::ReceiveDirect))
+        .unwrap();
+
+    assert!(!carrier.input_discard_required);
+    assert_eq!(
+        carrier.backend.writes,
+        [vec![0xf0, 0, 0x20, 0x32, 0, 0x0e, 0x3f, 0x04, 0, 0xf7]]
+    );
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Write(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        carrier
+            .backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count(),
+        3
+    );
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Read(_)))
+    );
+    carrier.finish().unwrap();
+}
+
+#[test]
+fn receive_direct_quiescence_rejects_another_closed_mode_before_io() {
+    let backend = FakeBackend::with_inbound([]);
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let device = DeviceId::new(0).unwrap();
+
+    assert_eq!(
+        carrier
+            .quiesce_receive_direct_command(RemoteModeCommand::new(device, RemoteMode::Transmit,)),
+        Err(DarwinCarrierError::RecoveryModeMismatch {
+            actual: RemoteMode::Transmit,
+        })
+    );
+    assert!(
+        !carrier
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Write(_) | Call::DiscardInput))
+    );
+    carrier.finish().unwrap();
+}
+
+#[test]
+fn consuming_finish_quiesces_an_attempted_enabling_mode_before_restore_and_close() {
+    let shared_calls = Rc::new(RefCell::new(Vec::new()));
+    let shared_writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend::with_inbound([])
+        .with_shared_calls(Rc::clone(&shared_calls))
+        .with_shared_writes(Rc::clone(&shared_writes));
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let device = DeviceId::new(0).unwrap();
+
+    carrier
+        .write_remote_mode_command(RemoteModeCommand::new(device, RemoteMode::Transmit))
+        .unwrap();
+    carrier.finish().unwrap();
+
+    assert_eq!(
+        shared_writes.borrow().as_slice(),
+        [
+            vec![0xf0, 0, 0x20, 0x32, 0, 0x0e, 0x3f, 0x08, 0, 0xf7],
+            vec![0xf0, 0, 0x20, 0x32, 0, 0x0e, 0x3f, 0x04, 0, 0xf7],
+        ]
+    );
+    let calls = shared_calls.borrow();
+    let second_write = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| matches!(call, Call::Write(_)))
+        .nth(1)
+        .map(|(index, _)| index)
+        .unwrap();
+    let restore = calls
+        .iter()
+        .position(|call| *call == Call::RestoreTermios)
+        .unwrap();
+    let close = calls.iter().position(|call| *call == Call::Close).unwrap();
+    assert!(second_write < restore && restore < close);
+}
+
+#[test]
+fn consuming_finish_quiesces_after_an_ambiguous_enabling_mode_write() {
+    let shared_writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend::with_inbound([]).with_shared_writes(Rc::clone(&shared_writes));
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    carrier.backend.short_write = Some(1);
+    let device = DeviceId::new(0).unwrap();
+
+    assert!(matches!(
+        carrier.write_remote_mode_command(RemoteModeCommand::new(device, RemoteMode::Transmit)),
+        Err(DarwinCarrierError::ShortWrite {
+            written: 1,
+            expected: 10,
+        })
+    ));
+    carrier.backend.short_write = None;
+    carrier.finish().unwrap();
+
+    assert_eq!(shared_writes.borrow().len(), 2);
+    assert_eq!(shared_writes.borrow()[0][7], 0x08);
+    assert_eq!(shared_writes.borrow()[1][7], 0x04);
+}
+
+#[test]
+fn successful_receive_direct_quiescence_prevents_a_second_finish_write() {
+    let shared_writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend::with_inbound([]).with_shared_writes(Rc::clone(&shared_writes));
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let device = DeviceId::new(0).unwrap();
+
+    carrier
+        .write_remote_mode_command(RemoteModeCommand::new(device, RemoteMode::Transmit))
+        .unwrap();
+    carrier
+        .write_remote_mode_command(RemoteModeCommand::new(device, RemoteMode::ReceiveDirect))
+        .unwrap();
+    carrier.finish().unwrap();
+
+    assert_eq!(shared_writes.borrow().len(), 2);
+    assert_eq!(shared_writes.borrow()[0][7], 0x08);
+    assert_eq!(shared_writes.borrow()[1][7], 0x04);
+}
+
+#[test]
+fn snapshot_dump_failure_is_quiesced_once_before_finish_restores_and_closes() {
+    let identity = synthetic_response(0);
+    let inbound = (0..10).flat_map(|_| identity).collect::<Vec<_>>();
+    let shared_calls = Rc::new(RefCell::new(Vec::new()));
+    let shared_writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend::with_inbound(inbound)
+        .with_shared_calls(Rc::clone(&shared_calls))
+        .with_shared_writes(Rc::clone(&shared_writes));
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let mut pacer = FastPacer::default();
+
+    assert!(execute_persistent_snapshot(carrier, &mut pacer, DeviceId::new(0).unwrap()).is_err());
+
+    let writes = shared_writes.borrow();
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|frame| frame.get(6) == Some(&0x3f) && frame.get(7) == Some(&0x08))
+            .count(),
+        1
+    );
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|frame| frame.get(6) == Some(&0x3f) && frame.get(7) == Some(&0x04))
+            .count(),
+        1
+    );
+    let calls = shared_calls.borrow();
+    let quiesce_write = calls
+        .iter()
+        .enumerate()
+        .rfind(|(_, call)| matches!(call, Call::Write(10)))
+        .map(|(index, _)| index)
+        .unwrap();
+    let restore = calls
+        .iter()
+        .position(|call| *call == Call::RestoreTermios)
+        .unwrap();
+    let close = calls.iter().position(|call| *call == Call::Close).unwrap();
+    assert!(quiesce_write < restore && restore < close);
+}
+
+#[test]
+fn direct_write_failure_is_quiesced_once_before_finish_restores_and_closes() {
+    let shared_calls = Rc::new(RefCell::new(Vec::new()));
+    let shared_writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend::with_inbound([])
+        .with_shared_calls(Rc::clone(&shared_calls))
+        .with_shared_writes(Rc::clone(&shared_writes));
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let device = DeviceId::new(0).unwrap();
+
+    carrier
+        .write_remote_mode_command(RemoteModeCommand::new(
+            device,
+            RemoteMode::ReceiveAndTransmit,
+        ))
+        .unwrap();
+    carrier.backend.short_write = Some(1);
+    let direct = DirectParameterCommand::new(
+        device,
+        vec![DirectParameterAction::new(5, 0x3c, 40).unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        carrier.write_direct_command(&direct),
+        Err(DarwinCarrierError::ShortWrite { written: 1, .. })
+    ));
+    carrier.backend.short_write = None;
+    carrier.finish().unwrap();
+
+    let writes = shared_writes.borrow();
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|frame| frame.get(6) == Some(&0x3f) && frame.get(7) == Some(&0x0c))
+            .count(),
+        1
+    );
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|frame| frame.get(6) == Some(&0x20))
+            .count(),
+        1
+    );
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|frame| frame.get(6) == Some(&0x3f) && frame.get(7) == Some(&0x04))
+            .count(),
+        1
+    );
+    let calls = shared_calls.borrow();
+    let restore = calls
+        .iter()
+        .position(|call| *call == Call::RestoreTermios)
+        .unwrap();
+    let close = calls.iter().position(|call| *call == Call::Close).unwrap();
+    assert!(restore < close);
+}
+
+#[test]
+fn recovery_drain_rejects_an_always_readable_nonprogressing_backend() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.wait_script = [(true, Duration::ZERO)].into_iter().collect();
+
+    assert_eq!(
+        run_receive_direct_recovery(&binding(), &mut backend, DeviceId::new(0).unwrap()),
+        Err(DarwinCarrierError::Deadline {
+            stage: CarrierStage::WaitReadable,
+        })
+    );
+    assert_eq!(backend.writes.len(), 1);
+    assert_eq!(backend.calls.last(), Some(&Call::Close));
 }
 
 #[test]
@@ -1472,7 +1798,7 @@ fn persistent_snapshot_replays_one_empty_carrier_timeout() {
 }
 
 #[test]
-fn snapshot_reader_strips_one_request_echo_and_exact_response_replays() {
+fn snapshot_search_reader_strips_echo_and_consumes_all_already_queued_replays() {
     let request = synthetic_search_request();
     let response = synthetic_response(0);
     let mut inbound = request.to_vec();
@@ -1496,10 +1822,12 @@ fn snapshot_reader_strips_one_request_echo_and_exact_response_replays() {
     assert_eq!(bounded.read, SnapshotRead::complete(&response).unwrap());
     assert!(backend.inbound.is_empty());
     assert_eq!(backend.post_response_input, 0);
+    assert_eq!(backend.now, Duration::ZERO);
+    assert!(!backend.calls.contains(&Call::WaitReadable));
 }
 
 #[test]
-fn snapshot_reader_settles_a_late_search_replay_before_returning() {
+fn snapshot_search_reader_returns_before_a_late_replay_becomes_readable() {
     let request = synthetic_search_request();
     let response = synthetic_response(0);
     let inbound = response.into_iter().chain(response).collect::<Vec<_>>();
@@ -1524,9 +1852,43 @@ fn snapshot_reader_settles_a_late_search_replay_before_returning() {
     .unwrap();
 
     assert_eq!(bounded.read, SnapshotRead::complete(&response).unwrap());
-    assert!(backend.inbound.is_empty());
+    assert_eq!(
+        backend.inbound.iter().copied().collect::<Vec<_>>(),
+        response.to_vec()
+    );
     assert_eq!(backend.post_response_input, 0);
-    assert_eq!(backend.now, Duration::from_millis(475));
+    assert_eq!(backend.now, Duration::ZERO);
+    assert!(!backend.calls.contains(&Call::WaitReadable));
+}
+
+#[test]
+fn snapshot_search_reader_rejects_an_already_queued_partial_without_waiting() {
+    let request = synthetic_search_request();
+    let response = synthetic_response(0);
+    let partial = &response[..13];
+    let inbound = response
+        .into_iter()
+        .chain(partial.iter().copied())
+        .collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.written = true;
+    backend.read_goal = response.len();
+    backend.post_response_input = partial.len();
+
+    assert!(matches!(
+        read_snapshot_bounded(
+            &mut backend,
+            SNAPSHOT_OPERATION_TIMEOUT,
+            SEARCH_RESPONSE_LIMIT,
+            &request,
+            true,
+        ),
+        Err(DarwinCarrierError::UnexpectedTrailingFrame { received })
+            if received == partial.len()
+    ));
+    assert!(backend.inbound.is_empty());
+    assert_eq!(backend.now, Duration::ZERO);
+    assert!(!backend.calls.contains(&Call::WaitReadable));
 }
 
 #[test]

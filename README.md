@@ -127,14 +127,18 @@ those records.
   modem lines, configures 38400 8N1 once, and reuses the descriptor.
 - Every request is a closed typed value. Dump capture and readback send the
   named-device-qualified transmit-only remote mode before Dump0/Dump1, then
-  make one source-documented receive-only transition. Apply and rollback use
-  receive-and-transmit only immediately before the reviewed direct command. No
-  unobserved disable frame is invented.
+  make one source-documented receive-only transition. Once a transmit-capable
+  mode is attempted, consuming finish performs that same bounded receive-only
+  quiescence on every later failure before restoring the tty. Apply and rollback
+  use receive-and-transmit only immediately before the reviewed direct command.
+  No unobserved disable frame is invented.
 - Queued input blocks a write. Reads have exact response ceilings and stop on
   timeout, malformed framing, wrong address/part, overflow, or EOF.
 - The separate `recover-receive-direct` operation is the sole exception to
   queued-input refusal: it discards rather than accepts pending input and can
-  write only the closed, named-device ReceiveDirect command at fixed 38400.
+  write only the closed, named-device ReceiveDirect command at fixed 38400. It
+  drains resumed input without parsing until one continuous bounded quiet
+  window is observed; it never retries the typed write.
 - Finish restores and reads back the original terminal and modem-line state,
   then closes. Raw paths and response payloads stay out of diagnostics.
 
