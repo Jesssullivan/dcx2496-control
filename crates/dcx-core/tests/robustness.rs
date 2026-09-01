@@ -233,6 +233,8 @@ fn every_fourteen_bit_value_projects_through_the_reviewed_split_layout() {
                 | (u16::from((dump[middle] >> bit) & 1) << 7)
                 | (u16::from(dump[high]) << 8);
             assert_eq!(reconstructed, value);
+            let inverse = baseline.inverse_actions_for(&[action]).unwrap();
+            assert_eq!(desired.project_direct_actions(&inverse).unwrap(), baseline);
         }
     }
 }
