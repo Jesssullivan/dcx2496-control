@@ -34,15 +34,15 @@ response is tolerated. After each five-second device-cadence interval, the
 persistent carrier also reconciles at most one still-later queued frame against
 the previous accepted Search response before the next write; it never counts
 that replay as a new identity. The final valid Search retains one cadence
-interval before transmit mode so the same reconciliation covers the
+interval before remote mode so the same reconciliation covers the
 Search-to-Dump boundary. Partial, different, already-replayed, or surplus input
 remains terminal. Qualification collects ten valid
 matching identities on the same descriptor and permits at most ten empty-timeout
 replays, for a hard ceiling of twenty Search attempts and 120 seconds. Every
 attempt after the first is preceded by at least five seconds. Empty timeouts are
 counted; malformed, partial, or transport failures remain terminal. Snapshot
-and readback use the same ten-search identity sequence
-followed by typed transmit remote mode, Dump0, and Dump1. Apply and rollback
+and readback use the same ten-search identity sequence followed by the pinned
+receive-and-transmit remote mode, Dump0, and Dump1. Apply and rollback
 accept only immutable plans produced from the exact O1/channel 5/PEQ9 desired
 profile, verify a fresh baseline, issue one reviewed direct-parameter command
 when needed, and attempt complete readback. The full apply envelope is 150
