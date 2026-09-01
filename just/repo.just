@@ -200,7 +200,10 @@ apple-adhoc-bundle: apple-project-generate
 # provisioning profiles.
 #
 # Set DCX_CODESIGN_IDENTITY to one exact certificate SHA-1 or full identity
-# label when more than one valid team identity is visible. Set
+# label when more than one valid team identity is visible. Apple Development
+# labels may carry a member identifier rather than the signing TeamIdentifier;
+# an explicit match is therefore accepted only subject to the post-sign team
+# verification below. Set
 # DCX_CODESIGN_KEYCHAIN to restrict discovery and signing to one temporary
 # host-owned keychain. For a noninteractive file keychain, set
 # DCX_CODESIGN_KEYCHAIN_PASSWORD_FILE to a caller-owned password file so the
@@ -237,10 +240,10 @@ apple-team-signed-bundle: apple-project-generate
     }
     unlock_selected_keychain
     identity_lines="$(/usr/bin/security "${security_args[@]}")"
-    team_signers="$(
+    eligible_signers="$(
       printf '%s\n' "$identity_lines" \
-        | /usr/bin/awk -v team="$team_id" '
-            $0 ~ /"(Apple Development|Developer ID Application):/ && index($0, "(" team ")") {
+        | /usr/bin/awk '
+            $0 ~ /"(Apple Development|Developer ID Application):/ {
               hash = toupper($2)
               label = $0
               sub(/^[^"]*"/, "", label)
@@ -248,6 +251,10 @@ apple-team-signed-bundle: apple-project-generate
               print hash "\t" label
             }
           '
+    )"
+    team_signers="$(
+      printf '%s\n' "$eligible_signers" \
+        | /usr/bin/awk -F '\t' -v team="$team_id" 'index($2, "(" team ")") { print $0 }'
     )"
     team_signer_count="$(
       printf '%s\n' "$team_signers" \
@@ -260,7 +267,7 @@ apple-team-signed-bundle: apple-project-generate
       signer_record="$team_signers"
     else
       signer_record="$(
-        printf '%s\n' "$team_signers" \
+        printf '%s\n' "$eligible_signers" \
           | /usr/bin/awk -F '\t' -v requested="$requested_signer" '
               toupper(requested) == $1 || requested == $2 {
                 print $0
@@ -282,7 +289,9 @@ apple-team-signed-bundle: apple-project-generate
       "Apple Development:"*|"Developer ID Application:"*) ;;
       *) exit 1 ;;
     esac
-    [[ "$signer_label" == *"($team_id)" ]]
+    if [[ -z "$requested_signer" ]]; then
+      [[ "$signer_label" == *"($team_id)" ]]
+    fi
     xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"
     xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"
     dcx_cargo_bin="$(command -v cargo)"
