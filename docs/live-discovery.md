@@ -42,16 +42,19 @@ most ten empty-timeout replays, for a hard ceiling of twenty Search attempts and
 attempt after the first is preceded by at least five seconds. Empty timeouts are
 counted; malformed, partial, or transport failures remain terminal. Snapshot
 and readback use the same ten-search identity sequence followed by the
-named-device-qualified transmit-only remote mode, Dump0, and Dump1. Apply and
-rollback switch to receive-and-transmit only immediately before the typed
-direct-parameter command. They accept only immutable plans produced from the
-exact O1/channel 5/PEQ9 desired profile, verify a fresh baseline, issue one
-reviewed direct-parameter command when needed, and attempt complete readback. The full apply envelope is 150
+named-device-qualified transmit-only remote mode, Dump0, and Dump1, then switch
+once to the source-documented receive-only mode before close. Apply and rollback
+switch to receive-and-transmit only immediately before the typed direct-parameter command.
+They accept only immutable plans produced from the exact O1/channel 5/PEQ9
+desired profile, verify a fresh baseline, issue one reviewed direct-parameter
+command when needed, and attempt complete readback. The full apply envelope is 150
 seconds so the maximum qualified baseline path plus mutation readback remains
 bounded with room for complete cleanup.
 
-Unrecognized queued input blocks a write. Each operation has an exact request
-type, response ceiling, and deadline. The caller cannot choose frame bytes, remote-mode bytes,
+Unrecognized queued input blocks a write. The post-capture ReceiveDirect
+transition is part of a successful complete capture; failure to send it fails
+the capture. Each operation has an exact request type, response ceiling, and deadline. The caller
+cannot choose frame bytes, remote-mode bytes,
 baud, serial format, retry count, or timeout, and no generic write surface or
 port enumeration exists. Raw callout paths and payloads stay out of diagnostic
 output. Sanitized Search receipts distinguish total consumed wire bytes from
