@@ -21,11 +21,13 @@ dcxctl control recover-receive-direct \
 ```
 
 It configures the same fixed 38400 binding, discards pending input without
-parsing it, accepts only one typed ReceiveDirect command, discards input again,
-and observes a 25 ms quiet window before verified tty restoration and close.
-The sanitized receipt proves one complete kernel write and observed quiet, not
-device acknowledgement or durable mode state. A normal complete snapshot must
-reacquire identity and exact baseline state after recovery.
+parsing it, accepts only one typed ReceiveDirect command, and discards input
+again. If input resumes, recovery discards it without parsing and restarts the
+quiet observation until one continuous 25 ms quiet window is observed inside
+the fixed operation deadline. The sanitized receipt proves one complete kernel
+write, the bounded discard count, and observed quiet, not device acknowledgement
+or durable mode state. A normal complete snapshot must reacquire identity and
+exact baseline state after recovery.
 
 ## Persistent session
 
@@ -41,14 +43,14 @@ the eight-byte Search immediately followed by that identity. The optional
 exact request-prefix echo is removed only when it arrives as its own complete
 frame and is recorded as a byte count. The reader stops at the first frame
 terminator under the protocol hard bound, then still requires an exact 26-byte
-identity. The Search reader settles through the existing bounded receive
-deadline and consumes every complete trailing frame only when it is a
-byte-for-byte duplicate response. After each five-second device-cadence
-interval, the persistent carrier also reconciles all queued complete frames
-against the previous accepted Search response before the next write; it never
-counts those replays as new identities. The final valid Search retains one
-bounded settlement window, then remote mode and Dump0 follow immediately. The
-carrier still reconciles any already-queued exact replay at each write boundary.
+identity. The Search reader consumes every complete byte-for-byte duplicate
+already queued after the accepted response, then returns without waiting out
+the remaining receive deadline. After each five-second device-cadence interval,
+the persistent carrier also reconciles all queued complete frames against the
+previous accepted Search response before the next write; it never counts those
+replays as new identities. After the final valid Search and its queued-only
+reconciliation, remote mode and Dump0 follow immediately. The carrier still
+reconciles any already-queued exact replay at each write boundary.
 Each frame remains bounded to 26 bytes and the whole operation remains bounded
 by its existing deadline; partial or different input is terminal. Qualification
 collects ten valid matching identities on the same descriptor and permits at
@@ -66,10 +68,12 @@ seconds so the maximum qualified baseline path plus mutation readback remains
 bounded with room for complete cleanup.
 
 Unrecognized queued input blocks every normal operation write; the separate
-recovery command discards it without parsing before its sole closed write. The
-post-capture ReceiveDirect transition is part of a successful complete capture;
-failure to send it fails the capture. Each operation has an exact request type,
-response ceiling, and deadline. The caller
+recovery command discards it without parsing before its sole closed write. Once
+a transmit-capable mode is attempted, consuming session finish retains the
+bound device and performs one recovery-capable ReceiveDirect quiescence before
+tty restoration on every later exit. A successful capture performs that same
+transition immediately after Dump1, so finish does not duplicate it. Each
+operation has an exact request type, response ceiling, and deadline. The caller
 cannot choose frame bytes, remote-mode bytes,
 baud, serial format, retry count, or timeout, and no generic write surface or
 port enumeration exists. Raw callout paths and payloads stay out of diagnostic

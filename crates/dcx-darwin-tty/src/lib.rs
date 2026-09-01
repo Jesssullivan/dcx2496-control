@@ -192,8 +192,6 @@ pub enum CarrierFailureKind {
     ShortWrite,
     /// Input was already queued before a typed write.
     PreexistingInput,
-    /// Input resumed during the bounded recovery quiet window.
-    PostWriteInput,
     /// More input was pending than the current typed response permits.
     Overflow,
     /// The tty reached end-of-file.
@@ -214,6 +212,20 @@ pub enum DarwinCarrierError {
         expected_baud: u32,
         /// Baud requested by the rejected typed operation.
         actual_baud: u32,
+    },
+    /// A recovery-capable operation was supplied a mode other than receive-direct.
+    #[error("recovery quiescence requires ReceiveDirect, got {actual:?}")]
+    RecoveryModeMismatch {
+        /// Rejected closed mode.
+        actual: RemoteMode,
+    },
+    /// Receive-direct cleanup targeted a different device than the enabling mode.
+    #[error("recovery quiescence device mismatch")]
+    RecoveryDeviceMismatch {
+        /// Device whose enabling-mode attempt armed cleanup.
+        expected: DeviceId,
+        /// Device supplied to the receive-direct cleanup.
+        actual: DeviceId,
     },
     /// An earlier queued/trailing-input failure made this session terminal.
     #[error("tty session requires input cleanup and close before another operation")]
@@ -249,9 +261,6 @@ pub enum DarwinCarrierError {
         /// Bytes observed without consuming them during operation admission.
         queued: usize,
     },
-    /// Input became readable during the bounded post-recovery quiet window.
-    #[error("input resumed during the bounded post-recovery quiet window")]
-    PostWriteInput,
     /// More bytes were queued than the exact response budget permits.
     #[error("typed response overflow: {received} received and {queued} additional queued")]
     Overflow {
@@ -301,6 +310,8 @@ impl DarwinCarrierError {
     const fn kind(&self) -> CarrierFailureKind {
         match self {
             Self::OperationMismatch { .. }
+            | Self::RecoveryModeMismatch { .. }
+            | Self::RecoveryDeviceMismatch { .. }
             | Self::InputRecoveryRequired
             | Self::ProtocolEncoding(_) => CarrierFailureKind::Operation,
             Self::Binding(_) => CarrierFailureKind::Binding,
@@ -308,7 +319,6 @@ impl DarwinCarrierError {
             Self::System { .. } | Self::Cleanup { .. } => CarrierFailureKind::System,
             Self::ShortWrite { .. } => CarrierFailureKind::ShortWrite,
             Self::PreexistingInput { .. } => CarrierFailureKind::PreexistingInput,
-            Self::PostWriteInput => CarrierFailureKind::PostWriteInput,
             Self::Overflow { .. } => CarrierFailureKind::Overflow,
             Self::EndOfFile { .. } => CarrierFailureKind::EndOfFile,
             Self::UnexpectedTrailingFrame { .. }
@@ -470,8 +480,8 @@ pub struct SanitizedRecoveryReceipt {
     pub elapsed_micros: u64,
     /// Bytes accepted by the single recovery write syscall.
     pub tx_bytes: usize,
-    /// Successful input-only discards, exactly one before and one after write.
-    pub input_discard_count: u8,
+    /// Successful input-only discards before and after the sole write.
+    pub input_discard_count: usize,
     /// Termios restoration result.
     pub termios_cleanup: CleanupDisposition,
     /// Modem control-line restoration result.
@@ -658,6 +668,7 @@ struct PersistentCarrier<B: SerialBackend> {
     control_lines_snapshot: i32,
     input_discard_required: bool,
     last_search_response: Option<[u8; SEARCH_RESPONSE_LIMIT]>,
+    receive_direct_cleanup_device: Option<DeviceId>,
 }
 
 impl<B: SerialBackend> PersistentCarrier<B> {
@@ -757,6 +768,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             control_lines_snapshot,
             input_discard_required: false,
             last_search_response: None,
+            receive_direct_cleanup_device: None,
         })
     }
 
@@ -826,6 +838,14 @@ impl<B: SerialBackend> PersistentCarrier<B> {
     }
 
     fn finish(mut self) -> Result<SanitizedSessionReceipt, DarwinCarrierError> {
+        let quiescence = match self.receive_direct_cleanup_device {
+            Some(device) => self.quiesce_receive_direct_command(RemoteModeCommand::new(
+                device,
+                RemoteMode::ReceiveDirect,
+            )),
+            None => Ok(()),
+        };
+        let primary = quiescence.as_ref().err().map(DarwinCarrierError::kind);
         let input_cleanup = recover_input_state(&mut self.backend, self.input_discard_required);
         let termios_cleanup = if self.backend.restore_termios(&self.termios_snapshot).is_ok()
             && self.backend.verify_termios_restore(&self.termios_snapshot) == Ok(true)
@@ -864,12 +884,13 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             || control_lines_cleanup == CleanupDisposition::Failed
         {
             return Err(DarwinCarrierError::Cleanup {
-                primary: None,
+                primary,
                 input_failed: input_cleanup == CleanupDisposition::Failed,
                 termios_failed: termios_cleanup == CleanupDisposition::Failed,
                 control_lines_failed: control_lines_cleanup == CleanupDisposition::Failed,
             });
         }
+        quiescence?;
         Ok(receipt)
     }
 
@@ -998,7 +1019,55 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         &mut self,
         command: RemoteModeCommand,
     ) -> Result<(), DarwinCarrierError> {
-        self.write_typed_frame(&command.encode()?)
+        match command.mode() {
+            RemoteMode::ReceiveDirect => self.quiesce_receive_direct_command(command),
+            RemoteMode::Transmit | RemoteMode::ReceiveAndTransmit => {
+                self.receive_direct_cleanup_device = Some(command.device());
+                self.write_typed_frame(&command.encode()?)
+            }
+        }
+    }
+
+    fn quiesce_receive_direct_command(
+        &mut self,
+        command: RemoteModeCommand,
+    ) -> Result<(), DarwinCarrierError> {
+        if command.mode() != RemoteMode::ReceiveDirect {
+            return Err(DarwinCarrierError::RecoveryModeMismatch {
+                actual: command.mode(),
+            });
+        }
+        if let Some(expected) = self.receive_direct_cleanup_device
+            && expected != command.device()
+        {
+            return Err(DarwinCarrierError::RecoveryDeviceMismatch {
+                expected,
+                actual: command.device(),
+            });
+        }
+
+        let encoded = command.encode()?;
+        let start = self.backend.monotonic_now();
+        let deadline = active_io_deadline(start, SEARCH_ATTEMPT_TIMEOUT);
+        let mut write_attempted = false;
+        let result = execute_receive_direct_recovery_write(
+            &mut self.backend,
+            deadline,
+            &encoded,
+            &mut write_attempted,
+        );
+        match result {
+            Ok(_) => {
+                self.input_discard_required = false;
+                self.last_search_response = None;
+                self.receive_direct_cleanup_device = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.input_discard_required = true;
+                Err(error)
+            }
+        }
     }
 
     fn write_typed_frame(&mut self, frame: &[u8]) -> Result<(), DarwinCarrierError> {
@@ -1086,17 +1155,18 @@ type AttemptResult = (
     SanitizedAttemptReceipt,
 );
 
-#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn execute_receive_direct_recovery_write<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
     command: &[u8],
     write_attempted: &mut bool,
-) -> Result<usize, DarwinCarrierError> {
+) -> Result<(usize, usize), DarwinCarrierError> {
+    let mut discard_count = 0_usize;
     ensure_before_deadline(backend, deadline, CarrierStage::DiscardInput)?;
     backend
         .discard_input()
         .map_err(|fault| system_error(CarrierStage::DiscardInput, fault))?;
+    discard_count += 1;
 
     ensure_before_deadline(backend, deadline, CarrierStage::Write)?;
     *write_attempted = true;
@@ -1114,33 +1184,63 @@ fn execute_receive_direct_recovery_write<B: SerialBackend>(
     backend
         .discard_input()
         .map_err(|fault| system_error(CarrierStage::DiscardInput, fault))?;
+    discard_count += 1;
 
-    ensure_before_deadline(backend, deadline, CarrierStage::WaitReadable)?;
-    if remaining(backend, deadline) <= RECOVERY_QUIET_WINDOW {
-        return Err(DarwinCarrierError::Deadline {
-            stage: CarrierStage::WaitReadable,
-        });
+    drain_until_quiet(backend, deadline, &mut discard_count)?;
+    Ok((written, discard_count))
+}
+
+/// Discard without parsing until one continuous quiet window is observed.
+///
+/// Resumed input restarts the fixed quiet observation but never retries the
+/// typed write. The common operation deadline bounds the complete drain.
+fn drain_until_quiet<B: SerialBackend>(
+    backend: &mut B,
+    deadline: Duration,
+    discard_count: &mut usize,
+) -> Result<(), DarwinCarrierError> {
+    loop {
+        ensure_before_deadline(backend, deadline, CarrierStage::WaitReadable)?;
+        if remaining(backend, deadline) <= RECOVERY_QUIET_WINDOW {
+            return Err(DarwinCarrierError::Deadline {
+                stage: CarrierStage::WaitReadable,
+            });
+        }
+        let quiet_started = backend.monotonic_now();
+        if backend
+            .wait_readable(RECOVERY_QUIET_WINDOW)
+            .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
+        {
+            ensure_before_deadline(backend, deadline, CarrierStage::DiscardInput)?;
+            backend
+                .discard_input()
+                .map_err(|fault| system_error(CarrierStage::DiscardInput, fault))?;
+            *discard_count = discard_count.saturating_add(1);
+            if backend.monotonic_now() <= quiet_started {
+                return Err(DarwinCarrierError::Deadline {
+                    stage: CarrierStage::WaitReadable,
+                });
+            }
+            continue;
+        }
+        if backend.monotonic_now().saturating_sub(quiet_started) < RECOVERY_QUIET_WINDOW {
+            return Err(DarwinCarrierError::Deadline {
+                stage: CarrierStage::WaitReadable,
+            });
+        }
+        ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+        let queued = backend
+            .bytes_available()
+            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+        if queued == 0 {
+            return Ok(());
+        }
+        ensure_before_deadline(backend, deadline, CarrierStage::DiscardInput)?;
+        backend
+            .discard_input()
+            .map_err(|fault| system_error(CarrierStage::DiscardInput, fault))?;
+        *discard_count = discard_count.saturating_add(1);
     }
-    let quiet_started = backend.monotonic_now();
-    if backend
-        .wait_readable(RECOVERY_QUIET_WINDOW)
-        .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
-    {
-        return Err(DarwinCarrierError::PostWriteInput);
-    }
-    if backend.monotonic_now().saturating_sub(quiet_started) < RECOVERY_QUIET_WINDOW {
-        return Err(DarwinCarrierError::Deadline {
-            stage: CarrierStage::WaitReadable,
-        });
-    }
-    ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
-    let queued = backend
-        .bytes_available()
-        .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-    if queued != 0 {
-        return Err(DarwinCarrierError::PostWriteInput);
-    }
-    Ok(written)
 }
 
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
@@ -1209,7 +1309,7 @@ fn run_receive_direct_recovery<B: SerialBackend>(
             control_lines_failed,
         });
     }
-    let tx_bytes = primary?;
+    let (tx_bytes, input_discard_count) = primary?;
     let elapsed = backend.monotonic_now().saturating_sub(start);
     if elapsed > SEARCH_ATTEMPT_TIMEOUT {
         return Err(DarwinCarrierError::Deadline {
@@ -1225,7 +1325,7 @@ fn run_receive_direct_recovery<B: SerialBackend>(
         quiet_window_millis: duration_millis(RECOVERY_QUIET_WINDOW),
         elapsed_micros: duration_micros_ceil(elapsed),
         tx_bytes,
-        input_discard_count: 2,
+        input_discard_count,
         termios_cleanup,
         control_lines_cleanup,
         closed: true,
@@ -1605,6 +1705,71 @@ fn finish_bounded_response<B: SerialBackend, O: WireObserver>(
     }
 }
 
+/// Consume every complete replay already queued at one snapshot-Search boundary.
+///
+/// An empty queue returns immediately. This never waits for later input; the
+/// persistent carrier reconciles any replay that arrives before the next typed
+/// write. A queued partial, different frame, or over-limit frame is terminal.
+fn finish_queued_snapshot_search_replays<B: SerialBackend, O: WireObserver>(
+    backend: &mut B,
+    deadline: Duration,
+    frame_limit: usize,
+    response: &[u8],
+    observer: &mut O,
+) -> Result<(), DarwinCarrierError> {
+    loop {
+        ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+        let queued = backend
+            .bytes_available()
+            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+        if queued == 0 {
+            return Ok(());
+        }
+        match read_one_queued_frame(backend, frame_limit, queued, observer)? {
+            FramedRead::Complete(duplicate) if duplicate == response => observer.duplicate(),
+            FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
+                return Err(observer.unexpected(other.len()));
+            }
+        }
+    }
+}
+
+/// Read at most the bytes reported by one nonblocking queued-input observation.
+fn read_one_queued_frame<B: SerialBackend, O: WireObserver>(
+    backend: &mut B,
+    frame_limit: usize,
+    queued: usize,
+    observer: &mut O,
+) -> Result<FramedRead, DarwinCarrierError> {
+    let limit = frame_limit.min(MAX_FRAME_LEN);
+    let mut frame = Vec::with_capacity(limit.min(queued));
+    for _ in 0..queued {
+        if frame.len() == limit {
+            return Err(observer.overflow(frame.len(), queued.saturating_sub(frame.len())));
+        }
+        let mut byte = [0_u8; 1];
+        match backend
+            .read_once(&mut byte)
+            .map_err(|fault| system_error(CarrierStage::Read, fault))?
+        {
+            ReadProgress::Bytes(1) => {
+                frame.push(byte[0]);
+                observer.consumed(1);
+            }
+            ReadProgress::Bytes(_) | ReadProgress::EndOfFile => {
+                return Err(DarwinCarrierError::EndOfFile {
+                    received: frame.len(),
+                });
+            }
+            ReadProgress::WouldBlock => return Ok(FramedRead::TimedOut(frame)),
+        }
+        if byte[0] == 0xf7 {
+            return Ok(FramedRead::Complete(frame));
+        }
+    }
+    Ok(FramedRead::TimedOut(frame))
+}
+
 fn read_one_frame<B: SerialBackend, O: WireObserver>(
     backend: &mut B,
     deadline: Duration,
@@ -1661,7 +1826,7 @@ fn read_snapshot_bounded<B: SerialBackend>(
     deadline: Duration,
     limit: usize,
     request: &[u8],
-    settle_until_deadline: bool,
+    consume_all_queued_search_replays: bool,
 ) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
     let mut observer = ();
     let first = read_one_frame(backend, deadline, limit, &mut observer)?;
@@ -1686,14 +1851,11 @@ fn read_snapshot_bounded<B: SerialBackend>(
         FramedRead::Complete(response) => response,
     };
     let read = SnapshotRead::complete(&response)?;
-    finish_bounded_response(
-        backend,
-        deadline,
-        limit,
-        &response,
-        &mut observer,
-        settle_until_deadline,
-    )?;
+    if consume_all_queued_search_replays {
+        finish_queued_snapshot_search_replays(backend, deadline, limit, &response, &mut observer)?;
+    } else {
+        finish_bounded_response(backend, deadline, limit, &response, &mut observer, false)?;
+    }
     Ok(BoundedRead {
         read,
         response: Some(response),
@@ -1713,6 +1875,8 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         Ok(_) => SanitizedAttemptOutcome::TimedOut,
         Err(
             DarwinCarrierError::OperationMismatch { .. }
+            | DarwinCarrierError::RecoveryModeMismatch { .. }
+            | DarwinCarrierError::RecoveryDeviceMismatch { .. }
             | DarwinCarrierError::InputRecoveryRequired
             | DarwinCarrierError::ProtocolEncoding(_),
         ) => SanitizedAttemptOutcome::OperationRejected,
@@ -1723,7 +1887,6 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         Err(DarwinCarrierError::PreexistingInput { .. }) => {
             SanitizedAttemptOutcome::PreexistingInput
         }
-        Err(DarwinCarrierError::PostWriteInput) => SanitizedAttemptOutcome::PreexistingInput,
         Err(DarwinCarrierError::Overflow { .. }) => SanitizedAttemptOutcome::Overflow,
         Err(DarwinCarrierError::EndOfFile { .. }) => SanitizedAttemptOutcome::EndOfFile,
         Err(
