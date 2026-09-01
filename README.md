@@ -175,8 +175,10 @@ bundled `dcxctl`, AUv3, and containing app from the inside out with ad-hoc
 signatures. It verifies arm64 binaries, signatures, entitlement separation,
 bundle/component identifiers, and the absence of provisioning profiles. This is
 the bounded carrier for helper-absent AU discovery and `auval`; because an ad-hoc
-signature has no team identifier, it does not qualify App Group access, helper
-IPC, installation, registration, Logic, or device behavior.
+signature has no team identifier, the carrier uses qualification-only app and AU
+entitlements that omit the production App Group and serial access. It does not
+qualify App Group access, helper IPC, installation, registration, Logic, or
+device behavior.
 
 `just apple-provisioned-bundle` is the non-installing production carrier. It
 requires an accessible Apple Development identity plus matching profiles for
