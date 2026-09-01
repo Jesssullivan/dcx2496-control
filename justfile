@@ -29,7 +29,7 @@ apple-bundle-check: repo::apple-bundle-check
 
 apple-adhoc-bundle: repo::apple-adhoc-bundle
 
-apple-provisioned-bundle: repo::apple-provisioned-bundle
+apple-team-development-bundle: repo::apple-team-development-bundle
 
 product-check: repo::product-check
 

@@ -8,7 +8,6 @@ pub mod profile;
 pub mod protocol;
 pub mod rew;
 pub mod snapshot;
-pub mod state_machine;
 
 pub use profile::{LabProfileV1, ProfileBinding, ProfileDiff, ProfileError};
 pub use protocol::{
@@ -24,4 +23,3 @@ pub use snapshot::{
     PlanCarrierError, ReadbackVerificationV1, RollbackPlanV1, SnapshotDiffError, SnapshotDiffV1,
     SnapshotError, SnapshotProjectionError, SnapshotSection, SnapshotSectionChange, SnapshotV1,
 };
-pub use state_machine::{ControllerMachine, ControllerState, Event, TransitionError};
