@@ -215,11 +215,11 @@ impl Query {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteMode {
-    /// Accept typed function-`0x20` direct-parameter writes.
+    /// Enable device receipt of typed function-`0x20` parameter changes.
     ReceiveDirect,
-    /// Transmit complete Dump0/Dump1 responses.
+    /// Enable device transmission of function-`0x20` parameter changes.
     Transmit,
-    /// Accept direct writes and transmit subsequent dump readback.
+    /// Enable device receipt and transmission of parameter changes.
     ReceiveAndTransmit,
 }
 
