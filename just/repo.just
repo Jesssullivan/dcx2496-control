@@ -93,11 +93,11 @@ apple-bundle-check: apple-project-generate
       DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CC="$xcode_toolchain/clang" CPLUSPLUS="$xcode_toolchain/clang++" LD="$xcode_toolchain/clang" LDPLUSPLUS="$xcode_toolchain/clang++" build
 
 # Build and verify one arm64 ad-hoc test carrier for helper-absent AU discovery/auval.
-# This does not prove the team-bound App Group, install/register, or launch a GUI.
+# Its qualification-only entitlements deliberately omit the team-bound App Group
+# and serial access; this does not prove helper IPC, install/register, or launch a GUI.
 apple-adhoc-bundle: apple-project-generate
     #!/usr/bin/env bash
     set -euo pipefail
-    app_group="QP994XQKNH.io.tinyland.dcx2496"
     xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"
     xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"
     derived_data="apple/.derived-adhoc"
@@ -131,11 +131,11 @@ apple-adhoc-bundle: apple-project-generate
       "$child"
     /usr/bin/codesign \
       --force --sign - --options runtime --timestamp=none \
-      --entitlements apple/DCXControlAU/DCXControlAU.entitlements \
+      --entitlements apple/DCXControlAU/DCXControlAU.adhoc.entitlements \
       "$au"
     /usr/bin/codesign \
       --force --sign - --options runtime --timestamp=none \
-      --entitlements apple/DCXLogicHelper/DCXLogicHelper.entitlements \
+      --entitlements apple/DCXLogicHelper/DCXLogicHelper.adhoc.entitlements \
       "$app"
     for binary in "$app_binary" "$au_binary" "$child"; do
       test -x "$binary"
@@ -164,14 +164,15 @@ apple-adhoc-bundle: apple-project-generate
     app_entitlements="$(extract_entitlements_json "$app")"
     au_entitlements="$(extract_entitlements_json "$au")"
     child_entitlements="$(extract_entitlements_json "$child")"
-    printf '%s' "$app_entitlements" | /usr/bin/jq -e --arg group "$app_group" '
+    printf '%s' "$app_entitlements" | /usr/bin/jq -e '
       ."com.apple.security.app-sandbox" == true and
-      ."com.apple.security.device.serial" == true and
-      ."com.apple.security.application-groups" == [$group]
+      (has("com.apple.security.device.serial") | not) and
+      (has("com.apple.security.application-groups") | not)
     ' >/dev/null
-    printf '%s' "$au_entitlements" | /usr/bin/jq -e --arg group "$app_group" '
+    printf '%s' "$au_entitlements" | /usr/bin/jq -e '
       ."com.apple.security.app-sandbox" == true and
-      ."com.apple.security.application-groups" == [$group] and
+      ."com.apple.security.files.user-selected.read-only" == true and
+      (has("com.apple.security.application-groups") | not) and
       (has("com.apple.security.device.serial") | not)
     ' >/dev/null
     printf '%s' "$child_entitlements" | /usr/bin/jq -e '
