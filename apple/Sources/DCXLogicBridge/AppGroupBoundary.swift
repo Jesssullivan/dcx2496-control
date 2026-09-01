@@ -95,11 +95,19 @@ public enum BridgeJSONCodec {
 }
 
 public final class AppGroupSocketClient: @unchecked Sendable {
+    /// Ten seconds beyond the helper's maximum child envelope for framing,
+    /// response encoding, and scheduling outside Logic's render thread.
+    public static let defaultTimeoutSeconds = 165
+    public static let maximumTimeoutSeconds = 165
+
     private let socketURL: URL
     private let timeoutSeconds: Int
 
-    public init(socketURL: URL, timeoutSeconds: Int = 135) throws {
-        guard (1...135).contains(timeoutSeconds) else {
+    public init(
+        socketURL: URL,
+        timeoutSeconds: Int = AppGroupSocketClient.defaultTimeoutSeconds
+    ) throws {
+        guard (1...Self.maximumTimeoutSeconds).contains(timeoutSeconds) else {
             throw AppGroupBoundaryError.invalidTimeout
         }
         _ = try UnixSocketAddress(path: socketURL.path)

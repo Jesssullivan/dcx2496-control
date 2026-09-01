@@ -1,6 +1,6 @@
 [package]
 name = "dcx-core"
-description = "Pure DCX2496 protocol, profile, safety-state, and REW translation logic"
+description = "Pure DCX2496 protocol, profile, direct-parameter, and REW translation logic"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
