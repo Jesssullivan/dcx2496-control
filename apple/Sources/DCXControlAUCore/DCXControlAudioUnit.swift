@@ -6,11 +6,24 @@ import Foundation
 public final class DCXControlAudioUnit: AUAudioUnit {
     private static let controlStateKey = DCXControlPersistedStateV1.schemaVersion
     private static let legacyProjectStateKey = StagedProjectStateV1.schemaVersion
+    @objc dynamic private var controlStateRevision: UInt64 = 0
 
     public enum ParameterAddress {
         public static let desiredStateStaged: AUParameterAddress = 0
         public static let pendingChangeCount: AUParameterAddress = 1
         public static let rollbackAvailable: AUParameterAddress = 2
+    }
+
+    public override class func keyPathsForValuesAffectingValue(
+        forKey key: String
+    ) -> Set<String> {
+        var paths = super.keyPathsForValuesAffectingValue(forKey: key)
+        if key == #keyPath(AUAudioUnit.fullState)
+            || key == #keyPath(AUAudioUnit.fullStateForDocument)
+            || key == #keyPath(AUAudioUnit.allParameterValues) {
+            paths.insert("controlStateRevision")
+        }
+        return paths
     }
 
     public let controlState = DCXControlState()
@@ -143,6 +156,35 @@ public final class DCXControlAudioUnit: AUAudioUnit {
             }
             try? controlState.reset()
         }
+    }
+
+    /// Apply one typed state transition and tell the host that the custom AU
+    /// document state changed. The notification never performs helper IPC or
+    /// device I/O; it only invalidates the read-only presentation parameters.
+    @discardableResult
+    public func performControlStateMutation<Result>(
+        _ update: (DCXControlState) throws -> Result
+    ) rethrows -> Result {
+        let result = try update(controlState)
+        publishControlStateChange()
+        return result
+    }
+
+    private func publishControlStateChange() {
+        let state = controlState.view()
+        parameterTree?.parameter(withAddress: ParameterAddress.desiredStateStaged)?.setValue(
+            state.projectState == nil ? 0 : 1,
+            originator: nil
+        )
+        parameterTree?.parameter(withAddress: ParameterAddress.pendingChangeCount)?.setValue(
+            AUValue(state.diff?.changes.count ?? 0),
+            originator: nil
+        )
+        parameterTree?.parameter(withAddress: ParameterAddress.rollbackAvailable)?.setValue(
+            state.rollbackBaseline == nil ? 0 : 1,
+            originator: nil
+        )
+        controlStateRevision &+= 1
     }
 
     public override var internalRenderBlock: AUInternalRenderBlock {
