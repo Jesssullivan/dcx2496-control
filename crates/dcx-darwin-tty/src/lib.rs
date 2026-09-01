@@ -1705,11 +1705,13 @@ fn finish_bounded_response<B: SerialBackend, O: WireObserver>(
     }
 }
 
-/// Consume every complete replay already queued at one snapshot-Search boundary.
+/// Consume every replay already begun at one snapshot-Search boundary.
 ///
-/// An empty queue returns immediately. This never waits for later input; the
-/// persistent carrier reconciles any replay that arrives before the next typed
-/// write. A queued partial, different frame, or over-limit frame is terminal.
+/// An empty queue returns immediately. Once any replay byte is queued, finish
+/// that already-started frame within the existing operation deadline. The
+/// persistent carrier reconciles any replay that begins before the next typed
+/// write. A partial that does not finish, different frame, or over-limit frame
+/// is terminal.
 fn finish_queued_snapshot_search_replays<B: SerialBackend, O: WireObserver>(
     backend: &mut B,
     deadline: Duration,
@@ -1725,49 +1727,13 @@ fn finish_queued_snapshot_search_replays<B: SerialBackend, O: WireObserver>(
         if queued == 0 {
             return Ok(());
         }
-        match read_one_queued_frame(backend, frame_limit, queued, observer)? {
+        match read_one_frame(backend, deadline, frame_limit, observer)? {
             FramedRead::Complete(duplicate) if duplicate == response => observer.duplicate(),
             FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
                 return Err(observer.unexpected(other.len()));
             }
         }
     }
-}
-
-/// Read at most the bytes reported by one nonblocking queued-input observation.
-fn read_one_queued_frame<B: SerialBackend, O: WireObserver>(
-    backend: &mut B,
-    frame_limit: usize,
-    queued: usize,
-    observer: &mut O,
-) -> Result<FramedRead, DarwinCarrierError> {
-    let limit = frame_limit.min(MAX_FRAME_LEN);
-    let mut frame = Vec::with_capacity(limit.min(queued));
-    for _ in 0..queued {
-        if frame.len() == limit {
-            return Err(observer.overflow(frame.len(), queued.saturating_sub(frame.len())));
-        }
-        let mut byte = [0_u8; 1];
-        match backend
-            .read_once(&mut byte)
-            .map_err(|fault| system_error(CarrierStage::Read, fault))?
-        {
-            ReadProgress::Bytes(1) => {
-                frame.push(byte[0]);
-                observer.consumed(1);
-            }
-            ReadProgress::Bytes(_) | ReadProgress::EndOfFile => {
-                return Err(DarwinCarrierError::EndOfFile {
-                    received: frame.len(),
-                });
-            }
-            ReadProgress::WouldBlock => return Ok(FramedRead::TimedOut(frame)),
-        }
-        if byte[0] == 0xf7 {
-            return Ok(FramedRead::Complete(frame));
-        }
-    }
-    Ok(FramedRead::TimedOut(frame))
 }
 
 fn read_one_frame<B: SerialBackend, O: WireObserver>(

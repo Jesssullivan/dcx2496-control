@@ -43,16 +43,18 @@ the eight-byte Search immediately followed by that identity. The optional
 exact request-prefix echo is removed only when it arrives as its own complete
 frame and is recorded as a byte count. The reader stops at the first frame
 terminator under the protocol hard bound, then still requires an exact 26-byte
-identity. The Search reader consumes every complete byte-for-byte duplicate
-already queued after the accepted response, then returns without waiting out
-the remaining receive deadline. After each five-second device-cadence interval,
+identity. The Search reader returns immediately when no replay has begun. If a
+replay prefix is already queued after the accepted response, it finishes only
+that already-started frame within the existing receive deadline and accepts it
+only as a complete byte-for-byte duplicate. After each five-second device-cadence interval,
 the persistent carrier also reconciles all queued complete frames against the
 previous accepted Search response before the next write; it never counts those
 replays as new identities. After the final valid Search and its queued-only
 reconciliation, remote mode and Dump0 follow immediately. The carrier still
 reconciles any already-queued exact replay at each write boundary.
 Each frame remains bounded to 26 bytes and the whole operation remains bounded
-by its existing deadline; partial or different input is terminal. Qualification
+by its existing deadline; a begun replay that does not finish, or any different
+input, is terminal. Qualification
 collects ten valid matching identities on the same descriptor and permits at
 most ten empty-timeout replays, for a hard ceiling of twenty Search attempts and 120 seconds. Every
 attempt after the first is preceded by at least five seconds. Empty timeouts are
