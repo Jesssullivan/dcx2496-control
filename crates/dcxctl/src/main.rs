@@ -179,6 +179,16 @@ enum RewCommand {
 
 #[derive(Debug, Subcommand)]
 enum ControlCommand {
+    /// Discard pending input and issue one typed `ReceiveDirect` recovery command.
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    RecoverReceiveDirect {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address encoded into the recovery command.
+        #[arg(long)]
+        expected_device: u8,
+    },
     /// Capture ten validated identities plus exact Dump0 and Dump1.
     #[cfg(all(feature = "live-control", target_os = "macos"))]
     Snapshot {
@@ -250,6 +260,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn control(command: ControlCommand) -> Result<(), Box<dyn Error>> {
     match command {
+        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        ControlCommand::RecoverReceiveDirect {
+            tty,
+            expected_device,
+        } => live_control::recover_receive_direct(tty, expected_device),
         #[cfg(all(feature = "live-control", target_os = "macos"))]
         ControlCommand::Snapshot {
             tty,

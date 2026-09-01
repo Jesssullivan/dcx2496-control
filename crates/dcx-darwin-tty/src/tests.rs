@@ -1023,6 +1023,141 @@ fn persistent_open_discards_preexisting_input_after_rejection_and_preserves_prim
 }
 
 #[test]
+fn receive_direct_recovery_discards_without_reading_and_writes_one_closed_frame() {
+    let mut backend = FakeBackend::with_inbound([0x01, 0x02, 0xff]);
+    backend.preexisting_input = 12;
+    let device = DeviceId::new(0).unwrap();
+
+    let receipt = run_receive_direct_recovery(&binding(), &mut backend, device).unwrap();
+
+    assert_eq!(
+        backend.writes,
+        [vec![0xf0, 0, 0x20, 0x32, 0, 0x0e, 0x3f, 0x04, 0, 0xf7]]
+    );
+    assert_eq!(
+        backend
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Write(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count(),
+        2
+    );
+    assert!(
+        !backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Read(_)))
+    );
+    assert_eq!(receipt.device, device);
+    assert_eq!(receipt.remote_mode, RemoteMode::ReceiveDirect);
+    assert_eq!(receipt.baud, FALLBACK_BAUD);
+    assert_eq!(receipt.tx_bytes, 10);
+    assert_eq!(receipt.input_discard_count, 2);
+    assert_eq!(
+        receipt.termios_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert_eq!(
+        receipt.control_lines_cleanup,
+        CleanupDisposition::VerifiedRestored
+    );
+    assert!(receipt.closed);
+    let serialized = serde_json::to_string(&receipt).unwrap();
+    assert!(!serialized.contains(SYNTHETIC_PATH));
+    assert!(!serialized.contains("F0002032"));
+}
+
+#[test]
+fn receive_direct_recovery_fails_on_resumed_input_and_still_restores_and_closes() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend
+        .wait_script
+        .push_back((true, Duration::from_millis(1)));
+
+    assert_eq!(
+        run_receive_direct_recovery(&binding(), &mut backend, DeviceId::new(0).unwrap()),
+        Err(DarwinCarrierError::PostWriteInput)
+    );
+    assert_eq!(backend.writes.len(), 1);
+    assert_eq!(
+        backend
+            .calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count(),
+        3
+    );
+    assert!(
+        !backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Read(_)))
+    );
+    assert!(backend.calls.contains(&Call::RestoreTermios));
+    assert!(backend.calls.contains(&Call::VerifyTermiosRestore));
+    assert!(backend.calls.contains(&Call::RestoreControlLines));
+    assert!(backend.calls.contains(&Call::VerifyControlLinesRestore));
+    assert_eq!(backend.calls.last(), Some(&Call::Close));
+}
+
+#[test]
+fn receive_direct_recovery_post_config_failures_never_retry_and_always_restore() {
+    let mut short_write = FakeBackend::with_inbound([]);
+    short_write.short_write = Some(1);
+    let mut insufficient_quiet_budget = FakeBackend::with_inbound([]);
+    insufficient_quiet_budget.advance_at = Some((CarrierStage::Write, Duration::from_millis(460)));
+
+    for (mut backend, expected) in [
+        (
+            short_write,
+            DarwinCarrierError::ShortWrite {
+                written: 1,
+                expected: 10,
+            },
+        ),
+        (
+            insufficient_quiet_budget,
+            DarwinCarrierError::Deadline {
+                stage: CarrierStage::WaitReadable,
+            },
+        ),
+    ] {
+        assert_eq!(
+            run_receive_direct_recovery(&binding(), &mut backend, DeviceId::new(0).unwrap()),
+            Err(expected)
+        );
+        assert_eq!(backend.writes.len(), 1);
+        assert_eq!(
+            backend
+                .calls
+                .iter()
+                .filter(|call| matches!(call, Call::Write(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !backend
+                .calls
+                .iter()
+                .any(|call| matches!(call, Call::Read(_)))
+        );
+        assert!(backend.calls.contains(&Call::RestoreTermios));
+        assert!(backend.calls.contains(&Call::VerifyTermiosRestore));
+        assert!(backend.calls.contains(&Call::RestoreControlLines));
+        assert!(backend.calls.contains(&Call::VerifyControlLinesRestore));
+        assert_eq!(backend.calls.last(), Some(&Call::Close));
+    }
+}
+
+#[test]
 fn post_write_failure_taints_every_persistent_operation_until_consuming_cleanup() {
     let shared_calls = Rc::new(RefCell::new(Vec::new()));
     let mut backend = FakeBackend::with_inbound([]).with_shared_calls(Rc::clone(&shared_calls));

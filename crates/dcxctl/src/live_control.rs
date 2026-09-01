@@ -17,7 +17,7 @@ use dcx_core::ApplyTransactionState;
 use dcx_core::{ApplyPlanV1, RollbackPlanV1, protocol::DeviceId};
 use dcx_core::{ApplyTransactionV1, DirectParameterAction, SnapshotV1, rew::DesiredPeqProfileV1};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
-use dcx_darwin_tty::{DarwinSearchSession, PrivateTtyBinding};
+use dcx_darwin_tty::{DarwinSearchSession, PrivateTtyBinding, recover_receive_direct_known_38400};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 use dcx_transport::{
     RepeatPacer,
@@ -55,6 +55,15 @@ impl RepeatPacer for SystemPacer {
         thread::sleep(minimum);
         Ok(())
     }
+}
+
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn recover_receive_direct(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> {
+    let device = DeviceId::new(expected_device)?;
+    let binding = PrivateTtyBinding::new(tty)?;
+    let receipt = recover_receive_direct_known_38400(&binding, device)?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
 }
 
 #[cfg(all(feature = "live-control", target_os = "macos"))]

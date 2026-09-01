@@ -19,7 +19,10 @@ use std::{
 
 use dcx_core::{
     discovery::FALLBACK_BAUD,
-    protocol::{DirectParameterCommand, MAX_FRAME_LEN, ProtocolError, RemoteModeCommand},
+    protocol::{
+        DeviceId, DirectParameterCommand, MAX_FRAME_LEN, ProtocolError, RemoteMode,
+        RemoteModeCommand,
+    },
 };
 use dcx_transport::{
     SEARCH_ATTEMPT_TIMEOUT, SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, SearchOperation,
@@ -37,6 +40,8 @@ const PRIVATE_CALLOUT_PREFIX: &[u8] = b"/dev/cu.usbserial-";
 const SHA256_PREFIX: &str = "sha256/";
 /// Portion of the 500 ms whole-attempt budget reserved for restoration/close.
 pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
+/// Quiet observation after the explicit `ReceiveDirect` recovery write.
+const RECOVERY_QUIET_WINDOW: Duration = Duration::from_millis(25);
 
 /// A lower-case, prefixed SHA-256 digest safe for sanitized receipts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -157,7 +162,7 @@ pub enum CarrierStage {
     WaitReadable,
     /// Consume no more than the remaining response allowance.
     Read,
-    /// Discard queued input after the current operation has failed terminally.
+    /// Discard queued input during explicit recovery or terminal cleanup.
     DiscardInput,
     /// Restore the saved termios structure.
     RestoreTermios,
@@ -187,6 +192,8 @@ pub enum CarrierFailureKind {
     ShortWrite,
     /// Input was already queued before a typed write.
     PreexistingInput,
+    /// Input resumed during the bounded recovery quiet window.
+    PostWriteInput,
     /// More input was pending than the current typed response permits.
     Overflow,
     /// The tty reached end-of-file.
@@ -242,6 +249,9 @@ pub enum DarwinCarrierError {
         /// Bytes observed without consuming them during operation admission.
         queued: usize,
     },
+    /// Input became readable during the bounded post-recovery quiet window.
+    #[error("input resumed during the bounded post-recovery quiet window")]
+    PostWriteInput,
     /// More bytes were queued than the exact response budget permits.
     #[error("typed response overflow: {received} received and {queued} additional queued")]
     Overflow {
@@ -298,6 +308,7 @@ impl DarwinCarrierError {
             Self::System { .. } | Self::Cleanup { .. } => CarrierFailureKind::System,
             Self::ShortWrite { .. } => CarrierFailureKind::ShortWrite,
             Self::PreexistingInput { .. } => CarrierFailureKind::PreexistingInput,
+            Self::PostWriteInput => CarrierFailureKind::PostWriteInput,
             Self::Overflow { .. } => CarrierFailureKind::Overflow,
             Self::EndOfFile { .. } => CarrierFailureKind::EndOfFile,
             Self::UnexpectedTrailingFrame { .. }
@@ -427,6 +438,40 @@ pub struct SanitizedSessionReceipt {
     pub attempt_count: usize,
     /// Total session lifetime, rounded up to microseconds.
     pub elapsed_micros: u64,
+    /// Termios restoration result.
+    pub termios_cleanup: CleanupDisposition,
+    /// Modem control-line restoration result.
+    pub control_lines_cleanup: CleanupDisposition,
+    /// True after the owned descriptor was closed.
+    pub closed: bool,
+}
+
+/// Sanitized result of one explicit `ReceiveDirect` recovery operation.
+///
+/// A successful receipt proves that the exact typed frame was accepted by one
+/// kernel write and that no input became readable during the bounded quiet
+/// window. It is not a device acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SanitizedRecoveryReceipt {
+    /// Digest of the validated callout path; the path itself is never emitted.
+    pub binding_digest: Sha256Digest,
+    /// Exact device address encoded into the closed recovery command.
+    pub device: DeviceId,
+    /// Source-documented mode encoded into the closed recovery command.
+    pub remote_mode: RemoteMode,
+    /// Fixed line rate used for the operation.
+    pub baud: u32,
+    /// Fixed whole-operation budget.
+    pub deadline_millis: u64,
+    /// Duration observed for input after the post-write discard.
+    pub quiet_window_millis: u64,
+    /// Observed monotonic duration, rounded up to microseconds.
+    pub elapsed_micros: u64,
+    /// Bytes accepted by the single recovery write syscall.
+    pub tx_bytes: usize,
+    /// Successful input-only discards, exactly one before and one after write.
+    pub input_discard_count: u8,
     /// Termios restoration result.
     pub termios_cleanup: CleanupDisposition,
     /// Modem control-line restoration result.
@@ -1041,6 +1086,152 @@ type AttemptResult = (
     SanitizedAttemptReceipt,
 );
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+fn execute_receive_direct_recovery_write<B: SerialBackend>(
+    backend: &mut B,
+    deadline: Duration,
+    command: &[u8],
+    write_attempted: &mut bool,
+) -> Result<usize, DarwinCarrierError> {
+    ensure_before_deadline(backend, deadline, CarrierStage::DiscardInput)?;
+    backend
+        .discard_input()
+        .map_err(|fault| system_error(CarrierStage::DiscardInput, fault))?;
+
+    ensure_before_deadline(backend, deadline, CarrierStage::Write)?;
+    *write_attempted = true;
+    let written = backend
+        .write_once(command)
+        .map_err(|fault| system_error(CarrierStage::Write, fault))?;
+    if written != command.len() {
+        return Err(DarwinCarrierError::ShortWrite {
+            written,
+            expected: command.len(),
+        });
+    }
+
+    ensure_before_deadline(backend, deadline, CarrierStage::DiscardInput)?;
+    backend
+        .discard_input()
+        .map_err(|fault| system_error(CarrierStage::DiscardInput, fault))?;
+
+    ensure_before_deadline(backend, deadline, CarrierStage::WaitReadable)?;
+    if remaining(backend, deadline) <= RECOVERY_QUIET_WINDOW {
+        return Err(DarwinCarrierError::Deadline {
+            stage: CarrierStage::WaitReadable,
+        });
+    }
+    let quiet_started = backend.monotonic_now();
+    if backend
+        .wait_readable(RECOVERY_QUIET_WINDOW)
+        .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
+    {
+        return Err(DarwinCarrierError::PostWriteInput);
+    }
+    if backend.monotonic_now().saturating_sub(quiet_started) < RECOVERY_QUIET_WINDOW {
+        return Err(DarwinCarrierError::Deadline {
+            stage: CarrierStage::WaitReadable,
+        });
+    }
+    ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
+    let queued = backend
+        .bytes_available()
+        .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+    if queued != 0 {
+        return Err(DarwinCarrierError::PostWriteInput);
+    }
+    Ok(written)
+}
+
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+fn run_receive_direct_recovery<B: SerialBackend>(
+    binding: &PrivateTtyBinding,
+    backend: &mut B,
+    device: DeviceId,
+) -> Result<SanitizedRecoveryReceipt, DarwinCarrierError> {
+    let command = RemoteModeCommand::new(device, RemoteMode::ReceiveDirect).encode()?;
+    let start = backend.monotonic_now();
+    let deadline = active_io_deadline(start, SEARCH_ATTEMPT_TIMEOUT);
+    let mut opened = false;
+    let mut configuration_attempted = false;
+    let mut write_attempted = false;
+    let mut termios_snapshot = None;
+    let mut control_lines_snapshot = None;
+
+    let primary = (|| {
+        binding.verify()?;
+        ensure_before_deadline(backend, deadline, CarrierStage::OpenExclusive)?;
+        backend
+            .open_exclusive_noctty(&binding.path)
+            .map_err(|fault| system_error(CarrierStage::OpenExclusive, fault))?;
+        opened = true;
+
+        ensure_before_deadline(backend, deadline, CarrierStage::SnapshotTermios)?;
+        let snapshot = backend
+            .snapshot_termios()
+            .map_err(|fault| system_error(CarrierStage::SnapshotTermios, fault))?;
+        termios_snapshot = Some(snapshot.clone());
+        ensure_before_deadline(backend, deadline, CarrierStage::SnapshotControlLines)?;
+        control_lines_snapshot = Some(
+            backend
+                .snapshot_control_lines()
+                .map_err(|fault| system_error(CarrierStage::SnapshotControlLines, fault))?,
+        );
+
+        ensure_before_deadline(backend, deadline, CarrierStage::Configure)?;
+        configuration_attempted = true;
+        backend
+            .configure(&snapshot, FALLBACK_BAUD)
+            .map_err(|fault| system_error(CarrierStage::Configure, fault))?;
+
+        execute_receive_direct_recovery_write(backend, deadline, &command, &mut write_attempted)
+    })();
+
+    let primary_kind = primary.as_ref().err().map(DarwinCarrierError::kind);
+    let input_cleanup = recover_input_state(backend, primary.is_err() && write_attempted);
+    let input_failed = input_cleanup == CleanupDisposition::Failed;
+    let (termios_cleanup, control_lines_cleanup, termios_failed, control_lines_failed) =
+        restore_attempt_state(
+            backend,
+            termios_snapshot.as_ref(),
+            control_lines_snapshot,
+            configuration_attempted,
+        );
+    if opened {
+        backend.close();
+    }
+
+    if input_failed || termios_failed || control_lines_failed {
+        return Err(DarwinCarrierError::Cleanup {
+            primary: primary_kind,
+            input_failed,
+            termios_failed,
+            control_lines_failed,
+        });
+    }
+    let tx_bytes = primary?;
+    let elapsed = backend.monotonic_now().saturating_sub(start);
+    if elapsed > SEARCH_ATTEMPT_TIMEOUT {
+        return Err(DarwinCarrierError::Deadline {
+            stage: CarrierStage::Close,
+        });
+    }
+    Ok(SanitizedRecoveryReceipt {
+        binding_digest: binding.digest(),
+        device,
+        remote_mode: RemoteMode::ReceiveDirect,
+        baud: FALLBACK_BAUD,
+        deadline_millis: duration_millis(SEARCH_ATTEMPT_TIMEOUT),
+        quiet_window_millis: duration_millis(RECOVERY_QUIET_WINDOW),
+        elapsed_micros: duration_micros_ceil(elapsed),
+        tx_bytes,
+        input_discard_count: 2,
+        termios_cleanup,
+        control_lines_cleanup,
+        closed: true,
+    })
+}
+
 #[cfg(test)]
 fn run_attempt<B: SerialBackend>(
     binding: &PrivateTtyBinding,
@@ -1150,7 +1341,7 @@ fn run_attempt<B: SerialBackend>(
     (result, receipt.finish(elapsed, outcome))
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn restore_attempt_state<B: SerialBackend>(
     backend: &mut B,
     termios_snapshot: Option<&B::TermiosSnapshot>,
@@ -1532,6 +1723,7 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         Err(DarwinCarrierError::PreexistingInput { .. }) => {
             SanitizedAttemptOutcome::PreexistingInput
         }
+        Err(DarwinCarrierError::PostWriteInput) => SanitizedAttemptOutcome::PreexistingInput,
         Err(DarwinCarrierError::Overflow { .. }) => SanitizedAttemptOutcome::Overflow,
         Err(DarwinCarrierError::EndOfFile { .. }) => SanitizedAttemptOutcome::EndOfFile,
         Err(
@@ -1541,6 +1733,21 @@ fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> Sanitize
         ) => SanitizedAttemptOutcome::ReadInvariant,
         Err(DarwinCarrierError::Cleanup { .. }) => SanitizedAttemptOutcome::CleanupFailed,
     }
+}
+
+/// Execute one closed, fixed-38400 `ReceiveDirect` recovery operation.
+///
+/// # Errors
+///
+/// Fails closed on binding, open, configuration, write, observed post-write
+/// input, or exact restoration failure. Pending input is discarded and never
+/// parsed or exposed.
+#[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
+pub fn recover_receive_direct_known_38400(
+    binding: &PrivateTtyBinding,
+    device: DeviceId,
+) -> Result<SanitizedRecoveryReceipt, DarwinCarrierError> {
+    run_receive_direct_recovery(binding, &mut macos::MacOsBackend::new(), device)
 }
 
 /// Persistent macOS implementation of fixed-38400 typed DCX control.
