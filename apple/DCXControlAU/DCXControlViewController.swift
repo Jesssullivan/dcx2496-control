@@ -26,8 +26,13 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     private var localActionButtons: [NSButton] = []
 
     public override func loadView() {
-        let root = NSView()
-        root.translatesAutoresizingMaskIntoConstraints = false
+        // Logic's remote ViewBridge initially asks the extension for a view at
+        // zero size. Give the host a usable presentation size and leave the
+        // root view under host autoresizing; Auto Layout owns only its content.
+        let contentSize = NSSize(width: 720, height: 420)
+        preferredContentSize = contentSize
+        let root = NSView(frame: NSRect(origin: .zero, size: contentSize))
+        root.autoresizingMask = [.width, .height]
 
         let title = NSTextField(labelWithString: "DCX2496 Control")
         title.font = .systemFont(ofSize: 20, weight: .semibold)
