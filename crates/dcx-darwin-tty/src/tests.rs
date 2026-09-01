@@ -1862,10 +1862,39 @@ fn snapshot_search_reader_returns_before_a_late_replay_becomes_readable() {
 }
 
 #[test]
-fn snapshot_search_reader_rejects_an_already_queued_partial_without_waiting() {
+fn snapshot_search_reader_finishes_an_already_queued_replay_prefix() {
     let request = synthetic_search_request();
     let response = synthetic_response(0);
-    let partial = &response[..13];
+    let partial_len = 7;
+    let inbound = response.into_iter().chain(response).collect::<Vec<_>>();
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.written = true;
+    backend.read_goal = response.len();
+    backend.post_response_input = partial_len;
+    backend.post_response_input_after_wait = Some(response.len() - partial_len);
+    backend.wait_script = [(true, Duration::from_millis(10))].into_iter().collect();
+
+    let bounded = read_snapshot_bounded(
+        &mut backend,
+        SNAPSHOT_OPERATION_TIMEOUT,
+        SEARCH_RESPONSE_LIMIT,
+        &request,
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(bounded.read, SnapshotRead::complete(&response).unwrap());
+    assert!(backend.inbound.is_empty());
+    assert_eq!(backend.post_response_input, 0);
+    assert_eq!(backend.now, Duration::from_millis(10));
+    assert!(backend.calls.contains(&Call::WaitReadable));
+}
+
+#[test]
+fn snapshot_search_reader_rejects_an_unfinished_queued_replay_prefix() {
+    let request = synthetic_search_request();
+    let response = synthetic_response(0);
+    let partial = &response[..7];
     let inbound = response
         .into_iter()
         .chain(partial.iter().copied())
@@ -1887,8 +1916,8 @@ fn snapshot_search_reader_rejects_an_already_queued_partial_without_waiting() {
             if received == partial.len()
     ));
     assert!(backend.inbound.is_empty());
-    assert_eq!(backend.now, Duration::ZERO);
-    assert!(!backend.calls.contains(&Call::WaitReadable));
+    assert_eq!(backend.now, SNAPSHOT_OPERATION_TIMEOUT);
+    assert!(backend.calls.contains(&Call::WaitReadable));
 }
 
 #[test]
