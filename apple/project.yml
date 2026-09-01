@@ -46,10 +46,14 @@ targets:
           set -euo pipefail
           export CARGO_TARGET_DIR="${SRCROOT}/../target"
           export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
-          cargo_bin="$(command -v cargo || true)"
-          rustc_bin="$(command -v rustc || true)"
+          cargo_bin="${DCX_CARGO_BIN:-}"
+          rustc_bin="${DCX_RUSTC_BIN:-}"
           if [[ -z "${cargo_bin}" || -z "${rustc_bin}" ]]; then
-            echo "pinned cargo and rustc must be inherited from PATH" >&2
+            echo "DCX_CARGO_BIN and DCX_RUSTC_BIN must name the pinned toolchain" >&2
+            exit 1
+          fi
+          if [[ ! -x "${cargo_bin}" || ! -x "${rustc_bin}" ]]; then
+            echo "pinned cargo and rustc must be executable" >&2
             exit 1
           fi
           export RUSTC="${rustc_bin}"

@@ -90,7 +90,9 @@ apple-bundle-check: apple-project-generate
     # Resolve the compiler from Xcode itself: inside a Nix shell, xcrun can return a wrapped Nix clang.
     xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"; \
       xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"; \
-      DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CC="$xcode_toolchain/clang" CPLUSPLUS="$xcode_toolchain/clang++" LD="$xcode_toolchain/clang" LDPLUSPLUS="$xcode_toolchain/clang++" build
+      dcx_cargo_bin="$(command -v cargo)"; \
+      dcx_rustc_bin="$(command -v rustc)"; \
+      DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CC="$xcode_toolchain/clang" CPLUSPLUS="$xcode_toolchain/clang++" LD="$xcode_toolchain/clang" LDPLUSPLUS="$xcode_toolchain/clang++" DCX_CARGO_BIN="$dcx_cargo_bin" DCX_RUSTC_BIN="$dcx_rustc_bin" build
 
 # Build and verify one arm64 ad-hoc test carrier for helper-absent AU discovery/auval.
 # Its qualification-only entitlements deliberately omit the team-bound App Group
@@ -100,6 +102,8 @@ apple-adhoc-bundle: apple-project-generate
     set -euo pipefail
     xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"
     xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+    dcx_cargo_bin="$(command -v cargo)"
+    dcx_rustc_bin="$(command -v rustc)"
     derived_data="apple/.derived-adhoc"
     archive_path="$derived_data/DCXLogicHelper.xcarchive"
     DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" \
@@ -117,6 +121,8 @@ apple-adhoc-bundle: apple-project-generate
       CPLUSPLUS="$xcode_toolchain/clang++" \
       LD="$xcode_toolchain/clang" \
       LDPLUSPLUS="$xcode_toolchain/clang++" \
+      DCX_CARGO_BIN="$dcx_cargo_bin" \
+      DCX_RUSTC_BIN="$dcx_rustc_bin" \
       archive
     app="$archive_path/Products/Applications/DCXLogicHelper.app"
     au="$app/Contents/PlugIns/DCXControlAU.appex"
@@ -194,6 +200,8 @@ apple-provisioned-bundle: apple-project-generate
     app_group="QP994XQKNH.io.tinyland.dcx2496"
     xcode_developer_dir="$(unset DEVELOPER_DIR; /usr/bin/xcode-select -p)"
     xcode_toolchain="$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+    dcx_cargo_bin="$(command -v cargo)"
+    dcx_rustc_bin="$(command -v rustc)"
     derived_data="apple/.derived-provisioned"
     DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" \
       -project apple/DCXLogic.xcodeproj \
@@ -213,6 +221,8 @@ apple-provisioned-bundle: apple-project-generate
       CPLUSPLUS="$xcode_toolchain/clang++" \
       LD="$xcode_toolchain/clang" \
       LDPLUSPLUS="$xcode_toolchain/clang++" \
+      DCX_CARGO_BIN="$dcx_cargo_bin" \
+      DCX_RUSTC_BIN="$dcx_rustc_bin" \
       build
     app="$derived_data/Build/Products/Release/DCXLogicHelper.app"
     au="$app/Contents/PlugIns/DCXControlAU.appex"
