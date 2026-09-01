@@ -3,9 +3,11 @@
 //! Dump payload semantics remain broadly unestablished on the named device.
 //! This module preserves exact validated wire frames and exposes only one
 //! reviewed projection: O1/PEQ9 frequency, Q, gain, and kind from the pinned
-//! MIT `DuinoDCX` `00b9d70` layout. Every other dump byte remains opaque and
-//! unappliable. Apply plans accept only explicit checked direct-parameter
-//! actions and exact inverses; they never accept caller-supplied frames.
+//! MIT `DuinoDCX` `00b9d70` layout. Projection also preserves the observed
+//! modulo-128 balance of one device-maintained Dump0 trailer byte; every other
+//! dump byte remains opaque and unappliable. Apply plans accept only explicit
+//! checked direct-parameter actions and exact inverses; they never accept
+//! caller-supplied frames.
 
 use std::{fmt, fmt::Write as _};
 
@@ -36,6 +38,8 @@ const DIGEST_PREFIX: &str = "sha256/";
 const SNAPSHOT_DOMAIN: &[u8] = b"dcx2496.snapshot/v1\0";
 const APPLY_PLAN_DOMAIN: &[u8] = b"dcx2496.apply-plan/v1\0";
 const ROLLBACK_PLAN_DOMAIN: &[u8] = b"dcx2496.rollback-plan/v1\0";
+const DUMP0_PACKED_PAYLOAD_START: usize = 13;
+const DUMP0_DERIVED_TRAILER_OFFSET: usize = DUMP0_RESPONSE_LEN - 2;
 
 /// One fixed component of a complete DCX snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -305,6 +309,7 @@ impl SnapshotV1 {
                 }
             }
         }
+        preserve_dump0_trailer_balance(&self.dump0.frame, &mut dump0);
         Ok(Self::from_frames(
             &self.identity.frame,
             &dump0,
@@ -372,6 +377,25 @@ impl SnapshotV1 {
             SnapshotSection::Dump1 => &self.dump1,
         }
     }
+}
+
+fn preserve_dump0_trailer_balance(before: &[u8], after: &mut [u8]) {
+    // Named firmware 1.17 evidence and the independent pinned `domenut`
+    // `97cdcca` Dump0 establish that the packed payload plus its penultimate
+    // trailer preserves one modulo-128 balance across direct edits. Preserve
+    // the baseline's own balance rather than assigning meaning to opaque data
+    // or extending the observation to Dump1.
+    let baseline_balance =
+        seven_bit_sum(&before[DUMP0_PACKED_PAYLOAD_START..=DUMP0_DERIVED_TRAILER_OFFSET]);
+    let projected_payload =
+        seven_bit_sum(&after[DUMP0_PACKED_PAYLOAD_START..DUMP0_DERIVED_TRAILER_OFFSET]);
+    after[DUMP0_DERIVED_TRAILER_OFFSET] = baseline_balance.wrapping_sub(projected_payload) & 0x7f;
+}
+
+fn seven_bit_sum(bytes: &[u8]) -> u8 {
+    bytes
+        .iter()
+        .fold(0_u8, |sum, byte| sum.wrapping_add(*byte) & 0x7f)
 }
 
 fn patch_split_value(
@@ -1880,8 +1904,24 @@ mod tests {
         assert_eq!(after[852] & (1 << 3), 0);
         assert_eq!(after[849], 0x0a >> 1);
         assert_eq!(after[850], 1);
+        assert_eq!(
+            seven_bit_sum(&after[DUMP0_PACKED_PAYLOAD_START..=DUMP0_DERIVED_TRAILER_OFFSET]),
+            seven_bit_sum(&before[DUMP0_PACKED_PAYLOAD_START..=DUMP0_DERIVED_TRAILER_OFFSET])
+        );
         for index in 0..DUMP0_RESPONSE_LEN {
-            if ![843, 844, 845, 846, 848, 849, 850, 852].contains(&index) {
+            if ![
+                843,
+                844,
+                845,
+                846,
+                848,
+                849,
+                850,
+                852,
+                DUMP0_DERIVED_TRAILER_OFFSET,
+            ]
+            .contains(&index)
+            {
                 assert_eq!(after[index], before[index], "unexpected patch at {index}");
             }
         }
@@ -1901,6 +1941,44 @@ mod tests {
             DirectParameterAction::new(5, 0x3d, 0).unwrap(),
             DirectParameterAction::new(5, 0x3e, 0).unwrap(),
         ];
+        assert_eq!(desired.project_direct_actions(&inverse).unwrap(), baseline);
+    }
+
+    #[test]
+    fn named_o1_peq9_projection_updates_the_observed_dump0_trailer_exactly() {
+        let mut baseline_dump0 = dump(0, 0, 0);
+        // Carry the omitted opaque body's sanitized residue so this minimized
+        // fixture retains the named and independent Dump0 balance of 23.
+        baseline_dump0[DUMP0_PACKED_PAYLOAD_START] = 104;
+        baseline_dump0[843] = 52;
+        baseline_dump0[844] = 65;
+        baseline_dump0[846] = 20;
+        baseline_dump0[848] = 22;
+        baseline_dump0[850] = 1;
+        baseline_dump0[852] = 8;
+        baseline_dump0[DUMP0_DERIVED_TRAILER_OFFSET] = 7;
+        let baseline =
+            SnapshotV1::from_frames(&identity(0), &baseline_dump0, &dump(0, 1, 0)).unwrap();
+        let actions = [
+            DirectParameterAction::new(5, 0x3b, 53).unwrap(),
+            DirectParameterAction::new(5, 0x3c, 32).unwrap(),
+            DirectParameterAction::new(5, 0x3d, 118).unwrap(),
+        ];
+
+        let desired = baseline.project_direct_actions(&actions).unwrap();
+        let after = desired.frame(SnapshotSection::Dump0);
+        assert_eq!(after[843], 53);
+        assert_eq!(after[844], 1);
+        assert_eq!(after[846], 32);
+        assert_eq!(after[848], 118);
+        assert_eq!(after[852], 0);
+        assert_eq!(after[DUMP0_DERIVED_TRAILER_OFFSET], 98);
+        assert_eq!(
+            seven_bit_sum(&after[DUMP0_PACKED_PAYLOAD_START..=DUMP0_DERIVED_TRAILER_OFFSET]),
+            23
+        );
+
+        let inverse = baseline.inverse_actions_for(&actions).unwrap();
         assert_eq!(desired.project_direct_actions(&inverse).unwrap(), baseline);
     }
 
