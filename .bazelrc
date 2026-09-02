@@ -1,4 +1,13 @@
 common --enable_bzlmod
+common --lockfile_mode=error
 common --announce_rc
 build --incompatible_strict_action_env
 test --test_output=errors
+test --test_summary=detailed
+
+# The cache and executor contract lives only in .bazelrc.flywheel. Never repeat
+# either of the --config blocks it defines in this file: a single definition
+# keeps their refusal posture from being softened by a second, looser copy.
+# Concrete endpoints come from the runtime profile and auth, never from a
+# committed file.
+try-import %workspace%/.bazelrc.flywheel
