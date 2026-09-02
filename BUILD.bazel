@@ -46,6 +46,14 @@ filegroup(
     srcs = ["fixtures/protocol/SYNTHETIC-search-response-26.hex"],
 )
 
+filegroup(
+    name = "o4_mute_fixtures",
+    srcs = [
+        "fixtures/protocol/SYNTHETIC-o4-mute-off.hex",
+        "fixtures/protocol/SYNTHETIC-o4-mute-on.hex",
+    ],
+)
+
 test_suite(
     name = "check",
     tests = [
@@ -67,11 +75,15 @@ sh_test(
         "$(location fixtures/profiles/safe-muted-v1.json)",
         "$(location fixtures/profiles/SYNTHETIC-control-room-v1.json)",
         "$(location fixtures/rew/SYNTHETIC-cut-only.txt)",
+        "$(location fixtures/protocol/SYNTHETIC-o4-mute-on.hex)",
+        "$(location fixtures/protocol/SYNTHETIC-o4-mute-off.hex)",
     ],
     data = [
         "fixtures/profiles/SYNTHETIC-control-room-v1.json",
         "fixtures/profiles/safe-muted-v1.json",
         "fixtures/protocol/SYNTHETIC-direct-parameter.hex",
+        "fixtures/protocol/SYNTHETIC-o4-mute-off.hex",
+        "fixtures/protocol/SYNTHETIC-o4-mute-on.hex",
         "fixtures/protocol/SYNTHETIC-search-response-26.hex",
         "fixtures/rew/SYNTHETIC-cut-only.txt",
         "//crates/dcxctl",

@@ -17,6 +17,24 @@ fn synthetic_search_response() -> Vec<u8> {
         .collect()
 }
 
+fn parse_hex_fixture(text: &str) -> Vec<u8> {
+    text.split_ascii_whitespace()
+        .map(|word| u8::from_str_radix(word, 16).unwrap())
+        .collect()
+}
+
+fn synthetic_o4_mute_on() -> Vec<u8> {
+    parse_hex_fixture(include_str!(
+        "../../../fixtures/protocol/SYNTHETIC-o4-mute-on.hex"
+    ))
+}
+
+fn synthetic_o4_mute_off() -> Vec<u8> {
+    parse_hex_fixture(include_str!(
+        "../../../fixtures/protocol/SYNTHETIC-o4-mute-off.hex"
+    ))
+}
+
 #[test]
 fn arbitrary_byte_streams_never_panic_or_retain_unbounded_candidates() {
     let mut seed = 0x2496_dc00_u64;
@@ -246,11 +264,94 @@ fn every_unreviewed_direct_address_is_rejected_by_snapshot_projection() {
         for parameter in 0..=0x7f {
             let action = DirectParameterAction::new(channel, parameter, 0).unwrap();
             let projected = baseline.project_direct_actions(&[action]);
-            if channel == 5 && (0x3b..=0x3e).contains(&parameter) {
+            let reviewed_o1_peq9 = channel == 5 && (0x3b..=0x3e).contains(&parameter);
+            // O4 output mute is the only other reviewed address; it remains
+            // fixture-derived pending WORD-FS-A hardware confirmation.
+            let reviewed_o4_mute = channel == 8 && parameter == 0x03;
+            if reviewed_o1_peq9 || reviewed_o4_mute {
                 assert!(projected.is_ok());
             } else {
                 assert!(projected.is_err());
             }
+        }
+    }
+}
+
+// O4 output-mute frame fixtures for the Legalab first-sound P16 lane. The
+// frames are derived from the typed model only; nothing here is hardware
+// evidence, and the WORD-FS-A silent rehearsal owns confirmation.
+#[test]
+fn o4_mute_fixture_frames_encode_and_decode_byte_exactly() {
+    let device = DeviceId::new(0).unwrap();
+    for (fixture, value) in [
+        (synthetic_o4_mute_on(), 1_u8),
+        (synthetic_o4_mute_off(), 0_u8),
+    ] {
+        // Byte-exact derivation of the expected frame:
+        //   F0        SysEx start
+        //   00 20 32  Behringer manufacturer id
+        //   00        device address 0
+        //   0E        model id, DCX2496
+        //   20        function 0x20, direct parameter change
+        //   01        one four-byte action follows
+        //   08        channel 8 = output O4 (outputs 1..6 are channels 5..10)
+        //   03        parameter 0x03 = output mute (1 = muted)
+        //   00        value bits 13..7 (value / 128)
+        //   01|00     value bits 6..0 (value % 128): 1 = muted, 0 = unmuted
+        //   F7        SysEx end
+        let expected = vec![
+            0xf0, 0x00, 0x20, 0x32, 0x00, 0x0e, 0x20, 0x01, 0x08, 0x03, 0x00, value, 0xf7,
+        ];
+        assert_eq!(fixture, expected);
+
+        // Typed model -> encoded frame is byte-identical to the fixture.
+        let action = DirectParameterAction::new(8, 0x03, u16::from(value)).unwrap();
+        let command = DirectParameterCommand::new(device, vec![action]).unwrap();
+        assert_eq!(command.encode().unwrap(), fixture);
+
+        // Fixture frame -> parser round trip recovers the exact typed tuple.
+        assert_eq!(
+            decode(parse_frame(&fixture).unwrap()).unwrap(),
+            DecodedMessage::DirectParameters {
+                device,
+                changes: vec![dcx_core::protocol::ParameterChange {
+                    channel: 8,
+                    parameter: 0x03,
+                    value: u16::from(value),
+                }],
+            }
+        );
+    }
+}
+
+#[test]
+fn mute_frames_for_other_channels_do_not_match_the_o4_fixtures() {
+    let device = DeviceId::new(0).unwrap();
+    let o4_on = synthetic_o4_mute_on();
+    for channel in [0, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+        let action = DirectParameterAction::new(channel, 0x03, 1).unwrap();
+        let frame = DirectParameterCommand::new(device, vec![action])
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_ne!(frame, o4_on);
+        // The frames differ at exactly the channel byte (offset 8) and the
+        // parser preserves the distinction.
+        assert_eq!(frame.len(), o4_on.len());
+        let differing: Vec<usize> = frame
+            .iter()
+            .zip(o4_on.iter())
+            .enumerate()
+            .filter(|(_, (left, right))| left != right)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(differing, [8]);
+        match decode(parse_frame(&frame).unwrap()).unwrap() {
+            DecodedMessage::DirectParameters { changes, .. } => {
+                assert_eq!(changes[0].channel, channel);
+                assert_ne!(changes[0].channel, 8);
+            }
+            other => panic!("unexpected decode {other:?}"),
         }
     }
 }

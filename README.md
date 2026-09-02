@@ -70,7 +70,10 @@ dcxctl control recover-receive-direct \
 REW import and slot mapping are offline. The MVP writable mapping is exactly
 physical output O1, PEQ9: channel 5 parameters `0x3b` through `0x3e`
 (frequency, Q, gain, and filter kind). It deliberately excludes EQ enable,
-editor selection, and shelf slope.
+editor selection, and shelf slope. One further reviewed direct address exists
+outside the REW path: the O4 output mute (channel 8, parameter `0x03`, Dump1
+byte 223), fixture-derived for Legalab's first-sound preparation and pending
+hardware confirmation by the WORD-FS-A silent mute-frame rehearsal.
 
 ```sh
 dcxctl rew plan-slot fixtures/rew/SYNTHETIC-cut-only.txt \

@@ -14,10 +14,14 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   snapshot/readback, and reviewed direct-parameter plans.
   It never enumerates ports or accepts caller-supplied frames, baud, retry,
   timeout, remote-mode bytes, or generic writes.
-- Mutation is snapshot -> strict O1/PEQ9 semantic diff -> immutable apply and
-  inverse plans -> stale-baseline check -> typed apply -> complete readback ->
-  rollback. Every other output, slot, address, or opaque dump mapping fails
-  closed. No server or automatic apply path belongs in the MVP.
+- Mutation is snapshot -> strict reviewed-address semantic diff -> immutable
+  apply and inverse plans -> stale-baseline check -> typed apply -> complete
+  readback -> rollback. The reviewed addresses are exactly O1/PEQ9 (channel 5,
+  `0x3b` through `0x3e`) plus the O4 output mute (channel 8, `0x03`, Dump1
+  byte 223); the mute address is fixture-derived and pending hardware
+  confirmation by Legalab's WORD-FS-A silent mute-frame rehearsal. Every other
+  output, slot, address, or opaque dump mapping fails closed. No server or
+  automatic apply path belongs in the MVP.
 - The desired profile is exactly O1/channel 5/PEQ9 with four ordered actions
   (`0x3b` through `0x3e`), and its semantic diff contains zero or one complete
   PEQ-slot change. Missing post-write capture remains explicit uncertainty:

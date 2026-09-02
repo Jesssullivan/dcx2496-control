@@ -36,6 +36,8 @@ darwin-carrier-check:
 
 fixtures:
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
+    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-on.hex >/dev/null
+    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-off.hex >/dev/null
     cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
     cargo run --quiet --package dcxctl -- discovery plan --expected-device 0 >/dev/null
     cargo run --quiet --package dcxctl -- discovery validate-response fixtures/protocol/SYNTHETIC-search-response-26.hex --expected-device 0 >/dev/null
