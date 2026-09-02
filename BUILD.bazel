@@ -64,6 +64,20 @@ test_suite(
     ],
 )
 
+# The tests that declare every input they read and every tool they run, listed
+# one by one rather than through the per-crate suites so adding a target to a
+# crate never silently widens this set. Kept flat for the same reason.
+test_suite(
+    name = "remote_eligible",
+    tests = [
+        "//crates/dcx-core:robustness",
+        "//crates/dcx-core:unit_tests",
+        "//crates/dcx-darwin-tty:unit_tests",
+        "//crates/dcx-transport:robustness",
+        "//crates/dcx-transport:unit_tests",
+    ],
+)
+
 sh_test(
     name = "fixture_contract",
     size = "small",
@@ -87,5 +101,12 @@ sh_test(
         "fixtures/protocol/SYNTHETIC-search-response-26.hex",
         "fixtures/rew/SYNTHETIC-cut-only.txt",
         "//crates/dcxctl",
+    ],
+    # The script runs bash, grep, dd, and diff out of the host PATH. Those are
+    # not inputs the action declares, so this test is not describable to a
+    # content-addressed executor and must never be dispatched to one.
+    tags = [
+        "no-remote",
+        "no-remote-exec",
     ],
 )
