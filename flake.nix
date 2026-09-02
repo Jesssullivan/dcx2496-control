@@ -86,6 +86,8 @@
               pkgs.just
               pkgs.jq
               pkgs.alejandra
+              # scripts/run_bazelisk.sh resolves DCX_BAZELISK through python3.
+              pkgs.python3
               pkgs.ripgrep
               (toolchainFor pkgs)
               pkgs.shellcheck
