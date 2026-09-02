@@ -73,6 +73,12 @@ bazel-check:
     bash scripts/run_bazelisk.sh test //:check
     bash scripts/run_bazelisk.sh build "${build_targets[@]}"
 
+# The GitHub-hosted lane, named for what it is. Its Bazel work is deliberately
+# the local, no-remote-flags `bazel-check` and is kept visibly separate from
+# `test-unit` so a hosted run can never be cited as the on-prem or
+# executor-backed receipt.
+hosted-advisory: bazel-check
+
 nix-check:
     nix flake check
 

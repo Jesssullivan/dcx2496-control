@@ -11,6 +11,8 @@ test-unit: repo::test-unit
 
 bazel-check: repo::bazel-check
 
+hosted-advisory: repo::hosted-advisory
+
 nix-check: repo::nix-check
 
 security: repo::security
