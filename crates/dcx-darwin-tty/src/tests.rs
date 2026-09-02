@@ -1948,3 +1948,27 @@ fn persistent_carrier_rejects_a_different_baud_without_writing() {
     );
     carrier.finish().unwrap();
 }
+
+/// The Bazel `unit_tests` target compiles this crate with
+/// `--cfg=bazel_test_no_native` so the platform-independent suite never pulls
+/// in the native macOS backend. Nothing else paired that flag with the
+/// `#[cfg(all(target_os = "macos", not(bazel_test_no_native)))]` gates it
+/// exists to switch off: misspell it in `BUILD.bazel`, or rename the cfg here,
+/// and the target would quietly start compiling the native path again.
+///
+/// Rust cannot assert that a symbol is absent, so the strongest form the cfg
+/// structure allows is a `const` assertion on the canary the native gate
+/// defines. It is evaluated during compilation, which means drift breaks the
+/// *build* of the target that is supposed to be free of the native backend,
+/// naming the target -- not a run-time failure that a `--test_tag_filters` run
+/// could skip past. The run-time assertion below restates it so the test has
+/// an observable body.
+#[cfg(bazel_test_no_native)]
+#[test]
+fn native_backend_is_excluded() {
+    const _: () = assert!(
+        !NATIVE_BACKEND_COMPILED,
+        "bazel_test_no_native is set but the native macOS backend is still compiled in"
+    );
+    assert!(!NATIVE_BACKEND_COMPILED);
+}
