@@ -61,6 +61,7 @@ test_suite(
     name = "check",
     tests = [
         ":fixture_contract",
+        ":toolchain_pin_parity",
         "//crates/dcx-core:all_tests",
         "//crates/dcx-darwin-tty:all_tests",
         "//crates/dcx-transport:all_tests",
