@@ -1,0 +1,37 @@
+# This hosted workflow is deliberately non-authoritative. Its result is not a
+# product gate and never a DCX2496 control receipt. It runs `just bazel-check`
+# with no remote flags at all, so it shows only that the Bazel graph builds and
+# that the offline suite passes on a generic hosted runner. Authoritative
+# execution is on-prem. Anything that touches a device, or that must run on one
+# specific machine, is out of scope for this workflow and never runs on a
+# hosted runner. TIN-4050 tracks the on-prem repository attachment.
+name: Advisory
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  advisory-bazel-check:
+    name: Advisory Bazel graph check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: tinyland-inc/ci-templates/.github/actions/setup-nix@d8d178c022a0f84853d53a2c8fe0fc90115f0949 # v3.1.0
+
+      - uses: tinyland-inc/ci-templates/.github/actions/nix-setup@d8d178c022a0f84853d53a2c8fe0fc90115f0949 # v3.1.0
+
+      - name: Run the advisory Bazel check
+        run: nix develop --no-write-lock-file --command just bazel-check
