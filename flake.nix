@@ -74,6 +74,7 @@
         pkgs = pkgsFor system;
       in {
         default = pkgs.mkShell {
+          DCX_BAZELISK = "${pkgs.bazelisk}/bin/bazelisk";
           packages =
             [
               pkgs.actionlint

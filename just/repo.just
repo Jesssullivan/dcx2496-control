@@ -14,7 +14,7 @@ lint:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo clippy --workspace --all-targets --all-features -- -D warnings
-    shellcheck tests/*.sh
+    shellcheck scripts/*.sh tests/*.sh
     workflow_files=()
     while IFS= read -r workflow_file; do
         workflow_files+=("$workflow_file")
@@ -31,7 +31,7 @@ test:
 # platform -- is defined once in .bazelrc.flywheel, and nothing here may add a
 # flag that softens it.
 test-unit:
-    bazelisk test --config=executor-backed --test_tag_filters=-no-remote //:remote_eligible
+    bash scripts/run_bazelisk.sh test --config=executor-backed --test_tag_filters=-no-remote //:remote_eligible
 
 # Exercise the injected, no-device discovery/snapshot/apply transport contract.
 transport-check:
@@ -70,8 +70,8 @@ bazel-check:
     if [[ $(uname -s) == Darwin ]]; then
         build_targets+=(//:dcxctl_live_control)
     fi
-    bazelisk test //:check
-    bazelisk build "${build_targets[@]}"
+    bash scripts/run_bazelisk.sh test //:check
+    bash scripts/run_bazelisk.sh build "${build_targets[@]}"
 
 nix-check:
     nix flake check
