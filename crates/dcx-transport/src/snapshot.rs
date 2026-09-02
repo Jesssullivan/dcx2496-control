@@ -1535,6 +1535,53 @@ mod tests {
     }
 
     #[test]
+    fn o4_unmute_typed_apply_round_trip_writes_the_exact_mute_frame() {
+        // Offline rehearsal of the WORD-FS-A one-change O4 unmute shape:
+        // muted baseline -> one typed unmute action -> apply -> exact desired
+        // readback -> Verified, with the exact mute=1 inverse staged for
+        // rollback. The O4 mute address (channel 8, parameter 0x03, Dump1
+        // byte 223) is fixture-derived and pending hardware confirmation;
+        // this test drives the injected fake session only.
+        let mut baseline_dump1 = dump(0, 1, 0);
+        baseline_dump1[223] = 1;
+        let baseline =
+            SnapshotV1::from_frames(&identity(0), &dump(0, 0, 0), &baseline_dump1).unwrap();
+        let unmute = DirectParameterAction::new(8, 0x03, 0).unwrap();
+        let desired = baseline.project_direct_actions(&[unmute]).unwrap();
+        let inverse = DirectParameterAction::new(8, 0x03, 1).unwrap();
+        let mut transaction = ApplyTransactionV1::stage(
+            baseline.clone(),
+            desired.clone(),
+            vec![unmute],
+            vec![inverse],
+        )
+        .unwrap();
+        assert_eq!(
+            transaction.rollback_plan().command().unwrap().actions(),
+            [inverse]
+        );
+
+        let mut apply_steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        apply_steps.extend(snapshot_steps(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(apply_steps);
+        assert!(matches!(
+            execute_apply_readback(session, &mut FakePacer::default(), &mut transaction).unwrap(),
+            ApplyReadbackOutcome::Verified(_)
+        ));
+        assert_eq!(transaction.state(), ApplyTransactionState::Verified);
+        assert_eq!(log.borrow().writes.len(), 1);
+        assert_eq!(log.borrow().writes[0].actions(), [unmute]);
+        // The single written frame is byte-identical to the committed
+        // fixtures/protocol/SYNTHETIC-o4-mute-off.hex frame.
+        assert_eq!(
+            log.borrow().writes[0].encode().unwrap(),
+            [
+                0xf0, 0x00, 0x20, 0x32, 0x00, 0x0e, 0x20, 0x01, 0x08, 0x03, 0x00, 0x00, 0xf7
+            ],
+        );
+    }
+
+    #[test]
     fn mutation_failure_requires_rollback_and_verified_finish() {
         let baseline = snapshot(0, 0, 0);
         let apply = DirectParameterAction::new(5, 0x3c, 40).unwrap();

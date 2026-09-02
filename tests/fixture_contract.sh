@@ -7,10 +7,25 @@ search_fixture=$3
 safe_profile=$4
 desired_profile=$5
 rew_fixture=$6
+o4_mute_on_fixture=$7
+o4_mute_off_fixture=$8
 digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 "${dcxctl}" decode --file "${protocol_fixture}" >/dev/null
 "${dcxctl}" decode --file "${search_fixture}" | grep -q '"kind": "search_response"'
+
+# O4 output-mute frames (legalab first-sound P16 prep): channel 8 is O4 and
+# parameter 3 is output mute; the frames decode as exactly one direct action.
+o4_mute_on_output=$("${dcxctl}" decode --file "${o4_mute_on_fixture}")
+grep -q '"kind": "direct_parameters"' <<<"${o4_mute_on_output}"
+grep -q '"channel": 8' <<<"${o4_mute_on_output}"
+grep -q '"parameter": 3' <<<"${o4_mute_on_output}"
+grep -q '"value": 1' <<<"${o4_mute_on_output}"
+o4_mute_off_output=$("${dcxctl}" decode --file "${o4_mute_off_fixture}")
+grep -q '"kind": "direct_parameters"' <<<"${o4_mute_off_output}"
+grep -q '"channel": 8' <<<"${o4_mute_off_output}"
+grep -q '"parameter": 3' <<<"${o4_mute_off_output}"
+grep -q '"value": 0' <<<"${o4_mute_off_output}"
 plan_output=$("${dcxctl}" discovery plan --expected-device 0)
 grep -q '"kind": "primary"' <<<"${plan_output}"
 grep -q '"baud": 115200' <<<"${plan_output}"

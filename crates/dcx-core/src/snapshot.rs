@@ -1,13 +1,15 @@
 //! Deterministic, versioned DCX snapshot and fail-closed apply planning.
 //!
 //! Dump payload semantics remain broadly unestablished on the named device.
-//! This module preserves exact validated wire frames and exposes only one
-//! reviewed projection: O1/PEQ9 frequency, Q, gain, and kind from the pinned
-//! MIT `DuinoDCX` `00b9d70` layout. Projection also preserves the observed
-//! modulo-128 balance of one device-maintained Dump0 trailer byte; every other
-//! dump byte remains opaque and unappliable. Apply plans accept only explicit
-//! checked direct-parameter actions and exact inverses; they never accept
-//! caller-supplied frames.
+//! This module preserves exact validated wire frames and exposes only two
+//! reviewed projections from the pinned MIT `DuinoDCX` `00b9d70` layout:
+//! O1/PEQ9 frequency, Q, gain, and kind, plus the O4 output mute. The O4
+//! mute address is fixture-derived and pending hardware confirmation by the
+//! Legalab WORD-FS-A silent mute-frame rehearsal. Projection also preserves
+//! the observed modulo-128 balance of one device-maintained Dump0 trailer
+//! byte; every other dump byte remains opaque and unappliable. Apply plans
+//! accept only explicit checked direct-parameter actions and exact inverses;
+//! they never accept caller-supplied frames.
 
 use std::{fmt, fmt::Write as _};
 
@@ -260,12 +262,14 @@ impl SnapshotV1 {
         })
     }
 
-    /// Project the reviewed O1/PEQ9 direct actions into an exact desired dump.
+    /// Project the reviewed direct actions into an exact desired dump.
     ///
-    /// This is intentionally not a general dump mapper. It accepts only direct
-    /// channel 5 and parameters `0x3b` through `0x3e`, corresponding to O1 PEQ9
-    /// frequency, Q, gain, and filter kind in the pinned reference. Slope
-    /// `0x3f` and every other address fail closed. The identity and Dump1 bytes
+    /// This is intentionally not a general dump mapper. It accepts only the
+    /// reviewed addresses: channel 5 parameters `0x3b` through `0x3e` (O1
+    /// PEQ9 frequency, Q, gain, and filter kind in the pinned reference) and
+    /// channel 8 parameter `0x03` (O4 output mute, on/off; fixture-derived,
+    /// pending hardware confirmation by the Legalab WORD-FS-A rehearsal).
+    /// Slope `0x3f` and every other address fail closed. The identity bytes
     /// remain unchanged, and a fresh snapshot digest is calculated.
     ///
     /// # Errors
@@ -281,6 +285,7 @@ impl SnapshotV1 {
         }
         let mut addresses = std::collections::BTreeSet::new();
         let mut dump0 = self.dump0.frame.clone();
+        let mut dump1 = self.dump1.frame.clone();
         for action in actions {
             if !addresses.insert((action.channel(), action.parameter())) {
                 return Err(SnapshotProjectionError::DuplicateAction {
@@ -288,19 +293,33 @@ impl SnapshotV1 {
                     parameter: action.parameter(),
                 });
             }
-            if action.channel() != 5 {
-                return Err(SnapshotProjectionError::UnmappedAction {
-                    channel: action.channel(),
-                    parameter: action.parameter(),
-                });
-            }
             // Independently transcribed from the pinned MIT DuinoDCX
             // 00b9d70 Ultradrive.cpp `outputLocations[0]` and `patchBuffer`.
-            match action.parameter() {
-                0x3b => patch_split_value(&mut dump0, action.value(), 843, 844, 6, 845),
-                0x3c => patch_low_only(&mut dump0, *action, 846)?,
-                0x3d => patch_split_value(&mut dump0, action.value(), 848, 852, 3, 849),
-                0x3e => patch_low_only(&mut dump0, *action, 850)?,
+            match (action.channel(), action.parameter()) {
+                (5, 0x3b) => patch_split_value(&mut dump0, action.value(), 843, 844, 6, 845),
+                (5, 0x3c) => patch_low_only(&mut dump0, *action, 846)?,
+                (5, 0x3d) => patch_split_value(&mut dump0, action.value(), 848, 852, 3, 849),
+                (5, 0x3e) => patch_low_only(&mut dump0, *action, 850)?,
+                // O4 output mute. Address independently transcribed from the
+                // same pinned DuinoDCX revision: direct channel 8 selects
+                // `outputLocations[3]` and parameter 0x03 selects row 1,
+                // whose location is Dump1 byte 223, low-only. The semantic
+                // name and the 1=muted value domain follow the pinned
+                // `geftactics` UltradrivePi `259fa83` protocol notes
+                // (`03 mute (1:muted)`, outputs on channels 05..0A).
+                // FIXTURE-DERIVED, PENDING HARDWARE CONFIRMATION: this
+                // address has never been exercised on the named device; the
+                // Legalab WORD-FS-A silent mute-frame rehearsal (first-sound
+                // precondition P16) is what confirms or refutes it.
+                (8, 0x03) => {
+                    if action.value() > 1 {
+                        return Err(SnapshotProjectionError::ValueNotOnOff {
+                            parameter: action.parameter(),
+                            value: action.value(),
+                        });
+                    }
+                    patch_low_only(&mut dump1, *action, 223)?;
+                }
                 _ => {
                     return Err(SnapshotProjectionError::UnmappedAction {
                         channel: action.channel(),
@@ -310,18 +329,21 @@ impl SnapshotV1 {
             }
         }
         preserve_dump0_trailer_balance(&self.dump0.frame, &mut dump0);
-        Ok(Self::from_frames(
-            &self.identity.frame,
-            &dump0,
-            &self.dump1.frame,
-        )?)
+        // No balance rule is applied to Dump1. The modulo-128 trailer
+        // observation is established for Dump0 only, and this projection
+        // still declines to extend it: a projected Dump1 differs from its
+        // baseline in exactly the patched payload byte. Whether the named
+        // device maintains its own Dump1 trailer across a direct O4-mute
+        // write is precisely what the WORD-FS-A readback observes.
+        Ok(Self::from_frames(&self.identity.frame, &dump0, &dump1)?)
     }
 
     /// Extract exact inverse values for a reviewed action address set.
     ///
     /// Returned actions preserve caller order but replace each value with the
-    /// value decoded from this immutable snapshot's O1/PEQ9 Dump0 locations.
-    /// This supports rollback derivation without caller-supplied inverse bytes.
+    /// value decoded from this immutable snapshot's reviewed O1/PEQ9 Dump0
+    /// locations or O4-mute Dump1 location. This supports rollback derivation
+    /// without caller-supplied inverse bytes.
     ///
     /// # Errors
     ///
@@ -334,6 +356,7 @@ impl SnapshotV1 {
             return Err(SnapshotProjectionError::EmptyActions);
         }
         let dump0 = &self.dump0.frame;
+        let dump1 = &self.dump1.frame;
         let mut addresses = std::collections::BTreeSet::new();
         let mut inverse = Vec::with_capacity(actions.len());
         for action in actions {
@@ -343,17 +366,25 @@ impl SnapshotV1 {
                     parameter: action.parameter(),
                 });
             }
-            if action.channel() != 5 {
-                return Err(SnapshotProjectionError::UnmappedAction {
-                    channel: action.channel(),
-                    parameter: action.parameter(),
-                });
-            }
-            let value = match action.parameter() {
-                0x3b => read_split_value(dump0, 843, 844, 6, 845),
-                0x3c => u16::from(dump0[846]),
-                0x3d => read_split_value(dump0, 848, 852, 3, 849),
-                0x3e => u16::from(dump0[850]),
+            let value = match (action.channel(), action.parameter()) {
+                (5, 0x3b) => read_split_value(dump0, 843, 844, 6, 845),
+                (5, 0x3c) => u16::from(dump0[846]),
+                (5, 0x3d) => read_split_value(dump0, 848, 852, 3, 849),
+                (5, 0x3e) => u16::from(dump0[850]),
+                // O4 output mute inverse: Dump1 byte 223 (see the projection
+                // transcription note). A baseline byte outside the on/off
+                // domain is evidence against the fixture-derived transcription
+                // and fails closed rather than round-tripping silently.
+                (8, 0x03) => {
+                    let observed = u16::from(dump1[223]);
+                    if observed > 1 {
+                        return Err(SnapshotProjectionError::ValueNotOnOff {
+                            parameter: action.parameter(),
+                            value: observed,
+                        });
+                    }
+                    observed
+                }
                 _ => {
                     return Err(SnapshotProjectionError::UnmappedAction {
                         channel: action.channel(),
@@ -762,7 +793,8 @@ pub enum SnapshotProjectionError {
     /// Projection requires at least one explicit action.
     #[error("snapshot projection action set cannot be empty")]
     EmptyActions,
-    /// Address is outside the reviewed O1/PEQ9 frequency/Q/gain/kind subset.
+    /// Address is outside the reviewed subset: O1/PEQ9 frequency/Q/gain/kind
+    /// and the fixture-derived O4 output mute.
     #[error("unmapped snapshot action channel {channel}, parameter {parameter:#04x}")]
     UnmappedAction { channel: u8, parameter: u8 },
     /// One opaque address cannot be projected twice.
@@ -771,6 +803,9 @@ pub enum SnapshotProjectionError {
     /// A low-only field cannot represent a high-bit value.
     #[error("parameter {parameter:#04x} cannot project value {value} into a seven-bit field")]
     ValueTooWide { parameter: u8, value: u16 },
+    /// A reviewed on/off field carries only zero or one.
+    #[error("parameter {parameter:#04x} reviewed on/off field cannot carry value {value}")]
+    ValueNotOnOff { parameter: u8, value: u16 },
     /// A reconstructed typed inverse could not be represented.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
@@ -1998,6 +2033,148 @@ mod tests {
             Err(SnapshotProjectionError::ValueTooWide {
                 parameter: 0x3c,
                 value: 128,
+            })
+        ));
+    }
+
+    // The O4 output-mute address (channel 8, parameter 0x03, Dump1 byte 223)
+    // is fixture-derived from the pinned references and remains pending
+    // hardware confirmation by the Legalab WORD-FS-A silent mute-frame
+    // rehearsal. These tests establish the offline shape only.
+
+    fn muted_o4_baseline() -> SnapshotV1 {
+        let mut baseline_dump1 = dump(0, 1, 0);
+        // O4 mute value 1 = muted at the transcribed Dump1 location.
+        baseline_dump1[223] = 1;
+        SnapshotV1::from_frames(&identity(0), &dump(0, 0, 0), &baseline_dump1).unwrap()
+    }
+
+    #[test]
+    fn reviewed_o4_mute_projection_patches_only_the_exact_dump1_byte() {
+        let baseline = muted_o4_baseline();
+        let unmute = DirectParameterAction::new(8, 0x03, 0).unwrap();
+        let desired = baseline.project_direct_actions(&[unmute]).unwrap();
+
+        let before = baseline.frame(SnapshotSection::Dump1);
+        let after = desired.frame(SnapshotSection::Dump1);
+        assert_eq!(after[223], 0);
+        for index in 0..DUMP1_RESPONSE_LEN {
+            if index != 223 {
+                assert_eq!(after[index], before[index], "unexpected patch at {index}");
+            }
+        }
+        // The Dump1 trailer byte is deliberately untouched: no balance rule
+        // is established for Dump1, and the projection declines to invent one.
+        assert_eq!(
+            after[DUMP1_RESPONSE_LEN - 2],
+            before[DUMP1_RESPONSE_LEN - 2]
+        );
+        assert_eq!(
+            desired.frame(SnapshotSection::Identity),
+            baseline.frame(SnapshotSection::Identity)
+        );
+        assert_eq!(
+            desired.frame(SnapshotSection::Dump0),
+            baseline.frame(SnapshotSection::Dump0)
+        );
+        assert_ne!(desired.digest(), baseline.digest());
+
+        let inverse = baseline.inverse_actions_for(&[unmute]).unwrap();
+        assert_eq!(inverse, [DirectParameterAction::new(8, 0x03, 1).unwrap()]);
+        assert_eq!(desired.project_direct_actions(&inverse).unwrap(), baseline);
+    }
+
+    #[test]
+    fn one_change_o4_unmute_plan_diffs_to_exactly_one_field() {
+        let baseline = muted_o4_baseline();
+        let unmute = DirectParameterAction::new(8, 0x03, 0).unwrap();
+        let desired = baseline.project_direct_actions(&[unmute]).unwrap();
+
+        // Section-level semantic diff: exactly one changed section, Dump1.
+        let diff = baseline.diff(&desired).unwrap();
+        assert_eq!(diff.changes().len(), 1);
+        assert_eq!(diff.changes()[0].section, SnapshotSection::Dump1);
+
+        // Byte-level: exactly one byte differs across the complete snapshot.
+        let mut changed = 0_usize;
+        for section in [
+            SnapshotSection::Identity,
+            SnapshotSection::Dump0,
+            SnapshotSection::Dump1,
+        ] {
+            let before = baseline.frame(section);
+            let after = desired.frame(section);
+            assert_eq!(before.len(), after.len());
+            changed += before
+                .iter()
+                .zip(after.iter())
+                .filter(|(before_byte, after_byte)| before_byte != after_byte)
+                .count();
+        }
+        assert_eq!(changed, 1);
+
+        // Plan-level: one typed action out, exact mute=1 inverse back.
+        let transaction =
+            ApplyTransactionV1::stage_projected(baseline.clone(), vec![unmute]).unwrap();
+        assert_eq!(transaction.apply_plan().action_count(), 1);
+        assert_eq!(
+            transaction.apply_plan().command().unwrap().actions(),
+            [unmute]
+        );
+        assert_eq!(transaction.apply_plan().desired(), &desired);
+        assert_eq!(
+            transaction.rollback_plan().command().unwrap().actions(),
+            [DirectParameterAction::new(8, 0x03, 1).unwrap()]
+        );
+    }
+
+    #[test]
+    fn o4_mute_projection_rejects_other_channels_unreviewed_params_and_wide_values() {
+        let baseline = muted_o4_baseline();
+        // A mute address on any other channel does not match O4's reviewed
+        // address: O1/O2/O3/O5/O6 mutes and the setup channel fail closed, as
+        // do O4 parameters adjacent to mute.
+        for (channel, parameter) in [
+            (0, 0x03),
+            (5, 0x03),
+            (6, 0x03),
+            (7, 0x03),
+            (9, 0x03),
+            (10, 0x03),
+            (8, 0x02),
+            (8, 0x04),
+            (8, 0x3b),
+        ] {
+            let action = DirectParameterAction::new(channel, parameter, 1).unwrap();
+            assert!(matches!(
+                baseline.project_direct_actions(&[action]),
+                Err(SnapshotProjectionError::UnmappedAction { .. })
+            ));
+            assert!(matches!(
+                baseline.inverse_actions_for(&[action]),
+                Err(SnapshotProjectionError::UnmappedAction { .. })
+            ));
+        }
+        // The on/off domain is closed: 2 is not a mute state.
+        let wide = DirectParameterAction::new(8, 0x03, 2).unwrap();
+        assert!(matches!(
+            baseline.project_direct_actions(&[wide]),
+            Err(SnapshotProjectionError::ValueNotOnOff {
+                parameter: 0x03,
+                value: 2,
+            })
+        ));
+        // A baseline byte outside the on/off domain refutes the transcription
+        // and must fail closed on inverse derivation.
+        let mut suspect_dump1 = dump(0, 1, 0);
+        suspect_dump1[223] = 5;
+        let suspect =
+            SnapshotV1::from_frames(&identity(0), &dump(0, 0, 0), &suspect_dump1).unwrap();
+        assert!(matches!(
+            suspect.inverse_actions_for(&[DirectParameterAction::new(8, 0x03, 0).unwrap()]),
+            Err(SnapshotProjectionError::ValueNotOnOff {
+                parameter: 0x03,
+                value: 5,
             })
         ));
     }

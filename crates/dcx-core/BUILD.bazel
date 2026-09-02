@@ -23,6 +23,7 @@ rust_test(
     size = "small",
     srcs = ["tests/robustness.rs"],
     compile_data = [
+        "//:o4_mute_fixtures",
         "//:safe_profile_fixture",
         "//:synthetic_search_fixture",
     ],
