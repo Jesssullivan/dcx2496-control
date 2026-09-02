@@ -7,6 +7,8 @@ default: check
 
 check: repo::check
 
+test-unit: repo::test-unit
+
 bazel-check: repo::bazel-check
 
 nix-check: repo::nix-check

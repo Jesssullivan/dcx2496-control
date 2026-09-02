@@ -26,6 +26,13 @@ lint:
 test:
     cargo test --workspace --all-targets --all-features
 
+# Dispatch the remote-eligible Bazel tests. This recipe is pure dispatch: the
+# refusal posture -- no local fallback, remote spawn strategy, pinned execution
+# platform -- is defined once in .bazelrc.flywheel, and nothing here may add a
+# flag that softens it.
+test-unit:
+    bazelisk test --config=executor-backed --test_tag_filters=-no-remote //:remote_eligible
+
 # Exercise the injected, no-device discovery/snapshot/apply transport contract.
 transport-check:
     cargo test --locked --package dcx-transport --all-targets --all-features
