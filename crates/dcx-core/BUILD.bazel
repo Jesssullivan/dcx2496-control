@@ -18,9 +18,10 @@ rust_test(
     crate = ":dcx_core",
 )
 
+# Medium: the exhaustive sweeps run 20-35s, too near a small test's 60s cap.
 rust_test(
     name = "robustness",
-    size = "small",
+    size = "medium",
     srcs = ["tests/robustness.rs"],
     compile_data = [
         "//:o4_mute_fixtures",
