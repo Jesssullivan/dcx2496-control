@@ -1,3 +1,4 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -7,7 +8,9 @@ exports_files([
     "Cargo.toml",
     "LICENSE",
     "LICENSE-APACHE",
+    "MODULE.bazel",
     "NOTICE",
+    "rust-toolchain.toml",
     "third_party/duinodcx/LICENSE",
 ])
 
@@ -70,12 +73,26 @@ test_suite(
 test_suite(
     name = "remote_eligible",
     tests = [
+        ":toolchain_pin_parity",
         "//crates/dcx-core:robustness",
         "//crates/dcx-core:unit_tests",
         "//crates/dcx-darwin-tty:unit_tests",
         "//crates/dcx-transport:robustness",
         "//crates/dcx-transport:unit_tests",
     ],
+)
+
+# Bazel and rustup pin the Rust toolchain in two files that nothing else ties
+# together. Read both at compile time and fail if they ever disagree.
+rust_test(
+    name = "toolchain_pin_parity",
+    size = "small",
+    srcs = ["tests/toolchain_pin_parity.rs"],
+    compile_data = [
+        "MODULE.bazel",
+        "rust-toolchain.toml",
+    ],
+    edition = "2024",
 )
 
 sh_test(
