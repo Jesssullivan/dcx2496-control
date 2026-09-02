@@ -18,6 +18,14 @@ llvm.toolchain(
 )
 use_repo(llvm, "llvm_toolchain")
 
+# Darwin is not yet hermetic end to end. With no explicit `llvm.sysroot`,
+# toolchains_llvm resolves the macOS sysroot once, at fetch time, by running
+# `/usr/bin/xcrun --show-sdk-path --sdk macosx`, and bakes that absolute path
+# into the generated repository. Fetch from a shell whose DEVELOPER_DIR points
+# at nixpkgs' apple-sdk and the baked SDK ships no `libc++.tbd`, so every later
+# Darwin link fails until the repository is refetched. An explicit
+# `llvm.sysroot(path = ...)` would only trade one host probe for one host
+# literal; closing this needs a sysroot Bazel can fetch and hash. TIN-4050.
 register_toolchains("@llvm_toolchain//:all")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
