@@ -2,9 +2,17 @@
 
 use dcx_core::{
     LabProfileV1,
+    discovery::{DiscoveryError, QueryOnlyDiscovery},
     protocol::{DeviceId, FrameDecoder, MAX_FRAME_LEN, Query, parse_frame},
     rew::{RewParseError, import_rew},
 };
+
+fn synthetic_search_response() -> Vec<u8> {
+    include_str!("../../../fixtures/protocol/SYNTHETIC-search-response-26.hex")
+        .split_ascii_whitespace()
+        .map(|word| u8::from_str_radix(word, 16).unwrap())
+        .collect()
+}
 
 #[test]
 fn arbitrary_byte_streams_never_panic_or_retain_unbounded_candidates() {
@@ -43,6 +51,82 @@ fn no_single_byte_corruption_of_query_envelope_is_accepted_as_original() {
         let mut corrupted = original_bytes.clone();
         corrupted[index] ^= 1;
         assert_ne!(parse_frame(&corrupted).ok(), Some(original.clone()));
+    }
+}
+
+#[test]
+fn every_device_address_requires_an_exact_expected_search_identity() {
+    let template = synthetic_search_response();
+    for expected in 0..=15 {
+        for observed in 0..=15 {
+            let mut frame = template.clone();
+            frame[4] = observed;
+            let mut discovery = QueryOnlyDiscovery::new(DeviceId::new(expected).unwrap());
+            let result = discovery.accept_candidates(&[&frame]);
+            if expected == observed {
+                assert_eq!(result.unwrap().device().get(), expected);
+            } else {
+                assert_eq!(
+                    result,
+                    Err(DiscoveryError::UnexpectedDevice {
+                        expected,
+                        actual: observed,
+                    })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn only_one_complete_candidate_can_cross_the_discovery_gate() {
+    let frame = synthetic_search_response();
+    for count in 0..=32 {
+        let candidates: Vec<&[u8]> = (0..count).map(|_| frame.as_slice()).collect();
+        let mut discovery = QueryOnlyDiscovery::new(DeviceId::new(0).unwrap());
+        let result = discovery.accept_candidates(&candidates);
+        match count {
+            0 => assert_eq!(result, Err(DiscoveryError::NoCandidate)),
+            1 => assert!(result.is_ok()),
+            _ => assert_eq!(result, Err(DiscoveryError::AmbiguousCandidates(count))),
+        }
+    }
+}
+
+#[test]
+fn every_nonidentity_envelope_mutation_fails_closed_without_state_change() {
+    let original = synthetic_search_response();
+    for position in [1_usize, 2, 3, 5, 6] {
+        for replacement in 0..=0x7f {
+            if replacement == original[position] {
+                continue;
+            }
+            let mut mutated = original.clone();
+            mutated[position] = replacement;
+            let mut discovery = QueryOnlyDiscovery::new(DeviceId::new(0).unwrap());
+            assert!(
+                discovery.accept_candidates(&[&mutated]).is_err(),
+                "identity byte {position} accepted replacement {replacement:#04x}"
+            );
+            assert_eq!(
+                discovery.state(),
+                dcx_core::discovery::DiscoveryState::AwaitingPrimary
+            );
+        }
+    }
+}
+
+#[test]
+fn every_nonexact_search_response_length_is_rejected() {
+    let original = synthetic_search_response();
+    for length in 0..=64 {
+        if length == original.len() {
+            continue;
+        }
+        let mut candidate = original.clone();
+        candidate.resize(length, 0);
+        let mut discovery = QueryOnlyDiscovery::new(DeviceId::new(0).unwrap());
+        assert!(discovery.accept_candidates(&[&candidate]).is_err());
     }
 }
 

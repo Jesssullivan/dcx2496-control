@@ -6,6 +6,13 @@ use thiserror::Error;
 /// Maximum accepted frame size. The largest currently described dump is 1015
 /// bytes, so this leaves bounded room for future observed variants.
 pub const MAX_FRAME_LEN: usize = 2_048;
+/// Exact total size of a discovery response, including envelope bytes.
+///
+/// This bound is a behavioral hypothesis from the pinned `DuinoDCX` reference;
+/// the payload remains opaque until named-device evidence exists.
+pub const SEARCH_RESPONSE_LEN: usize = 26;
+/// Exact opaque payload size inside a [`SearchResponse26`].
+pub const SEARCH_RESPONSE_PAYLOAD_LEN: usize = SEARCH_RESPONSE_LEN - 8;
 /// `SysEx` start byte.
 pub const START: u8 = 0xf0;
 /// `SysEx` terminator byte.
@@ -206,12 +213,76 @@ pub struct ParameterChange {
     pub value: u16,
 }
 
+/// Exact, bounded wire identity returned by a DCX2496 discovery search.
+///
+/// The fixed manufacturer and model bytes are validated by [`parse_frame`],
+/// and this type additionally requires a physical device address, function
+/// `0x00`, and exactly 26 total bytes. The remaining 18 bytes are deliberately
+/// opaque: accepting this value proves only a matching protocol identity, not
+/// the identity or compatibility of a named hardware unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchResponse26 {
+    device: DeviceId,
+    opaque_payload: [u8; SEARCH_RESPONSE_PAYLOAD_LEN],
+}
+
+impl SearchResponse26 {
+    /// Validate one complete candidate discovery frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] for any partial, oversized, malformed,
+    /// wrong-manufacturer, wrong-model, wrong-function, or broadcast frame.
+    pub fn parse(frame: &[u8]) -> Result<Self, ProtocolError> {
+        if frame.len() != SEARCH_RESPONSE_LEN {
+            return Err(ProtocolError::InvalidSearchResponseLength(frame.len()));
+        }
+        Self::try_from(parse_frame(frame)?)
+    }
+
+    /// Return the response device address.
+    pub const fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// Return the uninterpreted, seven-bit response payload.
+    pub const fn opaque_payload(&self) -> &[u8; SEARCH_RESPONSE_PAYLOAD_LEN] {
+        &self.opaque_payload
+    }
+}
+
+impl TryFrom<Message> for SearchResponse26 {
+    type Error = ProtocolError;
+
+    fn try_from(message: Message) -> Result<Self, Self::Error> {
+        let device = match message.address {
+            Address::Device(device) => device,
+            Address::BroadcastSearch => return Err(ProtocolError::BroadcastSearchResponse),
+        };
+        if message.function != 0x00 {
+            return Err(ProtocolError::UnexpectedSearchResponseFunction(
+                message.function,
+            ));
+        }
+        let actual_len = message.data.len() + 8;
+        let opaque_payload = message
+            .data
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidSearchResponseLength(actual_len))?;
+        Ok(Self {
+            device,
+            opaque_payload,
+        })
+    }
+}
+
 /// Semantic classification of a valid frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DecodedMessage {
-    /// A discovery response. Payload interpretation awaits hardware evidence.
-    SearchResponse { device: DeviceId, payload: Vec<u8> },
+    /// An exact 26-byte discovery response with an opaque payload.
+    SearchResponse(SearchResponse26),
     /// A ping response. Payload interpretation awaits hardware evidence.
     PingResponse { device: DeviceId, payload: Vec<u8> },
     /// One state dump segment.
@@ -289,10 +360,9 @@ pub fn decode(message: Message) -> Result<DecodedMessage, ProtocolError> {
     };
 
     match message.function {
-        0x00 => Ok(DecodedMessage::SearchResponse {
-            device,
-            payload: message.data,
-        }),
+        0x00 => Ok(DecodedMessage::SearchResponse(SearchResponse26::try_from(
+            message,
+        )?)),
         0x04 => Ok(DecodedMessage::PingResponse {
             device,
             payload: message.data,
@@ -413,6 +483,15 @@ pub enum ProtocolError {
     /// Device IDs are limited to 0 through 15.
     #[error("invalid device id: {0}")]
     InvalidDeviceId(u8),
+    /// Search responses must be exactly 26 bytes, including the envelope.
+    #[error("search response must be exactly 26 bytes: found {0}")]
+    InvalidSearchResponseLength(usize),
+    /// A search response must originate from one physical device address.
+    #[error("search response used the broadcast request address")]
+    BroadcastSearchResponse,
+    /// Search responses use function zero.
+    #[error("unexpected search response function: {0:#04x}")]
+    UnexpectedSearchResponseFunction(u8),
     /// Dump payload was too short to contain the described part field.
     #[error("malformed dump payload: {0} bytes")]
     MalformedDump(usize),
@@ -450,6 +529,59 @@ mod tests {
             .encode()
             .unwrap(),
             [0xf0, 0, 0x20, 0x32, 3, 0x0e, 0x50, 1, 0, 1, 0xf7]
+        );
+    }
+
+    #[test]
+    fn exact_search_response_has_typed_wire_identity_and_opaque_payload() {
+        let mut frame = vec![0xf0, 0x00, 0x20, 0x32, 3, 0x0e, 0x00];
+        frame.extend_from_slice(b"SYNTHETIC-IDENTITY");
+        frame.push(0xf7);
+
+        let response = SearchResponse26::parse(&frame).unwrap();
+        assert_eq!(response.device(), DeviceId::new(3).unwrap());
+        assert_eq!(response.opaque_payload(), b"SYNTHETIC-IDENTITY");
+        assert_eq!(
+            decode(parse_frame(&frame).unwrap()).unwrap(),
+            DecodedMessage::SearchResponse(response)
+        );
+    }
+
+    #[test]
+    fn malformed_identity_and_nonexact_search_responses_fail_closed() {
+        let mut frame = vec![0xf0, 0x00, 0x20, 0x32, 0, 0x0e, 0x00];
+        frame.extend_from_slice(b"SYNTHETIC-IDENTITY");
+        frame.push(0xf7);
+
+        assert_eq!(
+            SearchResponse26::parse(&frame[..frame.len() - 1]),
+            Err(ProtocolError::InvalidSearchResponseLength(25))
+        );
+        let mut extended = frame.clone();
+        extended.insert(extended.len() - 1, 0);
+        assert_eq!(
+            SearchResponse26::parse(&extended),
+            Err(ProtocolError::InvalidSearchResponseLength(27))
+        );
+
+        let mut wrong_manufacturer = frame.clone();
+        wrong_manufacturer[3] = 0x33;
+        assert_eq!(
+            SearchResponse26::parse(&wrong_manufacturer),
+            Err(ProtocolError::WrongManufacturer([0x00, 0x20, 0x33]))
+        );
+
+        let mut wrong_model = frame.clone();
+        wrong_model[5] = 0x0f;
+        assert_eq!(
+            SearchResponse26::parse(&wrong_model),
+            Err(ProtocolError::WrongModel(0x0f))
+        );
+
+        frame[6] = 0x04;
+        assert_eq!(
+            SearchResponse26::parse(&frame),
+            Err(ProtocolError::UnexpectedSearchResponseFunction(0x04))
         );
     }
 

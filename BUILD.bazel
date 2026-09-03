@@ -21,6 +21,11 @@ filegroup(
     srcs = ["fixtures/profiles/safe-muted-v1.json"],
 )
 
+filegroup(
+    name = "synthetic_search_fixture",
+    srcs = ["fixtures/protocol/SYNTHETIC-search-response-26.hex"],
+)
+
 test_suite(
     name = "check",
     tests = [
@@ -36,6 +41,7 @@ sh_test(
     args = [
         "$(location //crates/dcxctl:dcxctl)",
         "$(location fixtures/protocol/SYNTHETIC-direct-parameter.hex)",
+        "$(location fixtures/protocol/SYNTHETIC-search-response-26.hex)",
         "$(location fixtures/profiles/safe-muted-v1.json)",
         "$(location fixtures/profiles/SYNTHETIC-control-room-v1.json)",
         "$(location fixtures/rew/SYNTHETIC-cut-only.txt)",
@@ -44,6 +50,7 @@ sh_test(
         "fixtures/profiles/SYNTHETIC-control-room-v1.json",
         "fixtures/profiles/safe-muted-v1.json",
         "fixtures/protocol/SYNTHETIC-direct-parameter.hex",
+        "fixtures/protocol/SYNTHETIC-search-response-26.hex",
         "fixtures/rew/SYNTHETIC-cut-only.txt",
         "//crates/dcxctl",
     ],
