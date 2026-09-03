@@ -22,7 +22,12 @@ llvm.toolchain(
 # `/usr/bin/xcrun --show-sdk-path --sdk macosx`, and bakes that absolute path
 # into the generated repository. Fetch from a shell whose DEVELOPER_DIR points
 # at nixpkgs' apple-sdk and the baked SDK ships no `libc++.tbd`, so every later
-# Darwin link fails until the repository is refetched. An explicit
+# Darwin link fails until the repository is refetched.
+#
+# scripts/run_bazelisk.sh scrubs DEVELOPER_DIR and SDKROOT so that probe reads
+# the Xcode SDK instead. That keeps the question clean rather than freezing an
+# answer, but it only governs the first fetch into an output base; a base
+# already carrying the nixpkgs SDK needs `clean --expunge`. An explicit
 # `llvm.sysroot(path = ...)` would only trade one host probe for one host
 # literal; closing this needs a sysroot Bazel can fetch and hash. TIN-4050.
 
