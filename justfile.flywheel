@@ -1,0 +1,33 @@
+# GloriousFlywheel consumer front-door recipes.
+# Generated from tinyland-inc/GloriousFlywheel kit/frontdoor at
+# 017c3b490610148e4be3458980156e9f14a2611a. This fragment owns no global
+# settings, endpoint, token, or runner enrollment.
+
+_flywheel_env := 'set -a; if [ -f .env.flywheel.local ]; then . ./.env.flywheel.local; fi; set +a'
+
+flywheel-doctor *args:
+    @{{_flywheel_env}}; exec flywheel-doctor {{args}}
+
+flywheel-verify *args:
+    @{{_flywheel_env}}; exec flywheel-verify {{args}}
+
+flywheel-enroll profile *args:
+    @{{_flywheel_env}}; exec flywheel-enroll "{{profile}}" {{args}}
+
+flywheel-consumer-env profile *args:
+    @{{_flywheel_env}}; exec flywheel-consumer-env "{{profile}}" {{args}}
+
+flywheel-bazel command *args:
+    @{{_flywheel_env}}; exec gloriousflywheel-bazel "{{command}}" {{args}}
+
+flywheel-build *targets:
+    @{{_flywheel_env}}; exec gloriousflywheel-bazel build {{targets}}
+
+flywheel-test *targets:
+    @{{_flywheel_env}}; exec gloriousflywheel-bazel test {{targets}}
+
+flywheel-fetch *targets:
+    @{{_flywheel_env}}; exec gloriousflywheel-bazel fetch {{targets}}
+
+flywheel-info *args:
+    @{{_flywheel_env}}; exec gloriousflywheel-bazel info {{args}}

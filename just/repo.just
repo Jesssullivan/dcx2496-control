@@ -42,12 +42,16 @@ lint:
 test:
     cargo test --workspace --all-targets --all-features
 
-# Dispatch the remote-eligible Bazel tests. This recipe is pure dispatch: the
-# refusal posture -- no local fallback, remote spawn strategy, pinned execution
-# platform -- is defined once in .bazelrc.flywheel, and nothing here may add a
-# flag that softens it.
+# Dispatch the remote-eligible Bazel tests through the vendored GloriousFlywheel
+# consumer front door rather than a dispatch of our own. This recipe adds no
+# posture of its own: the endpoint contract is `gloriousflywheel-bazel`'s, which
+# refuses without a runtime cache/executor profile and is the only thing that
+# can refuse about an endpoint, since no committed file in this repo names one;
+# the Bazel-side posture -- no local fallback, remote spawn strategy, pinned
+# execution platform -- is defined once in .bazelrc.flywheel. Nothing here may
+# add a flag that softens either.
 test-unit:
-    bash scripts/run_bazelisk.sh test --config=executor-backed --test_tag_filters=-no-remote //:remote_eligible
+    just flywheel-test --config=executor-backed --test_tag_filters=-no-remote //:remote_eligible
 
 # Exercise the injected, no-device discovery/snapshot/apply transport contract.
 transport-check:
