@@ -1972,6 +1972,20 @@ impl PersistentApplySession for DarwinSearchSession {
     }
 }
 
+/// Canary for the `bazel_test_no_native` exclusion contract.
+///
+/// `true` exactly when the native [`macos`] backend below is part of this
+/// compilation. The two arms are the gate expression that admits that module
+/// and its literal negation, so the constant tracks the gate rather than
+/// restating a guess about it. `tests::native_backend_is_excluded` reads it.
+#[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
+#[allow(dead_code)]
+const NATIVE_BACKEND_COMPILED: bool = true;
+
+#[cfg(not(all(target_os = "macos", not(bazel_test_no_native))))]
+#[allow(dead_code)]
+const NATIVE_BACKEND_COMPILED: bool = false;
+
 #[cfg(all(target_os = "macos", not(bazel_test_no_native)))]
 mod macos {
     use std::{

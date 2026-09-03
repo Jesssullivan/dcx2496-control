@@ -16,17 +16,41 @@ llvm.toolchain(
     name = "llvm_toolchain",
     llvm_version = "22.1.8",
 )
-use_repo(llvm, "llvm_toolchain")
 
 # Darwin is not yet hermetic end to end. With no explicit `llvm.sysroot`,
 # toolchains_llvm resolves the macOS sysroot once, at fetch time, by running
 # `/usr/bin/xcrun --show-sdk-path --sdk macosx`, and bakes that absolute path
 # into the generated repository. Fetch from a shell whose DEVELOPER_DIR points
 # at nixpkgs' apple-sdk and the baked SDK ships no `libc++.tbd`, so every later
-# Darwin link fails until the repository is refetched. An explicit
+# Darwin link fails until the repository is refetched.
+#
+# scripts/run_bazelisk.sh scrubs DEVELOPER_DIR and SDKROOT so that probe reads
+# the Xcode SDK instead. That keeps the question clean rather than freezing an
+# answer, but it only governs the first fetch into an output base; a base
+# already carrying the nixpkgs SDK needs `clean --expunge`. An explicit
 # `llvm.sysroot(path = ...)` would only trade one host probe for one host
 # literal; closing this needs a sysroot Bazel can fetch and hash. TIN-4050.
-register_toolchains("@llvm_toolchain//:all")
+
+# The same pinned release, configured to run on a linux-x86_64 execution
+# platform rather than this host. Without it, resolution against
+# //tools/bazel/platforms:linux_x86_64 finds no C/C++ toolchain at all and
+# analysis fails before any action is described.
+llvm.toolchain(
+    name = "llvm_toolchain_linux_x86_64",
+    exec_arch = "x86_64",
+    exec_os = "linux",
+    llvm_version = "22.1.8",
+)
+use_repo(
+    llvm,
+    "llvm_toolchain",
+    "llvm_toolchain_linux_x86_64",
+)
+
+register_toolchains(
+    "@llvm_toolchain//:all",
+    "@llvm_toolchain_linux_x86_64//:all",
+)
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(versions = ["1.98.0"])

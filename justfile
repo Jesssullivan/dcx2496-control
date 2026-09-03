@@ -3,11 +3,21 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 mod repo 'just/repo.just'
 
+# The GloriousFlywheel consumer front door, vendored from GF `kit/frontdoor`
+# rather than re-implemented. It owns no global setting, endpoint, token, or
+# runner enrollment; `gloriousflywheel-bazel` is an operator tool, so the
+# import is optional and the recipes it defines are absent where it is.
+import? 'justfile.flywheel'
+
 default: check
 
 check: repo::check
 
+test-unit: repo::test-unit
+
 bazel-check: repo::bazel-check
+
+hosted-advisory: repo::hosted-advisory
 
 nix-check: repo::nix-check
 

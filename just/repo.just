@@ -2,11 +2,13 @@ set working-directory := ".."
 
 fmt:
     cargo fmt --all
+    rustfmt --edition 2024 tests/toolchain_pin_parity.rs
     alejandra flake.nix
     rg --files -0 -g 'BUILD.bazel' -g '*.bzl' -g 'MODULE.bazel' | xargs -0 buildifier -mode=fix
 
 fmt-check:
     cargo fmt --all --check
+    rustfmt --edition 2024 --check tests/toolchain_pin_parity.rs
     alejandra --check flake.nix
     rg --files -0 -g 'BUILD.bazel' -g '*.bzl' -g 'MODULE.bazel' | xargs -0 buildifier -mode=check
 
@@ -14,7 +16,21 @@ lint:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo clippy --workspace --all-targets --all-features -- -D warnings
-    shellcheck tests/*.sh
+    # tests/toolchain_pin_parity.rs belongs to no Cargo package -- the root
+    # manifest is a virtual workspace -- so `cargo fmt --all` and
+    # `cargo clippy --workspace` never reach it and only Bazel compiles it.
+    # Lint it directly, under the levels [workspace.lints] sets, so the file
+    # asserting the toolchain pins is not itself the one source nothing checks.
+    parity_lint_out="$(mktemp -d)"
+    trap 'rm -rf "$parity_lint_out"' EXIT
+    clippy-driver --edition 2024 --test \
+        --crate-name toolchain_pin_parity \
+        --emit=metadata --out-dir "$parity_lint_out" \
+        tests/toolchain_pin_parity.rs \
+        -F unsafe_code -D warnings \
+        -D clippy::all -D clippy::pedantic \
+        -A clippy::module_name_repetitions -A clippy::must_use_candidate
+    shellcheck scripts/*.sh tests/*.sh
     workflow_files=()
     while IFS= read -r workflow_file; do
         workflow_files+=("$workflow_file")
@@ -25,6 +41,17 @@ lint:
 
 test:
     cargo test --workspace --all-targets --all-features
+
+# Dispatch the remote-eligible Bazel tests through the vendored GloriousFlywheel
+# consumer front door rather than a dispatch of our own. This recipe adds no
+# posture of its own: the endpoint contract is `gloriousflywheel-bazel`'s, which
+# refuses without a runtime cache/executor profile and is the only thing that
+# can refuse about an endpoint, since no committed file in this repo names one;
+# the Bazel-side posture -- no local fallback, remote spawn strategy, pinned
+# execution platform -- is defined once in .bazelrc.flywheel. Nothing here may
+# add a flag that softens either.
+test-unit:
+    just flywheel-test --config=executor-backed --test_tag_filters=-no-remote //:remote_eligible
 
 # Exercise the injected, no-device discovery/snapshot/apply transport contract.
 transport-check:
@@ -63,8 +90,14 @@ bazel-check:
     if [[ $(uname -s) == Darwin ]]; then
         build_targets+=(//:dcxctl_live_control)
     fi
-    bazelisk test //:check
-    bazelisk build "${build_targets[@]}"
+    bash scripts/run_bazelisk.sh test //:check
+    bash scripts/run_bazelisk.sh build "${build_targets[@]}"
+
+# The GitHub-hosted lane, named for what it is. Its Bazel work is deliberately
+# the local, no-remote-flags `bazel-check` and is kept visibly separate from
+# `test-unit` so a hosted run can never be cited as the on-prem or
+# executor-backed receipt.
+hosted-advisory: bazel-check
 
 nix-check:
     nix flake check

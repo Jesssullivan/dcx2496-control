@@ -1,3 +1,4 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -7,7 +8,9 @@ exports_files([
     "Cargo.toml",
     "LICENSE",
     "LICENSE-APACHE",
+    "MODULE.bazel",
     "NOTICE",
+    "rust-toolchain.toml",
     "third_party/duinodcx/LICENSE",
 ])
 
@@ -58,10 +61,39 @@ test_suite(
     name = "check",
     tests = [
         ":fixture_contract",
+        ":toolchain_pin_parity",
         "//crates/dcx-core:all_tests",
         "//crates/dcx-darwin-tty:all_tests",
         "//crates/dcx-transport:all_tests",
     ],
+)
+
+# The tests that declare every input they read and every tool they run, listed
+# one by one rather than through the per-crate suites so adding a target to a
+# crate never silently widens this set. Kept flat for the same reason.
+test_suite(
+    name = "remote_eligible",
+    tests = [
+        ":toolchain_pin_parity",
+        "//crates/dcx-core:robustness",
+        "//crates/dcx-core:unit_tests",
+        "//crates/dcx-darwin-tty:unit_tests",
+        "//crates/dcx-transport:robustness",
+        "//crates/dcx-transport:unit_tests",
+    ],
+)
+
+# Bazel and rustup pin the Rust toolchain in two files that nothing else ties
+# together. Read both at compile time and fail if they ever disagree.
+rust_test(
+    name = "toolchain_pin_parity",
+    size = "small",
+    srcs = ["tests/toolchain_pin_parity.rs"],
+    compile_data = [
+        "MODULE.bazel",
+        "rust-toolchain.toml",
+    ],
+    edition = "2024",
 )
 
 sh_test(
@@ -87,5 +119,12 @@ sh_test(
         "fixtures/protocol/SYNTHETIC-search-response-26.hex",
         "fixtures/rew/SYNTHETIC-cut-only.txt",
         "//crates/dcxctl",
+    ],
+    # The script runs bash, grep, dd, and diff out of the host PATH. Those are
+    # not inputs the action declares, so this test is not describable to a
+    # content-addressed executor and must never be dispatched to one.
+    tags = [
+        "no-remote",
+        "no-remote-exec",
     ],
 )

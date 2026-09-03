@@ -74,6 +74,7 @@
         pkgs = pkgsFor system;
       in {
         default = pkgs.mkShell {
+          DCX_BAZELISK = "${pkgs.bazelisk}/bin/bazelisk";
           packages =
             [
               pkgs.actionlint
@@ -85,6 +86,8 @@
               pkgs.just
               pkgs.jq
               pkgs.alejandra
+              # scripts/run_bazelisk.sh resolves DCX_BAZELISK with GNU realpath.
+              pkgs.coreutils
               pkgs.ripgrep
               (toolchainFor pkgs)
               pkgs.shellcheck
