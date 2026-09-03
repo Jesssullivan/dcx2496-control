@@ -1,6 +1,6 @@
 //! Assert the two Rust toolchain pins in this repository name one version.
 //!
-//! `MODULE.bazel` pins the toolchain rules_rust downloads for the Bazel graph.
+//! `MODULE.bazel` pins the toolchain `rules_rust` downloads for the Bazel graph.
 //! `rust-toolchain.toml` pins the toolchain rustup gives Cargo, clippy, and
 //! rustfmt. Nothing else ties them together, so they can drift silently and
 //! leave the two build paths compiling this crate tree with different

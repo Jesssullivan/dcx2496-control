@@ -2,11 +2,13 @@ set working-directory := ".."
 
 fmt:
     cargo fmt --all
+    rustfmt --edition 2024 tests/toolchain_pin_parity.rs
     alejandra flake.nix
     rg --files -0 -g 'BUILD.bazel' -g '*.bzl' -g 'MODULE.bazel' | xargs -0 buildifier -mode=fix
 
 fmt-check:
     cargo fmt --all --check
+    rustfmt --edition 2024 --check tests/toolchain_pin_parity.rs
     alejandra --check flake.nix
     rg --files -0 -g 'BUILD.bazel' -g '*.bzl' -g 'MODULE.bazel' | xargs -0 buildifier -mode=check
 
@@ -14,6 +16,20 @@ lint:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo clippy --workspace --all-targets --all-features -- -D warnings
+    # tests/toolchain_pin_parity.rs belongs to no Cargo package -- the root
+    # manifest is a virtual workspace -- so `cargo fmt --all` and
+    # `cargo clippy --workspace` never reach it and only Bazel compiles it.
+    # Lint it directly, under the levels [workspace.lints] sets, so the file
+    # asserting the toolchain pins is not itself the one source nothing checks.
+    parity_lint_out="$(mktemp -d)"
+    trap 'rm -rf "$parity_lint_out"' EXIT
+    clippy-driver --edition 2024 --test \
+        --crate-name toolchain_pin_parity \
+        --emit=metadata --out-dir "$parity_lint_out" \
+        tests/toolchain_pin_parity.rs \
+        -F unsafe_code -D warnings \
+        -D clippy::all -D clippy::pedantic \
+        -A clippy::module_name_repetitions -A clippy::must_use_candidate
     shellcheck scripts/*.sh tests/*.sh
     workflow_files=()
     while IFS= read -r workflow_file; do
