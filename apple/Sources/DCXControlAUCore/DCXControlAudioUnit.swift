@@ -190,7 +190,13 @@ public final class DCXControlAudioUnit: AUAudioUnit {
     public override var internalRenderBlock: AUInternalRenderBlock {
         let midiOutput = midiOutputEventBlock
         let midiEventListOutput = midiOutputEventListBlock
-        return { _, _, _, _, _, realtimeEventListHead, _ in
+        return { flags, _, _, _, outputData, realtimeEventListHead, _ in
+            // The stereo bus exists for the host's MIDI-effect lifecycle, not
+            // audio production. Never leave host-provided samples untouched.
+            for buffer in UnsafeMutableAudioBufferListPointer(outputData) {
+                if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+            }
+            flags.pointee.insert(.unitRenderAction_OutputIsSilence)
             var event = realtimeEventListHead
             while let current = event {
                 let header = current.pointee.head
