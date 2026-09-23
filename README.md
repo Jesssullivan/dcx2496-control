@@ -34,6 +34,14 @@ Apple process that can execute the bundled `dcxctl`. The separate CoreMIDI
 Commands and Status endpoints have no device-control packet mapping in bridge
 v1.
 
+On a nonzero child exit, the helper returns a bounded `failureDiagnostic` with
+the exit code, duration, stderr size/digest, and an allowlisted failure category.
+The AU displays the category, including Search identity counts or the failed
+Dump0/Dump1 stage. Raw stderr is neither displayed nor saved. Unknown, oversized,
+or changed error formats remain unclassified. A cleanup-failure flag reports an
+explicit failure; its absence is not independent proof of device restoration.
+The native regression label is `//apple:child_failure_diagnostics` (PZM only).
+
 ## CLI
 
 Discovery uses one open descriptor to collect ten validated Search identities,
