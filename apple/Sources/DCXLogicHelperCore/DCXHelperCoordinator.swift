@@ -267,12 +267,11 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 timeoutSeconds: configuration.childTimeoutSeconds,
                 mutationLock: processLock
             )
-            guard result.terminationStatus == 0 else {
-                return failure(
-                    request,
-                    .childFailed,
-                    "dcxctl exited with status \(result.terminationStatus)",
-                    false
+            if let failure = result.failurePayload() {
+                return BridgeResponse(
+                    requestID: request.requestID,
+                    operation: request.operation,
+                    error: failure
                 )
             }
             let response = try decode(request: request, result: result)

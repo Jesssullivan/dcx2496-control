@@ -612,6 +612,55 @@
         }
       ]
     },
+    "childFailureDiagnostic": {
+      "type": "object",
+      "required": ["kind", "stage", "exitCode", "durationMilliseconds", "stderrDigest", "stderrByteCount", "inspectionTruncated", "cleanupFailureReported"],
+      "properties": {
+        "kind": { "enum": ["searchIncomplete", "timeout", "transport", "invalidResponse", "responseLimit", "sessionBudget", "sessionCleanup", "serialSystem", "unknown"] },
+        "stage": { "enum": ["search", "dump0", "dump1", "serial", "remoteMode", "cleanup", "unknown"] },
+        "exitCode": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647, "not": { "const": 0 } },
+        "durationMilliseconds": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+        "stderrDigest": { "$ref": "#/$defs/digest" },
+        "stderrByteCount": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "inspectionTruncated": { "type": "boolean" },
+        "cleanupFailureReported": { "type": "boolean" },
+        "validSearchCount": { "type": "integer", "minimum": 0, "maximum": 9 },
+        "searchAttempts": { "const": 20 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "searchIncomplete" } } },
+          "then": { "required": ["validSearchCount", "searchAttempts"], "properties": { "stage": { "const": "search" } } },
+          "else": { "not": { "anyOf": [{ "required": ["validSearchCount"] }, { "required": ["searchAttempts"] }] } }
+        },
+        {
+          "if": { "properties": { "stderrByteCount": { "maximum": 4096 } } },
+          "then": { "properties": { "inspectionTruncated": { "const": false } } },
+          "else": { "properties": { "inspectionTruncated": { "const": true }, "kind": { "const": "unknown" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "enum": ["timeout", "invalidResponse", "responseLimit", "sessionBudget"] } } },
+          "then": { "properties": { "stage": { "enum": ["search", "dump0", "dump1"] } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "transport" } } },
+          "then": { "properties": { "stage": { "enum": ["search", "dump0", "dump1", "remoteMode"] } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "sessionCleanup" } } },
+          "then": { "properties": { "stage": { "const": "cleanup" }, "cleanupFailureReported": { "const": true } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "serialSystem" } } },
+          "then": { "properties": { "stage": { "const": "serial" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "unknown" } } },
+          "then": { "properties": { "stage": { "const": "unknown" }, "cleanupFailureReported": { "const": false } } }
+        }
+      ],
+      "additionalProperties": false
+    },
     "errorPayload": {
       "type": "object",
       "required": ["code", "message", "retryable"],
@@ -634,8 +683,10 @@
           ]
         },
         "message": { "type": "string", "maxLength": 512 },
-        "retryable": { "type": "boolean" }
+        "retryable": { "type": "boolean" },
+        "failureDiagnostic": { "$ref": "#/$defs/childFailureDiagnostic" }
       },
+      "allOf": [{ "if": { "required": ["failureDiagnostic"] }, "then": { "properties": { "code": { "const": "child_failed" } } } }],
       "additionalProperties": false
     },
     "errorResponse": {
