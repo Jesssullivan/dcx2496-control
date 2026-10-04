@@ -17,20 +17,23 @@ use std::{
     time::Duration,
 };
 
+use dcx_core::protocol::{DeviceId, ProtocolError, RemoteMode};
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 use dcx_core::{
     discovery::FALLBACK_BAUD,
-    protocol::{
-        DeviceId, DirectParameterCommand, MAX_FRAME_LEN, ProtocolError, RemoteMode,
-        RemoteModeCommand,
+    protocol::{DirectParameterCommand, MAX_FRAME_LEN, RemoteModeCommand},
+};
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+use dcx_transport::{
+    SEARCH_ATTEMPT_TIMEOUT, SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, SearchRead, SearchReadEnd,
+    SearchTransport,
+    snapshot::{
+        PersistentApplySession, PersistentSnapshotSession, SnapshotOperation,
+        SnapshotOperationKind, SnapshotRead, SnapshotReadEnd,
     },
 };
 use dcx_transport::{
-    SEARCH_ATTEMPT_TIMEOUT, SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, SearchOperation,
-    SearchOperationKind, SearchRead, SearchReadEnd, SearchReadError, SearchTransport,
-    snapshot::{
-        PersistentApplySession, PersistentSnapshotSession, SnapshotOperation,
-        SnapshotOperationKind, SnapshotRead, SnapshotReadEnd, SnapshotReadError,
-    },
+    SearchOperation, SearchOperationKind, SearchReadError, snapshot::SnapshotReadError,
 };
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -41,6 +44,7 @@ const SHA256_PREFIX: &str = "sha256/";
 /// Portion of the 500 ms whole-attempt budget reserved for restoration/close.
 pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
 /// Quiet observation after the explicit `ReceiveDirect` recovery write.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 const RECOVERY_QUIET_WINDOW: Duration = Duration::from_millis(25);
 
 /// A lower-case, prefixed SHA-256 digest safe for sanitized receipts.
@@ -80,6 +84,7 @@ impl Serialize for Sha256Digest {
 /// The path is validated at construction and again immediately before every
 /// open. It is intentionally omitted from `Debug` and carrier receipts.
 pub struct PrivateTtyBinding {
+    #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
     path: PathBuf,
     digest: Sha256Digest,
 }
@@ -94,7 +99,15 @@ impl PrivateTtyBinding {
     pub fn new(path: PathBuf) -> Result<Self, BindingError> {
         validate_private_path(&path)?;
         let digest = Sha256Digest::of_bytes(path.as_os_str().as_bytes());
-        Ok(Self { path, digest })
+        // Preserve the owned constructor API while offline consumers retain
+        // only the digest; native runtime and fake tests retain the path.
+        #[cfg(not(any(test, all(target_os = "macos", not(bazel_test_no_native)))))]
+        drop(path);
+        Ok(Self {
+            #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+            path,
+            digest,
+        })
     }
 
     /// Return only the sanitized path digest.
@@ -102,6 +115,7 @@ impl PrivateTtyBinding {
         self.digest
     }
 
+    #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
     fn verify(&self) -> Result<(), BindingError> {
         validate_private_path(&self.path)
     }
@@ -306,6 +320,7 @@ pub enum DarwinCarrierError {
     },
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl DarwinCarrierError {
     const fn kind(&self) -> CarrierFailureKind {
         match self {
@@ -490,25 +505,31 @@ pub struct SanitizedRecoveryReceipt {
     pub closed: bool,
 }
 
+// The private state machine belongs to the native runtime and the injected
+// tests. Non-Darwin library consumers retain the public offline binding,
+// error, and sanitized receipt types without unreachable syscall machinery.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SystemFault {
     errno: i32,
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl SystemFault {
     const fn new(errno: i32) -> Self {
         Self { errno }
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadProgress {
     Bytes(usize),
     WouldBlock,
-    #[cfg_attr(bazel_test_no_native, allow(dead_code))]
     EndOfFile,
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 trait SerialBackend {
     type TermiosSnapshot: Clone;
 
@@ -533,6 +554,7 @@ trait SerialBackend {
     fn close(&mut self);
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 struct ReceiptBuilder {
     attempt: SanitizedAttemptKind,
     binding_digest: Sha256Digest,
@@ -553,6 +575,7 @@ struct ReceiptBuilder {
     closed: bool,
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl ReceiptBuilder {
     fn new(binding: &PrivateTtyBinding, operation: SearchOperation) -> Self {
         Self {
@@ -616,10 +639,12 @@ impl ReceiptBuilder {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn duration_micros_ceil(duration: Duration) -> u64 {
     let nanos = duration.as_nanos();
     let micros = nanos.saturating_add(999) / 1_000;
@@ -657,6 +682,7 @@ impl<B> Carrier<B> {
 /// Construction opens, snapshots, and configures the tty exactly once. Callers
 /// must consume the session with [`Self::finish`] to obtain verified restoration;
 /// the native backend retains a best-effort `Drop` fallback for abnormal exits.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 struct PersistentCarrier<B: SerialBackend> {
     binding: PrivateTtyBinding,
     backend: B,
@@ -671,6 +697,7 @@ struct PersistentCarrier<B: SerialBackend> {
     receive_direct_cleanup_device: Option<DeviceId>,
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl<B: SerialBackend> PersistentCarrier<B> {
     fn open(
         binding: PrivateTtyBinding,
@@ -1106,6 +1133,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl<B: SerialBackend> SearchTransport for PersistentCarrier<B> {
     type Error = DarwinCarrierError;
 
@@ -1117,6 +1145,7 @@ impl<B: SerialBackend> SearchTransport for PersistentCarrier<B> {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl<B: SerialBackend> PersistentSnapshotSession for PersistentCarrier<B> {
     type Error = DarwinCarrierError;
 
@@ -1133,6 +1162,7 @@ impl<B: SerialBackend> PersistentSnapshotSession for PersistentCarrier<B> {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl<B: SerialBackend> PersistentApplySession for PersistentCarrier<B> {
     fn write_direct(&mut self, command: &DirectParameterCommand) -> Result<(), Self::Error> {
         self.write_direct_command(command)
@@ -1150,11 +1180,13 @@ impl<B: SerialBackend> SearchTransport for Carrier<B> {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 type AttemptResult = (
     Result<SearchRead, DarwinCarrierError>,
     SanitizedAttemptReceipt,
 );
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn execute_receive_direct_recovery_write<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1194,6 +1226,7 @@ fn execute_receive_direct_recovery_write<B: SerialBackend>(
 ///
 /// Resumed input restarts the fixed quiet observation but never retries the
 /// typed write. The common operation deadline bounds the complete drain.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn drain_until_quiet<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1484,11 +1517,13 @@ fn restore_attempt_state<B: SerialBackend>(
     )
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn active_io_deadline(start: Duration, timeout: Duration) -> Duration {
     let whole = start.checked_add(timeout).unwrap_or(Duration::MAX);
     whole.saturating_sub(SEARCH_CLEANUP_RESERVE)
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn requires_input_discard(error: &DarwinCarrierError) -> bool {
     matches!(
         error,
@@ -1503,6 +1538,7 @@ fn requires_input_discard(error: &DarwinCarrierError) -> bool {
 /// This is cleanup after a terminal operation failure, never operation recovery:
 /// callers either consume/close the session immediately or fail construction.
 /// The fixed call count and cleanup reserve keep the cleanup bounded.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn recover_input_state<B: SerialBackend>(backend: &mut B, required: bool) -> CleanupDisposition {
     if !required {
         return CleanupDisposition::NotRequired;
@@ -1520,6 +1556,7 @@ fn recover_input_state<B: SerialBackend>(backend: &mut B, required: bool) -> Cle
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn reject_preexisting_input<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1535,6 +1572,7 @@ fn reject_preexisting_input<B: SerialBackend>(
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn ensure_before_deadline<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1546,10 +1584,12 @@ fn ensure_before_deadline<B: SerialBackend>(
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn remaining<B: SerialBackend>(backend: &mut B, deadline: Duration) -> Duration {
     deadline.saturating_sub(backend.monotonic_now())
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn read_bounded<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1592,16 +1632,19 @@ fn read_bounded<B: SerialBackend>(
     })
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 enum FramedRead {
     Complete(Vec<u8>),
     TimedOut(Vec<u8>),
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 struct BoundedRead<T> {
     read: T,
     response: Option<Vec<u8>>,
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn fixed_search_response(
     response: Vec<u8>,
 ) -> Result<[u8; SEARCH_RESPONSE_LIMIT], DarwinCarrierError> {
@@ -1611,6 +1654,7 @@ fn fixed_search_response(
         .map_err(|_response: Vec<u8>| SearchReadError::CompleteLength(received).into())
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 trait WireObserver {
     fn consumed(&mut self, count: usize);
     fn duplicate(&mut self);
@@ -1618,6 +1662,7 @@ trait WireObserver {
     fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError;
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl WireObserver for ReceiptBuilder {
     fn consumed(&mut self, count: usize) {
         self.wire_bytes += count;
@@ -1637,6 +1682,7 @@ impl WireObserver for ReceiptBuilder {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl WireObserver for () {
     fn consumed(&mut self, _count: usize) {}
 
@@ -1659,6 +1705,7 @@ impl WireObserver for () {
 /// trailing-input check and accepts at most one queued exact replay because its
 /// larger deadline is sized for wire transfer, not an added settle delay. Every
 /// replay is independently frame-bounded; partial or different input is terminal.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn finish_bounded_response<B: SerialBackend, O: WireObserver>(
     backend: &mut B,
     deadline: Duration,
@@ -1712,6 +1759,7 @@ fn finish_bounded_response<B: SerialBackend, O: WireObserver>(
 /// persistent carrier reconciles any replay that begins before the next typed
 /// write. A partial that does not finish, different frame, or over-limit frame
 /// is terminal.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn finish_queued_snapshot_search_replays<B: SerialBackend, O: WireObserver>(
     backend: &mut B,
     deadline: Duration,
@@ -1736,6 +1784,7 @@ fn finish_queued_snapshot_search_replays<B: SerialBackend, O: WireObserver>(
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn read_one_frame<B: SerialBackend, O: WireObserver>(
     backend: &mut B,
     deadline: Duration,
@@ -1787,6 +1836,7 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn read_snapshot_bounded<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1828,6 +1878,7 @@ fn read_snapshot_bounded<B: SerialBackend>(
     })
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 const fn system_error(stage: CarrierStage, fault: SystemFault) -> DarwinCarrierError {
     DarwinCarrierError::System {
         stage,
@@ -1835,6 +1886,7 @@ const fn system_error(stage: CarrierStage, fault: SystemFault) -> DarwinCarrierE
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn classify_outcome(result: &Result<SearchRead, DarwinCarrierError>) -> SanitizedAttemptOutcome {
     match result {
         Ok(read) if read.end() == SearchReadEnd::Complete => SanitizedAttemptOutcome::Complete,

@@ -13,6 +13,24 @@ operations. `live-discovery` remains a compatibility feature name.
 There is no port enumeration, server, arbitrary-frame input, generic byte-write
 surface, MIDI-to-device mapping, or automatic project-recall apply.
 
+Source checks use the pinned Nix-bound Bazelisk through Just locally by default,
+with two action/test jobs on an admitted host. `just build`, `just test-unit`
+and `just bazel-check` select that lane. `just remote-build` and
+`just remote-test` require `DCX_REAPI_EXECUTOR` and an absolute external
+`DCX_REAPI_CONFIG` rc for operator authentication and executor properties.
+Unavailable remote actions fail without local fallback. Runtime rc content is
+not printed; ambient rc is excluded. GF enrollment is deferred. Hosted advisory
+provides formatting, shell/workflow/schema and lockfile feedback only.
+
+Record the host, exact revision, command and executed/skipped targets. Cache
+hits and source passes do not establish new remote execution, a signed artifact,
+Logic/helper/serial behavior or named-device qualification. `just check` retains
+the separate Cargo source checks.
+Just also bounds Cargo compilation to two jobs, uses the dependency lock for
+compiling recipes, and runs tests with two threads. The Linux REAPI platform
+declares OS/architecture constraints only; executor properties come from the
+external operator rc.
+
 ## Control flow
 
 The implemented product path is:
@@ -33,6 +51,24 @@ The foreground helper owns one single-flight child transaction and is the only
 Apple process that can execute the bundled `dcxctl`. The separate CoreMIDI
 Commands and Status endpoints have no device-control packet mapping in bridge
 v1.
+
+On a nonzero child exit, the helper returns a bounded `failureDiagnostic` with
+the exit code, duration, stderr size/digest, and an allowlisted failure category.
+The AU displays the category, including Search identity counts or the failed
+Dump0/Dump1 stage. The classifier recognizes the exact Identity Search
+`LiveSearchFailed` incomplete message and the snapshot error vocabulary, with
+at most one `Capture(...)` envelope from mutation orchestration. Identity Search
+incomplete counts describe the exhausted 20-attempt qualification loop; other
+Identity Search failure phases remain unclassified. Raw stderr is neither
+displayed nor saved. Unknown, oversized, nested, multiline, or changed error
+formats remain unclassified. A cleanup-failure flag reports an
+explicit failure; its absence is not independent proof of device restoration.
+Launch and output-limit failures have separate fixed messages. An output-limit
+failure leaves device state unverified. These errors do not automatically retry
+the child or clear an admitted mutation's durable recovery state.
+The native regression label is `//apple:child_failure_diagnostics` (PZM only).
+Its fixtures are synthetic examples of source-emitted Rust error formats;
+passing the test establishes classification behavior, not named-device proof.
 
 ## CLI
 

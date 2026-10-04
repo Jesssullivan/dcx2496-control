@@ -267,12 +267,11 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 timeoutSeconds: configuration.childTimeoutSeconds,
                 mutationLock: processLock
             )
-            guard result.terminationStatus == 0 else {
-                return failure(
-                    request,
-                    .childFailed,
-                    "dcxctl exited with status \(result.terminationStatus)",
-                    false
+            if let failure = result.failurePayload() {
+                return BridgeResponse(
+                    requestID: request.requestID,
+                    operation: request.operation,
+                    error: failure
                 )
             }
             let response = try decode(request: request, result: result)
@@ -280,6 +279,22 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             return response
         } catch DCXCTLRunnerError.timedOut {
             return failure(request, .childTimedOut, "dcxctl exceeded its configured deadline", true)
+        } catch DCXCTLRunnerError.launchFailed {
+            return commandFailure(
+                request,
+                applyAdmitted: applyAdmitted,
+                .childFailed,
+                "bundled dcxctl could not be launched",
+                false
+            )
+        } catch DCXCTLRunnerError.outputTooLarge {
+            return commandFailure(
+                request,
+                applyAdmitted: applyAdmitted,
+                .childFailed,
+                "dcxctl exceeded its bounded output limit; device state is not verified",
+                false
+            )
         } catch MutationRecoveryStateError.applyAlreadyActive {
             return commandFailure(
                 request,

@@ -1,5 +1,9 @@
 set working-directory := ".."
 
+# Modules keep their own environment; the same bound reaches nested Cargo builds.
+# Ruling: dec-local-first-reapi-20261004. CLI flags also bind compiling recipes.
+export CARGO_BUILD_JOBS := "2"
+
 fmt:
     cargo fmt --all
     rustfmt --edition 2024 tests/toolchain_pin_parity.rs
@@ -12,10 +16,22 @@ fmt-check:
     alejandra --check flake.nix
     rg --files -0 -g 'BUILD.bazel' -g '*.bzl' -g 'MODULE.bazel' | xargs -0 buildifier -mode=check
 
-lint:
+lint-static:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    shellcheck scripts/*.sh tests/*.sh
+    workflow_files=()
+    while IFS= read -r workflow_file; do
+        workflow_files+=("$workflow_file")
+    done < <(rg --files .github/workflows -g '*.yml' -g '*.yaml' 2>/dev/null || true)
+    if ((${#workflow_files[@]})); then
+        actionlint "${workflow_files[@]}"
+    fi
+
+lint: lint-static
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo clippy --locked --jobs 2 --workspace --all-targets --all-features -- -D warnings
     # tests/toolchain_pin_parity.rs belongs to no Cargo package -- the root
     # manifest is a virtual workspace -- so `cargo fmt --all` and
     # `cargo clippy --workspace` never reach it and only Bazel compiles it.
@@ -30,58 +46,67 @@ lint:
         -F unsafe_code -D warnings \
         -D clippy::all -D clippy::pedantic \
         -A clippy::module_name_repetitions -A clippy::must_use_candidate
-    shellcheck scripts/*.sh tests/*.sh
-    workflow_files=()
-    while IFS= read -r workflow_file; do
-        workflow_files+=("$workflow_file")
-    done < <(rg --files .github/workflows -g '*.yml' -g '*.yaml' 2>/dev/null || true)
-    if ((${#workflow_files[@]})); then
-        actionlint "${workflow_files[@]}"
-    fi
 
 test:
-    cargo test --workspace --all-targets --all-features
+    cargo test --locked --jobs 2 --workspace --all-targets --all-features -- --test-threads=2
 
-# Dispatch the remote-eligible Bazel tests through the vendored GloriousFlywheel
-# consumer front door rather than a dispatch of our own. This recipe adds no
-# posture of its own: the endpoint contract is `gloriousflywheel-bazel`'s, which
-# refuses without a runtime cache/executor profile and is the only thing that
-# can refuse about an endpoint, since no committed file in this repo names one;
-# the Bazel-side posture -- no local fallback, remote spawn strategy, pinned
-# execution platform -- is defined once in .bazelrc.flywheel. Nothing here may
-# add a flag that softens either.
+# dec-local-first-reapi-20261004: pinned Bazelisk, local unless explicitly REAPI.
 test-unit:
-    just flywheel-test --config=executor-backed --test_tag_filters=-no-remote //:remote_eligible
+    bash scripts/run_bazelisk.sh test //:remote_eligible
+
+build:
+    bash scripts/run_bazelisk.sh build //:dcxctl //crates/dcx-darwin-tty:dcx_darwin_tty
+
+[script]
+[positional-arguments]
+bazel command *args:
+    exec bash scripts/run_bazelisk.sh "$@"
+
+[script]
+[positional-arguments]
+remote-build *targets="//:dcxctl":
+    exec bash scripts/run_bazelisk.sh --reapi build "$@"
+
+[script]
+[positional-arguments]
+remote-test *targets="//:remote_eligible":
+    exec bash scripts/run_bazelisk.sh --reapi test "$@"
+
+# Precondition refusals never launch Bazel. The test uses the host shell/tools.
+frontdoor-check:
+    bash tests/bazel_frontdoor_rejections.sh scripts/run_bazelisk.sh
 
 # Exercise the injected, no-device discovery/snapshot/apply transport contract.
 transport-check:
-    cargo test --locked --package dcx-transport --all-targets --all-features
+    cargo test --locked --jobs 2 --package dcx-transport --all-targets --all-features -- --test-threads=2
 
 # Exercise the Darwin carrier only through its injected fake syscall boundary.
 darwin-carrier-check:
-    cargo test --locked --package dcx-darwin-tty --all-targets --all-features
+    cargo test --locked --jobs 2 --package dcx-darwin-tty --all-targets --all-features -- --test-threads=2
 
 fixtures:
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-on.hex >/dev/null
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-off.hex >/dev/null
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
-    cargo run --quiet --package dcxctl -- discovery plan --expected-device 0 >/dev/null
-    cargo run --quiet --package dcxctl -- discovery validate-response fixtures/protocol/SYNTHETIC-search-response-26.hex --expected-device 0 >/dev/null
-    cargo run --quiet --package dcxctl -- profile validate fixtures/profiles/safe-muted-v1.json >/dev/null
-    cargo run --quiet --package dcxctl -- profile diff fixtures/profiles/safe-muted-v1.json fixtures/profiles/SYNTHETIC-control-room-v1.json >/dev/null
-    cargo run --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 >/dev/null
-    ! cargo run --quiet --package dcxctl -- profile apply-ready fixtures/profiles/safe-muted-v1.json --profile-digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1
-    ! cargo run --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 --allow-boost >/dev/null 2>&1
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-on.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-off.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- discovery plan --expected-device 0 >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- discovery validate-response fixtures/protocol/SYNTHETIC-search-response-26.hex --expected-device 0 >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- profile validate fixtures/profiles/safe-muted-v1.json >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- profile diff fixtures/profiles/safe-muted-v1.json fixtures/profiles/SYNTHETIC-control-room-v1.json >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 >/dev/null
+    ! cargo run --locked --jobs 2 --quiet --package dcxctl -- profile apply-ready fixtures/profiles/safe-muted-v1.json --profile-digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1
+    ! cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 --allow-boost >/dev/null 2>&1
 
-lockfiles:
+lockfiles-static:
     test -s Cargo.lock
     test -s MODULE.bazel.lock
     test -s flake.lock
     git ls-files --error-unmatch Cargo.lock MODULE.bazel.lock flake.lock >/dev/null
+
+lockfiles: lockfiles-static
     cargo metadata --locked --offline --no-deps --format-version 1 >/dev/null
 
-check: fmt-check lint test fixtures lockfiles
+check: fmt-check lint test fixtures lockfiles frontdoor-check
 
 bazel-check:
     #!/usr/bin/env bash
@@ -90,14 +115,11 @@ bazel-check:
     if [[ $(uname -s) == Darwin ]]; then
         build_targets+=(//:dcxctl_live_control)
     fi
-    bash scripts/run_bazelisk.sh test //:check
+    bash scripts/run_bazelisk.sh test --config=host-gates //:check
     bash scripts/run_bazelisk.sh build "${build_targets[@]}"
 
-# The GitHub-hosted lane, named for what it is. Its Bazel work is deliberately
-# the local, no-remote-flags `bazel-check` and is kept visibly separate from
-# `test-unit` so a hosted run can never be cited as the on-prem or
-# executor-backed receipt.
-hosted-advisory: bazel-check
+# Hosted static feedback performs no Rust compile/test or Bazel execution.
+hosted-advisory: fmt-check lint-static schema-check lockfiles-static
 
 nix-check:
     nix flake check

@@ -1,9 +1,30 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "Package.swift",
     "project.yml",
 ])
+
+# Native-only test. The lab-owned PZM lane supplies the selected Xcode SDK.
+sh_test(
+    name = "child_failure_diagnostics",
+    size = "medium",
+    srcs = ["Tests/run_child_failure_diagnostics.sh"],
+    args = ["$(location Package.swift)"],
+    data = [
+        "Package.swift",
+        ":swift_package_sources",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+)
 
 filegroup(
     name = "swift_package_sources",

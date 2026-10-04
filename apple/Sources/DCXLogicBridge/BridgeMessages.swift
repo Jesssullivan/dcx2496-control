@@ -583,15 +583,24 @@ public struct BridgeErrorPayload: Codable, Equatable, Sendable {
     public let code: Code
     public let message: String
     public let retryable: Bool
+    public let failureDiagnostic: ChildFailureDiagnosticV1?
 
-    public init(code: Code, message: String, retryable: Bool) {
+    public init(
+        code: Code, message: String, retryable: Bool,
+        failureDiagnostic: ChildFailureDiagnosticV1? = nil
+    ) {
         self.code = code
         self.message = String(message.prefix(512))
         self.retryable = retryable
+        self.failureDiagnostic = failureDiagnostic
     }
 
     public func validate() throws {
         guard message.count <= 512 else { throw BridgeMessageError.invalidResponse }
+        if let failureDiagnostic {
+            guard code == .childFailed else { throw BridgeMessageError.invalidResponse }
+            try failureDiagnostic.validate()
+        }
     }
 }
 

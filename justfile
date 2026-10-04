@@ -1,19 +1,33 @@
 set dotenv-load := false
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-mod repo 'just/repo.just'
+# dec-local-first-reapi-20261004: bound Cargo inherited by frontend children.
+export CARGO_BUILD_JOBS := "2"
 
-# The GloriousFlywheel consumer front door, vendored from GF `kit/frontdoor`
-# rather than re-implemented. It owns no global setting, endpoint, token, or
-# runner enrollment; `gloriousflywheel-bazel` is an operator tool, so the
-# import is optional and the recipes it defines are absent where it is.
-import? 'justfile.flywheel'
+mod repo 'just/repo.just'
 
 default: check
 
 check: repo::check
 
 test-unit: repo::test-unit
+
+build: repo::build
+
+[script]
+[positional-arguments]
+bazel command *args:
+    exec just -- repo::bazel "$@"
+
+[script]
+[positional-arguments]
+remote-build *targets:
+    exec just -- repo::remote-build "$@"
+
+[script]
+[positional-arguments]
+remote-test *targets:
+    exec just -- repo::remote-test "$@"
 
 bazel-check: repo::bazel-check
 
@@ -43,5 +57,7 @@ apple-team-signed-bundle: repo::apple-team-signed-bundle
 
 product-check: repo::product-check
 
+[script]
+[positional-arguments]
 dcxctl *args:
-    cargo run --quiet --package dcxctl -- {{args}}
+    exec cargo run --locked --jobs 2 --quiet --package dcxctl -- "$@"
