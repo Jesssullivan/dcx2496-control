@@ -135,6 +135,11 @@ apple-package-check:
       "$xcode_developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift" \
       test --package-path apple --jobs 1
 
+# dec-native-studio-20261004 / dec-local-first-reapi-20261004 / R-N13:
+# Named Darwin-only recovery suites, one Swift job, owned fixture lease stores.
+native-mutation-recovery:
+    bash scripts/run_bazelisk.sh test //apple:mutation_recovery
+
 # Parse the checked-in bridge schema without introducing another validator stack.
 schema-check:
     jq -e . schemas/v1/dcx_logic_bridge.schema.json >/dev/null

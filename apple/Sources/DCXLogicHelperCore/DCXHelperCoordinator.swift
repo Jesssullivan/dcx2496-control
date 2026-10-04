@@ -1,12 +1,37 @@
 import DCXLogicBridge
 import Foundation
 
+/// Helper-only storage boundary. The public coordinator always receives the
+/// checked App Group locations; tests may supply an owned fixture directory.
+struct DCXHelperStorageLocations: Sendable {
+    let helperConfigurationURL: URL
+    let transactionRootURL: URL
+    let snapshotRootURL: URL
+    let planRootURL: URL
+
+    init(_ locations: AppGroupLocations) {
+        helperConfigurationURL = locations.helperConfigurationURL
+        transactionRootURL = locations.transactionRootURL
+        snapshotRootURL = locations.snapshotRootURL
+        planRootURL = locations.planRootURL
+    }
+
+    init(fixtureRoot: URL) {
+        helperConfigurationURL = fixtureRoot.appendingPathComponent(
+            DCXBridgeContract.helperConfigurationFileName
+        )
+        transactionRootURL = fixtureRoot.appendingPathComponent("Transactions", isDirectory: true)
+        snapshotRootURL = fixtureRoot.appendingPathComponent("Snapshots", isDirectory: true)
+        planRootURL = fixtureRoot.appendingPathComponent("Plans", isDirectory: true)
+    }
+}
+
 public final class DCXHelperCoordinator: @unchecked Sendable {
-    private let locations: AppGroupLocations
+    private let locations: DCXHelperStorageLocations
     private var configuration: HelperConfigurationV1?
     private var configurationError: Error?
     private let coreMIDI: CoreMIDIPresentation
-    private let runner = DCXCTLProcessRunner()
+    private let runner: any DCXCTLCommandExecuting
     private let snapshotStore: RawSnapshotStore
     private let planStore: RawPlanStore
     private let recoveryLeaseStore: MutationRecoveryLeaseStore
@@ -17,12 +42,27 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     private var recoveryCompletion: MutationRecoveryCompletionV1?
     private var recoveryLeaseError: Error?
 
-    public init(
+    public convenience init(
         locations: AppGroupLocations,
         configuration: Result<HelperConfigurationV1, Error>,
         coreMIDI: CoreMIDIPresentation
     ) {
+        self.init(
+            locations: DCXHelperStorageLocations(locations),
+            configuration: configuration,
+            coreMIDI: coreMIDI,
+            runner: DCXCTLProcessRunner()
+        )
+    }
+
+    init(
+        locations: DCXHelperStorageLocations,
+        configuration: Result<HelperConfigurationV1, Error>,
+        coreMIDI: CoreMIDIPresentation,
+        runner: any DCXCTLCommandExecuting
+    ) {
         self.locations = locations
+        self.runner = runner
         snapshotStore = .init(root: locations.snapshotRootURL)
         planStore = .init(root: locations.planRootURL)
         let recoveryLeaseStore = MutationRecoveryLeaseStore(root: locations.planRootURL)
@@ -647,7 +687,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         configuration: HelperConfigurationV1,
         workspace: TransactionWorkspace
     ) throws -> DCXCTLInvocation {
-        let executable = try configuration.resolveExecutable()
+        let executable = try runner.resolveExecutable(for: configuration)
         let targetArguments = [
             "--tty", configuration.ttyPath,
             "--expected-device", String(configuration.target.expectedDeviceAddress),
