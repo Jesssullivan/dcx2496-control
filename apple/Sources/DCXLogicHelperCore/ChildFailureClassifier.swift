@@ -3,7 +3,8 @@ import DCXLogicBridge
 import Foundation
 
 /// Allowlist the Rust Debug output emitted by main's Result termination at
-/// source 77a0a2d. Require one complete bounded line; never return matched text.
+/// source 77a0a2d (tree-equivalent to 31cc828). Require one complete bounded
+/// line; never return matched text. Only snapshot errors may use Capture(...).
 enum ChildFailureClassifier {
     static let inspectionLimit = 4_096
 
@@ -12,20 +13,31 @@ enum ChildFailureClassifier {
         // Truncated, malformed, multiline, or changed formats remain unknown.
         let text = result.stderr.count <= inspectionLimit
             ? String(data: result.stderr, encoding: .utf8) ?? "" : ""
+        let snapshotText = snapshotErrorText(text)
         var kind = ChildFailureDiagnosticV1.Kind.unknown
         var stage = ChildFailureDiagnosticV1.Stage.unknown
         var valid: Int?
         var attempts: Int?
         var cleanupFailed = false
 
-        if matches("Finish \\{ source: \(carrier) \\}", text)
+        if let fields = captures(
+            #"LiveSearchFailed \{ phase: "qualification_incomplete", detail: "([0-9]) of 10 required Search identities were valid" \}"#,
+            text
+        ), let count = Int(fields[0]) {
+            kind = .searchIncomplete
+            stage = .search
+            valid = count
+            // This phase is emitted only after the full bounded loop exhausts
+            // its 20 attempts. Budget/search/finish failures use other phases.
+            attempts = 20
+        } else if matches("Finish \\{ source: \(carrier) \\}", snapshotText)
             || matches(cleanup, text) {
             kind = .sessionCleanup
             stage = .cleanup
             cleanupFailed = true
         } else if let fields = captures(
             "SearchQualificationIncomplete \\{ valid: ([0-9]{1,2}), required: 10, attempts: (20), finish_error: (\(finish)) \\}",
-            text
+            snapshotText
         ), let count = Int(fields[0]), let trials = Int(fields[1]),
            (0..<10).contains(count), (1...20).contains(trials), count <= trials {
             kind = .searchIncomplete
@@ -35,7 +47,7 @@ enum ChildFailureClassifier {
             cleanupFailed = fields[2] != "None"
         } else if let fields = captures(
             "(BudgetExceeded|Transport|Timeout|ResponseLimit|Validation) \\{ operation: (\(operation)), (\(operationDetail))finish_error: (\(finish)) \\}",
-            text
+            snapshotText
         ), detailMatches(kind: fields[0], detail: fields[2]) {
             switch fields[0] {
             case "BudgetExceeded": kind = .sessionBudget
@@ -48,7 +60,7 @@ enum ChildFailureClassifier {
             stage = fields[1] == "Dump0" ? .dump0 : fields[1] == "Dump1" ? .dump1 : .search
             cleanupFailed = fields[3] != "None"
         } else if let fields = captures(
-            "RemoteMode \\{ mode: (?:Transmit|ReceiveDirect), source: \(carrier), finish_error: (\(finish)) \\}", text
+            "RemoteMode \\{ mode: (?:Transmit|ReceiveDirect), source: \(carrier), finish_error: (\(finish)) \\}", snapshotText
         ) {
             kind = .transport
             stage = .remoteMode
@@ -77,6 +89,23 @@ enum ChildFailureClassifier {
     private static let validation = "(?:InvalidDumpLength \\{ part: Part[01], expected: \(number), actual: \(number) \\}|WrongDumpPart \\{ expected: Part[01], actual: Part[01] \\}|DeviceMismatch \\{ section: (?:Identity|Dump0|Dump1), expected: [0-9]{1,2}, actual: [0-9]{1,2} \\}|UnexpectedMessage \\{ section: (?:Identity|Dump0|Dump1), kind: \"non_dump_response\" \\}|Protocol\\(\(protocolError)\\))"
     private static let protocolError = "(?:(?:FrameTooShort|FrameTooLong|MissingStart|MissingTerminator|WrongModel|InvalidDeviceId|InvalidSearchResponseLength|UnexpectedSearchResponseFunction|MalformedDump|InvalidDumpPart)\\(\(number)\\)|BroadcastSearchResponse|WrongManufacturer\\(\\[\(number), \(number), \(number)\\]\\)|NonSevenBitData \\{ index: \(number), value: \(number) \\})"
     private static let operationDetail = "(?:source: (?:\(carrier)|\(validation)), |received: \(number)(?:, limit: \(number))?, )?"
+
+    /// TransactionExecutionError::Capture adds exactly one Debug envelope.
+    /// Remove it only for the snapshot allowlist, never for arbitrary carrier
+    /// errors or LiveSearchFailed. Nested envelopes still fail that allowlist.
+    private static func snapshotErrorText(_ text: String) -> String {
+        let prefix = "Error: Capture("
+        guard text.hasPrefix(prefix) else { return text }
+        let suffix: String
+        if text.hasSuffix(")\n") {
+            suffix = ")\n"
+        } else if text.hasSuffix(")") {
+            suffix = ")"
+        } else {
+            return text
+        }
+        return "Error: " + String(text.dropFirst(prefix.count).dropLast(suffix.count))
+    }
 
     private static func detailMatches(kind: String, detail: String) -> Bool {
         switch kind {

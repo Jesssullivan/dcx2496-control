@@ -11,9 +11,27 @@ build --incompatible_strict_action_env
 test --test_output=errors
 test --test_summary=detailed
 
-# The cache and executor contract lives only in .bazelrc.flywheel. Never repeat
-# either of the --config blocks it defines in this file: a single definition
-# keeps their refusal posture from being softened by a second, looser copy.
-# Concrete endpoints come from the runtime profile and auth, never from a
-# committed file.
-try-import %workspace%/.bazelrc.flywheel
+# dec-local-first-reapi-20261004: bounded local development is independent of
+# provider enrollment. The dispatcher selects one explicit execution lane.
+build:local --jobs=2
+build:local --remote_executor=
+build:local --remote_cache=
+build:local --spawn_strategy=local
+build:local --strategy_regexp=.*=local
+build:local --strategy=TestRunner=local
+test:local --local_test_jobs=2
+test:local --test_strategy=standalone
+
+# Endpoint, authentication and executor properties come from an external
+# operator rc. Unavailable remote actions fail without local fallback.
+build:reapi --jobs=2
+build:reapi --spawn_strategy=remote
+build:reapi --strategy_regexp=.*=remote
+build:reapi --strategy=TestRunner=remote
+build:reapi --remote_local_fallback=false
+build:reapi --remote_download_minimal
+build:reapi --host_platform=//tools/bazel/platforms:linux_x86_64
+build:reapi --extra_execution_platforms=//tools/bazel/platforms:linux_x86_64
+
+# Host-dependent shell tests use the operator toolchain, outside REAPI.
+test:host-gates --test_env=PATH

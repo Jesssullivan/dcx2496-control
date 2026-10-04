@@ -60,11 +60,27 @@ filegroup(
 test_suite(
     name = "check",
     tests = [
+        ":bazel_frontdoor_rejections",
         ":fixture_contract",
         ":toolchain_pin_parity",
         "//crates/dcx-core:all_tests",
         "//crates/dcx-darwin-tty:all_tests",
         "//crates/dcx-transport:all_tests",
+    ],
+)
+
+# These refusal cases consult the operator's Bash/GNU realpath on PATH. They
+# launch no compiler or Bazel, and have no remote/hermetic qualification claim.
+sh_test(
+    name = "bazel_frontdoor_rejections",
+    size = "small",
+    srcs = ["tests/bazel_frontdoor_rejections.sh"],
+    args = ["$(location scripts/run_bazelisk.sh)"],
+    data = ["scripts/run_bazelisk.sh"],
+    tags = [
+        "no-remote",
+        "no-remote-cache",
+        "no-remote-exec",
     ],
 )
 

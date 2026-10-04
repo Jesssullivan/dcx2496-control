@@ -6,6 +6,14 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
 - Use `just` as the operator entrypoint. Bazel labels own the Rust build graph
   and index the Apple/schema product sources; SwiftPM and the checked-in
   XcodeGen specification own the native Apple build.
+- Source build/test through pinned Bazelisk is local by default, bounded to two
+  jobs; explicit REAPI requires an operator-supplied executor and external rc
+  for authentication/properties and refuses local fallback
+  (`dec-local-first-reapi-20261004`). GF enrollment is deferred. Host placement
+  still needs separate admission. Hosted CI provides static advisory feedback;
+  name the actual host, source revision and executed/skipped targets in receipts.
+  Cache hits do not prove new remote execution. Native Apple and named-device
+  acceptance remain separate PZM/Legalab lanes (`dec-native-studio-20261004`).
 - `dcxctl` is offline-only by default. The explicit macOS-only `live-control`
   feature (`live-discovery` remains a compatibility alias) accepts one exact
   `/dev/cu.usbserial-*` callout and holds one fixed 38400 8N1 session. Its

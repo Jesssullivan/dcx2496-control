@@ -1,11 +1,11 @@
 # This hosted workflow is deliberately non-authoritative. Its result is not a
 # product gate and never a DCX2496 control receipt. It runs the purpose-named
-# `just hosted-advisory` lane, whose Bazel work carries no remote flags at all,
-# so it shows only that the Bazel graph builds and that the offline suite
-# passes on a generic hosted runner. Authoritative execution is on-prem.
+# `just hosted-advisory` lane provides static feedback under
+# dec-local-first-reapi-20261004. It runs no Rust compile/test or Bazel workload.
+# Eligible-host source receipts identify local versus explicit REAPI execution.
 # Anything that touches a device, or that must run on one specific machine, is
 # out of scope for this workflow and never runs on a hosted runner. TIN-4050
-# tracks the on-prem repository attachment.
+# carries the local-first source policy; provider enrollment is deferred.
 name: Advisory
 
 on:
@@ -26,7 +26,7 @@ jobs:
   hosted-advisory:
     name: Hosted advisory (non-authoritative)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 

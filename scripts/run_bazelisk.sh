@@ -1,6 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# dec-local-first-reapi-20261004: the pinned binding grants no host-placement
+# authority. Host admission and native/device proof remain separate.
+lane=local
+if [[ "${1:-}" == --reapi ]]; then
+  lane=reapi
+  shift
+fi
+command="${1:-}"
+if [[ -z "$command" ]]; then
+  printf 'usage: run_bazelisk.sh [--reapi] COMMAND [ARGS...]\n' >&2
+  exit 64
+fi
+if [[ "$command" == -* ]]; then
+  printf 'Bazel COMMAND must not begin with -\n' >&2
+  exit 64
+fi
+shift
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+startup=(--nosystem_rc --nohome_rc --noworkspace_rc "--bazelrc=$repo_root/.bazelrc")
+execution=()
+if [[ "$lane" == reapi ]]; then
+  case "$command" in
+    build | test | coverage) ;;
+    *) printf 'REAPI supports only build, test and coverage\n' >&2; exit 64 ;;
+  esac
+  if [[ -z "${DCX_REAPI_EXECUTOR:-}" || -z "${DCX_REAPI_CONFIG:-}" ]]; then
+    printf 'REAPI requires DCX_REAPI_EXECUTOR and an external DCX_REAPI_CONFIG rc file\n' >&2
+    exit 78
+  fi
+  if [[ "$DCX_REAPI_CONFIG" != /* || ! -f "$DCX_REAPI_CONFIG" ]]; then
+    printf 'DCX_REAPI_CONFIG must name an absolute operator rc file\n' >&2
+    exit 78
+  fi
+  case "$DCX_REAPI_EXECUTOR" in
+    grpc://?* | grpcs://?*) ;;
+    *) printf 'DCX_REAPI_EXECUTOR must use grpc or grpcs\n' >&2; exit 78 ;;
+  esac
+  if [[ "$DCX_REAPI_EXECUTOR" == *'@'* ||
+    "$DCX_REAPI_EXECUTOR" == *'?'* ||
+    "$DCX_REAPI_EXECUTOR" == *'#'* ||
+    "$DCX_REAPI_EXECUTOR" == *[[:space:]]* ]]; then
+    printf 'REAPI endpoint must not contain credentials, query or fragment material\n' >&2
+    exit 78
+  fi
+  startup+=("--bazelrc=$DCX_REAPI_CONFIG")
+  execution+=(--config=reapi "--remote_executor=$DCX_REAPI_EXECUTOR"
+    --spawn_strategy=remote '--strategy_regexp=.*=remote'
+    --strategy=TestRunner=remote --remote_local_fallback=false --jobs=2)
+  if [[ "$command" == test || "$command" == coverage ]]; then
+    execution+=(--test_strategy=standalone
+      '--test_tag_filters=-no-remote,-no-remote-exec,-local,-exclusive')
+  fi
+else
+  case "$command" in
+    build | test | coverage | run)
+      execution+=(--config=local --remote_executor= --remote_cache=
+        --spawn_strategy=local '--strategy_regexp=.*=local'
+        --strategy=TestRunner=local --jobs=2)
+      if [[ "$command" == test || "$command" == coverage ]]; then
+        execution+=(--test_strategy=standalone --local_test_jobs=2)
+      fi
+      ;;
+  esac
+fi
+
 candidate="${DCX_BAZELISK:-}"
 if [[ -z "$candidate" ]]; then
   printf 'DCX_BAZELISK is unavailable; enter the pinned Nix development shell\n' >&2
@@ -46,6 +112,24 @@ fi
 # SDK baked in still needs `clean --expunge`. And it is a scrub, not hermeticity:
 # the durable fix stays a sysroot Bazel can fetch and hash. See MODULE.bazel,
 # TIN-4050.
-unset DEVELOPER_DIR SDKROOT
+unset DEVELOPER_DIR SDKROOT BAZELRC
 
-exec "$resolved" "$@"
+# Lane flags stay with Bazel; run's program arguments stay after its separator.
+options=()
+program_args=()
+after_separator=false
+for argument in "$@"; do
+  if [[ "$command" == run && "$argument" == -- ]]; then
+    after_separator=true
+  fi
+  if [[ "$after_separator" == true ]]; then
+    program_args+=("$argument")
+  else
+    options+=("$argument")
+  fi
+done
+
+# The selected external rc may hold authentication configuration. Do not print it.
+exec "$resolved" "${startup[@]}" "$command" \
+  ${options[@]+"${options[@]}"} ${execution[@]+"${execution[@]}"} \
+  --announce_rc=false ${program_args[@]+"${program_args[@]}"}
