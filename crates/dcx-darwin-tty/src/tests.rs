@@ -50,6 +50,7 @@ struct FakeBackend {
     written: bool,
     read_since_write: usize,
     read_goal: usize,
+    eof_after: Option<usize>,
     writes: Vec<Vec<u8>>,
     preexisting_input: usize,
     post_response_input: usize,
@@ -76,6 +77,7 @@ impl FakeBackend {
             written: false,
             read_since_write: 0,
             read_goal: 0,
+            eof_after: None,
             writes: Vec::new(),
             preexisting_input: 0,
             post_response_input: 0,
@@ -219,6 +221,9 @@ impl SerialBackend for FakeBackend {
 
     fn read_once(&mut self, bytes: &mut [u8]) -> Result<ReadProgress, SystemFault> {
         self.step(CarrierStage::Read, Call::Read(bytes.len()))?;
+        if self.eof_after == Some(self.read_since_write) {
+            return Ok(ReadProgress::EndOfFile);
+        }
         if self.inbound.is_empty() {
             return Ok(ReadProgress::WouldBlock);
         }
@@ -1200,6 +1205,85 @@ fn receive_direct_recovery_post_config_failures_never_retry_and_always_restore()
         assert!(backend.calls.contains(&Call::RestoreControlLines));
         assert!(backend.calls.contains(&Call::VerifyControlLinesRestore));
         assert_eq!(backend.calls.last(), Some(&Call::Close));
+    }
+}
+
+#[test]
+fn persistent_eof_is_terminal_without_retry_and_finish_restores_and_closes() {
+    for received in [0, 7] {
+        let shared_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = FakeBackend::with_inbound(synthetic_response(0))
+            .with_shared_calls(Rc::clone(&shared_calls));
+        backend.eof_after = Some(received);
+        let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+        let expected = DeviceId::new(0).unwrap();
+
+        assert!(matches!(
+            execute_known_38400_search(&mut carrier, expected),
+            Err(Known38400SearchError::Transport {
+                source: DarwinCarrierError::EndOfFile { received: actual },
+            }) if actual == received
+        ));
+        let first_receipt = &carrier.receipts()[0];
+        assert_eq!(first_receipt.outcome, SanitizedAttemptOutcome::EndOfFile);
+        assert_eq!(first_receipt.tx_bytes, SEARCH_REQUEST_LEN);
+        assert_eq!(first_receipt.wire_bytes, received);
+        assert_eq!(first_receipt.rx_bytes, 0);
+        assert_eq!(first_receipt.rx_digest, None);
+        assert!(!first_receipt.closed);
+        assert_eq!(
+            shared_calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == Call::Read(1))
+                .count(),
+            received + 1
+        );
+
+        // An EOF after a write leaves the same descriptor terminal. Even if
+        // a caller explicitly asks again, it must not perform another syscall.
+        let calls_after_eof = shared_calls.borrow().len();
+        assert!(matches!(
+            execute_known_38400_search(&mut carrier, expected),
+            Err(Known38400SearchError::Transport {
+                source: DarwinCarrierError::InputRecoveryRequired,
+            })
+        ));
+        assert_eq!(shared_calls.borrow().len(), calls_after_eof);
+
+        let session = carrier.finish().unwrap();
+        assert_eq!(
+            session.termios_cleanup,
+            CleanupDisposition::VerifiedRestored
+        );
+        assert_eq!(
+            session.control_lines_cleanup,
+            CleanupDisposition::VerifiedRestored
+        );
+        assert!(session.closed);
+        let calls = shared_calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::Write(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == Call::DiscardInput)
+                .count(),
+            1
+        );
+        assert_eq!(calls.iter().filter(|call| **call == Call::Close).count(), 1);
+        assert!(calls.ends_with(&[
+            Call::RestoreTermios,
+            Call::VerifyTermiosRestore,
+            Call::RestoreControlLines,
+            Call::VerifyControlLinesRestore,
+            Call::Close,
+        ]));
     }
 }
 

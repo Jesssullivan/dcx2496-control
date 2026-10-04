@@ -33,3 +33,13 @@ constructor. The follow-up explicitly drops the owned `PathBuf` after
 validation and digesting only when native/test storage is absent. This keeps
 the public owned-argument API and native/test path retention intact. The
 follow-up has not been compiled or tested in this source lane.
+
+Root's reported Sting retry at `40b8bfb` reached the portable test build and
+reported that `ReadProgress::EndOfFile` was never constructed by the injected
+fake. A narrow fake EOF threshold and regression now exercise zero-byte and
+seven-byte EOF, terminal refusal of another Search without additional I/O,
+one outbound write, input cleanup, both restoration readbacks, and one close.
+The regression checks the sanitized EOF attempt and verified closed-session
+receipts. The former Bazel-only dead-code allowance on that variant is removed;
+production EOF handling is unchanged. The new regression remains unexecuted
+in this source lane; root owns the next validation receipt.

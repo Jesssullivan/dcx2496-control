@@ -526,7 +526,6 @@ impl SystemFault {
 enum ReadProgress {
     Bytes(usize),
     WouldBlock,
-    #[cfg_attr(bazel_test_no_native, allow(dead_code))]
     EndOfFile,
 }
 
