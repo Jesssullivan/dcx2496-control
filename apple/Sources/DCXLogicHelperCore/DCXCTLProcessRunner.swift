@@ -26,8 +26,23 @@ struct DCXCTLProcessResult: Sendable {
     }
 }
 
-final class DCXCTLProcessRunner: @unchecked Sendable {
+/// Internal command boundary for coordinator tests. Production still resolves
+/// only the bundled exact dcxctl and executes through the bounded runner.
+protocol DCXCTLCommandExecuting: Sendable {
+    func resolveExecutable(for configuration: HelperConfigurationV1) throws -> URL
+    func run(
+        _ invocation: DCXCTLInvocation,
+        timeoutSeconds: UInt8,
+        mutationLock: MutationRecoveryProcessLock?
+    ) throws -> DCXCTLProcessResult
+}
+
+final class DCXCTLProcessRunner: DCXCTLCommandExecuting, @unchecked Sendable {
     static let maximumOutputBytes = 1_048_576
+
+    func resolveExecutable(for configuration: HelperConfigurationV1) throws -> URL {
+        try configuration.resolveExecutable()
+    }
 
     func run(
         _ invocation: DCXCTLInvocation,

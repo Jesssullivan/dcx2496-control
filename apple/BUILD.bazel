@@ -34,6 +34,32 @@ filegroup(
     ]),
 )
 
+# dec-native-studio-20261004 / dec-local-first-reapi-20261004 / R-N13:
+# Darwin fixture-only recovery proof; no serial, audio, or child process work.
+sh_test(
+    name = "mutation_recovery",
+    size = "medium",
+    srcs = ["Tests/run_mutation_recovery.sh"],
+    args = [
+        "$(location Package.swift)",
+        "$(location Tests/DCXLogicHelperCoreTests/MutationRecoveryCoordinatorTests.swift)",
+        "$(location Tests/DCXLogicHelperCoreTests/MutationRecoveryLeaseStoreTests.swift)",
+    ],
+    data = [
+        "Package.swift",
+        "Tests/DCXLogicHelperCoreTests/MutationRecoveryCoordinatorTests.swift",
+        "Tests/DCXLogicHelperCoreTests/MutationRecoveryLeaseStoreTests.swift",
+        ":swift_package_sources",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+)
+
 filegroup(
     name = "bundle_sources",
     srcs = [
