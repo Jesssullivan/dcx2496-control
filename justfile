@@ -1,6 +1,9 @@
 set dotenv-load := false
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# dec-local-first-reapi-20261004: bound Cargo inherited by frontend children.
+export CARGO_BUILD_JOBS := "2"
+
 mod repo 'just/repo.just'
 
 default: check
@@ -54,5 +57,7 @@ apple-team-signed-bundle: repo::apple-team-signed-bundle
 
 product-check: repo::product-check
 
+[script]
+[positional-arguments]
 dcxctl *args:
-    cargo run --quiet --package dcxctl -- {{args}}
+    exec cargo run --locked --jobs 2 --quiet --package dcxctl -- "$@"

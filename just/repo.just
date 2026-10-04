@@ -1,5 +1,9 @@
 set working-directory := ".."
 
+# Modules keep their own environment; the same bound reaches nested Cargo builds.
+# Ruling: dec-local-first-reapi-20261004. CLI flags also bind compiling recipes.
+export CARGO_BUILD_JOBS := "2"
+
 fmt:
     cargo fmt --all
     rustfmt --edition 2024 tests/toolchain_pin_parity.rs
@@ -27,7 +31,7 @@ lint-static:
 lint: lint-static
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --locked --jobs 2 --workspace --all-targets --all-features -- -D warnings
     # tests/toolchain_pin_parity.rs belongs to no Cargo package -- the root
     # manifest is a virtual workspace -- so `cargo fmt --all` and
     # `cargo clippy --workspace` never reach it and only Bazel compiles it.
@@ -44,7 +48,7 @@ lint: lint-static
         -A clippy::module_name_repetitions -A clippy::must_use_candidate
 
 test:
-    cargo test --workspace --all-targets --all-features
+    cargo test --locked --jobs 2 --workspace --all-targets --all-features -- --test-threads=2
 
 # dec-local-first-reapi-20261004: pinned Bazelisk, local unless explicitly REAPI.
 test-unit:
@@ -74,24 +78,24 @@ frontdoor-check:
 
 # Exercise the injected, no-device discovery/snapshot/apply transport contract.
 transport-check:
-    cargo test --locked --package dcx-transport --all-targets --all-features
+    cargo test --locked --jobs 2 --package dcx-transport --all-targets --all-features -- --test-threads=2
 
 # Exercise the Darwin carrier only through its injected fake syscall boundary.
 darwin-carrier-check:
-    cargo test --locked --package dcx-darwin-tty --all-targets --all-features
+    cargo test --locked --jobs 2 --package dcx-darwin-tty --all-targets --all-features -- --test-threads=2
 
 fixtures:
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-on.hex >/dev/null
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-off.hex >/dev/null
-    cargo run --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
-    cargo run --quiet --package dcxctl -- discovery plan --expected-device 0 >/dev/null
-    cargo run --quiet --package dcxctl -- discovery validate-response fixtures/protocol/SYNTHETIC-search-response-26.hex --expected-device 0 >/dev/null
-    cargo run --quiet --package dcxctl -- profile validate fixtures/profiles/safe-muted-v1.json >/dev/null
-    cargo run --quiet --package dcxctl -- profile diff fixtures/profiles/safe-muted-v1.json fixtures/profiles/SYNTHETIC-control-room-v1.json >/dev/null
-    cargo run --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 >/dev/null
-    ! cargo run --quiet --package dcxctl -- profile apply-ready fixtures/profiles/safe-muted-v1.json --profile-digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1
-    ! cargo run --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 --allow-boost >/dev/null 2>&1
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-direct-parameter.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-on.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-o4-mute-off.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- decode --file fixtures/protocol/SYNTHETIC-search-response-26.hex >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- discovery plan --expected-device 0 >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- discovery validate-response fixtures/protocol/SYNTHETIC-search-response-26.hex --expected-device 0 >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- profile validate fixtures/profiles/safe-muted-v1.json >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- profile diff fixtures/profiles/safe-muted-v1.json fixtures/profiles/SYNTHETIC-control-room-v1.json >/dev/null
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 >/dev/null
+    ! cargo run --locked --jobs 2 --quiet --package dcxctl -- profile apply-ready fixtures/profiles/safe-muted-v1.json --profile-digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1
+    ! cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 --allow-boost >/dev/null 2>&1
 
 lockfiles-static:
     test -s Cargo.lock

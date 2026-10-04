@@ -26,6 +26,10 @@ Record the host, exact revision, command and executed/skipped targets. Cache
 hits and source passes do not establish new remote execution, a signed artifact,
 Logic/helper/serial behavior or named-device qualification. `just check` retains
 the separate Cargo source checks.
+Just also bounds Cargo compilation to two jobs, uses the dependency lock for
+compiling recipes, and runs tests with two threads. The Linux REAPI platform
+declares OS/architecture constraints only; executor properties come from the
+external operator rc.
 
 ## Control flow
 

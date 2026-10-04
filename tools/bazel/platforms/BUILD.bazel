@@ -4,6 +4,5 @@ platform(
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
     ],
-    exec_properties = {"gf.platform": "gloriousflywheel-rbe-linux-x86_64"},
     visibility = ["//visibility:public"],
 )
