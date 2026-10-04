@@ -28,7 +28,8 @@ let package = Package(
         ),
         .testTarget(
             name: "DCXLogicHelperCoreTests",
-            dependencies: ["DCXLogicBridge", "DCXLogicHelperCore"]
+            dependencies: ["DCXLogicBridge", "DCXLogicHelperCore"],
+            resources: [.copy("Fixtures/DCXChildFixture.c")]
         ),
     ]
 )
