@@ -26,3 +26,10 @@ change is introduced. Source whitespace inspection passed. Compilation,
 Clippy, formatting, and tests remain unverified in this lane; root owns the
 next exact-revision validation. This lane ran no builds, tests, Nix, host,
 device, staging, or commit commands.
+
+Root's reported Sting retry at `8777623` removed the private dead-code errors
+and reached one Clippy `needless_pass_by_value` error in the offline binding
+constructor. The follow-up explicitly drops the owned `PathBuf` after
+validation and digesting only when native/test storage is absent. This keeps
+the public owned-argument API and native/test path retention intact. The
+follow-up has not been compiled or tested in this source lane.

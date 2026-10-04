@@ -99,6 +99,10 @@ impl PrivateTtyBinding {
     pub fn new(path: PathBuf) -> Result<Self, BindingError> {
         validate_private_path(&path)?;
         let digest = Sha256Digest::of_bytes(path.as_os_str().as_bytes());
+        // Preserve the owned constructor API while offline consumers retain
+        // only the digest; native runtime and fake tests retain the path.
+        #[cfg(not(any(test, all(target_os = "macos", not(bazel_test_no_native)))))]
+        drop(path);
         Ok(Self {
             #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
             path,
