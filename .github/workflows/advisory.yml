@@ -30,9 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: tinyland-inc/ci-templates/.github/actions/setup-nix@d8d178c022a0f84853d53a2c8fe0fc90115f0949 # v3.1.0
+      - uses: xoxd-ai/ci-templates/.github/actions/setup-nix@d8d178c022a0f84853d53a2c8fe0fc90115f0949 # v3.1.0
 
-      - uses: tinyland-inc/ci-templates/.github/actions/nix-setup@d8d178c022a0f84853d53a2c8fe0fc90115f0949 # v3.1.0
+      - uses: xoxd-ai/ci-templates/.github/actions/nix-setup@d8d178c022a0f84853d53a2c8fe0fc90115f0949 # v3.1.0
 
       - name: Run the hosted advisory lane
         run: nix develop --no-write-lock-file --command just hosted-advisory
