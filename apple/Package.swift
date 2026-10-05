@@ -23,6 +23,10 @@ let package = Package(
             dependencies: ["DCXLogicBridge"]
         ),
         .testTarget(
+            name: "DCXLogicBridgeTests",
+            dependencies: ["DCXLogicBridge"]
+        ),
+        .testTarget(
             name: "DCXControlAUCoreTests",
             dependencies: ["DCXControlAUCore", "DCXLogicBridge"]
         ),

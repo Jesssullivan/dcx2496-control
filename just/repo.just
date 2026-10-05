@@ -144,6 +144,14 @@ native-mutation-recovery:
 native-process-runner:
     bash scripts/run_bazelisk.sh test //apple:process_runner
 
+# Explicit first-Apply admission and zero-contact document recall fixtures.
+native-logic-recall:
+    bash scripts/run_bazelisk.sh test //apple:logic_recall
+
+# Pure correlation of replies with the exact request and readback digest.
+native-response-binding:
+    bash scripts/run_bazelisk.sh test //apple:response_binding
+
 # Parse the checked-in bridge schema without introducing another validator stack.
 schema-check:
     jq -e . schemas/v1/dcx_logic_bridge.schema.json >/dev/null

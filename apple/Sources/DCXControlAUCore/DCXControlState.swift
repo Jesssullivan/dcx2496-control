@@ -208,6 +208,28 @@ public final class DCXControlState: @unchecked Sendable {
         try baseline.validate()
         lock.lock()
         defer { lock.unlock() }
+        try beginApplyAttemptLocked(transactionID: transactionID, baseline: baseline)
+    }
+
+    /// Bind the complete prepared request and retain recovery under one lock.
+    /// Host restoration cannot replace the preview between these two steps.
+    public func beginApplyAttempt(_ request: ApplyRequest) throws {
+        try BridgeRequestBody.apply(request).validate()
+        lock.lock()
+        defer { lock.unlock() }
+        guard let projectState,
+              request.target == projectState.target,
+              request.plan.desired == projectState.desired,
+              request.plan.diff == currentDiff else {
+            throw DCXControlStateError.invalidTransactionBinding
+        }
+        try beginApplyAttemptLocked(
+            transactionID: request.plan.diff.applyPlanDigest,
+            baseline: request.plan.baseline
+        )
+    }
+
+    private func beginApplyAttemptLocked(transactionID: String, baseline: SnapshotV1) throws {
         guard let projectState, let currentDiff, let currentSnapshot,
               lastTransactionID == nil, rollbackBaseline == nil,
               baseline.target == projectState.target,

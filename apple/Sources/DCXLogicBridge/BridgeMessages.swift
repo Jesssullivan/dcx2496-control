@@ -632,6 +632,61 @@ public struct BridgeResponse: Codable, Equatable, Sendable {
         self.error = error
     }
 
+    /// A well-formed reply is useful only for the exact request it answers.
+    /// In particular, readback equality is derived from the requested digest,
+    /// never accepted as an unbound helper assertion.
+    public func validate(for request: BridgeRequest) throws {
+        try request.body.validate()
+        guard schemaVersion == DCXBridgeContract.schemaVersion,
+              requestID == request.requestID,
+              operation == request.operation else {
+            throw BridgeMessageError.invalidResponse
+        }
+        if status == .error {
+            guard body == nil, let error else { throw BridgeMessageError.invalidResponse }
+            try error.validate()
+            return
+        }
+        guard error == nil, let body else { throw BridgeMessageError.invalidResponse }
+        try body.validate()
+        switch (request.body, body) {
+        case (.helperStatus, .helperStatus):
+            break
+        case let (.identitySearch(sent), .identitySearch(received)):
+            guard received.identity.deviceAddress == sent.target.expectedDeviceAddress else {
+                throw BridgeMessageError.invalidResponse
+            }
+        case let (.snapshotCapture(sent), .snapshotCapture(received)):
+            guard received.snapshot.target == sent.target else { throw BridgeMessageError.invalidResponse }
+        case let (.diffPreview(sent), .diffPreview(received)):
+            guard received.diff.baselineSnapshotDigest == sent.baseline.digest,
+                  received.diff.desiredProfileDigest == sent.desired.digest else {
+                throw BridgeMessageError.invalidResponse
+            }
+        case let (.apply(sent), .apply(received)):
+            guard received.transactionID == sent.plan.diff.applyPlanDigest,
+                  received.baselineDigest == sent.plan.baseline.digest,
+                  received.desiredSnapshotDigest == sent.plan.diff.desiredSnapshotDigest,
+                  received.readback == nil || received.readback?.target == sent.target else {
+                throw BridgeMessageError.invalidResponse
+            }
+        case let (.readback(sent), .readback(received)):
+            guard received.transactionID == sent.transactionID,
+                  received.snapshot.target == sent.target,
+                  received.matchesDesired == (received.snapshot.digest == sent.expectedDesiredDigest) else {
+                throw BridgeMessageError.invalidResponse
+            }
+        case let (.rollback(sent), .rollback(received)):
+            guard received.transactionID == sent.plan.transactionID,
+                  received.baselineDigest == sent.plan.baseline.digest,
+                  received.restored == nil || received.restored?.target == sent.target else {
+                throw BridgeMessageError.invalidResponse
+            }
+        default:
+            throw BridgeMessageError.invalidResponse
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, requestID, operation, status, payload, error
     }
