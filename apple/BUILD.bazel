@@ -9,6 +9,28 @@ exports_files([
 
 # Native-only test. The lab-owned PZM lane supplies the selected Xcode SDK.
 sh_test(
+    name = "response_binding",
+    size = "medium",
+    srcs = ["Tests/run_response_binding.sh"],
+    args = [
+        "$(location Package.swift)",
+        "$(location Tests/DCXLogicBridgeTests/BridgeResponseBindingTests.swift)",
+    ],
+    data = [
+        "Package.swift",
+        "Tests/DCXLogicBridgeTests/BridgeResponseBindingTests.swift",
+        ":swift_package_sources",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+)
+
+sh_test(
     name = "logic_recall",
     size = "medium",
     srcs = ["Tests/run_logic_recall.sh"],

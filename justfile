@@ -47,6 +47,8 @@ apple-package-check: repo::apple-package-check
 
 native-logic-recall: repo::native-logic-recall
 
+native-response-binding: repo::native-response-binding
+
 schema-check: repo::schema-check
 
 apple-project-generate: repo::apple-project-generate

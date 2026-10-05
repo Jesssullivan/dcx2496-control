@@ -155,6 +155,7 @@ public final class AppGroupSocketClient: @unchecked Sendable {
         guard response.requestID == request.requestID else {
             throw AppGroupBoundaryError.responseIDMismatch
         }
+        try response.validate(for: request)
         return response
     }
 }
