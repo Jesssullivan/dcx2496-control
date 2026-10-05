@@ -15,7 +15,9 @@ failure is asserted.
 The controller now checks availability, the one-request bound, and request/client
 preparation before its typed Apply admission. Admission rechecks authorization,
 validates the exact current target, desired profile, baseline and diff, then
-retains recovery immediately before dispatch. A second Apply remains blocked.
+retains recovery under the same model lock immediately before dispatch. A
+concurrent host restoration cannot replace the preview between binding and
+retention. A second Apply remains blocked.
 Local preflight failures report their result without invoking the dispatched
 request's helper-rejection callback or clearing earlier recovery authority.
 

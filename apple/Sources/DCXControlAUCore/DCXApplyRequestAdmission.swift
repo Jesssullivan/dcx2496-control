@@ -13,19 +13,7 @@ public enum DCXApplyRequestAdmission {
         guard isAuthorized() else {
             throw DCXApplyRequestAdmissionError.operationUnavailable
         }
-        let staged = state.view()
-        guard let project = staged.projectState,
-              !staged.recoveryActive,
-              request.target == project.target,
-              request.plan.desired == project.desired,
-              request.plan.baseline == staged.currentSnapshot,
-              request.plan.diff == staged.diff else {
-            throw DCXControlStateError.invalidTransactionBinding
-        }
-        try state.beginApplyAttempt(
-            transactionID: request.plan.diff.applyPlanDigest,
-            baseline: request.plan.baseline
-        )
+        try state.beginApplyAttempt(request)
     }
 }
 
