@@ -319,6 +319,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             return response
         } catch DCXCTLRunnerError.timedOut {
             return failure(request, .childTimedOut, "dcxctl exceeded its configured deadline", true)
+        } catch DCXCTLRunnerError.terminationUnconfirmed {
+            return commandFailure(
+                request,
+                applyAdmitted: applyAdmitted,
+                .childTimedOut,
+                "dcxctl exceeded its deadline; child exit is unconfirmed and recovery authority is retained",
+                false
+            )
         } catch DCXCTLRunnerError.launchFailed {
             return commandFailure(
                 request,

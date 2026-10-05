@@ -31,6 +31,7 @@ filegroup(
     srcs = ["Package.swift"] + glob([
         "Sources/**/*.swift",
         "Tests/**/*.swift",
+        "Tests/**/Fixtures/*.c",
     ]),
 )
 
@@ -49,6 +50,31 @@ sh_test(
         "Package.swift",
         "Tests/DCXLogicHelperCoreTests/MutationRecoveryCoordinatorTests.swift",
         "Tests/DCXLogicHelperCoreTests/MutationRecoveryLeaseStoreTests.swift",
+        ":swift_package_sources",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+)
+
+# dec-native-studio-20261004 / R-N13: fixed owned child scenarios, no device.
+sh_test(
+    name = "process_runner",
+    size = "medium",
+    srcs = ["Tests/run_process_runner.sh"],
+    args = [
+        "$(location Package.swift)",
+        "$(location Tests/DCXLogicHelperCoreTests/DCXCTLProcessRunnerTests.swift)",
+        "$(location Tests/DCXLogicHelperCoreTests/Fixtures/DCXChildFixture.c)",
+    ],
+    data = [
+        "Package.swift",
+        "Tests/DCXLogicHelperCoreTests/DCXCTLProcessRunnerTests.swift",
+        "Tests/DCXLogicHelperCoreTests/Fixtures/DCXChildFixture.c",
         ":swift_package_sources",
     ],
     tags = [

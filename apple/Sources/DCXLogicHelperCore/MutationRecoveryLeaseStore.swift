@@ -170,7 +170,10 @@ final class MutationRecoveryProcessLock: @unchecked Sendable {
 
     func release() {
         guard descriptor >= 0 else { return }
-        _ = systemFlock(descriptor, LOCK_UN)
+        // flock belongs to the open-file description shared with child stdin.
+        // Explicit LOCK_UN would also release a still-running child's lease.
+        // Closing our reference releases the lock only after the final owner
+        // closes its descriptor, including an unconfirmed or orphaned child.
         Darwin.close(descriptor)
         descriptor = -1
     }

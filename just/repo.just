@@ -140,6 +140,10 @@ apple-package-check:
 native-mutation-recovery:
     bash scripts/run_bazelisk.sh test //apple:mutation_recovery
 
+# dec-native-studio-20261004 / R-N13: real owned child and recovery fixtures.
+native-process-runner:
+    bash scripts/run_bazelisk.sh test //apple:process_runner
+
 # Parse the checked-in bridge schema without introducing another validator stack.
 schema-check:
     jq -e . schemas/v1/dcx_logic_bridge.schema.json >/dev/null
