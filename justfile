@@ -45,6 +45,8 @@ live-package: repo::live-package
 
 apple-package-check: repo::apple-package-check
 
+native-logic-recall: repo::native-logic-recall
+
 schema-check: repo::schema-check
 
 apple-project-generate: repo::apple-project-generate

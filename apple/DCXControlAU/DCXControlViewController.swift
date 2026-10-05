@@ -342,13 +342,6 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 desired: project.desired,
                 diff: diff
             )
-            try dcxAudioUnit?.performControlStateMutation {
-                try $0.beginApplyAttempt(
-                    transactionID: diff.applyPlanDigest,
-                    baseline: baseline
-                )
-            }
-            refreshLabels()
             send(
                 .apply(.init(target: project.target, plan: plan)),
                 onError: { [weak self] error in
@@ -540,6 +533,8 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
 
     private func send(
         _ body: BridgeRequestBody,
+        // This callback is for a dispatched request's typed helper rejection.
+        // Local preflight failure cannot clear an earlier recovery attempt.
         onError: (@MainActor (BridgeErrorPayload) -> Void)? = nil,
         accept: @escaping @MainActor (BridgeResponseBody) -> Void
     ) {
@@ -549,7 +544,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 message: "\(body.operation.rawValue) is not available from the foreground helper",
                 retryable: false
             )
-            if let onError { onError(error) } else { report(error.message) }
+            report(error.message)
             return
         }
         guard !bridgeRequestInFlight else {
@@ -558,7 +553,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 message: "One bounded helper request is already in progress",
                 retryable: true
             )
-            if let onError { onError(error) } else { report(error.message) }
+            report(error.message)
             return
         }
         let request: BridgeRequest
@@ -573,8 +568,29 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 message: "The bounded helper request could not be prepared",
                 retryable: true
             )
-            if let onError { onError(error) } else { report(error.message) }
+            report(error.message)
             return
+        }
+        if case let .apply(apply) = body {
+            do {
+                guard let audioUnit = dcxAudioUnit else {
+                    throw DCXControlStateError.invalidTransactionBinding
+                }
+                try audioUnit.performControlStateMutation { state in
+                    try DCXApplyRequestAdmission.prepare(apply, state: state) {
+                        self.isOperationAvailable(.apply)
+                    }
+                }
+                refreshLabels()
+            } catch {
+                let error = BridgeErrorPayload(
+                    code: .mutationNotAdmitted,
+                    message: "Apply no longer matches the authorized staged transaction",
+                    retryable: false
+                )
+                report(error.message)
+                return
+            }
         }
         bridgeRequestInFlight = true
         actionButtons.forEach { $0.isEnabled = false }
