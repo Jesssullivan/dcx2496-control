@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 public final class DCXControlViewController: AUViewController, AUAudioUnitFactory {
     private var dcxAudioUnit: DCXControlAudioUnit?
     private var stateObservation: NSKeyValueObservation?
+    private var presentation = DCXControlPresentation()
     private let statusLabel = NSTextField(labelWithString: DCXControlPresentation.unstagedStatus)
     private let identityLabel = NSTextField(labelWithString: "Device: not identified")
     private let currentLabel = NSTextField(labelWithString: "Current: not captured")
@@ -118,6 +119,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     ) throws -> AUAudioUnit {
         let audioUnit = try DCXControlAudioUnit(componentDescription: componentDescription)
         dcxAudioUnit = audioUnit
+        presentation = DCXControlPresentation()
         stateObservation?.invalidate()
         stateObservation = audioUnit.observe(\.allParameterValues, options: [.initial, .new]) {
             [weak self, weak audioUnit] observed, _ in
@@ -176,21 +178,21 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             }
             refreshLabels()
             if status.recoveryUnavailable {
-                statusLabel.stringValue = "Helper recovery authority is temporarily unavailable; no device operation is authorized"
+                report("Helper recovery authority is temporarily unavailable; no device operation is authorized")
             } else if let recovery = status.recovery {
-                statusLabel.stringValue = status.foreground
+                report(status.foreground
                     ? "Helper reachable; mutation recovery \(recovery.transactionID) is pinned"
-                    : "Helper is not foreground; mutation recovery remains pinned"
+                    : "Helper is not foreground; mutation recovery remains pinned")
             } else if acceptedCompletion {
-                statusLabel.stringValue = "Helper terminal proof matched the local transaction; exact baseline recovery is complete"
+                report("Helper terminal proof matched the local transaction; exact baseline recovery is complete")
             } else if rejectedCompletion {
-                statusLabel.stringValue = "Helper terminal proof does not match the local recovery transaction"
+                report("Helper terminal proof does not match the local recovery transaction")
             } else if let completion = status.completion {
-                statusLabel.stringValue = "Helper retained exact-baseline completion \(completion.transactionID)"
+                report("Helper retained exact-baseline completion \(completion.transactionID)")
             } else {
-                statusLabel.stringValue = status.foreground
+                report(status.foreground
                     ? "Helper reachable; \(status.capabilities.count) capability entries"
-                    : "Helper is not foreground"
+                    : "Helper is not foreground")
             }
         }
     }
@@ -715,7 +717,11 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
 
     @MainActor
     private func report(_ message: String) {
-        statusLabel.stringValue = message
+        guard let state = dcxAudioUnit?.controlState.view() else {
+            statusLabel.stringValue = message
+            return
+        }
+        statusLabel.stringValue = presentation.statusAfterExplicitResult(message, state: state)
     }
 
     @MainActor
@@ -724,7 +730,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             refreshActionAvailability()
             return
         }
-        statusLabel.stringValue = DCXControlPresentation.statusAfterStateRefresh(
+        statusLabel.stringValue = presentation.statusAfterStateRefresh(
             statusLabel.stringValue,
             state: state
         )

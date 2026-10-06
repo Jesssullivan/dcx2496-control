@@ -136,15 +136,16 @@ final class DCXControlAudioUnitTests: XCTestCase {
         XCTAssertNil(view.currentSnapshot)
         XCTAssertNil(view.diff)
         XCTAssertFalse(view.recoveryActive)
+        var presentation = DCXControlPresentation()
         XCTAssertEqual(
-            DCXControlPresentation.statusAfterStateRefresh(
+            presentation.statusAfterStateRefresh(
                 DCXControlPresentation.unstagedStatus,
                 state: view
             ),
             DCXControlPresentation.restoredStatus
         )
         XCTAssertEqual(
-            DCXControlPresentation.statusAfterStateRefresh(
+            presentation.statusAfterStateRefresh(
                 "Semantic diff previewed",
                 state: view
             ),

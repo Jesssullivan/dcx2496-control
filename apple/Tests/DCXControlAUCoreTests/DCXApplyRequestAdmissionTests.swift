@@ -122,6 +122,131 @@ final class DCXApplyRequestAdmissionTests: XCTestCase {
         XCTAssertEqual(try restored.controlState.persistedState(), unresolved)
     }
 
+    func testSameInstanceHostRecallReplacesPreviousProjectOperationSummary() throws {
+        for previousSummary in ["Semantic diff previewed", "Rollback restored the baseline digest"] {
+            let fixture = try Fixture()
+            var presentation = DCXControlPresentation()
+            XCTAssertEqual(presentation.statusAfterStateRefresh(
+                previousSummary, state: fixture.audioUnit.controlState.view()
+            ), previousSummary)
+            let projectB = StagedProjectStateV1(
+                target: try .init(bindingID: "synthetic-project-b", expectedDeviceAddress: 1),
+                desired: fixture.request.plan.desired
+            )
+            let savedB = DCXControlPersistedStateV1(
+                projectState: projectB, currentSnapshot: nil, diff: nil,
+                transactionID: nil, rollbackBaseline: nil, deviceStateUncertain: false
+            )
+            fixture.audioUnit.fullStateForDocument = try carrier(savedB)
+            let view = fixture.audioUnit.controlState.view()
+            XCTAssertEqual(try fixture.audioUnit.controlState.persistedState(), savedB)
+            XCTAssertNil(view.currentSnapshot)
+            XCTAssertNil(view.diff)
+            XCTAssertEqual(view.restorationGeneration, 1)
+            XCTAssertEqual(presentation.statusAfterStateRefresh(previousSummary, state: view),
+                           DCXControlPresentation.restoredStatus)
+            // Ordinary refreshes after recall preserve a new explicit result.
+            XCTAssertEqual(presentation.statusAfterStateRefresh("Helper is unavailable", state: view),
+                           "Helper is unavailable")
+            // A fresh result can arrive before the host's queued notification.
+            fixture.audioUnit.fullStateForDocument = try carrier(savedB)
+            let recalledAgain = fixture.audioUnit.controlState.view()
+            let freshResult = presentation.statusAfterExplicitResult(
+                "Helper is unavailable", state: recalledAgain
+            )
+            XCTAssertEqual(presentation.statusAfterStateRefresh(freshResult, state: recalledAgain),
+                           "Helper is unavailable")
+        }
+    }
+
+    func testIdenticalDocumentRecallAlsoInvalidatesOldOperationSummary() throws {
+        let fixture = try Fixture()
+        let persisted = try fixture.audioUnit.controlState.persistedState()
+        let document = try XCTUnwrap(fixture.audioUnit.fullStateForDocument)
+        var presentation = DCXControlPresentation()
+        let previousSummary = "Semantic diff previewed"
+        XCTAssertEqual(presentation.statusAfterStateRefresh(
+            previousSummary, state: fixture.audioUnit.controlState.view()
+        ), previousSummary)
+        for generation in UInt64(1)...3 {
+            fixture.audioUnit.fullStateForDocument = document
+            let view = fixture.audioUnit.controlState.view()
+            XCTAssertEqual(try fixture.audioUnit.controlState.persistedState(), persisted)
+            XCTAssertEqual(view.restorationGeneration, generation)
+            XCTAssertEqual(presentation.statusAfterStateRefresh(previousSummary, state: view),
+                           DCXControlPresentation.restoredStatus)
+            XCTAssertEqual(fixture.audioUnit.fullStateForDocument?[DCXControlPersistedStateV1.schemaVersion]
+                           as? String, document[DCXControlPersistedStateV1.schemaVersion] as? String)
+        }
+    }
+
+    func testLegacyAndEmptyHostRecallClearPreviousOperationSummary() throws {
+        let fixture = try Fixture()
+        var presentation = DCXControlPresentation()
+        let project = try XCTUnwrap(fixture.audioUnit.controlState.view().projectState)
+        let encoded = try BridgeJSONCodec.encoder().encode(project).base64EncodedString()
+        fixture.audioUnit.fullStateForDocument = [StagedProjectStateV1.schemaVersion: encoded]
+        XCTAssertEqual(presentation.statusAfterStateRefresh(
+            "Apply readback matched the desired digest", state: fixture.audioUnit.controlState.view()
+        ), DCXControlPresentation.restoredStatus)
+        XCTAssertEqual(fixture.audioUnit.controlState.view().projectState, project)
+        XCTAssertNil(fixture.audioUnit.controlState.view().diff)
+        fixture.audioUnit.fullStateForDocument = try invalidLegacyCarrier(project)
+        XCTAssertEqual(presentation.statusAfterStateRefresh(
+            "Semantic diff previewed", state: fixture.audioUnit.controlState.view()
+        ), DCXControlPresentation.unstagedStatus)
+        XCTAssertNil(fixture.audioUnit.controlState.view().projectState)
+        XCTAssertEqual(fixture.audioUnit.controlState.view().restorationGeneration, 2)
+        try fixture.audioUnit.performControlStateMutation { try $0.stage(project) }
+        fixture.audioUnit.fullStateForDocument = nil
+        XCTAssertEqual(presentation.statusAfterStateRefresh(
+            "Rollback restored the baseline digest", state: fixture.audioUnit.controlState.view()
+        ), DCXControlPresentation.unstagedStatus)
+        XCTAssertNil(fixture.audioUnit.controlState.view().projectState)
+        XCTAssertEqual(fixture.audioUnit.controlState.view().restorationGeneration, 3)
+    }
+
+    func testRestoredRecoverySummaryAndRejectedRecallPreservePinnedTransaction() throws {
+        let fixture = try Fixture()
+        // Prepare recovery locally without dispatching a helper request.
+        try fixture.audioUnit.performControlStateMutation { state in
+            try DCXApplyRequestAdmission.prepare(fixture.request, state: state, isAuthorized: { true })
+        }
+        let unresolved = try fixture.audioUnit.controlState.persistedState()
+        let restored = try Fixture.makeAudioUnit()
+        restored.fullStateForDocument = try XCTUnwrap(fixture.audioUnit.fullStateForDocument)
+        var presentation = DCXControlPresentation()
+        XCTAssertEqual(presentation.statusAfterStateRefresh(
+            "Rollback restored the baseline digest", state: restored.controlState.view()
+        ), DCXControlPresentation.restoredRecoveryStatus)
+        XCTAssertEqual(try restored.controlState.persistedState(), unresolved)
+        // An active recovery rejects replacement; it must not report a recall
+        // or lose the exact transaction/baseline merely because Logic sets state.
+        restored.fullStateForDocument = nil
+        restored.fullStateForDocument = try invalidLegacyCarrier(
+            XCTUnwrap(unresolved.projectState)
+        )
+        XCTAssertEqual(restored.controlState.view().restorationGeneration, 1)
+        XCTAssertEqual(try restored.controlState.persistedState(), unresolved)
+        XCTAssertEqual(presentation.statusAfterStateRefresh(
+            "Readback is required", state: restored.controlState.view()
+        ), "Readback is required")
+    }
+
+    private func carrier(_ state: DCXControlPersistedStateV1) throws -> [String: Any] {
+        [DCXControlPersistedStateV1.schemaVersion:
+            try BridgeJSONCodec.encoder().encode(state).base64EncodedString()]
+    }
+
+    private func invalidLegacyCarrier(_ project: StagedProjectStateV1) throws -> [String: Any] {
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: BridgeJSONCodec.encoder().encode(project)
+        ) as? [String: Any])
+        document["schemaVersion"] = "unsupported-legacy-schema"
+        return [StagedProjectStateV1.schemaVersion:
+            try JSONSerialization.data(withJSONObject: document).base64EncodedString()]
+    }
+
     private enum FixtureError: Error { case lostResponse }
 
     private struct Fixture {
