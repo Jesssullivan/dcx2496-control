@@ -233,6 +233,79 @@ final class DCXApplyRequestAdmissionTests: XCTestCase {
         ), "Readback is required")
     }
 
+    func testPreviewResponseCannotCrossMatchingHostRestoration() throws {
+        let fixture = try Fixture()
+        let requestGeneration = fixture.audioUnit.controlState.view().restorationGeneration
+        let savedB = DCXControlPersistedStateV1(
+            projectState: fixture.audioUnit.controlState.view().projectState,
+            currentSnapshot: fixture.request.plan.baseline, diff: nil,
+            transactionID: nil, rollbackBaseline: nil, deviceStateUncertain: false
+        )
+        fixture.audioUnit.fullStateForDocument = try carrier(savedB)
+        // Digests and target deliberately still match A's reply. A digest-only
+        // admission would attach A's preview to the recalled document B.
+        XCTAssertEqual(savedB.currentSnapshot?.digest, fixture.request.plan.diff.baselineSnapshotDigest)
+        XCTAssertEqual(savedB.projectState?.desired.digest, fixture.request.plan.diff.desiredProfileDigest)
+        XCTAssertThrowsError(try fixture.audioUnit.performControlStateMutation {
+            try $0.accept(diff: fixture.request.plan.diff,
+                          expectedRestorationGeneration: requestGeneration)
+        }) { error in
+            XCTAssertEqual(error as? DCXControlStateError, .supersededReadResponse)
+        }
+        XCTAssertEqual(try fixture.audioUnit.controlState.persistedState(), savedB)
+        var presentation = DCXControlPresentation()
+        XCTAssertEqual(presentation.statusAfterReadResult(
+            "Semantic diff previewed", requestRestorationGeneration: requestGeneration,
+            state: fixture.audioUnit.controlState.view()
+        ), DCXControlPresentation.restoredStatus)
+
+        // A new explicit preview in B is accepted. If another recall occurs
+        // after model acceptance but before its summary, that summary is stale.
+        let currentGeneration = fixture.audioUnit.controlState.view().restorationGeneration
+        try fixture.audioUnit.performControlStateMutation {
+            try $0.accept(diff: fixture.request.plan.diff,
+                          expectedRestorationGeneration: currentGeneration)
+        }
+        XCTAssertEqual(presentation.statusAfterReadResult(
+            "Semantic diff previewed", requestRestorationGeneration: currentGeneration,
+            state: fixture.audioUnit.controlState.view()
+        ), "Semantic diff previewed")
+        fixture.audioUnit.fullStateForDocument = try carrier(savedB)
+        XCTAssertEqual(presentation.statusAfterReadResult(
+            "Semantic diff previewed", requestRestorationGeneration: currentGeneration,
+            state: fixture.audioUnit.controlState.view()
+        ), DCXControlPresentation.restoredStatus)
+        XCTAssertEqual(try fixture.audioUnit.controlState.persistedState(), savedB)
+    }
+
+    func testSnapshotResponseCannotDiscardRestoredMatchingReview() throws {
+        let fixture = try Fixture()
+        let reviewed = try fixture.audioUnit.controlState.persistedState()
+        let requestGeneration = fixture.audioUnit.controlState.view().restorationGeneration
+        let document = try XCTUnwrap(fixture.audioUnit.fullStateForDocument)
+        for _ in 1...3 {
+            fixture.audioUnit.fullStateForDocument = document
+            XCTAssertEqual(fixture.audioUnit.controlState.view().projectState?.target,
+                           fixture.request.plan.baseline.target)
+            XCTAssertThrowsError(try fixture.audioUnit.performControlStateMutation {
+                try $0.accept(snapshot: fixture.request.plan.baseline, validSearchResponses: 10,
+                              expectedRestorationGeneration: requestGeneration)
+            }) { error in
+                XCTAssertEqual(error as? DCXControlStateError, .supersededReadResponse)
+            }
+            XCTAssertEqual(try fixture.audioUnit.controlState.persistedState(), reviewed)
+        }
+        // The same snapshot can be captured deliberately in the current
+        // document; only that new action is allowed to invalidate its diff.
+        let generation = fixture.audioUnit.controlState.view().restorationGeneration
+        try fixture.audioUnit.performControlStateMutation {
+            try $0.accept(snapshot: fixture.request.plan.baseline, validSearchResponses: 10,
+                          expectedRestorationGeneration: generation)
+        }
+        XCTAssertNil(fixture.audioUnit.controlState.view().diff)
+        XCTAssertEqual(fixture.audioUnit.controlState.view().currentSnapshot, reviewed.currentSnapshot)
+    }
+
     private func carrier(_ state: DCXControlPersistedStateV1) throws -> [String: Any] {
         [DCXControlPersistedStateV1.schemaVersion:
             try BridgeJSONCodec.encoder().encode(state).base64EncodedString()]

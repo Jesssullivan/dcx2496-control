@@ -172,10 +172,15 @@ public final class DCXControlState: @unchecked Sendable {
         return projectState
     }
 
-    public func accept(snapshot: SnapshotV1, validSearchResponses: UInt8) throws {
+    public func accept(
+        snapshot: SnapshotV1,
+        validSearchResponses: UInt8,
+        expectedRestorationGeneration: UInt64? = nil
+    ) throws {
         let snapshot = try snapshot.reporting(validSearchResponses: validSearchResponses)
         lock.lock()
         defer { lock.unlock() }
+        try checkReadGenerationLocked(expectedRestorationGeneration)
         guard !recoveryActiveLocked else {
             throw DCXControlStateError.recoveryInProgress
         }
@@ -188,10 +193,14 @@ public final class DCXControlState: @unchecked Sendable {
         deviceStateUncertain = false
     }
 
-    public func accept(diff: SemanticDiffV1) throws {
+    public func accept(
+        diff: SemanticDiffV1,
+        expectedRestorationGeneration: UInt64? = nil
+    ) throws {
         try diff.validate()
         lock.lock()
         defer { lock.unlock() }
+        try checkReadGenerationLocked(expectedRestorationGeneration)
         guard let projectState, let currentSnapshot,
               lastTransactionID == nil, rollbackBaseline == nil,
               diff.changes.count <= 1,
@@ -446,6 +455,12 @@ public final class DCXControlState: @unchecked Sendable {
     private var recoveryActiveLocked: Bool {
         lastTransactionID != nil || rollbackBaseline != nil || deviceStateUncertain
     }
+
+    private func checkReadGenerationLocked(_ expected: UInt64?) throws {
+        if let expected, expected != restorationGeneration {
+            throw DCXControlStateError.supersededReadResponse
+        }
+    }
 }
 
 public struct DCXControlStateView: Sendable {
@@ -480,6 +495,19 @@ public struct DCXControlPresentation {
         return message
     }
 
+    /// Read preparation results belong to the document that requested them,
+    /// even if restoration raced with their already accepted model update.
+    public mutating func statusAfterReadResult(
+        _ message: String,
+        requestRestorationGeneration: UInt64,
+        state: DCXControlStateView
+    ) -> String {
+        guard requestRestorationGeneration == state.restorationGeneration else {
+            return statusAfterStateRefresh(Self.unstagedStatus, state: state)
+        }
+        return statusAfterExplicitResult(message, state: state)
+    }
+
     /// A host recall invalidates operation summaries from the previous document,
     /// even when its persisted contents are identical. Ordinary refreshes keep
     /// the latest explicit result. This path performs no helper or device work.
@@ -498,6 +526,7 @@ public struct DCXControlPresentation {
 }
 
 public enum DCXControlStateError: Error, Equatable, Sendable {
+    case supersededReadResponse
     case unsupportedSchema
     case invalidProjectBinding
     case invalidSnapshotBinding

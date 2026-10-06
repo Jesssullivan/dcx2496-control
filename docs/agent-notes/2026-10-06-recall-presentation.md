@@ -23,7 +23,15 @@ process, socket, serial or device operation.
 Four added native fixture methods cover different and identical project recall,
 legacy/empty/invalid-legacy carriers, recovery preservation and presentation
 ordering. `just native-logic-recall` / `//apple:logic_recall` now selects 13
-methods. Actual native execution, focused unsigned AU/UI compilation, qualified
+methods at the first checkpoint. A follow-up source counterexample retains the
+same desired profile and snapshot after recall while a Preview reply is pending:
+digest-only acceptance adds the old preview to the newly restored document.
+A pending Snapshot reply can similarly clear its restored diff. Snapshot/Preview
+now carry AU identity and request generation; acceptance checks generation under
+the model lock and summaries retain request provenance. Superseded preparation
+replies are discarded without retry. Mutation replies still reconcile pinned
+recovery. Two additional matching-state fixtures bring the combined selection
+to 15 methods. Actual native execution, focused unsigned AU/UI compilation, qualified
 Linux checks/history scan and final independent review are required before this
 source change merges; they are pending at this source checkpoint.
 
