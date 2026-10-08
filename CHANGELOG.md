@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Record the first named-device O4 PEQ round trips: the Dump1 trailer balance,
+  band-count ordering, and O4 PEQ on/off, count and band 1 locations read back
+  exactly and rolled back to the original snapshot.
 - Add static feedback suppression for O4: `dcxctl feedback import|inspect|
   plan|desired-profile`, digest-bound ring-out/REW measurements, and a pure
   notch planner that writes only cut-only bells above the operator's bands.

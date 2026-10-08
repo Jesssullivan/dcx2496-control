@@ -4,12 +4,13 @@
 //! This module preserves exact validated wire frames and exposes only the
 //! closed reviewed projections in [`crate::layout`], transcribed from the
 //! pinned MIT `DuinoDCX` `00b9d70` layout: PEQ on/off, PEQ band count, and the
-//! nine PEQ bands of every output, plus the O4 output mute. Only O1/PEQ9 has
+//! nine PEQ bands of every output, plus the O4 output mute. O1/PEQ9 has
 //! named-device readback; the O4 mute address is fixture-derived and pending
-//! the Legalab WORD-FS-A silent mute-frame rehearsal, and every other PEQ
-//! address is pending its first exact device readback. Projection preserves
-//! the observed modulo-128 balance of the device-maintained Dump0 trailer and
-//! applies the same rule to Dump1 as a named hypothesis; every other dump
+//! the Legalab WORD-FS-A silent mute-frame rehearsal, O4 PEQ on/off, band
+//! count and band 1 frequency/Q/gain/slope have exact device readback
+//! (2026-10-08), and every other PEQ address is pending its first exact device
+//! readback. Projection preserves the observed modulo-128 balance of the
+//! device-maintained Dump0 and Dump1 trailers; every other dump
 //! byte remains opaque and unappliable. Apply plans accept only explicit
 //! checked direct-parameter actions with cut-only PEQ gains and exact
 //! inverses; they never accept caller-supplied frames.
@@ -319,12 +320,11 @@ impl SnapshotV1 {
             })?;
         }
         preserve_trailer_balance(&self.dump0.frame, &mut dump0);
-        // DUMP1 TRAILER HYPOTHESIS: the named-device modulo-128 balance is
-        // observed for Dump0 only. Dump1 is framed identically and is assumed
-        // to be maintained by the same firmware routine. A projected Dump1
-        // keeps its baseline balance; an unchanged payload leaves the trailer
-        // byte unchanged. Exact device readback of the first O4 edit confirms
-        // or refutes this, and a refutation only forces the bound rollback.
+        // DUMP1 TRAILER: the named-device modulo-128 balance is observed for
+        // Dump0 and, since the 2026-10-08 O4 round trips, for Dump1 (byte 909
+        // read back exactly). A projected Dump1 keeps its baseline balance; an
+        // unchanged payload leaves the trailer byte unchanged. Any future
+        // inexact readback still only forces the bound rollback.
         preserve_trailer_balance(&self.dump1.frame, &mut dump1);
         Ok(Self::from_frames(&self.identity.frame, &dump0, &dump1)?)
     }
@@ -2102,8 +2102,9 @@ mod tests {
                 assert_eq!(after[index], before[index], "unexpected patch at {index}");
             }
         }
-        // Dump1 trailer hypothesis: the trailer keeps the baseline modulo-128
-        // balance, so lowering byte 223 by one raises the trailer by one.
+        // Dump1 trailer (named-device observed 2026-10-08): the trailer keeps
+        // the baseline modulo-128 balance, so lowering byte 223 by one raises
+        // the trailer by one.
         assert_eq!(
             after[DUMP1_RESPONSE_LEN - 2],
             (before[DUMP1_RESPONSE_LEN - 2] + 1) & 0x7f

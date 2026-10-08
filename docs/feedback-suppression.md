@@ -1,8 +1,9 @@
 # Static feedback suppression on O4
 
-Status: offline pipeline, synthetic fixtures, and injected-transport tests.
-No named-device readback of an O4 PEQ address has been recorded yet, and no
-acoustic claim is made. Real feedback frequencies need an attended ring-out.
+Status: offline pipeline, synthetic fixtures, injected-transport tests, and two
+named-device O4 round trips with exact readback and rollback (speakers muted;
+see "Named-device observations"). No acoustic claim is made. Real feedback
+frequencies need an attended ring-out.
 
 ## Scope
 
@@ -95,15 +96,19 @@ and band count are restored before the bands they had activated. Exact
 apply-then-rollback byte equality, both trailers included, is property-tested
 over seeded random baselines.
 
-## Open hypotheses for the first hardware probe
+## Named-device observations (2026-10-08, speakers muted)
 
-1. **Dump1 trailer.** The modulo-128 trailer balance is observed for Dump0. The
-   projection applies the same rule to Dump1. If the device does not maintain
-   Dump1 that way, the first O4 write reads back inexactly and the bound
-   rollback runs.
-2. **Band count side effects.** The plan writes band values before raising the
-   band count. If the device resets newly activated bands when the count rises,
-   readback is inexact and rollback runs.
-3. **O4 locations.** Only O1/PEQ9 has named-device readback. The first probe
-   should change only an inactive O4 band frequency, read back, and roll back,
-   before applying a synthetic two-notch plan with speakers muted.
+Two O4 round trips on the named device (inactive band 1 frequency step, then a
+synthetic -3 dB, Q 10 bell at 2.5 kHz) applied, read back exactly, rolled back,
+and read back equal to the original snapshot. Receipt:
+`docs/agent-notes/2026-10-08-a4-signed-install-o4-peq-probe.md`.
+
+1. **Dump1 trailer.** Observed: Dump1 keeps the modulo-128 trailer balance
+   (byte 909), as Dump0 does.
+2. **Band count side effects.** Observed: raising the band count after writing
+   the band values does not reset them; readback was exact.
+3. **O4 locations.** Observed for PEQ on/off, band count, and band 1 frequency,
+   Q, gain and slope (with their 7-of-8 carrier). Band 1 kind, bands 2-9 and the
+   O4 mute are still transcription-only.
+
+Real feedback frequencies still need an attended ring-out.

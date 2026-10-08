@@ -17,9 +17,11 @@
 //! all 444 rows and equality with the earlier hand-reviewed O1/PEQ9 and
 //! O4-mute offsets.
 //!
-//! These are behavioral-reference transcriptions. Only the O1/PEQ9 Dump0
-//! locations have been exercised on the named device; every other address is
-//! an implementation hypothesis until exact device readback confirms it.
+//! These are behavioral-reference transcriptions. The O1/PEQ9 Dump0
+//! locations and the O4 PEQ on/off, band count, and band 1 frequency, Q, gain
+//! and slope Dump1 locations (with the Dump1 trailer balance) have been
+//! exercised on the named device; every other address is an implementation
+//! hypothesis until exact device readback confirms it.
 
 use thiserror::Error;
 
