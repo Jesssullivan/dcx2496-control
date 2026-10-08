@@ -1,15 +1,18 @@
 //! Deterministic, versioned DCX snapshot and fail-closed apply planning.
 //!
 //! Dump payload semantics remain broadly unestablished on the named device.
-//! This module preserves exact validated wire frames and exposes only two
-//! reviewed projections from the pinned MIT `DuinoDCX` `00b9d70` layout:
-//! O1/PEQ9 frequency, Q, gain, and kind, plus the O4 output mute. The O4
-//! mute address is fixture-derived and pending hardware confirmation by the
-//! Legalab WORD-FS-A silent mute-frame rehearsal. Projection also preserves
-//! the observed modulo-128 balance of one device-maintained Dump0 trailer
-//! byte; every other dump byte remains opaque and unappliable. Apply plans
-//! accept only explicit checked direct-parameter actions and exact inverses;
-//! they never accept caller-supplied frames.
+//! This module preserves exact validated wire frames and exposes only the
+//! closed reviewed projections in [`crate::layout`], transcribed from the
+//! pinned MIT `DuinoDCX` `00b9d70` layout: PEQ on/off, PEQ band count, and the
+//! nine PEQ bands of every output, plus the O4 output mute. Only O1/PEQ9 has
+//! named-device readback; the O4 mute address is fixture-derived and pending
+//! the Legalab WORD-FS-A silent mute-frame rehearsal, and every other PEQ
+//! address is pending its first exact device readback. Projection preserves
+//! the observed modulo-128 balance of the device-maintained Dump0 trailer and
+//! applies the same rule to Dump1 as a named hypothesis; every other dump
+//! byte remains opaque and unappliable. Apply plans accept only explicit
+//! checked direct-parameter actions with cut-only PEQ gains and exact
+//! inverses; they never accept caller-supplied frames.
 
 use std::{fmt, fmt::Write as _};
 
@@ -17,10 +20,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::protocol::{
-    DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DirectParameterAction,
-    DirectParameterCommand, DumpPart, MAX_DIRECT_PARAMETER_ACTIONS, ProtocolError,
-    SearchResponse26, decode, parse_frame,
+use crate::{
+    layout::{
+        OutputField, PACKED_PAYLOAD_START, ReviewedAddress, UNITY_GAIN_CODE, reviewed_address,
+    },
+    protocol::{
+        DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DirectParameterAction,
+        DirectParameterCommand, DumpPart, MAX_DIRECT_PARAMETER_ACTIONS, ProtocolError,
+        SearchResponse26, decode, parse_frame,
+    },
 };
 
 /// Wire/schema version of [`SnapshotV1`].
@@ -40,7 +48,9 @@ const DIGEST_PREFIX: &str = "sha256/";
 const SNAPSHOT_DOMAIN: &[u8] = b"dcx2496.snapshot/v1\0";
 const APPLY_PLAN_DOMAIN: &[u8] = b"dcx2496.apply-plan/v1\0";
 const ROLLBACK_PLAN_DOMAIN: &[u8] = b"dcx2496.rollback-plan/v1\0";
-const DUMP0_PACKED_PAYLOAD_START: usize = 13;
+#[cfg(test)]
+const DUMP0_PACKED_PAYLOAD_START: usize = PACKED_PAYLOAD_START;
+#[cfg(test)]
 const DUMP0_DERIVED_TRAILER_OFFSET: usize = DUMP0_RESPONSE_LEN - 2;
 
 /// One fixed component of a complete DCX snapshot.
@@ -265,12 +275,14 @@ impl SnapshotV1 {
     /// Project the reviewed direct actions into an exact desired dump.
     ///
     /// This is intentionally not a general dump mapper. It accepts only the
-    /// reviewed addresses: channel 5 parameters `0x3b` through `0x3e` (O1
-    /// PEQ9 frequency, Q, gain, and filter kind in the pinned reference) and
-    /// channel 8 parameter `0x03` (O4 output mute, on/off; fixture-derived,
-    /// pending hardware confirmation by the Legalab WORD-FS-A rehearsal).
-    /// Slope `0x3f` and every other address fail closed. The identity bytes
-    /// remain unchanged, and a fresh snapshot digest is calculated.
+    /// closed allowlist in [`crate::layout::reviewed_address`]: PEQ on/off,
+    /// PEQ band count, and the nine PEQ bands on outputs O1 through O6, plus
+    /// the O4 output mute (fixture-derived, pending hardware confirmation by
+    /// the Legalab WORD-FS-A rehearsal). Each value must lie inside the
+    /// documented device domain of its field. Every other address fails
+    /// closed. The identity bytes remain unchanged, both dump trailers keep
+    /// their baseline modulo-128 balance, and a fresh snapshot digest is
+    /// calculated.
     ///
     /// # Errors
     ///
@@ -293,61 +305,42 @@ impl SnapshotV1 {
                     parameter: action.parameter(),
                 });
             }
-            // Independently transcribed from the pinned MIT DuinoDCX
-            // 00b9d70 Ultradrive.cpp `outputLocations[0]` and `patchBuffer`.
-            match (action.channel(), action.parameter()) {
-                (5, 0x3b) => patch_split_value(&mut dump0, action.value(), 843, 844, 6, 845),
-                (5, 0x3c) => patch_low_only(&mut dump0, *action, 846)?,
-                (5, 0x3d) => patch_split_value(&mut dump0, action.value(), 848, 852, 3, 849),
-                (5, 0x3e) => patch_low_only(&mut dump0, *action, 850)?,
-                // O4 output mute. Address independently transcribed from the
-                // same pinned DuinoDCX revision: direct channel 8 selects
-                // `outputLocations[3]` and parameter 0x03 selects row 1,
-                // whose location is Dump1 byte 223, low-only. The semantic
-                // name and the 1=muted value domain follow the pinned
-                // `geftactics` UltradrivePi `259fa83` protocol notes
-                // (`03 mute (1:muted)`, outputs on channels 05..0A).
-                // FIXTURE-DERIVED, PENDING HARDWARE CONFIRMATION: this
-                // address has never been exercised on the named device; the
-                // Legalab WORD-FS-A silent mute-frame rehearsal (first-sound
-                // precondition P16) is what confirms or refutes it.
-                (8, 0x03) => {
-                    if action.value() > 1 {
-                        return Err(SnapshotProjectionError::ValueNotOnOff {
-                            parameter: action.parameter(),
-                            value: action.value(),
-                        });
-                    }
-                    patch_low_only(&mut dump1, *action, 223)?;
+            let address = require_reviewed(*action)?;
+            require_device_domain(*action, address.field, action.value())?;
+            let frame = match address.location.part() {
+                DumpPart::Part0 => &mut dump0,
+                DumpPart::Part1 => &mut dump1,
+            };
+            address.location.write(frame, action.value()).map_err(|_| {
+                SnapshotProjectionError::ValueTooWide {
+                    parameter: action.parameter(),
+                    value: action.value(),
                 }
-                _ => {
-                    return Err(SnapshotProjectionError::UnmappedAction {
-                        channel: action.channel(),
-                        parameter: action.parameter(),
-                    });
-                }
-            }
+            })?;
         }
-        preserve_dump0_trailer_balance(&self.dump0.frame, &mut dump0);
-        // No balance rule is applied to Dump1. The modulo-128 trailer
-        // observation is established for Dump0 only, and this projection
-        // still declines to extend it: a projected Dump1 differs from its
-        // baseline in exactly the patched payload byte. Whether the named
-        // device maintains its own Dump1 trailer across a direct O4-mute
-        // write is precisely what the WORD-FS-A readback observes.
+        preserve_trailer_balance(&self.dump0.frame, &mut dump0);
+        // DUMP1 TRAILER HYPOTHESIS: the named-device modulo-128 balance is
+        // observed for Dump0 only. Dump1 is framed identically and is assumed
+        // to be maintained by the same firmware routine. A projected Dump1
+        // keeps its baseline balance; an unchanged payload leaves the trailer
+        // byte unchanged. Exact device readback of the first O4 edit confirms
+        // or refutes this, and a refutation only forces the bound rollback.
+        preserve_trailer_balance(&self.dump1.frame, &mut dump1);
         Ok(Self::from_frames(&self.identity.frame, &dump0, &dump1)?)
     }
 
     /// Extract exact inverse values for a reviewed action address set.
     ///
     /// Returned actions preserve caller order but replace each value with the
-    /// value decoded from this immutable snapshot's reviewed O1/PEQ9 Dump0
-    /// locations or O4-mute Dump1 location. This supports rollback derivation
-    /// without caller-supplied inverse bytes.
+    /// value decoded from this immutable snapshot at the transcribed location.
+    /// A baseline value outside the documented device domain is evidence
+    /// against the transcription and fails closed. This supports rollback
+    /// derivation without caller-supplied inverse bytes.
     ///
     /// # Errors
     ///
-    /// Rejects empty, duplicate, or unreviewed action addresses.
+    /// Rejects empty, duplicate, or unreviewed action addresses and baseline
+    /// values outside the reviewed device domain.
     pub fn inverse_actions_for(
         &self,
         actions: &[DirectParameterAction],
@@ -355,8 +348,6 @@ impl SnapshotV1 {
         if actions.is_empty() {
             return Err(SnapshotProjectionError::EmptyActions);
         }
-        let dump0 = &self.dump0.frame;
-        let dump1 = &self.dump1.frame;
         let mut addresses = std::collections::BTreeSet::new();
         let mut inverse = Vec::with_capacity(actions.len());
         for action in actions {
@@ -366,32 +357,9 @@ impl SnapshotV1 {
                     parameter: action.parameter(),
                 });
             }
-            let value = match (action.channel(), action.parameter()) {
-                (5, 0x3b) => read_split_value(dump0, 843, 844, 6, 845),
-                (5, 0x3c) => u16::from(dump0[846]),
-                (5, 0x3d) => read_split_value(dump0, 848, 852, 3, 849),
-                (5, 0x3e) => u16::from(dump0[850]),
-                // O4 output mute inverse: Dump1 byte 223 (see the projection
-                // transcription note). A baseline byte outside the on/off
-                // domain is evidence against the fixture-derived transcription
-                // and fails closed rather than round-tripping silently.
-                (8, 0x03) => {
-                    let observed = u16::from(dump1[223]);
-                    if observed > 1 {
-                        return Err(SnapshotProjectionError::ValueNotOnOff {
-                            parameter: action.parameter(),
-                            value: observed,
-                        });
-                    }
-                    observed
-                }
-                _ => {
-                    return Err(SnapshotProjectionError::UnmappedAction {
-                        channel: action.channel(),
-                        parameter: action.parameter(),
-                    });
-                }
-            };
+            let address = require_reviewed(*action)?;
+            let value = self.read_reviewed(address);
+            require_device_domain(*action, address.field, value)?;
             inverse.push(DirectParameterAction::new(
                 action.channel(),
                 action.parameter(),
@@ -399,6 +367,33 @@ impl SnapshotV1 {
             )?);
         }
         Ok(inverse)
+    }
+
+    /// Exact rollback actions for an apply action list.
+    ///
+    /// The inverse values come from [`Self::inverse_actions_for`]; the order
+    /// is reversed so a rollback first restores the PEQ enable and band count
+    /// and only then restores band values that are again inactive.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::inverse_actions_for`].
+    pub fn rollback_actions_for(
+        &self,
+        actions: &[DirectParameterAction],
+    ) -> Result<Vec<DirectParameterAction>, SnapshotProjectionError> {
+        let mut inverse = self.inverse_actions_for(actions)?;
+        inverse.reverse();
+        Ok(inverse)
+    }
+
+    /// Decode one reviewed address from this snapshot without domain checks.
+    pub fn read_reviewed(&self, address: ReviewedAddress) -> u16 {
+        let frame = match address.location.part() {
+            DumpPart::Part0 => &self.dump0.frame,
+            DumpPart::Part1 => &self.dump1.frame,
+        };
+        address.location.read(frame)
     }
 
     fn image(&self, section: SnapshotSection) -> &SnapshotImage {
@@ -410,72 +405,55 @@ impl SnapshotV1 {
     }
 }
 
-fn preserve_dump0_trailer_balance(before: &[u8], after: &mut [u8]) {
+fn require_reviewed(
+    action: DirectParameterAction,
+) -> Result<ReviewedAddress, SnapshotProjectionError> {
+    reviewed_address(action.channel(), action.parameter()).ok_or(
+        SnapshotProjectionError::UnmappedAction {
+            channel: action.channel(),
+            parameter: action.parameter(),
+        },
+    )
+}
+
+fn require_device_domain(
+    action: DirectParameterAction,
+    field: OutputField,
+    value: u16,
+) -> Result<(), SnapshotProjectionError> {
+    if value <= field.device_max() {
+        Ok(())
+    } else if field.is_switch() {
+        Err(SnapshotProjectionError::ValueNotOnOff {
+            parameter: action.parameter(),
+            value,
+        })
+    } else {
+        Err(SnapshotProjectionError::ValueOutOfRange {
+            channel: action.channel(),
+            parameter: action.parameter(),
+            value,
+            maximum: field.device_max(),
+        })
+    }
+}
+
+fn preserve_trailer_balance(before: &[u8], after: &mut [u8]) {
     // Named firmware 1.17 evidence and the independent pinned `domenut`
     // `97cdcca` Dump0 establish that the packed payload plus its penultimate
     // trailer preserves one modulo-128 balance across direct edits. Preserve
-    // the baseline's own balance rather than assigning meaning to opaque data
-    // or extending the observation to Dump1.
-    let baseline_balance =
-        seven_bit_sum(&before[DUMP0_PACKED_PAYLOAD_START..=DUMP0_DERIVED_TRAILER_OFFSET]);
-    let projected_payload =
-        seven_bit_sum(&after[DUMP0_PACKED_PAYLOAD_START..DUMP0_DERIVED_TRAILER_OFFSET]);
-    after[DUMP0_DERIVED_TRAILER_OFFSET] = baseline_balance.wrapping_sub(projected_payload) & 0x7f;
+    // the baseline's own balance rather than assigning meaning to opaque data.
+    // Dump1 reuses the rule as the documented hypothesis above.
+    let trailer = after.len() - 2;
+    let baseline_balance = seven_bit_sum(&before[PACKED_PAYLOAD_START..=trailer]);
+    let projected_payload = seven_bit_sum(&after[PACKED_PAYLOAD_START..trailer]);
+    after[trailer] = baseline_balance.wrapping_sub(projected_payload) & 0x7f;
 }
 
 fn seven_bit_sum(bytes: &[u8]) -> u8 {
     bytes
         .iter()
         .fold(0_u8, |sum, byte| sum.wrapping_add(*byte) & 0x7f)
-}
-
-fn patch_split_value(
-    dump: &mut [u8],
-    value: u16,
-    low_offset: usize,
-    middle_offset: usize,
-    middle_bit: u8,
-    high_offset: usize,
-) {
-    let [high_byte, low_byte] = value.to_be_bytes();
-    let value_low = low_byte & 0x7f;
-    let value_high = (high_byte << 1) | (low_byte >> 7);
-    dump[low_offset] = value_low;
-    let mask = 1_u8 << middle_bit;
-    dump[middle_offset] = (dump[middle_offset] & !mask) | ((value_high & 1) << middle_bit);
-    dump[high_offset] = value_high >> 1;
-}
-
-fn patch_low_only(
-    dump: &mut [u8],
-    action: DirectParameterAction,
-    offset: usize,
-) -> Result<(), SnapshotProjectionError> {
-    let value =
-        u8::try_from(action.value()).map_err(|_| SnapshotProjectionError::ValueTooWide {
-            parameter: action.parameter(),
-            value: action.value(),
-        })?;
-    if value > 0x7f {
-        return Err(SnapshotProjectionError::ValueTooWide {
-            parameter: action.parameter(),
-            value: action.value(),
-        });
-    }
-    dump[offset] = value;
-    Ok(())
-}
-
-fn read_split_value(
-    dump: &[u8],
-    low_offset: usize,
-    middle_offset: usize,
-    middle_bit: u8,
-    high_offset: usize,
-) -> u16 {
-    u16::from(dump[low_offset])
-        | (u16::from((dump[middle_offset] >> middle_bit) & 1) << 7)
-        | (u16::from(dump[high_offset]) << 8)
 }
 
 impl fmt::Debug for SnapshotV1 {
@@ -787,14 +765,13 @@ pub enum SnapshotDiffError {
     DeviceMismatch { observed: u8, desired: u8 },
 }
 
-/// Fail-closed errors from the exact O1/PEQ9 dump projection.
+/// Fail-closed errors from the reviewed dump projection.
 #[derive(Debug, Error)]
 pub enum SnapshotProjectionError {
     /// Projection requires at least one explicit action.
     #[error("snapshot projection action set cannot be empty")]
     EmptyActions,
-    /// Address is outside the reviewed subset: O1/PEQ9 frequency/Q/gain/kind
-    /// and the fixture-derived O4 output mute.
+    /// Address is outside the closed reviewed allowlist.
     #[error("unmapped snapshot action channel {channel}, parameter {parameter:#04x}")]
     UnmappedAction { channel: u8, parameter: u8 },
     /// One opaque address cannot be projected twice.
@@ -806,6 +783,16 @@ pub enum SnapshotProjectionError {
     /// A reviewed on/off field carries only zero or one.
     #[error("parameter {parameter:#04x} reviewed on/off field cannot carry value {value}")]
     ValueNotOnOff { parameter: u8, value: u16 },
+    /// A reviewed field value lies outside its documented device domain.
+    #[error(
+        "channel {channel} parameter {parameter:#04x} value {value} exceeds device maximum {maximum}"
+    )]
+    ValueOutOfRange {
+        channel: u8,
+        parameter: u8,
+        value: u16,
+        maximum: u16,
+    },
     /// A reconstructed typed inverse could not be represented.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
@@ -867,6 +854,7 @@ impl ApplyPlanV1 {
             ));
         } else {
             let command = DirectParameterCommand::new(diff.device_id, actions)?;
+            require_cut_only(command.actions())?;
             let projected = baseline.project_direct_actions(command.actions())?;
             if projected != *desired {
                 return Err(ApplyPlanError::DesiredProjectionMismatch {
@@ -1034,6 +1022,21 @@ fn actions_from_wire(
     Ok(actions)
 }
 
+fn require_cut_only(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanError> {
+    for action in actions {
+        let boost = reviewed_address(action.channel(), action.parameter())
+            .is_some_and(|address| address.field.is_gain() && action.value() > UNITY_GAIN_CODE);
+        if boost {
+            return Err(ApplyPlanError::BoostNotAdmitted {
+                channel: action.channel(),
+                parameter: action.parameter(),
+                value: action.value(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_from_value(value: &serde_json::Value) -> Result<SnapshotV1, PlanCarrierError> {
     Ok(SnapshotV1::from_json(&serde_json::to_vec(value)?)?)
 }
@@ -1097,6 +1100,15 @@ pub enum ApplyPlanError {
     /// Reviewed snapshot projection failed.
     #[error(transparent)]
     Projection(#[from] SnapshotProjectionError),
+    /// The apply path admits only PEQ cuts; boosts have no apply lane.
+    #[error(
+        "channel {channel} parameter {parameter:#04x} gain code {value} is a boost; apply is cut-only"
+    )]
+    BoostNotAdmitted {
+        channel: u8,
+        parameter: u8,
+        value: u16,
+    },
     /// Explicit typed actions did not project to the exact desired snapshot.
     #[error("typed action projection {projected} did not match desired snapshot {desired}")]
     DesiredProjectionMismatch { projected: String, desired: String },
@@ -1435,7 +1447,7 @@ impl ApplyTransactionV1 {
             .project_direct_actions(&apply_actions)
             .map_err(ApplyPlanError::from)?;
         let rollback_actions = baseline
-            .inverse_actions_for(&apply_actions)
+            .rollback_actions_for(&apply_actions)
             .map_err(ApplyPlanError::from)?;
         Self::stage(baseline, desired, apply_actions, rollback_actions)
     }
@@ -1459,7 +1471,7 @@ impl ApplyTransactionV1 {
         } else {
             apply_plan
                 .baseline()
-                .inverse_actions_for(&apply_actions)
+                .rollback_actions_for(&apply_actions)
                 .map_err(ApplyPlanError::from)?
         };
         let transaction = Self::stage(
@@ -1921,23 +1933,25 @@ mod tests {
     #[test]
     fn reviewed_o1_peq9_projection_patches_only_exact_dump0_locations() {
         let baseline = snapshot(0, 0, 0);
+        // 300 = 0x12c: low 0x2c, carrier bit clear, high 1.
+        // 150 = 0x096: low 0x16, carrier bit set, high 0.
         let actions = [
-            DirectParameterAction::new(5, 0x3b, 0x1234).unwrap(),
+            DirectParameterAction::new(5, 0x3b, 300).unwrap(),
             DirectParameterAction::new(5, 0x3c, 40).unwrap(),
-            DirectParameterAction::new(5, 0x3d, 0x567).unwrap(),
+            DirectParameterAction::new(5, 0x3d, 150).unwrap(),
             DirectParameterAction::new(5, 0x3e, 1).unwrap(),
         ];
         let desired = baseline.project_direct_actions(&actions).unwrap();
         let before = baseline.frame(SnapshotSection::Dump0);
         let after = desired.frame(SnapshotSection::Dump0);
 
-        assert_eq!(after[843], 0x34);
+        assert_eq!(after[843], 0x2c);
         assert_eq!(after[844] & (1 << 6), 0);
-        assert_eq!(after[845], 0x12);
+        assert_eq!(after[845], 1);
         assert_eq!(after[846], 40);
-        assert_eq!(after[848], 0x67);
-        assert_eq!(after[852] & (1 << 3), 0);
-        assert_eq!(after[849], 0x0a >> 1);
+        assert_eq!(after[848], 0x16);
+        assert_eq!(after[852] & (1 << 3), 1 << 3);
+        assert_eq!(after[849], 0);
         assert_eq!(after[850], 1);
         assert_eq!(
             seven_bit_sum(&after[DUMP0_PACKED_PAYLOAD_START..=DUMP0_DERIVED_TRAILER_OFFSET]),
@@ -2020,7 +2034,21 @@ mod tests {
     #[test]
     fn snapshot_projection_rejects_every_unreviewed_address_and_wide_low_field() {
         let baseline = snapshot(0, 0, 0);
-        for (channel, parameter) in [(4, 0x3b), (6, 0x3b), (5, 0x3a), (5, 0x3f)] {
+        // Input sum, output gain, mute off O4, PEQ editor index, dynamic EQ,
+        // crossover, output name, and setup/input channels all fail closed.
+        for (channel, parameter) in [
+            (4, 0x3b),
+            (5, 0x02),
+            (5, 0x03),
+            (5, 0x08),
+            (5, 0x09),
+            (5, 0x12),
+            (5, 0x40),
+            (5, 0x42),
+            (8, 0x45),
+            (0, 0x06),
+            (1, 0x13),
+        ] {
             let action = DirectParameterAction::new(channel, parameter, 1).unwrap();
             assert!(matches!(
                 baseline.project_direct_actions(&[action]),
@@ -2030,11 +2058,22 @@ mod tests {
         let wide_q = DirectParameterAction::new(5, 0x3c, 128).unwrap();
         assert!(matches!(
             baseline.project_direct_actions(&[wide_q]),
-            Err(SnapshotProjectionError::ValueTooWide {
+            Err(SnapshotProjectionError::ValueOutOfRange {
                 parameter: 0x3c,
                 value: 128,
+                maximum: 40,
+                ..
             })
         ));
+        for (parameter, maximum) in [(0x3b, 320), (0x3d, 300), (0x3e, 2), (0x3f, 1), (0x07, 9)] {
+            let action = DirectParameterAction::new(6, parameter, maximum + 1).unwrap();
+            assert!(matches!(
+                baseline.project_direct_actions(&[action]),
+                Err(SnapshotProjectionError::ValueOutOfRange { .. })
+            ));
+            let action = DirectParameterAction::new(6, parameter, maximum).unwrap();
+            assert!(baseline.project_direct_actions(&[action]).is_ok());
+        }
     }
 
     // The O4 output-mute address (channel 8, parameter 0x03, Dump1 byte 223)
@@ -2058,16 +2097,20 @@ mod tests {
         let before = baseline.frame(SnapshotSection::Dump1);
         let after = desired.frame(SnapshotSection::Dump1);
         assert_eq!(after[223], 0);
-        for index in 0..DUMP1_RESPONSE_LEN {
+        for index in 0..DUMP1_RESPONSE_LEN - 2 {
             if index != 223 {
                 assert_eq!(after[index], before[index], "unexpected patch at {index}");
             }
         }
-        // The Dump1 trailer byte is deliberately untouched: no balance rule
-        // is established for Dump1, and the projection declines to invent one.
+        // Dump1 trailer hypothesis: the trailer keeps the baseline modulo-128
+        // balance, so lowering byte 223 by one raises the trailer by one.
         assert_eq!(
             after[DUMP1_RESPONSE_LEN - 2],
-            before[DUMP1_RESPONSE_LEN - 2]
+            (before[DUMP1_RESPONSE_LEN - 2] + 1) & 0x7f
+        );
+        assert_eq!(
+            seven_bit_sum(&after[PACKED_PAYLOAD_START..=DUMP1_RESPONSE_LEN - 2]),
+            seven_bit_sum(&before[PACKED_PAYLOAD_START..=DUMP1_RESPONSE_LEN - 2])
         );
         assert_eq!(
             desired.frame(SnapshotSection::Identity),
@@ -2095,7 +2138,7 @@ mod tests {
         assert_eq!(diff.changes().len(), 1);
         assert_eq!(diff.changes()[0].section, SnapshotSection::Dump1);
 
-        // Byte-level: exactly one byte differs across the complete snapshot.
+        // Byte-level: the mute byte and the balanced Dump1 trailer differ.
         let mut changed = 0_usize;
         for section in [
             SnapshotSection::Identity,
@@ -2111,7 +2154,7 @@ mod tests {
                 .filter(|(before_byte, after_byte)| before_byte != after_byte)
                 .count();
         }
-        assert_eq!(changed, 1);
+        assert_eq!(changed, 2);
 
         // Plan-level: one typed action out, exact mute=1 inverse back.
         let transaction =
@@ -2133,7 +2176,7 @@ mod tests {
         let baseline = muted_o4_baseline();
         // A mute address on any other channel does not match O4's reviewed
         // address: O1/O2/O3/O5/O6 mutes and the setup channel fail closed, as
-        // do O4 parameters adjacent to mute.
+        // do O4 parameters adjacent to mute and the O4 crossover.
         for (channel, parameter) in [
             (0, 0x03),
             (5, 0x03),
@@ -2143,7 +2186,7 @@ mod tests {
             (10, 0x03),
             (8, 0x02),
             (8, 0x04),
-            (8, 0x3b),
+            (8, 0x42),
         ] {
             let action = DirectParameterAction::new(channel, parameter, 1).unwrap();
             assert!(matches!(

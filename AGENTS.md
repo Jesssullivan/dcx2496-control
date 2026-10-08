@@ -24,17 +24,26 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   timeout, remote-mode bytes, or generic writes.
 - Mutation is snapshot -> strict reviewed-address semantic diff -> immutable
   apply and inverse plans -> stale-baseline check -> typed apply -> complete
-  readback -> rollback. The reviewed addresses are exactly O1/PEQ9 (channel 5,
-  `0x3b` through `0x3e`) plus the O4 output mute (channel 8, `0x03`, Dump1
-  byte 223); the mute address is fixture-derived and pending hardware
-  confirmation by Legalab's WORD-FS-A silent mute-frame rehearsal. Every other
-  output, slot, address, or opaque dump mapping fails closed. No server or
-  automatic apply path belongs in the MVP.
-- The desired profile is exactly O1/channel 5/PEQ9 with four ordered actions
-  (`0x3b` through `0x3e`), and its semantic diff contains zero or one complete
-  PEQ-slot change. Missing post-write capture remains explicit uncertainty:
-  apply `readback` and rollback `restored` may be omitted or null, never
-  synthesized.
+  readback -> rollback. The reviewed addresses are the closed allowlist in
+  `crates/dcx-core/src/layout.rs`: PEQ on/off (`0x06`), PEQ band count
+  (`0x07`), and the nine PEQ bands (`0x13` through `0x3f`) on output channels
+  5 through 10, plus the O4 output mute (channel 8, `0x03`, Dump1 byte 223).
+  Locations are transcribed from the pinned MIT DuinoDCX `outputLocations`
+  table; only O1/PEQ9 has named-device readback, the O4 mute is pending
+  Legalab's WORD-FS-A rehearsal, and every other PEQ address is pending its
+  first exact readback. Values must lie in their device domain, the apply path
+  admits only PEQ cuts, and rollback restores the exact baseline in reverse
+  order. Dump1 keeps its baseline modulo-128 trailer balance as a named
+  hypothesis. Every other output, input, setup, crossover, dynamic-EQ, mute,
+  or opaque dump mapping fails closed. No server or automatic apply path
+  belongs in the MVP.
+- Desired profiles are `dcx.desired-profile/v1`, exactly O1/channel 5/PEQ9
+  with four ordered actions (`0x3b` through `0x3e`), or
+  `dcx.desired-profile/v2`, one output's ordered cut-only PEQ on/off, band
+  count, and band-field actions. Static feedback notches (`dcxctl feedback`)
+  target O4 only and never write the operator's active bands. Missing
+  post-write capture remains explicit uncertainty: apply `readback` and
+  rollback `restored` may be omitted or null, never synthesized.
 - The AUv3 MIDI FX owns staged desired state and MIDI pass-through only. It has
   no serial, filesystem, process, or socket work in its render path. The
   foreground helper is the only Apple process allowed to invoke its bundled

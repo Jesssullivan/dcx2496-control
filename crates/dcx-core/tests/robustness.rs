@@ -241,11 +241,21 @@ fn every_fourteen_bit_direct_value_round_trips_through_the_closed_frame() {
 #[test]
 fn every_fourteen_bit_value_projects_through_the_reviewed_split_layout() {
     let baseline = synthetic_snapshot();
-    for (parameter, low, middle, bit, high) in [(0x3b, 843, 844, 6, 845), (0x3d, 848, 852, 3, 849)]
-    {
+    for (parameter, low, middle, bit, high, maximum) in [
+        (0x3b, 843, 844, 6, 845, 320_u16),
+        (0x3d, 848, 852, 3, 849, 300),
+    ] {
         for value in 0..=0x3fff {
             let action = DirectParameterAction::new(5, parameter, value).unwrap();
-            let desired = baseline.project_direct_actions(&[action]).unwrap();
+            let projected = baseline.project_direct_actions(&[action]);
+            if value > maximum {
+                assert!(
+                    projected.is_err(),
+                    "value {value} escaped the device domain"
+                );
+                continue;
+            }
+            let desired = projected.unwrap();
             let dump = desired.frame(SnapshotSection::Dump0);
             let reconstructed = u16::from(dump[low])
                 | (u16::from((dump[middle] >> bit) & 1) << 7)
@@ -264,14 +274,17 @@ fn every_unreviewed_direct_address_is_rejected_by_snapshot_projection() {
         for parameter in 0..=0x7f {
             let action = DirectParameterAction::new(channel, parameter, 0).unwrap();
             let projected = baseline.project_direct_actions(&[action]);
-            let reviewed_o1_peq9 = channel == 5 && (0x3b..=0x3e).contains(&parameter);
-            // O4 output mute is the only other reviewed address; it remains
-            // fixture-derived pending WORD-FS-A hardware confirmation.
+            // Reviewed: PEQ on/off, band count, and the nine PEQ bands on
+            // every output channel, plus the O4 mute (fixture-derived,
+            // pending WORD-FS-A hardware confirmation).
+            let output_channel = (5..=10).contains(&channel);
+            let reviewed_peq = output_channel
+                && (parameter == 0x06 || parameter == 0x07 || (0x13..=0x3f).contains(&parameter));
             let reviewed_o4_mute = channel == 8 && parameter == 0x03;
-            if reviewed_o1_peq9 || reviewed_o4_mute {
-                assert!(projected.is_ok());
+            if reviewed_peq || reviewed_o4_mute {
+                assert!(projected.is_ok(), "{channel}/{parameter:#04x}");
             } else {
-                assert!(projected.is_err());
+                assert!(projected.is_err(), "{channel}/{parameter:#04x}");
             }
         }
     }

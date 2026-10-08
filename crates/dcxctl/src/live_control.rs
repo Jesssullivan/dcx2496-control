@@ -15,7 +15,10 @@ use crate::read_bounded;
 use dcx_core::ApplyTransactionState;
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 use dcx_core::{ApplyPlanV1, RollbackPlanV1, protocol::DeviceId};
-use dcx_core::{ApplyTransactionV1, DirectParameterAction, SnapshotV1, rew::DesiredPeqProfileV1};
+use dcx_core::{
+    ApplyTransactionV1, DirectParameterAction, SnapshotV1, layout::reviewed_address,
+    peq_bank::DesiredProfile,
+};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 use dcx_darwin_tty::{DarwinSearchSession, PrivateTtyBinding, recover_receive_direct_known_38400};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
@@ -83,12 +86,12 @@ pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
         MAX_CONTROL_DOCUMENT_BYTES,
         "control snapshot",
     )?)?;
-    let profile = DesiredPeqProfileV1::from_json(&read_bounded(
+    let profile = DesiredProfile::from_json(&read_bounded(
         profile,
         MAX_CONTROL_DOCUMENT_BYTES,
         "desired control profile",
     )?)?;
-    let desired_actions = profile.document().actions.clone();
+    let desired_actions = profile.actions().to_vec();
     let baseline_actions = baseline.inverse_actions_for(&desired_actions)?;
     let changed_actions = desired_actions
         .iter()
@@ -98,12 +101,14 @@ pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     let changes = if changed_actions.is_empty() {
         Vec::new()
-    } else {
+    } else if matches!(profile, DesiredProfile::V1(_)) {
         vec![serde_json::json!({
             "path": "$.outputs[0].peq[8]",
             "before": peq_slot_value(&baseline_actions)?,
             "after": peq_slot_value(&desired_actions)?,
         })]
+    } else {
+        field_changes(&desired_actions, &baseline_actions)?
     };
     let transaction = if changed_actions.is_empty() {
         ApplyTransactionV1::stage(baseline.clone(), baseline, Vec::new(), Vec::new())?
@@ -112,6 +117,7 @@ pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
     };
     let output = serde_json::json!({
         "baseline_snapshot_digest": transaction.apply_plan().baseline_snapshot_digest(),
+        "desired_profile_schema": profile.schema(),
         "desired_profile_digest": profile.digest(),
         "desired_snapshot_digest": transaction.apply_plan().desired_snapshot_digest(),
         "changes": changes,
@@ -208,6 +214,31 @@ pub fn rollback(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Bo
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+fn field_changes(
+    desired: &[DirectParameterAction],
+    baseline: &[DirectParameterAction],
+) -> Result<Vec<serde_json::Value>, io::Error> {
+    desired
+        .iter()
+        .zip(baseline)
+        .filter(|(desired, observed)| desired.value() != observed.value())
+        .map(|(desired, observed)| {
+            let address =
+                reviewed_address(desired.channel(), desired.parameter()).ok_or_else(|| {
+                    invalid_input("unmapped action escaped desired-profile validation")
+                })?;
+            Ok(serde_json::json!({
+                "output": address.output,
+                "field": address.field.label(),
+                "channel": desired.channel(),
+                "parameter": desired.parameter(),
+                "before": observed.value(),
+                "after": desired.value(),
+            }))
+        })
+        .collect()
 }
 
 fn peq_slot_value(actions: &[DirectParameterAction]) -> Result<serde_json::Value, io::Error> {

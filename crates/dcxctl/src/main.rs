@@ -4,6 +4,7 @@
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 mod live_discovery;
 
+mod feedback_cli;
 mod live_control;
 
 use std::{
@@ -59,6 +60,73 @@ enum Command {
     Control {
         #[command(subcommand)]
         command: ControlCommand,
+    },
+    /// Offline static feedback suppression: import, inspect, plan O4 notches.
+    Feedback {
+        #[command(subcommand)]
+        command: FeedbackCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FeedbackCommand {
+    /// Import a ring-out frequency list or REW Generic EQ export as a measurement.
+    Import {
+        /// Ring-out list: one `<frequency_hz>[,<level_db>]` per line.
+        #[arg(long, conflicts_with = "rew", required_unless_present = "rew")]
+        frequency_list: Option<PathBuf>,
+        /// REW Generic EQ export whose enabled peaking cuts are the peaks.
+        #[arg(
+            long,
+            conflicts_with = "frequency_list",
+            required_unless_present = "frequency_list"
+        )]
+        rew: Option<PathBuf>,
+        /// Explicit physical DCX output; the planner accepts only O4.
+        #[arg(long)]
+        target_output: u8,
+    },
+    /// Decode one output's PEQ bank from a saved snapshot (read-only).
+    Inspect {
+        /// Complete raw `SnapshotV1` produced by `control snapshot`.
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Physical DCX output, 1 through 6.
+        #[arg(long)]
+        target_output: u8,
+    },
+    /// Plan bounded static O4 notches above the operator's active bands.
+    Plan {
+        /// Measurement produced by `feedback import`.
+        #[arg(long)]
+        measurement: PathBuf,
+        /// Baseline `SnapshotV1` the plan is computed against.
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Receipt of the plan last applied to O4, so its bands are reused.
+        #[arg(long)]
+        prior_plan: Option<PathBuf>,
+        /// Maximum notches, 1 through 9.
+        #[arg(long, default_value_t = 4)]
+        max_notches: u8,
+        /// Deepest cut in dB, -15 through -1.
+        #[arg(long, default_value_t = -12.0, allow_negative_numbers = true)]
+        max_cut_db: f64,
+        /// Permit enabling PEQ while operator bands exist but PEQ is off.
+        #[arg(long)]
+        allow_enable_operator_bands: bool,
+    },
+    /// Bind a notch plan into a staged `dcx.desired-profile/v2` for `control diff`.
+    DesiredProfile {
+        /// Notch plan produced by `feedback plan`.
+        #[arg(long)]
+        plan: PathBuf,
+        /// Stable operator-facing profile identity.
+        #[arg(long)]
+        profile_id: String,
+        /// Stable operator-facing profile revision.
+        #[arg(long)]
+        revision: String,
     },
 }
 
@@ -199,12 +267,12 @@ enum ControlCommand {
         #[arg(long)]
         expected_device: u8,
     },
-    /// Bind one strict O1/PEQ9 desired profile to snapshot, apply, and rollback plans.
+    /// Bind one strict desired profile to snapshot, apply, and rollback plans.
     Diff {
         /// Complete raw `SnapshotV1` produced by `control snapshot`.
         #[arg(long)]
         snapshot: PathBuf,
-        /// Staged `dcx.desired-profile/v1` carrying one O1/PEQ9 plan-slot document.
+        /// Staged `dcx.desired-profile/v1` (O1/PEQ9) or `/v2` (one output's PEQ bank).
         #[arg(long)]
         profile: PathBuf,
     },
@@ -254,8 +322,50 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Profile { command } => profile(command)?,
         Command::Rew { command } => rew(command)?,
         Command::Control { command } => control(command)?,
+        Command::Feedback { command } => feedback(command)?,
     }
     Ok(())
+}
+
+fn feedback(command: FeedbackCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        FeedbackCommand::Import {
+            frequency_list,
+            rew,
+            target_output,
+        } => {
+            let input = match (&frequency_list, &rew) {
+                (Some(path), None) => feedback_cli::MeasurementInput::FrequencyList(path),
+                (None, Some(path)) => feedback_cli::MeasurementInput::Rew(path),
+                _ => unreachable!("clap enforces exactly one input"),
+            };
+            feedback_cli::import(&input, target_output)
+        }
+        FeedbackCommand::Inspect {
+            snapshot,
+            target_output,
+        } => feedback_cli::inspect(&snapshot, target_output),
+        FeedbackCommand::Plan {
+            measurement,
+            snapshot,
+            prior_plan,
+            max_notches,
+            max_cut_db,
+            allow_enable_operator_bands,
+        } => feedback_cli::plan(&feedback_cli::PlanOptions {
+            measurement: &measurement,
+            snapshot: &snapshot,
+            prior_plan: prior_plan.as_deref(),
+            max_notches,
+            max_cut_db,
+            allow_enable_operator_bands,
+        }),
+        FeedbackCommand::DesiredProfile {
+            plan,
+            profile_id,
+            revision,
+        } => feedback_cli::desired_profile(&plan, profile_id, revision),
+    }
 }
 
 fn control(command: ControlCommand) -> Result<(), Box<dyn Error>> {

@@ -26,7 +26,9 @@ Useful behavioral references reviewed for this offline foundation include:
   https://github.com/lasselukkari/DuinoDCX/blob/00b9d70d6192e993f31ec94ff0bc20e6e2265b2c/DuinoDCX/DuinoDCX.ino#L381-L384
   This source does not define the 18-byte response payload semantics or
   establish behavior on Legalab's named unit. Its license is reproduced in
-  third_party/duinodcx/LICENSE.
+  third_party/duinodcx/LICENSE. The output parameter location table in
+  crates/dcx-core/src/layout.rs is transcribed from the pinned
+  Ultradrive.cpp `outputLocations[6][74]` under that MIT license.
 - UltradrivePi protocol notes by geftactics; no repository license was present
   when reviewed on 2026-08-22, so it is an incompatible/uncertain-license
   behavioral reference only and no source code or prose was copied. Revision

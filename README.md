@@ -160,6 +160,25 @@ Legalab owns the physical mute, route, authorization, and attended-stop
 preconditions for every live invocation. This repository does not duplicate
 those records.
 
+### Static feedback suppression (O4 notches)
+
+`dcxctl feedback` turns a ring-out frequency list or a REW Generic EQ export
+into bounded cut-only notches on the O4 (PA) PEQ bank, placed only above the
+operator's active bands. It is offline; the result is a strict
+`dcx.desired-profile/v2` that goes through the same `control diff`, `apply`,
+and `rollback` carriers. See
+[`docs/feedback-suppression.md`](docs/feedback-suppression.md).
+
+```sh
+dcxctl feedback import --frequency-list ring-out.txt --target-output 4 > measurement.json
+dcxctl feedback inspect --snapshot snapshot.json --target-output 4
+dcxctl feedback plan --measurement measurement.json --snapshot snapshot.json > notch-plan.json
+dcxctl feedback desired-profile --plan notch-plan.json \
+  --profile-id o4-feedback --revision 2026-10-07 > desired-profile.json
+dcxctl control diff --snapshot snapshot.json --profile desired-profile.json \
+  > transaction-plans.json
+```
+
 ## Serial boundary
 
 - The caller supplies one exact `/dev/cu.usbserial-*` callout; the program never

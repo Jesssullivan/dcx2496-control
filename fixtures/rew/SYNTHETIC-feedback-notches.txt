@@ -1,0 +1,5 @@
+* SYNTHETIC REW Generic EQ export for the feedback importer; not a measurement.
+Equaliser: Generic
+Filter 1: ON PK Fc 630 Hz Gain -4.5 dB Q 8.0
+Filter 2: ON PK Fc 2500 Hz Gain -9.0 dB Q 10.0
+Filter 3: OFF PK Fc 4000 Hz Gain -3.0 dB Q 5.0

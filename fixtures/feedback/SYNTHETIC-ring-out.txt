@@ -1,0 +1,8 @@
+# SYNTHETIC ring-out frequency list. Not a measurement of any room or device.
+# One peak per line: <frequency_hz>[,<level_db>]. A repeated frequency is a
+# recurrence and deepens that notch by one policy step.
+frequency_hz,level_db
+630,4.0
+2500,9.0
+2500,7.5
+1260,3.0
