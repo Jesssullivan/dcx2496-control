@@ -44,7 +44,11 @@ targets:
         basedOnDependencyAnalysis: false
         script: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="${SRCROOT}/../target"
+          # A plain shell variable: Xcode resolves ${CARGO_TARGET_DIR} in this
+          # script from the caller's environment, so an ambient value would make
+          # ditto read a directory cargo never wrote.
+          dcx_target_dir="${SRCROOT}/../target"
+          export CARGO_TARGET_DIR="$dcx_target_dir"
           export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
           cargo_bin="${DCX_CARGO_BIN:-}"
           rustc_bin="${DCX_RUSTC_BIN:-}"
@@ -65,7 +69,7 @@ targets:
             --features live-control
           helper_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
           /bin/mkdir -p "${helper_dir}"
-          /usr/bin/ditto "${CARGO_TARGET_DIR}/release/dcxctl" "${helper_dir}/dcxctl"
+          /usr/bin/ditto "$dcx_target_dir/release/dcxctl" "${helper_dir}/dcxctl"
           /bin/chmod 0755 "${helper_dir}/dcxctl"
           if [[ "${CODE_SIGNING_ALLOWED:-NO}" == "YES" && -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
             /usr/bin/codesign \

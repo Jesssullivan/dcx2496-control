@@ -38,3 +38,21 @@ source change merges; they are pending at this source checkpoint.
 This does not establish current installed helper/AU identity, actual Logic
 zero-write recall, complete scene control, serial apply/readback/rollback or
 audio acceptance. Those remain separately admitted root-owned bench work.
+
+## 2026-10-07 native qualification and timeout root cause
+
+Authority: dec-autonomous-muted-bench-20261007 / R-HOOK-CONVERGENCE-20261004.
+The 2026-10-06 PZM attempt did not fail in source. An outside free-space monitor
+held a 15 GiB boot-disk floor with an 18 MB margin and terminated the process
+group 11 s into `//apple:logic_recall`, while Bazel and SwiftPM wrote under the
+default `/private/var/tmp` output root; the recorded `TimeoutExpired` came from
+its cleanup wait. `DCX_BAZEL_OUTPUT_USER_ROOT` now moves the whole Bazel output
+root (output bases, repository cache, `TEST_TMPDIR`, SwiftPM scratch) to an
+operator-chosen volume, and the source tree can sit there too.
+
+On PZM, with source and output root on `/Volumes/LegalabCache`, the pzm-bench
+lock held and the boot Data volume at 14 GiB free, `//apple:logic_recall`
+executed all 15 selected methods with 0 failures and `//apple:response_binding`
+passed. The first `just apple-bundle-check` then failed because the dcxctl embed
+phase built into `${SRCROOT}/../target` but `ditto` read an ambient
+`CARGO_TARGET_DIR`; the phase now uses one shell variable for both.
