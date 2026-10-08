@@ -21,6 +21,9 @@ and `just bazel-check` select that lane. `just remote-build` and
 Unavailable remote actions fail without local fallback. Runtime rc content is
 not printed; ambient rc is excluded. GF enrollment is deferred. Hosted advisory
 provides formatting, shell/workflow/schema and lockfile feedback only.
+On a host with a tight boot disk, set `DCX_BAZEL_OUTPUT_USER_ROOT` to an
+absolute writable directory on another volume; Bazel output bases, its
+repository cache, `TEST_TMPDIR` and the native SwiftPM scratch then live there.
 
 Record the host, exact revision, command and executed/skipped targets. Cache
 hits and source passes do not establish new remote execution, a signed artifact,

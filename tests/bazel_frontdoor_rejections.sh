@@ -5,7 +5,7 @@ set -euo pipefail
 # Uses host Bash/GNU realpath; it establishes no build, REAPI or device receipt.
 wrapper=${1:-scripts/run_bazelisk.sh}
 wrapper=$(cd "$(dirname "$wrapper")" && pwd -P)/$(basename "$wrapper")
-unset DCX_BAZELISK DCX_REAPI_EXECUTOR DCX_REAPI_CONFIG
+unset DCX_BAZELISK DCX_REAPI_EXECUTOR DCX_REAPI_CONFIG DCX_BAZEL_OUTPUT_USER_ROOT
 
 reject() {
   local expected_status=$1 expected_message=$2 output status
@@ -26,6 +26,13 @@ reject 64 'COMMAND must not begin with -' --batch build //:dcxctl
 reject 64 'COMMAND must not begin with -' --ignore_all_rc_files build //:dcxctl
 reject 78 'DCX_BAZELISK is unavailable' version
 reject 78 'REAPI requires' --reapi test //:remote_eligible
+
+# An output root off the boot disk must be an absolute writable directory.
+export DCX_BAZEL_OUTPUT_USER_ROOT=relative-output-root
+reject 78 'DCX_BAZEL_OUTPUT_USER_ROOT must name' version
+export DCX_BAZEL_OUTPUT_USER_ROOT=/nonexistent/dcx-output-root
+reject 78 'DCX_BAZEL_OUTPUT_USER_ROOT must name' version
+unset DCX_BAZEL_OUTPUT_USER_ROOT
 
 # Every synthetic external input below must refuse before a pinned tool runs.
 export DCX_REAPI_CONFIG="$wrapper" DCX_REAPI_EXECUTOR=https://synthetic.invalid
