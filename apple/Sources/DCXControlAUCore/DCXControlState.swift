@@ -131,6 +131,9 @@ public final class DCXControlState: @unchecked Sendable {
     private var lastTransactionID: String?
     private var rollbackBaseline: SnapshotV1?
     private var deviceStateUncertain = false
+    // Presentation provenance is local to this instance, never persisted in a
+    // Logic document. Ordinary control actions do not advance host recall.
+    private var restorationGeneration: UInt64 = 0
 
     public init() {}
 
@@ -169,10 +172,15 @@ public final class DCXControlState: @unchecked Sendable {
         return projectState
     }
 
-    public func accept(snapshot: SnapshotV1, validSearchResponses: UInt8) throws {
+    public func accept(
+        snapshot: SnapshotV1,
+        validSearchResponses: UInt8,
+        expectedRestorationGeneration: UInt64? = nil
+    ) throws {
         let snapshot = try snapshot.reporting(validSearchResponses: validSearchResponses)
         lock.lock()
         defer { lock.unlock() }
+        try checkReadGenerationLocked(expectedRestorationGeneration)
         guard !recoveryActiveLocked else {
             throw DCXControlStateError.recoveryInProgress
         }
@@ -185,10 +193,14 @@ public final class DCXControlState: @unchecked Sendable {
         deviceStateUncertain = false
     }
 
-    public func accept(diff: SemanticDiffV1) throws {
+    public func accept(
+        diff: SemanticDiffV1,
+        expectedRestorationGeneration: UInt64? = nil
+    ) throws {
         try diff.validate()
         lock.lock()
         defer { lock.unlock() }
+        try checkReadGenerationLocked(expectedRestorationGeneration)
         guard let projectState, let currentSnapshot,
               lastTransactionID == nil, rollbackBaseline == nil,
               diff.changes.count <= 1,
@@ -423,6 +435,7 @@ public final class DCXControlState: @unchecked Sendable {
         lastTransactionID = state.transactionID
         rollbackBaseline = state.rollbackBaseline
         deviceStateUncertain = state.deviceStateUncertain
+        restorationGeneration &+= 1
     }
 
     public func view() -> DCXControlStateView {
@@ -434,12 +447,19 @@ public final class DCXControlState: @unchecked Sendable {
             diff: currentDiff,
             transactionID: lastTransactionID,
             rollbackBaseline: rollbackBaseline,
-            deviceStateUncertain: deviceStateUncertain
+            deviceStateUncertain: deviceStateUncertain,
+            restorationGeneration: restorationGeneration
         )
     }
 
     private var recoveryActiveLocked: Bool {
         lastTransactionID != nil || rollbackBaseline != nil || deviceStateUncertain
+    }
+
+    private func checkReadGenerationLocked(_ expected: UInt64?) throws {
+        if let expected, expected != restorationGeneration {
+            throw DCXControlStateError.supersededReadResponse
+        }
     }
 }
 
@@ -450,30 +470,63 @@ public struct DCXControlStateView: Sendable {
     public let transactionID: String?
     public let rollbackBaseline: SnapshotV1?
     public let deviceStateUncertain: Bool
+    public let restorationGeneration: UInt64
 
     public var recoveryActive: Bool {
         transactionID != nil || rollbackBaseline != nil || deviceStateUncertain
     }
 }
 
-public enum DCXControlPresentation {
+public struct DCXControlPresentation {
     public static let unstagedStatus = "No desired profile is staged; helper contact requires an explicit action."
     public static let restoredStatus = "Desired profile restored from Logic project state; no device call occurred."
+    public static let restoredRecoveryStatus = "Recovery state restored from Logic project state; reconcile it explicitly before staging or applying. No device call occurred."
+    private var observedRestorationGeneration: UInt64 = 0
 
-    /// Replace only the untouched launch summary after host restoration so an
-    /// explicit helper or device result remains visible across state refreshes.
-    public static func statusAfterStateRefresh(
+    public init() {}
+
+    /// Record a new explicit result against the current recall generation so
+    /// a delayed host notification cannot erase it as an old-document result.
+    public mutating func statusAfterExplicitResult(
+        _ message: String,
+        state: DCXControlStateView
+    ) -> String {
+        observedRestorationGeneration = state.restorationGeneration
+        return message
+    }
+
+    /// Read preparation results belong to the document that requested them,
+    /// even if restoration raced with their already accepted model update.
+    public mutating func statusAfterReadResult(
+        _ message: String,
+        requestRestorationGeneration: UInt64,
+        state: DCXControlStateView
+    ) -> String {
+        guard requestRestorationGeneration == state.restorationGeneration else {
+            return statusAfterStateRefresh(Self.unstagedStatus, state: state)
+        }
+        return statusAfterExplicitResult(message, state: state)
+    }
+
+    /// A host recall invalidates operation summaries from the previous document,
+    /// even when its persisted contents are identical. Ordinary refreshes keep
+    /// the latest explicit result. This path performs no helper or device work.
+    public mutating func statusAfterStateRefresh(
         _ currentStatus: String,
         state: DCXControlStateView
     ) -> String {
-        guard state.projectState != nil, currentStatus == unstagedStatus else {
+        let restored = state.restorationGeneration != observedRestorationGeneration
+        observedRestorationGeneration = state.restorationGeneration
+        guard restored || (state.projectState != nil && currentStatus == Self.unstagedStatus) else {
             return currentStatus
         }
-        return restoredStatus
+        guard state.projectState != nil else { return Self.unstagedStatus }
+        return state.recoveryActive ? Self.restoredRecoveryStatus : Self.restoredStatus
     }
 }
 
 public enum DCXControlStateError: Error, Equatable, Sendable {
+    case supersededReadResponse
     case unsupportedSchema
     case invalidProjectBinding
     case invalidSnapshotBinding

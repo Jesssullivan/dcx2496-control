@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 public final class DCXControlViewController: AUViewController, AUAudioUnitFactory {
     private var dcxAudioUnit: DCXControlAudioUnit?
     private var stateObservation: NSKeyValueObservation?
+    private var presentation = DCXControlPresentation()
     private let statusLabel = NSTextField(labelWithString: DCXControlPresentation.unstagedStatus)
     private let identityLabel = NSTextField(labelWithString: "Device: not identified")
     private let currentLabel = NSTextField(labelWithString: "Current: not captured")
@@ -24,6 +25,11 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     private var actionButtons: [NSButton] = []
     private var capabilityButtons: [BridgeOperation: NSButton] = [:]
     private var localActionButtons: [NSButton] = []
+
+    private struct ReadResponseContext {
+        let audioUnit: DCXControlAudioUnit
+        let restorationGeneration: UInt64
+    }
 
     public override func loadView() {
         // Logic's remote ViewBridge initially asks the extension for a view at
@@ -118,6 +124,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     ) throws -> AUAudioUnit {
         let audioUnit = try DCXControlAudioUnit(componentDescription: componentDescription)
         dcxAudioUnit = audioUnit
+        presentation = DCXControlPresentation()
         stateObservation?.invalidate()
         stateObservation = audioUnit.observe(\.allParameterValues, options: [.initial, .new]) {
             [weak self, weak audioUnit] observed, _ in
@@ -176,21 +183,21 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             }
             refreshLabels()
             if status.recoveryUnavailable {
-                statusLabel.stringValue = "Helper recovery authority is temporarily unavailable; no device operation is authorized"
+                report("Helper recovery authority is temporarily unavailable; no device operation is authorized")
             } else if let recovery = status.recovery {
-                statusLabel.stringValue = status.foreground
+                report(status.foreground
                     ? "Helper reachable; mutation recovery \(recovery.transactionID) is pinned"
-                    : "Helper is not foreground; mutation recovery remains pinned"
+                    : "Helper is not foreground; mutation recovery remains pinned")
             } else if acceptedCompletion {
-                statusLabel.stringValue = "Helper terminal proof matched the local transaction; exact baseline recovery is complete"
+                report("Helper terminal proof matched the local transaction; exact baseline recovery is complete")
             } else if rejectedCompletion {
-                statusLabel.stringValue = "Helper terminal proof does not match the local recovery transaction"
+                report("Helper terminal proof does not match the local recovery transaction")
             } else if let completion = status.completion {
-                statusLabel.stringValue = "Helper retained exact-baseline completion \(completion.transactionID)"
+                report("Helper retained exact-baseline completion \(completion.transactionID)")
             } else {
-                statusLabel.stringValue = status.foreground
+                report(status.foreground
                     ? "Helper reachable; \(status.capabilities.count) capability entries"
-                    : "Helper is not foreground"
+                    : "Helper is not foreground")
             }
         }
     }
@@ -265,61 +272,76 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @objc private func captureSnapshot() {
-        let state = dcxAudioUnit?.controlState.view()
-        guard let target = state?.projectState?.target ?? configuredTarget else {
+        guard let audioUnit = dcxAudioUnit else { return }
+        let state = audioUnit.controlState.view()
+        let context = ReadResponseContext(
+            audioUnit: audioUnit, restorationGeneration: state.restorationGeneration
+        )
+        guard let target = state.projectState?.target ?? configuredTarget else {
             report("Request Helper Status before capturing the configured DCX target")
             return
         }
-        send(.snapshotCapture(.init(target: target))) { [weak self] body in
+        send(.snapshotCapture(.init(target: target)), readContext: context) { [weak self] body in
             guard let self, case let .snapshotCapture(result) = body else { return }
             do {
-                if let project = dcxAudioUnit?.controlState.view().projectState {
+                if let project = audioUnit.controlState.view().projectState {
                     guard project.target == target else {
-                        report("Staged target changed while snapshot capture was in progress")
+                        report("Staged target changed while snapshot capture was in progress", for: context)
                         return
                     }
-                    try dcxAudioUnit?.performControlStateMutation {
+                    try audioUnit.performControlStateMutation {
                         try $0.accept(
                             snapshot: result.snapshot,
-                            validSearchResponses: 10
+                            validSearchResponses: 10,
+                            expectedRestorationGeneration: context.restorationGeneration
                         )
                     }
-                    report("Complete snapshot captured and bound to the staged profile")
+                    report("Complete snapshot captured and bound to the staged profile", for: context)
                     refreshLabels()
                 } else {
                     guard configuredTarget == target else {
-                        report("Helper target changed while snapshot capture was in progress")
+                        report("Helper target changed while snapshot capture was in progress", for: context)
                         return
                     }
                     currentLabel.stringValue = "Current: \(result.snapshot.digest) (read-only; not stored in project state)"
-                    report("Complete read-only snapshot captured; stage a profile before previewing a diff")
+                    report("Complete read-only snapshot captured; stage a profile before previewing a diff", for: context)
                 }
                 let identity = result.snapshot.identity
                 identityLabel.stringValue = "Device: \(identity.manufacturer) \(identity.model) · address \(identity.deviceAddress) · \(identity.selectedBaud) baud · \(identity.validSearchResponses) responses"
+            } catch DCXControlStateError.supersededReadResponse {
+                refreshLabels()
             } catch {
-                report("Snapshot no longer matches the staged project target")
+                report("Snapshot no longer matches the staged project target", for: context)
             }
         }
     }
 
     @objc private func previewDiff() {
-        guard let state = dcxAudioUnit?.controlState.view(),
-              let project = state.projectState,
+        guard let audioUnit = dcxAudioUnit else { return }
+        let state = audioUnit.controlState.view()
+        let context = ReadResponseContext(
+            audioUnit: audioUnit, restorationGeneration: state.restorationGeneration
+        )
+        guard let project = state.projectState,
               let baseline = state.currentSnapshot else {
             report("A staged desired state and complete snapshot are required")
             return
         }
-        send(.diffPreview(.init(target: project.target, baseline: baseline, desired: project.desired))) {
+        send(.diffPreview(.init(target: project.target, baseline: baseline, desired: project.desired)),
+             readContext: context) {
             [weak self] body in
             guard case let .diffPreview(result) = body else { return }
             do {
-                try self?.dcxAudioUnit?.performControlStateMutation {
-                    try $0.accept(diff: result.diff)
+                try audioUnit.performControlStateMutation {
+                    try $0.accept(diff: result.diff,
+                                  expectedRestorationGeneration: context.restorationGeneration)
                 }
-                self?.report("Semantic diff previewed")
+                self?.report("Semantic diff previewed", for: context)
+                self?.refreshLabels()
+            } catch DCXControlStateError.supersededReadResponse {
                 self?.refreshLabels()
             } catch {
-                self?.report("Diff no longer matches the staged profile and snapshot")
+                self?.report("Diff no longer matches the staged profile and snapshot", for: context)
             }
         }
     }
@@ -536,6 +558,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         // This callback is for a dispatched request's typed helper rejection.
         // Local preflight failure cannot clear an earlier recovery attempt.
         onError: (@MainActor (BridgeErrorPayload) -> Void)? = nil,
+        readContext: ReadResponseContext? = nil,
         accept: @escaping @MainActor (BridgeResponseBody) -> Void
     ) {
         guard isOperationAvailable(body.operation) else {
@@ -544,7 +567,11 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 message: "\(body.operation.rawValue) is not available from the foreground helper",
                 retryable: false
             )
-            report(error.message)
+            if let readContext {
+                report(error.message, for: readContext)
+            } else {
+                report(error.message)
+            }
             return
         }
         guard !bridgeRequestInFlight else {
@@ -553,7 +580,15 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 message: "One bounded helper request is already in progress",
                 retryable: true
             )
-            report(error.message)
+            if let readContext {
+                report(error.message, for: readContext)
+            } else {
+                report(error.message)
+            }
+            return
+        }
+        if let readContext, !isCurrent(readContext) {
+            refreshLabels()
             return
         }
         let request: BridgeRequest
@@ -568,7 +603,11 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 message: "The bounded helper request could not be prepared",
                 retryable: true
             )
-            report(error.message)
+            if let readContext {
+                report(error.message, for: readContext)
+            } else {
+                report(error.message)
+            }
             return
         }
         if case let .apply(apply) = body {
@@ -594,33 +633,55 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         }
         bridgeRequestInFlight = true
         actionButtons.forEach { $0.isEnabled = false }
-        report("Request in progress")
+        if let readContext {
+            report("Request in progress", for: readContext)
+        } else {
+            report("Request in progress")
+        }
         workQueue.async { [weak self] in
             do {
                 let response = try client.exchange(request)
                 DispatchQueue.main.async {
                     self?.completeBridgeRequest()
+                    if response.error?.code == .helperNotForeground
+                        || response.error?.code == .mutationNotAdmitted {
+                        self?.invalidateVolatileHelperState()
+                    }
+                    // Only Snapshot/Preview carry this context. Mutation replies
+                    // still reconcile their conservatively retained recovery.
+                    if let readContext, self?.isCurrent(readContext) != true {
+                        self?.refreshLabels()
+                        return
+                    }
                     if let error = response.error {
-                        if error.code == .helperNotForeground
-                            || error.code == .mutationNotAdmitted {
-                            self?.invalidateVolatileHelperState()
-                        }
                         if let onError {
                             onError(error)
                         } else {
-                            self?.report(error.message)
+                            if let readContext {
+                                self?.report(error.message, for: readContext)
+                            } else {
+                                self?.report(error.message)
+                            }
                         }
                     } else if let body = response.body {
                         accept(body)
                     } else {
-                        self?.report("Helper returned an empty response")
+                        if let readContext {
+                            self?.report("Helper returned an empty response", for: readContext)
+                        } else {
+                            self?.report("Helper returned an empty response")
+                        }
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
                     self?.completeBridgeRequest()
                     self?.invalidateVolatileHelperState()
-                    self?.report("Foreground helper is unavailable")
+                    if let readContext {
+                        self?.report("Foreground helper is unavailable", for: readContext)
+                    } else {
+                        self?.report("Foreground helper is unavailable")
+                    }
                 }
             }
         }
@@ -714,8 +775,31 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     }
 
     @MainActor
+    private func isCurrent(_ context: ReadResponseContext) -> Bool {
+        dcxAudioUnit === context.audioUnit
+            && context.audioUnit.controlState.view().restorationGeneration == context.restorationGeneration
+    }
+
+    @MainActor
+    private func report(_ message: String, for context: ReadResponseContext) {
+        guard dcxAudioUnit === context.audioUnit else {
+            refreshLabels()
+            return
+        }
+        statusLabel.stringValue = presentation.statusAfterReadResult(
+            message,
+            requestRestorationGeneration: context.restorationGeneration,
+            state: context.audioUnit.controlState.view()
+        )
+    }
+
+    @MainActor
     private func report(_ message: String) {
-        statusLabel.stringValue = message
+        guard let state = dcxAudioUnit?.controlState.view() else {
+            statusLabel.stringValue = message
+            return
+        }
+        statusLabel.stringValue = presentation.statusAfterExplicitResult(message, state: state)
     }
 
     @MainActor
@@ -724,7 +808,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             refreshActionAvailability()
             return
         }
-        statusLabel.stringValue = DCXControlPresentation.statusAfterStateRefresh(
+        statusLabel.stringValue = presentation.statusAfterStateRefresh(
             statusLabel.stringValue,
             state: state
         )

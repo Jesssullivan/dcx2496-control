@@ -21,6 +21,20 @@ shift
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 startup=(--nosystem_rc --nohome_rc --noworkspace_rc "--bazelrc=$repo_root/.bazelrc")
+# Bazel's default output root lives on the boot disk (/private/var/tmp), and the
+# native Apple tests put SwiftPM scratch under TEST_TMPDIR inside it. On a host
+# whose boot disk is near full, that write pressure ended the 2026-10-06 PZM
+# //apple:logic_recall run. An operator may move the whole output root (output
+# bases, repository cache, TEST_TMPDIR, SwiftPM scratch) onto another volume.
+if [[ -n "${DCX_BAZEL_OUTPUT_USER_ROOT:-}" ]]; then
+  if [[ "$DCX_BAZEL_OUTPUT_USER_ROOT" != /* ||
+    "$DCX_BAZEL_OUTPUT_USER_ROOT" == *[[:space:]]* ||
+    ! -d "$DCX_BAZEL_OUTPUT_USER_ROOT" || ! -w "$DCX_BAZEL_OUTPUT_USER_ROOT" ]]; then
+    printf 'DCX_BAZEL_OUTPUT_USER_ROOT must name an absolute writable directory without spaces\n' >&2
+    exit 78
+  fi
+  startup+=("--output_user_root=$DCX_BAZEL_OUTPUT_USER_ROOT")
+fi
 execution=()
 if [[ "$lane" == reapi ]]; then
   case "$command" in

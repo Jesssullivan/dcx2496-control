@@ -140,7 +140,7 @@ public final class DCXControlAudioUnit: AUAudioUnit {
                           from: data
                       ),
                       (try? controlState.restore(persisted)) != nil else {
-                    try? controlState.reset()
+                    restoreDesiredOnlyState(nil)
                     return
                 }
                 return
@@ -151,11 +151,19 @@ public final class DCXControlAudioUnit: AUAudioUnit {
             if let encoded = newValue?[Self.legacyProjectStateKey] as? String,
                let data = Data(base64Encoded: encoded),
                let staged = try? BridgeJSONCodec.decoder().decode(StagedProjectStateV1.self, from: data),
-               (try? controlState.stage(staged)) != nil {
+               restoreDesiredOnlyState(staged) {
                 return
             }
-            try? controlState.reset()
+            restoreDesiredOnlyState(nil)
         }
+    }
+
+    @discardableResult
+    private func restoreDesiredOnlyState(_ staged: StagedProjectStateV1?) -> Bool {
+        (try? controlState.restore(.init(
+            projectState: staged, currentSnapshot: nil, diff: nil,
+            transactionID: nil, rollbackBaseline: nil, deviceStateUncertain: false
+        ))) != nil
     }
 
     /// Apply one typed state transition and tell the host that the custom AU
