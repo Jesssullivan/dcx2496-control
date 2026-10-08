@@ -4,6 +4,7 @@
 //! clock I/O. Callers must supply bytes, profiles, timestamps, and entropy.
 
 pub mod discovery;
+pub mod practice_inspect;
 pub mod profile;
 pub mod protocol;
 pub mod rew;

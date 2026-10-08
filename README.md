@@ -54,6 +54,15 @@ dcxctl control snapshot \
   --expected-device 0 > snapshot.json
 ```
 
+An optional, **unverified** offline diagnostic inspects selected candidate
+practice-route bytes in that saved snapshot. It cannot establish Auto Align or
++15 V state and is not an output safety gate. See
+[`docs/practice-route-diagnostic.md`](docs/practice-route-diagnostic.md).
+
+```sh
+dcxctl diagnostics practice-route --snapshot snapshot.json
+```
+
 If an earlier interrupted session left the device transmitting unsolicited
 direct-parameter traffic, recovery is a separate explicit state write. It
 discards input without parsing it, writes exactly one typed ReceiveDirect

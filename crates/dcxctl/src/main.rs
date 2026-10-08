@@ -60,6 +60,21 @@ enum Command {
         #[command(subcommand)]
         command: ControlCommand,
     },
+    /// Offline, unverified interpretation of selected raw dump bytes.
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnosticsCommand {
+    /// Inspect a saved validated snapshot; never opens a serial port.
+    PracticeRoute {
+        /// Complete raw SnapshotV1 from a prior control snapshot.
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -254,8 +269,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Profile { command } => profile(command)?,
         Command::Rew { command } => rew(command)?,
         Command::Control { command } => control(command)?,
+        Command::Diagnostics { command } => diagnostics(command)?,
     }
     Ok(())
+}
+
+fn diagnostics(command: DiagnosticsCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        DiagnosticsCommand::PracticeRoute { snapshot } => {
+            let bytes = read_bounded(
+                &snapshot,
+                dcx_core::snapshot::MAX_SNAPSHOT_JSON_BYTES,
+                "snapshot",
+            )?;
+            let snapshot = dcx_core::SnapshotV1::from_json(&bytes)?;
+            let report = dcx_core::practice_inspect::inspect_practice_route(&snapshot)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+    }
 }
 
 fn control(command: ControlCommand) -> Result<(), Box<dyn Error>> {
