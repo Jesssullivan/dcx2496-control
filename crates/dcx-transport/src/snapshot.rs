@@ -1582,6 +1582,78 @@ mod tests {
     }
 
     #[test]
+    fn o4_notch_plan_applies_reads_back_and_rolls_back_in_reverse_order() {
+        use dcx_core::feedback::{FeedbackMeasurementV1, NotchPolicyV1, plan_notches};
+
+        // Offline rehearsal of the static feedback-suppression write: a
+        // synthetic two-peak ring-out list becomes two O4 notches, one typed
+        // frame writes band fields then count then enable, the exact desired
+        // readback verifies, and the bound rollback writes the reverse order.
+        let baseline = snapshot(0, 0, 0);
+        let measurement = FeedbackMeasurementV1::from_frequency_list("630,4\n2500,9\n", 4).unwrap();
+        let plan = plan_notches(&measurement, &baseline, NotchPolicyV1::default(), None).unwrap();
+        let wanted = plan.direct_actions().unwrap();
+        let observed = baseline.inverse_actions_for(&wanted).unwrap();
+        let changed: Vec<_> = wanted
+            .iter()
+            .zip(&observed)
+            .filter(|(want, have)| want.value() != have.value())
+            .map(|(want, _)| *want)
+            .collect();
+        let mut transaction =
+            ApplyTransactionV1::stage_projected(baseline.clone(), changed.clone()).unwrap();
+        let desired = transaction.apply_plan().desired().clone();
+
+        let mut apply_steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        apply_steps.extend(snapshot_steps(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(apply_steps);
+        assert!(matches!(
+            execute_apply_readback(session, &mut FakePacer::default(), &mut transaction).unwrap(),
+            ApplyReadbackOutcome::Verified(_)
+        ));
+        assert_eq!(transaction.state(), ApplyTransactionState::Verified);
+        assert_eq!(log.borrow().writes.len(), 1);
+        let written = log.borrow().writes[0].actions().to_vec();
+        assert_eq!(written, changed);
+        let tail: Vec<_> = written[written.len() - 2..]
+            .iter()
+            .map(|action| (action.channel(), action.parameter(), action.value()))
+            .collect();
+        assert_eq!(tail, [(8, 0x07, 2), (8, 0x06, 1)]);
+
+        let mut rollback_transaction =
+            ApplyTransactionV1::resume_rollback(transaction.rollback_plan()).unwrap();
+        let mut rollback_steps = vec![Step::Read(
+            SnapshotRead::complete(baseline.frame(SnapshotSection::Identity)).unwrap(),
+        )];
+        rollback_steps.extend(snapshot_steps(&baseline, READBACK_SEARCH_COUNT));
+        let (session, rollback_log) = FakeSession::new(rollback_steps);
+        assert!(matches!(
+            execute_rollback_readback(
+                session,
+                &mut FakePacer::default(),
+                &mut rollback_transaction
+            )
+            .unwrap(),
+            RollbackReadbackOutcome::RolledBack(_)
+        ));
+        let mut reversed = changed;
+        reversed.reverse();
+        let restored: Vec<_> = rollback_log.borrow().writes[0]
+            .actions()
+            .iter()
+            .map(|action| (action.channel(), action.parameter()))
+            .collect();
+        assert_eq!(
+            restored,
+            reversed
+                .iter()
+                .map(|action| (action.channel(), action.parameter()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn mutation_failure_requires_rollback_and_verified_finish() {
         let baseline = snapshot(0, 0, 0);
         let apply = DirectParameterAction::new(5, 0x3c, 40).unwrap();

@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:public"])
 rust_binary(
     name = "dcxctl",
     srcs = [
+        "src/feedback_cli.rs",
         "src/live_control.rs",
         "src/main.rs",
     ],

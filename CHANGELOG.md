@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add static feedback suppression for O4: `dcxctl feedback import|inspect|
+  plan|desired-profile`, digest-bound ring-out/REW measurements, and a pure
+  notch planner that writes only cut-only bells above the operator's bands.
+- Generalize the reviewed writer to PEQ on/off, band count, and all nine PEQ
+  bands of every output from the transcribed DuinoDCX layout, with domain
+  checks, cut-only apply admission, reverse-order rollback, and the Dump1
+  trailer balance as a named hypothesis. Add `dcx.desired-profile/v2`.
 - Report Identity Search qualification counts from its exact Rust error format.
 - Preserve snapshot failure stage and explicit cleanup failure through one
   transaction `Capture(...)` envelope, retaining bounded inspection and unknown
