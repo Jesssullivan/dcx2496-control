@@ -23,6 +23,7 @@ pub use rew::{
 };
 pub use snapshot::{
     ApplyPlanError, ApplyPlanV1, ApplyTransactionError, ApplyTransactionState, ApplyTransactionV1,
-    PlanCarrierError, ReadbackVerificationV1, RollbackPlanV1, SnapshotDiffError, SnapshotDiffV1,
-    SnapshotError, SnapshotProjectionError, SnapshotSection, SnapshotSectionChange, SnapshotV1,
+    ByteChangeV1, PlanCarrierError, ReadbackVerificationV1, RollbackPlanV1, SnapshotDiffError,
+    SnapshotDiffV1, SnapshotError, SnapshotProjectionError, SnapshotSection, SnapshotSectionChange,
+    SnapshotV1,
 };

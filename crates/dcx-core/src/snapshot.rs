@@ -23,7 +23,9 @@ use thiserror::Error;
 
 use crate::{
     layout::{
-        OutputField, PACKED_PAYLOAD_START, ReviewedAddress, UNITY_GAIN_CODE, reviewed_address,
+        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, OUTPUT_COUNT, OutputField,
+        PACKED_PAYLOAD_START, PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE, band_parameter,
+        output_channel, reviewed_address,
     },
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DirectParameterAction,
@@ -801,6 +803,20 @@ pub enum SnapshotProjectionError {
     Snapshot(#[from] SnapshotError),
 }
 
+/// One frame byte that changed outside an apply plan's projected offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ByteChangeV1 {
+    /// Snapshot component holding the byte.
+    pub section: SnapshotSection,
+    /// Frame offset, header included.
+    pub offset: usize,
+    /// Baseline byte.
+    pub before: u8,
+    /// Readback byte.
+    pub after: u8,
+}
+
 /// Closed, bounded apply plan bound to exact observed and desired snapshots.
 ///
 /// Actions are explicit opaque wire-level tuples, not inferred semantic
@@ -825,10 +841,19 @@ impl ApplyPlanV1 {
     /// The caller must supply actions from a separately evidenced semantic
     /// mapping. Empty actions are accepted only for exact snapshot equality.
     ///
+    /// A plan may never make a PEQ band active (bands 1 through the band
+    /// count while PEQ is on) when that band holds a boost (gain code above
+    /// 150) and was inactive in the baseline: turning PEQ on or raising the
+    /// band count would otherwise apply a stored boost without writing one.
+    /// No caller policy (including `--allow-enable-operator-bands`) relaxes
+    /// this, because every v1/v2 diff and every durable apply carrier is
+    /// bound here.
+    ///
     /// # Errors
     ///
     /// Rejects another device, identity changes, missing or surplus actions,
-    /// and any invalid direct-parameter command.
+    /// any invalid direct-parameter command, any boost write, and any newly
+    /// active band holding a stored boost.
     pub fn new(
         baseline: &SnapshotV1,
         desired: &SnapshotV1,
@@ -864,6 +889,7 @@ impl ApplyPlanV1 {
             }
             Some(command)
         };
+        require_no_stored_boost_activation(baseline, desired)?;
         let plan_digest = plan_digest(
             APPLY_PLAN_DOMAIN,
             diff.device_id,
@@ -923,6 +949,82 @@ impl ApplyPlanV1 {
     /// Canonical digest binding snapshots and ordered typed actions.
     pub fn digest(&self) -> &str {
         &self.plan_digest
+    }
+
+    /// Every frame byte this plan may change on the device.
+    ///
+    /// That is each byte of every projected location (low byte, 7-of-8
+    /// carrier, and high byte) plus the trailer byte of each dump part a
+    /// projected location lies in. Identity bytes are never included. A no-op
+    /// plan may change nothing.
+    pub fn projected_offsets(&self) -> std::collections::BTreeSet<(SnapshotSection, usize)> {
+        let mut offsets = std::collections::BTreeSet::new();
+        let Some(command) = &self.command else {
+            return offsets;
+        };
+        for action in command.actions() {
+            // Every bound action passed the reviewed projection in `new`.
+            let Some(address) = reviewed_address(action.channel(), action.parameter()) else {
+                continue;
+            };
+            let section = match address.location.part() {
+                DumpPart::Part0 => SnapshotSection::Dump0,
+                DumpPart::Part1 => SnapshotSection::Dump1,
+            };
+            offsets.extend(
+                address
+                    .location
+                    .offsets()
+                    .into_iter()
+                    .map(|offset| (section, offset)),
+            );
+            offsets.insert((section, self.baseline.frame(section).len() - 2));
+        }
+        offsets
+    }
+
+    /// Bytes that differ between the bound baseline and a complete readback
+    /// outside [`Self::projected_offsets`].
+    ///
+    /// An empty result means every observed change stayed inside the plan's
+    /// projected addresses and the touched dump trailers. It does not mean
+    /// the readback equals the desired state; that is exact readback
+    /// verification's job.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a readback from another device.
+    pub fn uncontained_changes(
+        &self,
+        readback: &SnapshotV1,
+    ) -> Result<Vec<ByteChangeV1>, SnapshotDiffError> {
+        if readback.device() != self.device_id {
+            return Err(SnapshotDiffError::DeviceMismatch {
+                observed: self.device_id.get(),
+                desired: readback.device().get(),
+            });
+        }
+        let allowed = self.projected_offsets();
+        let mut changes = Vec::new();
+        for section in [
+            SnapshotSection::Identity,
+            SnapshotSection::Dump0,
+            SnapshotSection::Dump1,
+        ] {
+            let before = self.baseline.frame(section);
+            let after = readback.frame(section);
+            for (offset, (&before, &after)) in before.iter().zip(after).enumerate() {
+                if before != after && !allowed.contains(&(section, offset)) {
+                    changes.push(ByteChangeV1 {
+                        section,
+                        offset,
+                        before,
+                        after,
+                    });
+                }
+            }
+        }
+        Ok(changes)
     }
 
     /// Serialize the strict durable apply carrier.
@@ -1037,6 +1139,54 @@ fn require_cut_only(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanEr
     Ok(())
 }
 
+/// Refuse a desired snapshot that newly activates a band holding a boost.
+///
+/// The active PEQ bands of an output form the prefix 1 through the band count
+/// while PEQ is on (any non-zero on/off value counts as on, the conservative
+/// reading). Only outputs whose active prefix grows are inspected, and only
+/// their on/off, count, and newly active gain fields are read, so unrelated
+/// opaque output state cannot block an unrelated plan.
+fn require_no_stored_boost_activation(
+    baseline: &SnapshotV1,
+    desired: &SnapshotV1,
+) -> Result<(), ApplyPlanError> {
+    for output in 1..=OUTPUT_COUNT {
+        let before = active_band_count(baseline, output)?;
+        let after = active_band_count(desired, output)?;
+        for band in before.saturating_add(1)..=after {
+            let gain_code =
+                read_output_field(desired, output, band_parameter(band, BandField::Gain))?;
+            if gain_code > UNITY_GAIN_CODE {
+                return Err(ApplyPlanError::StoredBoostActivation {
+                    output,
+                    band,
+                    gain_code,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn active_band_count(snapshot: &SnapshotV1, output: u8) -> Result<u8, ApplyPlanError> {
+    if read_output_field(snapshot, output, EQ_ENABLED_PARAMETER)? == 0 {
+        return Ok(0);
+    }
+    let count = read_output_field(snapshot, output, EQ_COUNT_PARAMETER)?;
+    Ok(u8::try_from(count.min(u16::from(PEQ_BANDS))).unwrap_or(PEQ_BANDS))
+}
+
+fn read_output_field(
+    snapshot: &SnapshotV1,
+    output: u8,
+    parameter: u8,
+) -> Result<u16, ApplyPlanError> {
+    let channel = output_channel(output);
+    let address = reviewed_address(channel, parameter)
+        .ok_or(SnapshotProjectionError::UnmappedAction { channel, parameter })?;
+    Ok(snapshot.read_reviewed(address))
+}
+
 fn snapshot_from_value(value: &serde_json::Value) -> Result<SnapshotV1, PlanCarrierError> {
     Ok(SnapshotV1::from_json(&serde_json::to_vec(value)?)?)
 }
@@ -1108,6 +1258,18 @@ pub enum ApplyPlanError {
         channel: u8,
         parameter: u8,
         value: u16,
+    },
+    /// The desired state would activate a band that holds a stored boost.
+    #[error(
+        "O{output} band {band} holds stored boost gain code {gain_code} and would become active; apply is cut-only"
+    )]
+    StoredBoostActivation {
+        /// Physical output, 1 through 6.
+        output: u8,
+        /// Band that would become active.
+        band: u8,
+        /// Stored gain code above unity (150).
+        gain_code: u16,
     },
     /// Explicit typed actions did not project to the exact desired snapshot.
     #[error("typed action projection {projected} did not match desired snapshot {desired}")]

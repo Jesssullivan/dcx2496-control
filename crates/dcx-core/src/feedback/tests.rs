@@ -607,3 +607,346 @@ fn boosts_are_refused_at_apply_admission_even_when_projectable() {
         ))
     ));
 }
+
+/// A blank (all-cut, PEQ off) snapshot with one O4 bank overridden.
+fn o4_snapshot(enabled: bool, count: u8, gains: &[(u8, u16)]) -> SnapshotV1 {
+    let mut dump0 = blank_dump(0);
+    let mut dump1 = blank_dump(1);
+    write(&mut dump0, &mut dump1, 4, 0x06, u16::from(enabled));
+    write(&mut dump0, &mut dump1, 4, 0x07, u16::from(count));
+    for &(band, gain) in gains {
+        write(
+            &mut dump0,
+            &mut dump1,
+            4,
+            band_parameter(band, BandField::Gain),
+            gain,
+        );
+    }
+    SnapshotV1::from_frames(&identity(), &dump0, &dump1).unwrap()
+}
+
+fn o4_action(parameter: u8, value: u16) -> DirectParameterAction {
+    DirectParameterAction::new(8, parameter, value).unwrap()
+}
+
+fn stored_boost_refusal(
+    result: Result<ApplyTransactionV1, crate::ApplyTransactionError>,
+) -> Option<(u8, u8, u16)> {
+    match result {
+        Err(crate::ApplyTransactionError::Plan(crate::ApplyPlanError::StoredBoostActivation {
+            output,
+            band,
+            gain_code,
+        })) => Some((output, band, gain_code)),
+        Ok(_) => None,
+        Err(error) => panic!("unexpected staging error: {error}"),
+    }
+}
+
+#[test]
+fn enable_peq_over_stored_boost_is_refused() {
+    // PEQ off, two operator bands, band 2 stores +5 dB.
+    let baseline = o4_snapshot(false, 2, &[(1, 120), (2, 200)]);
+    let enable = o4_action(0x06, 1);
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline.clone(),
+            vec![enable]
+        )),
+        Some((4, 2, 200))
+    );
+    // The same refusal reaches a v2 desired profile bound through `control diff`.
+    let profile = DesiredPeqBankProfileV2::new(
+        "o4-enable".into(),
+        "r1".into(),
+        PeqBankDocumentV2 {
+            target_output: 4,
+            parameter_channel: 8,
+            actions: vec![enable],
+        },
+    )
+    .unwrap();
+    let changed = changed_actions(&baseline, &profile.document().actions);
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline.clone(),
+            changed
+        )),
+        Some((4, 2, 200))
+    );
+    // Writing a cut over the stored boost in the same plan is admitted.
+    let cut_then_enable = vec![o4_action(band_parameter(2, BandField::Gain), 140), enable];
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline.clone(),
+            cut_then_enable
+        )),
+        None
+    );
+    // Unity gain is not a boost.
+    let unity = o4_snapshot(false, 2, &[(1, 120), (2, 150)]);
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(unity, vec![enable])),
+        None
+    );
+    // The planner refuses it even with --allow-enable-operator-bands.
+    let measurement = FeedbackMeasurementV1::from_frequency_list("2500\n", 4).unwrap();
+    let permissive = NotchPolicyV1 {
+        allow_enable_operator_bands: true,
+        ..NotchPolicyV1::default()
+    };
+    assert!(matches!(
+        plan_notches(&measurement, &baseline, permissive, None),
+        Err(FeedbackPlanError::WouldEnableStoredBoost {
+            band: 2,
+            gain_code: 200
+        })
+    ));
+    // Operator cuts only: the flag admits the plan and it stages.
+    let cuts = o4_snapshot(false, 2, &[(1, 120), (2, 100)]);
+    let plan = plan_notches(&measurement, &cuts, permissive, None).unwrap();
+    let changed = changed_actions(&cuts, &plan.direct_actions().unwrap());
+    ApplyTransactionV1::stage_projected(cuts, changed).unwrap();
+}
+
+#[test]
+fn raise_band_count_over_stored_boost_is_refused() {
+    // PEQ on, one active band; band 2 stores +0.1 dB (code 151).
+    let baseline = o4_snapshot(true, 1, &[(1, 120), (2, 151)]);
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline.clone(),
+            vec![o4_action(0x07, 2)]
+        )),
+        Some((4, 2, 151))
+    );
+    // Raising past it is refused at the first boosted band.
+    let deep = o4_snapshot(true, 1, &[(2, 100), (3, 300)]);
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            deep,
+            vec![o4_action(0x07, 5)]
+        )),
+        Some((4, 3, 300))
+    );
+    // An already active stored boost is not newly activated: raising the
+    // count over a cut band is admitted, and so is lowering the count.
+    let active = o4_snapshot(true, 1, &[(1, 250), (2, 100)]);
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            active.clone(),
+            vec![o4_action(0x07, 2)]
+        )),
+        None
+    );
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline,
+            vec![o4_action(0x07, 0)]
+        )),
+        None
+    );
+    // Turning PEQ off and back on in separate plans: re-enabling is refused.
+    let off = o4_snapshot(false, 1, &[(1, 250)]);
+    assert_eq!(
+        stored_boost_refusal(ApplyTransactionV1::stage_projected(
+            off,
+            vec![o4_action(0x06, 1)]
+        )),
+        Some((4, 1, 250))
+    );
+    // An admitted carrier revalidates through the same check.
+    let plan = ApplyTransactionV1::stage_projected(active, vec![o4_action(0x07, 2)])
+        .unwrap()
+        .apply_plan()
+        .clone();
+    assert!(crate::ApplyPlanV1::from_json(&plan.to_json().unwrap()).is_ok());
+}
+
+/// Independent oracle: the first band that becomes active and holds a boost.
+fn newly_active_boost(baseline: &SnapshotV1, desired: &SnapshotV1) -> Option<(u8, u8, u16)> {
+    for output in 1..=OUTPUT_COUNT {
+        let before = decode_peq_bank(baseline, output).unwrap();
+        let after = decode_peq_bank(desired, output).unwrap();
+        for state in &after.bands {
+            let was_active = before.eq_enabled && state.band <= before.eq_count;
+            let is_active = after.eq_enabled && state.band <= after.eq_count;
+            if is_active && !was_active && state.codes.gain_code > 150 {
+                return Some((output, state.band, state.codes.gain_code));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn stored_boost_activation_property_over_seeded_random_banks() {
+    let mut rng = Rng(0xb005_7ed0_dcab_2496);
+    let (mut refused, mut admitted) = (0, 0);
+    for case in 0..400 {
+        let bank = random_bank(&mut rng);
+        let baseline = random_snapshot(&mut rng, bank);
+        let output = u8::try_from(1 + rng.below(6)).unwrap();
+        let channel = output_channel(output);
+        let mut actions = Vec::new();
+        if rng.chance(1, 2) {
+            actions.push(
+                DirectParameterAction::new(channel, 0x06, u16::from(rng.chance(3, 4))).unwrap(),
+            );
+        }
+        if rng.chance(2, 3) {
+            let count = u16::try_from(rng.below(10)).unwrap();
+            actions.push(DirectParameterAction::new(channel, 0x07, count).unwrap());
+        }
+        for band in 1..=9 {
+            if rng.chance(1, 6) {
+                let gain = u16::try_from(rng.below(151)).unwrap();
+                actions.push(
+                    DirectParameterAction::new(
+                        channel,
+                        band_parameter(band, BandField::Gain),
+                        gain,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let changed = if actions.is_empty() {
+            Vec::new()
+        } else {
+            changed_actions(&baseline, &actions)
+        };
+        if changed.is_empty() {
+            continue;
+        }
+        let desired = baseline.project_direct_actions(&changed).unwrap();
+        let expected = newly_active_boost(&baseline, &desired);
+        let result = ApplyTransactionV1::stage_projected(baseline.clone(), changed);
+        match (expected, result) {
+            (Some(found), result) => {
+                assert_eq!(stored_boost_refusal(result), Some(found), "case {case}");
+                refused += 1;
+            }
+            (None, Ok(transaction)) => {
+                let plan = transaction.apply_plan();
+                // Durable carrier revalidation is costly in debug; sample it.
+                if admitted % 25 == 0 {
+                    assert_eq!(
+                        &crate::ApplyPlanV1::from_json(&plan.to_json().unwrap()).unwrap(),
+                        plan,
+                        "case {case}"
+                    );
+                }
+                // The desired readback is contained by the plan's projection.
+                assert!(
+                    plan.uncontained_changes(&desired).unwrap().is_empty(),
+                    "case {case}"
+                );
+                admitted += 1;
+            }
+            (None, Err(error)) => panic!("case {case}: unexpected refusal {error}"),
+        }
+    }
+    assert!(
+        refused > 50 && admitted > 50,
+        "{refused} refused, {admitted} admitted"
+    );
+
+    // Under --allow-enable-operator-bands, every plan the planner emits stages.
+    let permissive = NotchPolicyV1 {
+        allow_enable_operator_bands: true,
+        ..NotchPolicyV1::default()
+    };
+    let mut planner_refused = 0;
+    for case in 0..200 {
+        let bank = random_bank(&mut rng);
+        let baseline = random_snapshot(&mut rng, bank);
+        let measurement = random_measurement(&mut rng);
+        match plan_notches(&measurement, &baseline, permissive, None) {
+            Ok(plan) => {
+                let changed = changed_actions(&baseline, &plan.direct_actions().unwrap());
+                ApplyTransactionV1::stage_projected(baseline, changed)
+                    .unwrap_or_else(|error| panic!("case {case}: {error}"));
+            }
+            Err(FeedbackPlanError::WouldEnableStoredBoost { band, gain_code }) => {
+                assert!(!bank.enabled && band <= bank.count, "case {case}");
+                assert!(gain_code > 150, "case {case}");
+                planner_refused += 1;
+            }
+            Err(FeedbackPlanError::NoFreeBands) => assert_eq!(bank.count, 9),
+            Err(error) => panic!("case {case}: {error}"),
+        }
+    }
+    assert!(
+        planner_refused > 20,
+        "only {planner_refused} planner refusals"
+    );
+}
+
+#[test]
+fn readback_bytes_outside_the_projection_are_uncontained() {
+    let baseline = o4_snapshot(false, 0, &[]);
+    let actions = vec![
+        o4_action(band_parameter(1, BandField::Frequency), 223),
+        o4_action(0x07, 1),
+        o4_action(0x06, 1),
+    ];
+    let transaction = ApplyTransactionV1::stage_projected(baseline.clone(), actions).unwrap();
+    let plan = transaction.apply_plan();
+    let desired = plan.desired().clone();
+    assert!(plan.uncontained_changes(&desired).unwrap().is_empty());
+    assert!(plan.uncontained_changes(&baseline).unwrap().is_empty());
+
+    let trailer1 = DUMP1_RESPONSE_LEN - 2;
+    let trailer0 = DUMP0_RESPONSE_LEN - 2;
+    let offsets = plan.projected_offsets();
+    assert!(offsets.contains(&(SnapshotSection::Dump1, trailer1)));
+    assert!(!offsets.contains(&(SnapshotSection::Dump0, trailer0)));
+    assert!(
+        offsets
+            .iter()
+            .all(|(section, _)| *section == SnapshotSection::Dump1)
+    );
+
+    let mutate = |section: SnapshotSection, offset: usize| {
+        let mut identity = desired.frame(SnapshotSection::Identity).to_vec();
+        let mut dump0 = desired.frame(SnapshotSection::Dump0).to_vec();
+        let mut dump1 = desired.frame(SnapshotSection::Dump1).to_vec();
+        let frame = match section {
+            SnapshotSection::Identity => &mut identity,
+            SnapshotSection::Dump0 => &mut dump0,
+            SnapshotSection::Dump1 => &mut dump1,
+        };
+        frame[offset] ^= 0x01;
+        SnapshotV1::from_frames(&identity, &dump0, &dump1).unwrap()
+    };
+    // The Dump1 trailer and a projected byte are contained.
+    assert!(
+        plan.uncontained_changes(&mutate(SnapshotSection::Dump1, trailer1))
+            .unwrap()
+            .is_empty()
+    );
+    let projected_low = output_location(4, band_parameter(1, BandField::Frequency))
+        .unwrap()
+        .low_offset();
+    assert!(
+        plan.uncontained_changes(&mutate(SnapshotSection::Dump1, projected_low))
+            .unwrap()
+            .is_empty()
+    );
+    // An unrelated Dump1 byte, the Dump0 trailer, and a Dump0 payload byte are not.
+    let neighbour = output_location(4, band_parameter(2, BandField::Frequency))
+        .unwrap()
+        .low_offset();
+    for (section, offset) in [
+        (SnapshotSection::Dump1, neighbour),
+        (SnapshotSection::Dump0, trailer0),
+        (SnapshotSection::Dump0, 200),
+        (SnapshotSection::Identity, 10),
+    ] {
+        let changes = plan.uncontained_changes(&mutate(section, offset)).unwrap();
+        assert_eq!(changes.len(), 1, "{section:?} {offset}");
+        assert_eq!((changes[0].section, changes[0].offset), (section, offset));
+    }
+}

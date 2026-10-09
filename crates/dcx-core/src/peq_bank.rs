@@ -25,6 +25,9 @@ use crate::{
 
 /// Versioned multi-action output PEQ desired-profile envelope.
 pub const DESIRED_PROFILE_V2_SCHEMA: &str = "dcx.desired-profile/v2";
+/// The only output a v2 desired profile may target: O4, matching the static
+/// feedback-notch planner, the one producer of v2 profiles.
+pub const DESIRED_PROFILE_V2_OUTPUT: u8 = 4;
 /// Versioned decoded PEQ bank receipt.
 pub const PEQ_BANK_STATE_SCHEMA: &str = "dcx.peq-bank-state/v1";
 /// Largest v2 document: on/off, count, and all five fields of nine bands.
@@ -278,19 +281,19 @@ pub enum PeqBankError {
     Protocol(#[from] crate::protocol::ProtocolError),
 }
 
-/// One output's ordered PEQ direct actions.
+/// O4's ordered PEQ direct actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeqBankDocumentV2 {
-    /// Physical output number, one through six.
+    /// Physical output number; v2 admits only O4.
     pub target_output: u8,
-    /// DCX direct-parameter channel, five through ten.
+    /// DCX direct-parameter channel; v2 admits only channel 8.
     pub parameter_channel: u8,
     /// Ordered PEQ on/off, band count, and band-field actions.
     pub actions: Vec<DirectParameterAction>,
 }
 
-/// One digest-bound desired multi-band PEQ state for one output.
+/// One digest-bound desired multi-band PEQ state for O4.
 ///
 /// The digest covers a domain separator, the profile identity and revision,
 /// the output/channel pair, and every ordered action.
@@ -310,7 +313,8 @@ impl DesiredPeqBankProfileV2 {
     ///
     /// # Errors
     ///
-    /// Rejects unbounded identity strings, a mismatched output/channel pair,
+    /// Rejects unbounded identity strings, any output but O4 or a mismatched
+    /// channel,
     /// an empty or oversized action list, duplicate addresses, any address
     /// outside PEQ on/off, band count, and band fields, out-of-domain values,
     /// and every boost.
@@ -442,11 +446,11 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), DesiredProfileE
 }
 
 fn validate_bank_document(document: &PeqBankDocumentV2) -> Result<(), DesiredProfileError> {
-    if !(1..=OUTPUT_COUNT).contains(&document.target_output)
-        || document.parameter_channel != output_channel(document.target_output)
+    if document.target_output != DESIRED_PROFILE_V2_OUTPUT
+        || document.parameter_channel != output_channel(DESIRED_PROFILE_V2_OUTPUT)
     {
         return Err(DesiredProfileError::UnsupportedDocument(
-            "v2 profile output must be 1 through 6 with its exact parameter channel",
+            "v2 profile targets O4 only, with parameter channel 8",
         ));
     }
     if document.actions.is_empty() || document.actions.len() > MAX_BANK_ACTIONS {
@@ -514,7 +518,7 @@ fn bank_digest(
 pub enum DesiredProfile {
     /// Exact O1/PEQ9 v1 envelope.
     V1(DesiredPeqProfileV1),
-    /// Multi-band output PEQ v2 envelope.
+    /// Multi-band O4 PEQ v2 envelope.
     V2(DesiredPeqBankProfileV2),
 }
 
@@ -638,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_profile_rejects_boosts_mutes_foreign_channels_and_unreviewed_addresses() {
+    fn v2_profile_rejects_boosts_mutes_foreign_outputs_and_unreviewed_addresses() {
         let boost = DirectParameterAction::new(8, band_parameter(1, BandField::Gain), 151).unwrap();
         let mute = DirectParameterAction::new(8, 0x03, 0).unwrap();
         let foreign =
@@ -648,6 +652,25 @@ mod tests {
         for action in [boost, mute, foreign, crossover, count] {
             assert!(matches!(
                 DesiredPeqBankProfileV2::new("p".into(), "r".into(), document(vec![action])),
+                Err(DesiredProfileError::UnsupportedDocument(_))
+            ));
+        }
+        // v2 targets O4 only, matching the planner, even with an exact channel.
+        for output in [1_u8, 2, 3, 5, 6] {
+            let channel = output_channel(output);
+            let action =
+                DirectParameterAction::new(channel, band_parameter(1, BandField::Gain), 100)
+                    .unwrap();
+            assert!(matches!(
+                DesiredPeqBankProfileV2::new(
+                    "p".into(),
+                    "r".into(),
+                    PeqBankDocumentV2 {
+                        target_output: output,
+                        parameter_channel: channel,
+                        actions: vec![action],
+                    }
+                ),
                 Err(DesiredProfileError::UnsupportedDocument(_))
             ));
         }

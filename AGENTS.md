@@ -32,16 +32,21 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   table; only O1/PEQ9 has named-device readback, the O4 mute is pending
   Legalab's WORD-FS-A rehearsal, and every other PEQ address is pending its
   first exact readback. Values must lie in their device domain, the apply path
-  admits only PEQ cuts, and rollback restores the exact baseline in reverse
+  admits only PEQ cuts and never makes a band active (PEQ on and inside the
+  band count) that holds a stored boost and was inactive in the baseline, under
+  any policy flag, and rollback restores the exact baseline in reverse
   order. Dump1 keeps its baseline modulo-128 trailer balance as a named
   hypothesis. Every other output, input, setup, crossover, dynamic-EQ, mute,
   or opaque dump mapping fails closed. No server or automatic apply path
   belongs in the MVP.
 - Desired profiles are `dcx.desired-profile/v1`, exactly O1/channel 5/PEQ9
   with four ordered actions (`0x3b` through `0x3e`), or
-  `dcx.desired-profile/v2`, one output's ordered cut-only PEQ on/off, band
-  count, and band-field actions. Static feedback notches (`dcxctl feedback`)
-  target O4 only and never write the operator's active bands. Missing
+  `dcx.desired-profile/v2`, exactly O4/channel 8 with ordered cut-only PEQ
+  on/off, band count, and band-field actions, matching the planner. Static
+  feedback notches (`dcxctl feedback`) target O4 only and never write the
+  operator's active bands. `dcxctl control verify-containment` is the offline
+  gate that fails when a readback changed any byte outside the plan's
+  projected addresses and touched dump trailer. Missing
   post-write capture remains explicit uncertainty: apply `readback` and
   rollback `restored` may be omitted or null, never synthesized.
 - The AUv3 MIDI FX owns staged desired state and MIDI pass-through only. It has

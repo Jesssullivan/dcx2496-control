@@ -23,8 +23,13 @@ ring-out list | REW Generic EQ
   -> dcxctl control diff          (apply_plan + rollback_plan)
   -> dcxctl control apply         (stale-baseline check, one typed frame,
                                    complete readback)
+  -> dcxctl control verify-containment   (offline: no byte outside the
+                                   projected addresses and touched trailer)
   -> dcxctl control rollback      (only if readback is not exact)
 ```
+
+`dcx.desired-profile/v2` targets O4/channel 8 only, the same scope as the
+planner; any other output is refused at parse time.
 
 `dcxctl feedback inspect --snapshot S --target-output 4` decodes O4's PEQ
 enable, band count, and all nine bands from a saved snapshot, read-only.
@@ -69,7 +74,9 @@ Bands 1 to n, where n is the current band count, belong to the operator and
 are never written. Notches go into bands n+1 to n+k. Each band writes all five
 fields, then the band count, then PEQ on. If PEQ is off while n > 0, planning
 refuses unless `--allow-enable-operator-bands` is given, because turning PEQ
-on would also enable the operator's bands.
+on would also enable the operator's bands. Even with that flag, planning
+refuses (`WouldEnableStoredBoost`) when an operator band about to become active
+holds a boost (gain code above 150).
 
 `--prior-plan` names the receipt of the plan last applied to O4. The baseline
 must still hold that plan's notches exactly directly above its operator count;
@@ -86,7 +93,11 @@ The writer is the generalized reviewed-address projection in
 `crates/dcx-core/src/layout.rs`: PEQ on/off (`0x06`), band count (`0x07`), and
 the nine bands (`0x13`-`0x3f`) of every output, plus the O4 mute, transcribed
 from the pinned MIT DuinoDCX `outputLocations` table. Every value is checked
-against its device domain. The apply path admits only cuts. Crossover, dynamic
+against its device domain. The apply path admits only cuts, and every apply
+plan (v1 or v2 diff, and every reparsed durable carrier) is refused when its
+desired state makes a band active that holds a stored boost and was inactive in
+the baseline, whether by turning PEQ on or raising the band count. No policy
+flag relaxes this; an already active stored boost is left as it is. Crossover, dynamic
 EQ, delay, limiter, gain, source, Input C mode, and every other mute fail
 closed, so this feature cannot enable Auto Align, phantom power, or unmute
 O5/O6.

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Refuse every apply plan whose desired state newly activates a PEQ band that
+  holds a stored boost (gain code above 150), by turning PEQ on or raising the
+  band count, under every policy including `--allow-enable-operator-bands`.
+- Restrict `dcx.desired-profile/v2` to O4, the planner's only target.
+- Add offline `dcxctl control verify-containment` and the
+  `scripts/serial-probe.sh` bench harness, which now exits non-zero when any
+  byte changes outside the projected addresses and touched dump trailer.
+- Bump the Apple helper and AUv3 bundle version to 0.1.2 (3).
 - Record the first named-device O4 PEQ round trips: the Dump1 trailer balance,
   band-count ordering, and O4 PEQ on/off, count and band 1 locations read back
   exactly and rolled back to the original snapshot.
