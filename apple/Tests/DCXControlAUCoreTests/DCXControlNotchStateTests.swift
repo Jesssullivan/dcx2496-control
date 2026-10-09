@@ -25,6 +25,31 @@ final class DCXControlNotchStateTests: XCTestCase {
         XCTAssertEqual(try restored.controlState.persistedState(), try source.controlState.persistedState())
     }
 
+    func testPendingChangeCountParameterSpansAFullV2BankDiff() throws {
+        let fixture = try Fixture()
+        let source = try Fixture.makeAudioUnit()
+        let parameter = try XCTUnwrap(source.parameterTree?.parameter(
+            withAddress: DCXControlAudioUnit.ParameterAddress.pendingChangeCount))
+        XCTAssertGreaterThanOrEqual(parameter.maxValue, AUValue(DesiredProfileV2.maximumActions))
+        try source.performControlStateMutation { try $0.stage(fixture.staged, baseline: fixture.baseline) }
+        // Every action of the one-notch plan changes: five band fields, the
+        // band count, and PEQ enable.
+        let befores: [UInt8: UInt16] = [0x13: 0, 0x14: 0, 0x15: 150, 0x16: 0, 0x17: 1, 0x07: 0, 0x06: 0]
+        let changes = try fixture.plan.expectedActions.map { action in
+            let address = try XCTUnwrap(PeqAddressV2(channel: action.channel, parameter: action.parameter))
+            return try FieldChangeV2(
+                output: 4, field: address.label, channel: action.channel, parameter: action.parameter,
+                before: try XCTUnwrap(befores[action.parameter]), after: action.value)
+        }
+        XCTAssertEqual(changes.count, 7)
+        try source.performControlStateMutation { try $0.accept(diff: SemanticDiff(
+            baselineSnapshotDigest: fixture.baseline.digest, desiredProfileDigest: fixture.profile.digest,
+            desiredSnapshotDigest: Fixture.digest("4"), applyPlanDigest: Fixture.digest("a"),
+            rollbackPlanDigest: Fixture.digest("b"), fieldChanges: changes)) }
+        XCTAssertEqual(parameter.value, 7)
+        XCTAssertLessThanOrEqual(parameter.value, parameter.maxValue)
+    }
+
     func testV1ProjectStateKeepsItsExactLegacyShape() throws {
         let fixture = try Fixture()
         let staged = StagedProjectStateV1(target: fixture.target, desired: try Fixture.v1Profile())

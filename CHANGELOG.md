@@ -19,6 +19,10 @@
   runs `feedback import|plan|desired-profile` against the helper's raw
   snapshot, and an AU notch list with explicit staging. Fixture parity with
   dcxctl is checked in `//:check`.
+- Carry a selected notch measurement file byte for byte from the AU (a
+  leading UTF-8 BOM was dropped, so `source_digest` no longer equalled the
+  file's digest), and widen the read-only Pending Changes AU parameter from
+  0-1 to 0-47 so a v2 bank diff stays inside its declared range.
 - Refuse every apply plan whose desired state newly activates a PEQ band that
   holds a stored boost (gain code above 150), by turning PEQ on or raising the
   band count, under every policy including `--allow-enable-operator-bands`.

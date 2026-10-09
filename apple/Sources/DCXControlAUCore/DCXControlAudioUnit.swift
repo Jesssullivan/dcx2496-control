@@ -76,7 +76,9 @@ public final class DCXControlAudioUnit: AUAudioUnit {
             name: "Pending Changes",
             address: ParameterAddress.pendingChangeCount,
             min: 0,
-            max: 1,
+            // A v1 diff has at most one change; a v2 O4 bank diff has up to
+            // one per desired action.
+            max: AUValue(DesiredProfileV2.maximumActions),
             unit: .indexed,
             unitName: nil,
             flags: [.flag_IsReadable],

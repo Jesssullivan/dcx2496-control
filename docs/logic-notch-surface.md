@@ -46,8 +46,10 @@ to 45 seconds, with no tty argument and without the device operation lock:
 
 1. `feedback import --frequency-list|--rew <text> --target-output 4`, skipped
    for an imported measurement document. The helper checks that the reported
-   `source_digest` is the sha256 of the exact text the AU sent, so it matches
-   legalab's `studio-measure` `cumulativeDigestAfter` for the same file.
+   `source_digest` is the sha256 of the exact text the AU sent. The AU sends
+   the selected file byte for byte (valid UTF-8 only, a leading BOM kept), so
+   the digest equals the digest of that file, the form legalab's
+   `studio-measure` records.
 2. `feedback plan --measurement ... --snapshot <helper raw snapshot>
    [--prior-plan <helper stored plan>]`. The prior plan is resolved before any
    child runs; a missing prior is `invalid_request`.
@@ -72,14 +74,15 @@ mutation recovery is pinned.
 The AU view gains an O4 notch section:
 
 - a measurement kind (ring-out list, REW Generic EQ, measurement JSON), a
-  "Recurrence: build on staged plan" switch, **Plan Notches…** and
+  "Recurrence: staged plan is on the device" switch, **Plan Notches…** and
   **Stage Notch Plan**;
 - a read-only list of the pending or staged plan: plan and baseline digests,
   the operator bands kept, and per notch the band, encoded frequency, cut and
   Q, measured frequency and occurrence count, followed by dropped peaks.
 
 Plan Notches reads one operator-selected file in the UI (never in the render
-path). It plans against the staged state's current snapshot (updated by
+path) and carries its exact bytes; a file that is not valid UTF-8 text (or,
+for the JSON kind, JSON) is refused before any request. It plans against the staged state's current snapshot (updated by
 capture, Apply readback, rollback and recovery), or against this document's
 read-only capture when nothing is staged. Stage
 Notch Plan is a pure model update: it stages the v2 profile and the plan
@@ -93,6 +96,9 @@ snapshot, and staged profile it was requested under; a reply that arrives after
 any of them moved on is dropped. Raw plans are stored first-write-wins by
 digest, so the bytes behind a staged plan never change. Recurrence names the staged plan as `--prior-plan`; dcxctl refuses it
 unless the snapshot holds exactly that plan's notches, and the AU says so.
+
+The read-only **Pending Changes** AU parameter ranges over 0-47, one per v2
+desired action (a v1 diff still holds at most one change).
 
 Known limitation (unchanged mutation semantics): after a verified Apply the
 helper keeps the recovery lease until a readback or rollback returns the exact

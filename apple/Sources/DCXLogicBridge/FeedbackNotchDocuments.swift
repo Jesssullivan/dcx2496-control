@@ -50,6 +50,31 @@ public struct FeedbackMeasurementInputV1: Codable, Equatable, Sendable {
         try .init(kind: .measurement, text: nil, document: document)
     }
 
+    /// Carry one selected file's exact bytes. Text must be valid UTF-8 and
+    /// travels byte for byte, a leading byte-order mark included, so the
+    /// `source_digest` dcxctl computes over the bytes it is handed is the
+    /// digest of the file itself, the form legalab's studio-measure records.
+    /// Foundation's `String(data:encoding: .utf8)` drops a leading BOM, which
+    /// would silently break that equality.
+    public static func file(_ kind: Kind, bytes: Data) throws -> Self {
+        switch kind {
+        case .measurement:
+            let document: JSONValue
+            do {
+                document = try BridgeJSONCodec.decoder().decode(JSONValue.self, from: bytes)
+            } catch {
+                throw BridgeValidationError.invalidMeasurement("measurement document must be JSON")
+            }
+            return try .measurement(document)
+        case .frequencyList, .rewGenericEq:
+            let text = String(decoding: bytes, as: UTF8.self)
+            guard Data(text.utf8) == bytes else {
+                throw BridgeValidationError.invalidMeasurement("measurement text must be valid UTF-8")
+            }
+            return try .init(kind: kind, text: text, document: nil)
+        }
+    }
+
     private init(kind: Kind, text: String?, document: JSONValue?) throws {
         self.kind = kind
         self.text = text

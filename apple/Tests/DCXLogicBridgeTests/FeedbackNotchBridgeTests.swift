@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import DCXLogicBridge
@@ -248,6 +249,30 @@ final class FeedbackNotchBridgeTests: XCTestCase {
         XCTAssertThrowsError(try FeedbackPlanRequest(
             target: baseline.target, baseline: baseline, measurement: .frequencyList("630"),
             priorPlanDigest: "sha256/nope", profileID: "o4-feedback", revision: "r"))
+    }
+
+    func testSelectedFileTravelsByteForByteSoTheSourceDigestIsTheFileDigest() throws {
+        let bytes = Data([0xEF, 0xBB, 0xBF]) + Data("frequency_hz,level_db\r\n630,4.0\r\n".utf8)
+        let fileDigest = "sha256/" + SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        // Foundation's UTF-8 initializer drops the BOM; the file path must not.
+        XCTAssertNotEqual(Data(try XCTUnwrap(String(data: bytes, encoding: .utf8)).utf8), bytes)
+        let input = try FeedbackMeasurementInputV1.file(.frequencyList, bytes: bytes)
+        XCTAssertEqual(Data(try XCTUnwrap(input.text).utf8), bytes)
+
+        let baseline = try Self.snapshot()
+        let request = try BridgeRequest(requestID: "synthetic-bom", body: .feedbackPlan(.init(
+            target: baseline.target, baseline: baseline, measurement: input,
+            profileID: "o4-feedback", revision: "synthetic-1")))
+        let decoded = try BridgeJSONCodec.decoder().decode(
+            BridgeRequest.self, from: BridgeJSONCodec.encoder().encode(request))
+        guard case let .feedbackPlan(carried) = decoded.body else { return XCTFail("expected plan request") }
+        let text = try XCTUnwrap(carried.measurement.text)
+        XCTAssertEqual(Data(text.utf8), bytes)
+        XCTAssertEqual(FeedbackNotchContract.sourceDigest(text), fileDigest)
+
+        XCTAssertThrowsError(try FeedbackMeasurementInputV1.file(.frequencyList, bytes: Data([0x36, 0xFF, 0x0A])))
+        XCTAssertThrowsError(try FeedbackMeasurementInputV1.file(.rewGenericEq, bytes: Data()))
+        XCTAssertThrowsError(try FeedbackMeasurementInputV1.file(.measurement, bytes: Data("630".utf8)))
     }
 
     func testFeedbackPlanCrossesTheWireAndBindsByRequestID() throws {

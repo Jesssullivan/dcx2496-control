@@ -558,17 +558,9 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                     return
                 }
                 let data = try Data(contentsOf: url)
-                let input: FeedbackMeasurementInputV1
-                switch kind {
-                case .measurement:
-                    input = try .measurement(BridgeJSONCodec.decoder().decode(JSONValue.self, from: data))
-                case .frequencyList, .rewGenericEq:
-                    guard let text = String(data: data, encoding: .utf8) else {
-                        report("Measurement text must be UTF-8")
-                        return
-                    }
-                    input = kind == .frequencyList ? try .frequencyList(text) : try .rewGenericEq(text)
-                }
+                // Exact file bytes, BOM included, so dcxctl's source digest
+                // is the digest of this file.
+                let input = try FeedbackMeasurementInputV1.file(kind, bytes: data)
                 let request = try FeedbackPlanRequest(
                     target: target,
                     baseline: baseline,
@@ -596,7 +588,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                     refreshLabels()
                 }
             } catch {
-                report("Selected file is not a valid bounded O4 measurement")
+                report("Selected file is not a valid bounded O4 measurement (UTF-8 text, or measurement JSON)")
             }
         }
     }
