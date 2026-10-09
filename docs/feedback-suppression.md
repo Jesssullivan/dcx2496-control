@@ -96,8 +96,12 @@ from the pinned MIT DuinoDCX `outputLocations` table. Every value is checked
 against its device domain. The apply path admits only cuts, and every apply
 plan (v1 or v2 diff, and every reparsed durable carrier) is refused when its
 desired state makes a band active that holds a stored boost and was inactive in
-the baseline, whether by turning PEQ on or raising the band count. No policy
-flag relaxes this; an already active stored boost is left as it is. Crossover, dynamic
+the baseline, whether by turning PEQ on or raising the band count. The check
+runs after every ordered action and every rollback step, because the device
+passes through each prefix of the frame: a cut must precede the count or
+on/off write that activates its band. An already active stored boost is left
+as it is, and a plan may not move or reshape it (frequency, Q, kind or slope)
+while it holds a boost. No policy flag relaxes this. Crossover, dynamic
 EQ, delay, limiter, gain, source, Input C mode, and every other mute fail
 closed, so this feature cannot enable Auto Align, phantom power, or unmute
 O5/O6.

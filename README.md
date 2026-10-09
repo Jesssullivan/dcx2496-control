@@ -160,8 +160,9 @@ dcxctl control rollback \
 ```
 
 `dcxctl control verify-containment --plan apply-plan.json --readback
-readback.json` is offline: it exits non-zero when any byte differs from the
-plan's baseline outside the projected addresses and the touched dump trailer.
+readback.json` is offline: it exits non-zero when any bit differs from the
+plan's baseline outside the projected addresses (only the plan's own bits of a
+shared 7-of-8 carrier byte) and the touched dump trailer.
 `scripts/serial-probe.sh` runs it on every named-device O4 round trip.
 
 Legalab owns the physical mute, route, authorization, and attended-stop

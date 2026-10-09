@@ -128,9 +128,9 @@ pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Offline containment gate: every byte that differs between an apply plan's
+/// Offline containment gate: every bit that differs between an apply plan's
 /// bound baseline and a complete readback must lie inside the plan's projected
-/// offsets (plus the touched dump trailers). Returns whether it does.
+/// bits (plus the touched dump trailers). Returns whether it does.
 pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn Error>> {
     let plan = ApplyPlanV1::from_json(&read_bounded(
         plan,
@@ -144,9 +144,11 @@ pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn 
     )?)?;
     let uncontained = plan.uncontained_changes(&readback)?;
     let projected = plan
-        .projected_offsets()
+        .projected_masks()
         .into_iter()
-        .map(|(section, offset)| serde_json::json!({"section": section, "offset": offset}))
+        .map(|((section, offset), mask)| {
+            serde_json::json!({"section": section, "offset": offset, "mask": mask})
+        })
         .collect::<Vec<_>>();
     let contained = uncontained.is_empty();
     let output = serde_json::json!({

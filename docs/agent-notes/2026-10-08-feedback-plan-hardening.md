@@ -54,3 +54,35 @@ source `44adf4eb04fe5fcb4828c10acf0c2cc8d8ec60d8` (tree `0fccbff6...`), output
 `tests/feedback_pipeline.sh` coverage of `verify-containment` exit codes.
 
 Validation receipts are in the pull request.
+
+## Adversarial review (2026-10-08)
+
+Three real gaps were found and fixed on this branch:
+
+1. **Ordering bypass.** The guard checked only the final desired state, but a
+   v2 profile keeps its caller order through `control diff` and one direct
+   frame is applied in order. `[count=2, band2.gain=140]` over a stored +5 dB
+   band 2 passed (end state is a cut) while the device sat with the boost
+   active between the two writes, or kept it if the frame was cut short. The
+   guard now checks every apply prefix, and every rollback step starting from
+   the desired state and from each apply prefix (a caller-ordered `stage` or
+   carrier rollback that restores the boost before lowering the count is
+   refused). The reversed inverse of an admitted apply always passes, since
+   its steps retrace the apply prefixes. The property test oracle is now
+   step-aware; the planner's order (band fields, count, on/off) is unaffected.
+2. **Moving an active boost.** Cut-only admission checked gain writes only, so
+   a v2 profile could rewrite the frequency, Q, kind or slope of an active
+   operator boost, placing the boost on a feedback frequency.
+   `ActiveBoostReshaped` refuses any step where an active boosted band
+   differs from its baseline fields; cutting the gain first remains admitted.
+3. **Carrier-bit masking in containment.** The gate admitted every bit of a
+   projected location's 7-of-8 carrier byte, which also carries bit 7 of up to
+   six neighbouring packed bytes. A readback that flipped a neighbour's bit 7
+   was reported contained. `projected_masks` now admits only each location's
+   own carrier bit; `verify-containment` prints the mask per offset.
+
+Checked and found sound: v1 and reloaded carriers rebuild through
+`ApplyPlanV1::new`; `RollbackPlanV1::from_json` rebuilds through its checked
+constructor; frame lengths are fixed, so the containment zip cannot truncate;
+`scripts/serial-probe.sh` cannot pass with a missing apply readback, a failed
+containment run, or a final readback whose digest is missing.

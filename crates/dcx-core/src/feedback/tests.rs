@@ -764,54 +764,96 @@ fn raise_band_count_over_stored_boost_is_refused() {
     assert!(crate::ApplyPlanV1::from_json(&plan.to_json().unwrap()).is_ok());
 }
 
-/// Independent oracle: the first band that becomes active and holds a boost.
-fn newly_active_boost(baseline: &SnapshotV1, desired: &SnapshotV1) -> Option<(u8, u8, u16)> {
-    for output in 1..=OUTPUT_COUNT {
-        let before = decode_peq_bank(baseline, output).unwrap();
-        let after = decode_peq_bank(desired, output).unwrap();
-        for state in &after.bands {
-            let was_active = before.eq_enabled && state.band <= before.eq_count;
-            let is_active = after.eq_enabled && state.band <= after.eq_count;
-            if is_active && !was_active && state.codes.gain_code > 150 {
-                return Some((output, state.band, state.codes.gain_code));
+/// Independent oracle over every ordered step of `actions`: the first band
+/// that is active and holds a boost while it was inactive in the baseline
+/// ("activation") or was active with different fields ("reshape").
+fn first_boost_exposure(
+    baseline: &SnapshotV1,
+    actions: &[DirectParameterAction],
+) -> Option<(&'static str, u8, u8, u16)> {
+    for step in 1..=actions.len() {
+        let state = baseline.project_direct_actions(&actions[..step]).unwrap();
+        for output in 1..=OUTPUT_COUNT {
+            let before = decode_peq_bank(baseline, output).unwrap();
+            let after = decode_peq_bank(&state, output).unwrap();
+            for (was, now) in before.bands.iter().zip(&after.bands) {
+                let was_active = before.eq_enabled && was.band <= before.eq_count;
+                let is_active = after.eq_enabled && now.band <= after.eq_count;
+                if !is_active || now.codes.gain_code <= 150 {
+                    continue;
+                }
+                if !was_active {
+                    return Some(("activation", output, now.band, now.codes.gain_code));
+                }
+                if now.codes != was.codes {
+                    return Some(("reshape", output, now.band, now.codes.gain_code));
+                }
             }
         }
     }
     None
 }
 
+/// Any boost-exposure refusal, by kind; panics on any other staging error.
+fn boost_refusal(
+    result: Result<ApplyTransactionV1, crate::ApplyTransactionError>,
+) -> Option<(&'static str, u8, u8, u16)> {
+    match result {
+        Err(crate::ApplyTransactionError::Plan(crate::ApplyPlanError::ActiveBoostReshaped {
+            output,
+            band,
+            gain_code,
+        })) => Some(("reshape", output, band, gain_code)),
+        other => stored_boost_refusal(other)
+            .map(|(output, band, gain_code)| ("activation", output, band, gain_code)),
+    }
+}
+
+/// A random ordered PEQ on/off, count, frequency and cut-gain action list.
+fn random_peq_actions(rng: &mut Rng, channel: u8) -> Vec<DirectParameterAction> {
+    let mut actions = Vec::new();
+    if rng.chance(1, 2) {
+        actions
+            .push(DirectParameterAction::new(channel, 0x06, u16::from(rng.chance(3, 4))).unwrap());
+    }
+    if rng.chance(2, 3) {
+        let count = u16::try_from(rng.below(10)).unwrap();
+        actions.push(DirectParameterAction::new(channel, 0x07, count).unwrap());
+    }
+    for band in 1..=9 {
+        if rng.chance(1, 8) {
+            // A non-gain write: moving an active stored boost is refused.
+            let frequency = u16::try_from(rng.below(321)).unwrap();
+            actions.push(
+                DirectParameterAction::new(
+                    channel,
+                    band_parameter(band, BandField::Frequency),
+                    frequency,
+                )
+                .unwrap(),
+            );
+        }
+        if rng.chance(1, 6) {
+            let gain = u16::try_from(rng.below(151)).unwrap();
+            actions.push(
+                DirectParameterAction::new(channel, band_parameter(band, BandField::Gain), gain)
+                    .unwrap(),
+            );
+        }
+    }
+    actions
+}
+
 #[test]
 fn stored_boost_activation_property_over_seeded_random_banks() {
     let mut rng = Rng(0xb005_7ed0_dcab_2496);
-    let (mut refused, mut admitted) = (0, 0);
+    let (mut refused, mut admitted, mut reshaped) = (0, 0, 0);
     for case in 0..400 {
         let bank = random_bank(&mut rng);
         let baseline = random_snapshot(&mut rng, bank);
         let output = u8::try_from(1 + rng.below(6)).unwrap();
         let channel = output_channel(output);
-        let mut actions = Vec::new();
-        if rng.chance(1, 2) {
-            actions.push(
-                DirectParameterAction::new(channel, 0x06, u16::from(rng.chance(3, 4))).unwrap(),
-            );
-        }
-        if rng.chance(2, 3) {
-            let count = u16::try_from(rng.below(10)).unwrap();
-            actions.push(DirectParameterAction::new(channel, 0x07, count).unwrap());
-        }
-        for band in 1..=9 {
-            if rng.chance(1, 6) {
-                let gain = u16::try_from(rng.below(151)).unwrap();
-                actions.push(
-                    DirectParameterAction::new(
-                        channel,
-                        band_parameter(band, BandField::Gain),
-                        gain,
-                    )
-                    .unwrap(),
-                );
-            }
-        }
+        let actions = random_peq_actions(&mut rng, channel);
         let changed = if actions.is_empty() {
             Vec::new()
         } else {
@@ -821,12 +863,16 @@ fn stored_boost_activation_property_over_seeded_random_banks() {
             continue;
         }
         let desired = baseline.project_direct_actions(&changed).unwrap();
-        let expected = newly_active_boost(&baseline, &desired);
+        // Every ordered step counts, not only the desired end state.
+        let expected = first_boost_exposure(&baseline, &changed);
         let result = ApplyTransactionV1::stage_projected(baseline.clone(), changed);
         match (expected, result) {
             (Some(found), result) => {
-                assert_eq!(stored_boost_refusal(result), Some(found), "case {case}");
+                assert_eq!(boost_refusal(result), Some(found), "case {case}");
                 refused += 1;
+                if found.0 == "reshape" {
+                    reshaped += 1;
+                }
             }
             (None, Ok(transaction)) => {
                 let plan = transaction.apply_plan();
@@ -849,8 +895,8 @@ fn stored_boost_activation_property_over_seeded_random_banks() {
         }
     }
     assert!(
-        refused > 50 && admitted > 50,
-        "{refused} refused, {admitted} admitted"
+        refused > 50 && admitted > 50 && reshaped > 10,
+        "{refused} refused ({reshaped} reshapes), {admitted} admitted"
     );
 
     // Under --allow-enable-operator-bands, every plan the planner emits stages.
@@ -949,4 +995,149 @@ fn readback_bytes_outside_the_projection_are_uncontained() {
         assert_eq!(changes.len(), 1, "{section:?} {offset}");
         assert_eq!((changes[0].section, changes[0].offset), (section, offset));
     }
+
+    // The 7-of-8 carrier byte is shared: only the plan's own bit is contained.
+    let (carrier, bit) = output_location(4, band_parameter(1, BandField::Frequency))
+        .unwrap()
+        .carrier()
+        .unwrap();
+    let masks = plan.projected_masks();
+    let mask = masks[&(SnapshotSection::Dump1, carrier)];
+    assert_ne!(mask & (1 << bit), 0);
+    let flip = |bit: u8| {
+        let mut dump1 = desired.frame(SnapshotSection::Dump1).to_vec();
+        dump1[carrier] ^= 1 << bit;
+        SnapshotV1::from_frames(
+            desired.frame(SnapshotSection::Identity),
+            desired.frame(SnapshotSection::Dump0),
+            &dump1,
+        )
+        .unwrap()
+    };
+    assert!(plan.uncontained_changes(&flip(bit)).unwrap().is_empty());
+    let foreign = (0..7_u8)
+        .find(|candidate| mask & (1 << candidate) == 0)
+        .expect("a carrier bit owned by a neighbouring packed byte");
+    let changes = plan.uncontained_changes(&flip(foreign)).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (changes[0].section, changes[0].offset),
+        (SnapshotSection::Dump1, carrier)
+    );
+}
+
+#[test]
+fn every_ordered_step_is_guarded_not_only_the_desired_state() {
+    // PEQ on, one active band; band 2 stores +5 dB.
+    let baseline = o4_snapshot(true, 1, &[(1, 120), (2, 200)]);
+    let cut = o4_action(band_parameter(2, BandField::Gain), 140);
+    let raise = o4_action(0x07, 2);
+    // Same desired state; raising the count first exposes the boost.
+    assert_eq!(
+        boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline.clone(),
+            vec![raise, cut]
+        )),
+        Some(("activation", 4, 2, 200))
+    );
+    let admitted = ApplyTransactionV1::stage_projected(baseline.clone(), vec![cut, raise]).unwrap();
+    // A v2 profile keeps its caller order through `control diff`.
+    let profile = DesiredPeqBankProfileV2::new(
+        "o4-order".into(),
+        "r1".into(),
+        PeqBankDocumentV2 {
+            target_output: 4,
+            parameter_channel: 8,
+            actions: vec![raise, cut],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline.clone(),
+            changed_actions(&baseline, &profile.document().actions)
+        )),
+        Some(("activation", 4, 2, 200))
+    );
+    // PEQ off: enabling before cutting is refused, cutting first is admitted.
+    let off = o4_snapshot(false, 2, &[(1, 120), (2, 200)]);
+    let enable = o4_action(0x06, 1);
+    assert_eq!(
+        boost_refusal(ApplyTransactionV1::stage_projected(
+            off.clone(),
+            vec![enable, cut]
+        )),
+        Some(("activation", 4, 2, 200))
+    );
+    ApplyTransactionV1::stage_projected(off, vec![cut, enable]).unwrap();
+
+    // A durable carrier cannot smuggle the unsafe order past the guard.
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&admitted.apply_plan().to_json().unwrap()).unwrap();
+    wire["command"]["actions"].as_array_mut().unwrap().reverse();
+    assert!(crate::ApplyPlanV1::from_json(&serde_json::to_vec(&wire).unwrap()).is_err());
+
+    // Rollback order is guarded too: restoring the boost before lowering the
+    // count would expose it, from the desired state or a cut-short apply.
+    let desired = admitted.apply_plan().desired().clone();
+    let restore_boost = o4_action(band_parameter(2, BandField::Gain), 200);
+    let lower = o4_action(0x07, 1);
+    assert_eq!(
+        boost_refusal(ApplyTransactionV1::stage(
+            baseline.clone(),
+            desired.clone(),
+            vec![cut, raise],
+            vec![restore_boost, lower],
+        )),
+        Some(("activation", 4, 2, 200))
+    );
+    ApplyTransactionV1::stage(
+        baseline,
+        desired,
+        vec![cut, raise],
+        vec![lower, restore_boost],
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_active_operator_boost_cannot_be_moved_or_reshaped() {
+    // PEQ on, band 1 is an active +5 dB operator boost.
+    let baseline = o4_snapshot(true, 1, &[(1, 200)]);
+    let frequency = band_parameter(1, BandField::Frequency);
+    let current = baseline.read_reviewed(crate::layout::reviewed_address(8, frequency).unwrap());
+    let moved = if current == 223 { 224 } else { 223 };
+    for field in [
+        BandField::Frequency,
+        BandField::Q,
+        BandField::Kind,
+        BandField::Slope,
+    ] {
+        let parameter = band_parameter(1, field);
+        let address = crate::layout::reviewed_address(8, parameter).unwrap();
+        let before = baseline.read_reviewed(address);
+        let after = if before == 0 { 1 } else { before - 1 };
+        assert_eq!(
+            boost_refusal(ApplyTransactionV1::stage_projected(
+                baseline.clone(),
+                vec![o4_action(parameter, after)]
+            )),
+            Some(("reshape", 4, 1, 200)),
+            "{field:?}"
+        );
+    }
+    // Cutting the gain first, then moving the band, is admitted; the reverse
+    // order passes through a moved boost and is refused.
+    let cut = o4_action(band_parameter(1, BandField::Gain), 140);
+    let move_band = o4_action(frequency, moved);
+    ApplyTransactionV1::stage_projected(baseline.clone(), vec![cut, move_band]).unwrap();
+    assert_eq!(
+        boost_refusal(ApplyTransactionV1::stage_projected(
+            baseline.clone(),
+            vec![move_band, cut]
+        )),
+        Some(("reshape", 4, 1, 200))
+    );
+    // Lowering the count over the boost deactivates it and is admitted.
+    ApplyTransactionV1::stage_projected(baseline, vec![o4_action(0x07, 0)]).unwrap();
 }
