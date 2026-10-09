@@ -98,6 +98,7 @@ fixtures:
     ! cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 --allow-boost >/dev/null 2>&1
     cargo build --locked --jobs 2 --quiet --package dcxctl
     bash tests/feedback_pipeline.sh target/debug/dcxctl fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/rew/SYNTHETIC-feedback-notches.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json
+    bash tests/routing_pipeline.sh target/debug/dcxctl fixtures/snapshots/SYNTHETIC-blank-snapshot.json
 
 lockfiles-static:
     test -s Cargo.lock

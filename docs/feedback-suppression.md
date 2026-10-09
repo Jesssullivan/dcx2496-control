@@ -85,11 +85,14 @@ and plan with `--prior-plan`.
 The writer is the generalized reviewed-address projection in
 `crates/dcx-core/src/layout.rs`: PEQ on/off (`0x06`), band count (`0x07`), and
 the nine bands (`0x13`-`0x3f`) of every output, plus the O4 mute, transcribed
-from the pinned MIT DuinoDCX `outputLocations` table. Every value is checked
-against its device domain. The apply path admits only cuts. Crossover, dynamic
-EQ, delay, limiter, gain, source, Input C mode, and every other mute fail
-closed, so this feature cannot enable Auto Align, phantom power, or unmute
-O5/O6.
+from the pinned MIT DuinoDCX `outputLocations` table. The writer also admits the
+closed MVP routing set (O4/O5/O6 mutes, O3/O4 sources, setup input sum), but
+only through `dcx.desired-routing/v1`. A v2 feedback profile rejects every
+non-PEQ field. Every value is checked against its device domain. The apply
+path admits only cuts. Crossover, dynamic EQ, delay, limiter, gain, Input C
+mode, and every other source, mute, and setup address fail closed, so this
+feature cannot enable Auto Align or phantom power, and it cannot touch any
+mute or route.
 
 Rollback actions are the exact baseline values in reverse order: PEQ enable
 and band count are restored before the bands they had activated. Exact

@@ -27,20 +27,31 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   readback -> rollback. The reviewed addresses are the closed allowlist in
   `crates/dcx-core/src/layout.rs`: PEQ on/off (`0x06`), PEQ band count
   (`0x07`), and the nine PEQ bands (`0x13` through `0x3f`) on output channels
-  5 through 10, plus the O4 output mute (channel 8, `0x03`, Dump1 byte 223).
-  Locations are transcribed from the pinned MIT DuinoDCX `outputLocations`
-  table; only O1/PEQ9 has named-device readback, the O4 mute is pending
-  Legalab's WORD-FS-A rehearsal, and every other PEQ address is pending its
-  first exact readback. Values must lie in their device domain, the apply path
-  admits only PEQ cuts, and rollback restores the exact baseline in reverse
-  order. Dump1 keeps its baseline modulo-128 trailer balance as a named
-  hypothesis. Every other output, input, setup, crossover, dynamic-EQ, mute,
-  or opaque dump mapping fails closed. No server or automatic apply path
-  belongs in the MVP.
+  5 through 10; plus the MVP routing set admitted by Jess's ruling
+  `dec-autonomous-muted-bench-20261007` (Linear TIN-5379 comment `d24dac45`):
+  the O4/O5/O6 output mutes (channels 8 through 10, `0x03`, Dump1 bytes
+  223/392/561), the O4 and O3 output sources (channels 8 and 7, `0x41`, Dump1
+  bytes 365/195), and the setup input sum type (channel 0, `0x02`, Dump0 byte
+  117) as off (0) or A+B (4) only. Locations are transcribed from the pinned
+  MIT DuinoDCX `outputLocations` and `setupLocations` tables; O1/PEQ9 and the
+  O4 PEQ on/off, band count and band 1 fields have named-device readback, and
+  every other address, including all routing addresses, is pending its first
+  exact readback. Values must lie in their reviewed domain, the apply path
+  admits only PEQ cuts and writes routing fields mutes first, then the input
+  sum, then the O4 and O3 sources, and rollback restores the exact baseline in
+  reverse order. Dump0 and Dump1 keep their baseline modulo-128 trailer
+  balance. Every other output, input, setup (Input C gain/mode at Dump0 121,
+  Mute Outs, links), crossover, dynamic-EQ, mute (O1-O3), source (O1, O2, O5,
+  O6), or opaque dump mapping fails closed. Auto Align and +15 V have no
+  address and must never gain one. No server or automatic apply path belongs
+  in the MVP.
 - Desired profiles are `dcx.desired-profile/v1`, exactly O1/channel 5/PEQ9
-  with four ordered actions (`0x3b` through `0x3e`), or
+  with four ordered actions (`0x3b` through `0x3e`);
   `dcx.desired-profile/v2`, one output's ordered cut-only PEQ on/off, band
-  count, and band-field actions. Static feedback notches (`dcxctl feedback`)
+  count, and band-field actions; or `dcx.desired-routing/v1`
+  (`dcxctl routing desired-profile`), one to six routing actions in the fixed
+  apply order above, with `--mvp` the ruling's routing (O5/O6 muted, input sum
+  A+B, O4 from C, O3 from SUM). Static feedback notches (`dcxctl feedback`)
   target O4 only and never write the operator's active bands. Missing
   post-write capture remains explicit uncertainty: apply `readback` and
   rollback `restored` may be omitted or null, never synthesized.

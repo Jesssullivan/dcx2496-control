@@ -6,6 +6,7 @@ mod live_discovery;
 
 mod feedback_cli;
 mod live_control;
+mod routing_cli;
 
 use std::{
     error::Error,
@@ -20,6 +21,7 @@ use dcx_core::{
     discovery::QueryOnlyDiscovery,
     protocol::{self, DeviceId, DumpPart, MAX_FRAME_LEN, Query},
     rew::{self, MAX_REW_BYTES},
+    routing::{InputSum, OutputSource},
 };
 
 const MAX_DECODE_FILE_BYTES: usize = MAX_FRAME_LEN * 4;
@@ -65,6 +67,94 @@ enum Command {
     Feedback {
         #[command(subcommand)]
         command: FeedbackCommand,
+    },
+    /// Offline closed MVP routing: O4/O5/O6 mutes, O3/O4 sources, input sum.
+    Routing {
+        #[command(subcommand)]
+        command: RoutingCommand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl Switch {
+    const fn muted(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum InputSumArg {
+    Off,
+    APlusB,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SourceArg {
+    A,
+    B,
+    C,
+    Sum,
+}
+
+impl SourceArg {
+    const fn source(self) -> OutputSource {
+        match self {
+            Self::A => OutputSource::A,
+            Self::B => OutputSource::B,
+            Self::C => OutputSource::C,
+            Self::Sum => OutputSource::Sum,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum RoutingCommand {
+    /// Bind routing targets into a staged `dcx.desired-routing/v1` for `control diff`.
+    ///
+    /// Actions are ordered mutes, input sum, then O4 and O3 sources; rollback
+    /// is the exact reverse. Unset targets are left untouched.
+    DesiredProfile {
+        /// Stable operator-facing profile identity.
+        #[arg(long)]
+        profile_id: String,
+        /// Stable operator-facing profile revision.
+        #[arg(long)]
+        revision: String,
+        /// The ruling's MVP routing: O5/O6 muted, input sum A+B, O4 from C, O3 from SUM.
+        #[arg(
+            long,
+            conflicts_with_all = ["o4_mute", "o5_mute", "o6_mute", "input_sum", "o4_source", "o3_source"]
+        )]
+        mvp: bool,
+        /// O4 mute.
+        #[arg(long, value_enum)]
+        o4_mute: Option<Switch>,
+        /// O5 mute.
+        #[arg(long, value_enum)]
+        o5_mute: Option<Switch>,
+        /// O6 mute.
+        #[arg(long, value_enum)]
+        o6_mute: Option<Switch>,
+        /// Setup input sum: off or A+B only.
+        #[arg(long, value_enum)]
+        input_sum: Option<InputSumArg>,
+        /// O4 source.
+        #[arg(long, value_enum)]
+        o4_source: Option<SourceArg>,
+        /// O3 source.
+        #[arg(long, value_enum)]
+        o3_source: Option<SourceArg>,
+    },
+    /// Decode the reviewed routing fields from a saved snapshot (read-only).
+    Inspect {
+        /// Complete raw `SnapshotV1` produced by `control snapshot`.
+        #[arg(long)]
+        snapshot: PathBuf,
     },
 }
 
@@ -272,7 +362,8 @@ enum ControlCommand {
         /// Complete raw `SnapshotV1` produced by `control snapshot`.
         #[arg(long)]
         snapshot: PathBuf,
-        /// Staged `dcx.desired-profile/v1` (O1/PEQ9) or `/v2` (one output's PEQ bank).
+        /// Staged `dcx.desired-profile/v1` (O1/PEQ9), `/v2` (one output's PEQ
+        /// bank), or `dcx.desired-routing/v1` (closed MVP routing).
         #[arg(long)]
         profile: PathBuf,
     },
@@ -323,8 +414,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Rew { command } => rew(command)?,
         Command::Control { command } => control(command)?,
         Command::Feedback { command } => feedback(command)?,
+        Command::Routing { command } => routing(command)?,
     }
     Ok(())
+}
+
+fn routing(command: RoutingCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        RoutingCommand::DesiredProfile {
+            profile_id,
+            revision,
+            mvp,
+            o4_mute,
+            o5_mute,
+            o6_mute,
+            input_sum,
+            o4_source,
+            o3_source,
+        } => routing_cli::desired_profile(
+            &routing_cli::Targets {
+                mvp,
+                o4_mute: o4_mute.map(Switch::muted),
+                o5_mute: o5_mute.map(Switch::muted),
+                o6_mute: o6_mute.map(Switch::muted),
+                input_sum: input_sum.map(|sum| match sum {
+                    InputSumArg::Off => InputSum::Off,
+                    InputSumArg::APlusB => InputSum::APlusB,
+                }),
+                o4_source: o4_source.map(SourceArg::source),
+                o3_source: o3_source.map(SourceArg::source),
+            },
+            profile_id,
+            revision,
+        ),
+        RoutingCommand::Inspect { snapshot } => routing_cli::inspect(&snapshot),
+    }
 }
 
 fn feedback(command: FeedbackCommand) -> Result<(), Box<dyn Error>> {
