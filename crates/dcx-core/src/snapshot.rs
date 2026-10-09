@@ -27,8 +27,9 @@ use thiserror::Error;
 
 use crate::{
     layout::{
-        OutputField, PACKED_PAYLOAD_START, ReviewedAddress, UNITY_GAIN_CODE, reviewed_address,
-        routing_rank,
+        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, OUTPUT_COUNT, OutputField,
+        PACKED_PAYLOAD_START, PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE, band_parameter,
+        output_channel, reviewed_address, routing_rank,
     },
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DirectParameterAction,
@@ -820,6 +821,20 @@ pub enum SnapshotProjectionError {
     Snapshot(#[from] SnapshotError),
 }
 
+/// One frame byte that changed outside an apply plan's projected offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ByteChangeV1 {
+    /// Snapshot component holding the byte.
+    pub section: SnapshotSection,
+    /// Frame offset, header included.
+    pub offset: usize,
+    /// Baseline byte.
+    pub before: u8,
+    /// Readback byte.
+    pub after: u8,
+}
+
 /// Closed, bounded apply plan bound to exact observed and desired snapshots.
 ///
 /// Actions are explicit opaque wire-level tuples, not inferred semantic
@@ -844,10 +859,22 @@ impl ApplyPlanV1 {
     /// The caller must supply actions from a separately evidenced semantic
     /// mapping. Empty actions are accepted only for exact snapshot equality.
     ///
+    /// A plan may never make a PEQ band active (bands 1 through the band
+    /// count while PEQ is on) when that band holds a boost (gain code above
+    /// 150) and was inactive in the baseline: turning PEQ on or raising the
+    /// band count would otherwise apply a stored boost without writing one.
+    /// Nor may it move or reshape an active operator boost by writing that
+    /// band's other fields. Both rules hold after every ordered action, not
+    /// only for the final desired state, because the device passes through
+    /// each prefix of the frame. No caller policy (including
+    /// `--allow-enable-operator-bands`) relaxes this, because every v1/v2
+    /// diff and every durable apply carrier is bound here.
+    ///
     /// # Errors
     ///
     /// Rejects another device, identity changes, missing or surplus actions,
-    /// and any invalid direct-parameter command.
+    /// any invalid direct-parameter command, any boost write, and any ordered
+    /// step that newly activates a stored boost or changes an active one.
     pub fn new(
         baseline: &SnapshotV1,
         desired: &SnapshotV1,
@@ -876,6 +903,7 @@ impl ApplyPlanV1 {
             require_cut_only(command.actions())?;
             require_routing_order(command.actions())?;
             let projected = baseline.project_direct_actions(command.actions())?;
+            require_no_stored_boost_activation(baseline, command.actions())?;
             if projected != *desired {
                 return Err(ApplyPlanError::DesiredProjectionMismatch {
                     projected: projected.digest().to_owned(),
@@ -943,6 +971,96 @@ impl ApplyPlanV1 {
     /// Canonical digest binding snapshots and ordered typed actions.
     pub fn digest(&self) -> &str {
         &self.plan_digest
+    }
+
+    /// Every frame bit this plan may change on the device, by byte.
+    ///
+    /// Each projected location owns its whole low and high bytes but only its
+    /// own bit of the shared 7-of-8 carrier byte; the other carrier bits hold
+    /// bit seven of neighbouring packed bytes the plan never writes. The
+    /// trailer byte of each dump part a projected location lies in may change
+    /// wholly. Identity bytes are never included. A no-op plan may change
+    /// nothing.
+    pub fn projected_masks(&self) -> std::collections::BTreeMap<(SnapshotSection, usize), u8> {
+        let mut masks = std::collections::BTreeMap::new();
+        let Some(command) = &self.command else {
+            return masks;
+        };
+        let mut allow = |key: (SnapshotSection, usize), mask: u8| {
+            *masks.entry(key).or_insert(0) |= mask;
+        };
+        for action in command.actions() {
+            // Every bound action passed the reviewed projection in `new`.
+            let Some(address) = reviewed_address(action.channel(), action.parameter()) else {
+                continue;
+            };
+            let location = address.location;
+            let section = match location.part() {
+                DumpPart::Part0 => SnapshotSection::Dump0,
+                DumpPart::Part1 => SnapshotSection::Dump1,
+            };
+            allow((section, location.low_offset()), 0xff);
+            if let Some((carrier, bit)) = location.carrier() {
+                allow((section, carrier), 1 << bit);
+            }
+            if let Some(high) = location.high_offset() {
+                allow((section, high), 0xff);
+            }
+            allow((section, self.baseline.frame(section).len() - 2), 0xff);
+        }
+        masks
+    }
+
+    /// Every frame byte this plan may change at least one bit of; see
+    /// [`Self::projected_masks`] for which bits.
+    pub fn projected_offsets(&self) -> std::collections::BTreeSet<(SnapshotSection, usize)> {
+        self.projected_masks().into_keys().collect()
+    }
+
+    /// Bytes that differ between the bound baseline and a complete readback
+    /// in any bit outside [`Self::projected_masks`].
+    ///
+    /// An empty result means every observed change stayed inside the plan's
+    /// projected bits and the touched dump trailers; a flipped carrier bit
+    /// that belongs to a neighbouring packed byte is uncontained even though
+    /// the plan shares its carrier byte. It does not mean the readback equals
+    /// the desired state; that is exact readback verification's job.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a readback from another device.
+    pub fn uncontained_changes(
+        &self,
+        readback: &SnapshotV1,
+    ) -> Result<Vec<ByteChangeV1>, SnapshotDiffError> {
+        if readback.device() != self.device_id {
+            return Err(SnapshotDiffError::DeviceMismatch {
+                observed: self.device_id.get(),
+                desired: readback.device().get(),
+            });
+        }
+        let allowed = self.projected_masks();
+        let mut changes = Vec::new();
+        for section in [
+            SnapshotSection::Identity,
+            SnapshotSection::Dump0,
+            SnapshotSection::Dump1,
+        ] {
+            let before = self.baseline.frame(section);
+            let after = readback.frame(section);
+            for (offset, (&before, &after)) in before.iter().zip(after).enumerate() {
+                let mask = allowed.get(&(section, offset)).copied().unwrap_or(0);
+                if (before ^ after) & !mask != 0 {
+                    changes.push(ByteChangeV1 {
+                        section,
+                        offset,
+                        before,
+                        after,
+                    });
+                }
+            }
+        }
+        Ok(changes)
     }
 
     /// Serialize the strict durable apply carrier.
@@ -1078,6 +1196,172 @@ fn require_routing_order(actions: &[DirectParameterAction]) -> Result<(), ApplyP
     Ok(())
 }
 
+/// Pending direct writes laid over one immutable snapshot.
+///
+/// Reads go through the reviewed address map without domain checks, exactly
+/// like [`SnapshotV1::read_reviewed`], so the guard sees each intermediate
+/// device state an ordered command passes through without rebuilding frames.
+struct WriteOverlay<'a> {
+    base: &'a SnapshotV1,
+    writes: std::collections::BTreeMap<(u8, u8), u16>,
+}
+
+impl<'a> WriteOverlay<'a> {
+    fn new(base: &'a SnapshotV1) -> Self {
+        Self {
+            base,
+            writes: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn write(&mut self, action: DirectParameterAction) {
+        self.writes
+            .insert((action.channel(), action.parameter()), action.value());
+    }
+
+    fn read(&self, output: u8, parameter: u8) -> Result<u16, ApplyPlanError> {
+        let channel = output_channel(output);
+        if let Some(&value) = self.writes.get(&(channel, parameter)) {
+            return Ok(value);
+        }
+        read_output_field(self.base, output, parameter)
+    }
+
+    fn active_band_count(&self, output: u8) -> Result<u8, ApplyPlanError> {
+        if self.read(output, EQ_ENABLED_PARAMETER)? == 0 {
+            return Ok(0);
+        }
+        let count = self.read(output, EQ_COUNT_PARAMETER)?;
+        Ok(u8::try_from(count.min(u16::from(PEQ_BANDS))).unwrap_or(PEQ_BANDS))
+    }
+}
+
+/// Outputs whose PEQ state an action list can touch.
+fn touched_outputs(actions: &[DirectParameterAction]) -> std::collections::BTreeSet<u8> {
+    actions
+        .iter()
+        .filter_map(|action| {
+            (1..=OUTPUT_COUNT).find(|&output| output_channel(output) == action.channel())
+        })
+        .collect()
+}
+
+/// Refuse one device state that activates, moves, or reshapes a boost.
+///
+/// The active PEQ bands of an output form the prefix 1 through the band count
+/// while PEQ is on (any non-zero on/off value counts as on, the conservative
+/// reading). In `state`, every active band holding a boost (gain code above
+/// 150) must have been active in `baseline` with all five band fields
+/// unchanged: the operator's untouched boost is the only admitted one.
+fn require_no_boost_exposure(
+    baseline: &WriteOverlay<'_>,
+    state: &WriteOverlay<'_>,
+    outputs: &std::collections::BTreeSet<u8>,
+) -> Result<(), ApplyPlanError> {
+    for &output in outputs {
+        let before = baseline.active_band_count(output)?;
+        let after = state.active_band_count(output)?;
+        for band in 1..=after {
+            let gain_code = state.read(output, band_parameter(band, BandField::Gain))?;
+            if gain_code <= UNITY_GAIN_CODE {
+                continue;
+            }
+            if band > before {
+                return Err(ApplyPlanError::StoredBoostActivation {
+                    output,
+                    band,
+                    gain_code,
+                });
+            }
+            for field in BandField::all() {
+                let parameter = band_parameter(band, field);
+                if state.read(output, parameter)? != baseline.read(output, parameter)? {
+                    return Err(ApplyPlanError::ActiveBoostReshaped {
+                        output,
+                        band,
+                        gain_code,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an ordered apply command that exposes a boost at any step.
+///
+/// One direct-parameter frame is processed in order, so every prefix of the
+/// action list is a device state the PA feed can sit in (briefly, or for good
+/// when the frame is cut short). Each prefix, not only the final desired
+/// state, must pass [`require_no_boost_exposure`]: a band holding a stored
+/// boost may not become active, and an active operator boost may not be moved
+/// or reshaped, before or after its gain is cut. Only outputs the actions
+/// address are read, so unrelated opaque output state cannot block a plan.
+fn require_no_stored_boost_activation(
+    baseline: &SnapshotV1,
+    actions: &[DirectParameterAction],
+) -> Result<(), ApplyPlanError> {
+    let outputs = touched_outputs(actions);
+    let reference = WriteOverlay::new(baseline);
+    let mut state = WriteOverlay::new(baseline);
+    for action in actions {
+        state.write(*action);
+        require_no_boost_exposure(&reference, &state, &outputs)?;
+    }
+    Ok(())
+}
+
+/// Refuse an ordered rollback command that exposes a boost at any step.
+///
+/// The rollback may start from the full desired state or from any prefix a
+/// cut-short apply frame left behind; every step from each of those starting
+/// states must pass [`require_no_boost_exposure`] against the baseline. The
+/// reversed inverse of an admitted apply always does, because from any apply
+/// prefix its steps retrace the earlier apply prefixes (each address is
+/// written once, so restoring an unapplied address is a no-op); only another
+/// order needs the full walk.
+fn require_rollback_never_exposes_boost(
+    baseline: &SnapshotV1,
+    apply: &[DirectParameterAction],
+    rollback: &[DirectParameterAction],
+) -> Result<(), ApplyPlanError> {
+    let address = |action: &DirectParameterAction| (action.channel(), action.parameter());
+    if apply
+        .iter()
+        .rev()
+        .map(address)
+        .eq(rollback.iter().map(address))
+    {
+        return Ok(());
+    }
+    let outputs = touched_outputs(apply);
+    let reference = WriteOverlay::new(baseline);
+    let mut start = WriteOverlay::new(baseline);
+    for action in apply {
+        start.write(*action);
+        let mut state = WriteOverlay {
+            base: baseline,
+            writes: start.writes.clone(),
+        };
+        for inverse in rollback {
+            state.write(*inverse);
+            require_no_boost_exposure(&reference, &state, &outputs)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_output_field(
+    snapshot: &SnapshotV1,
+    output: u8,
+    parameter: u8,
+) -> Result<u16, ApplyPlanError> {
+    let channel = output_channel(output);
+    let address = reviewed_address(channel, parameter)
+        .ok_or(SnapshotProjectionError::UnmappedAction { channel, parameter })?;
+    Ok(snapshot.read_reviewed(address))
+}
+
 fn snapshot_from_value(value: &serde_json::Value) -> Result<SnapshotV1, PlanCarrierError> {
     Ok(SnapshotV1::from_json(&serde_json::to_vec(value)?)?)
 }
@@ -1156,6 +1440,30 @@ pub enum ApplyPlanError {
          (mutes, then input sum, then O4 and O3 sources)"
     )]
     RoutingOrder { channel: u8, parameter: u8 },
+    /// The desired state would activate a band that holds a stored boost.
+    #[error(
+        "O{output} band {band} holds stored boost gain code {gain_code} and would become active; apply is cut-only"
+    )]
+    StoredBoostActivation {
+        /// Physical output, 1 through 6.
+        output: u8,
+        /// Band that would become active.
+        band: u8,
+        /// Stored gain code above unity (150).
+        gain_code: u16,
+    },
+    /// An ordered step would move or reshape an active operator boost.
+    #[error(
+        "O{output} band {band} is an active boost (gain code {gain_code}); a plan may not change its other fields while it holds a boost"
+    )]
+    ActiveBoostReshaped {
+        /// Physical output, 1 through 6.
+        output: u8,
+        /// Active band holding the boost.
+        band: u8,
+        /// Stored gain code above unity (150).
+        gain_code: u16,
+    },
     /// Explicit typed actions did not project to the exact desired snapshot.
     #[error("typed action projection {projected} did not match desired snapshot {desired}")]
     DesiredProjectionMismatch { projected: String, desired: String },
@@ -1253,6 +1561,11 @@ impl RollbackPlanV1 {
                 if apply_addresses != rollback_addresses {
                     return Err(ApplyPlanError::RollbackAddressMismatch);
                 }
+                require_rollback_never_exposes_boost(
+                    baseline,
+                    apply_command.actions(),
+                    rollback.actions(),
+                )?;
                 let projected = apply.desired.project_direct_actions(rollback.actions())?;
                 if projected != *baseline {
                     return Err(ApplyPlanError::RollbackProjectionMismatch {

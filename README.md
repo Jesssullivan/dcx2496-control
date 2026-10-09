@@ -165,6 +165,12 @@ dcxctl control rollback \
   --plan rollback-plan.json
 ```
 
+`dcxctl control verify-containment --plan apply-plan.json --readback
+readback.json` is offline: it exits non-zero when any bit differs from the
+plan's baseline outside the projected addresses (only the plan's own bits of a
+shared 7-of-8 carrier byte) and the touched dump trailer.
+`scripts/serial-probe.sh` runs it on every named-device O4 round trip.
+
 Legalab owns the physical mute, route, authorization, and attended-stop
 preconditions for every live invocation. This repository does not duplicate
 those records.
@@ -174,7 +180,7 @@ those records.
 `dcxctl feedback` turns a ring-out frequency list or a REW Generic EQ export
 into bounded cut-only notches on the O4 (PA) PEQ bank, placed only above the
 operator's active bands. It is offline; the result is a strict
-`dcx.desired-profile/v2` that goes through the same `control diff`, `apply`,
+`dcx.desired-profile/v2` (O4 only) that goes through the same `control diff`, `apply`,
 and `rollback` carriers. See
 [`docs/feedback-suppression.md`](docs/feedback-suppression.md). The Logic AU
 can run the same offline plan through the helper and stage the result; see

@@ -23,8 +23,13 @@ ring-out list | REW Generic EQ
   -> dcxctl control diff          (apply_plan + rollback_plan)
   -> dcxctl control apply         (stale-baseline check, one typed frame,
                                    complete readback)
+  -> dcxctl control verify-containment   (offline: no byte outside the
+                                   projected addresses and touched trailer)
   -> dcxctl control rollback      (only if readback is not exact)
 ```
+
+`dcx.desired-profile/v2` targets O4/channel 8 only, the same scope as the
+planner; any other output is refused at parse time.
 
 `dcxctl feedback inspect --snapshot S --target-output 4` decodes O4's PEQ
 enable, band count, and all nine bands from a saved snapshot, read-only.
@@ -69,7 +74,9 @@ Bands 1 to n, where n is the current band count, belong to the operator and
 are never written. Notches go into bands n+1 to n+k. Each band writes all five
 fields, then the band count, then PEQ on. If PEQ is off while n > 0, planning
 refuses unless `--allow-enable-operator-bands` is given, because turning PEQ
-on would also enable the operator's bands.
+on would also enable the operator's bands. Even with that flag, planning
+refuses (`WouldEnableStoredBoost`) when an operator band about to become active
+holds a boost (gain code above 150).
 
 `--prior-plan` names the receipt of the plan last applied to O4. The baseline
 must still hold that plan's notches exactly directly above its operator count;
@@ -87,9 +94,17 @@ The writer is the generalized reviewed-address projection in
 the nine bands (`0x13`-`0x3f`) of every output, plus the O4 mute, transcribed
 from the pinned MIT DuinoDCX `outputLocations` table. The writer also admits the
 closed MVP routing set (O4/O5/O6 mutes, O3/O4 sources, setup input sum), but
-only through `dcx.desired-routing/v1`. A v2 feedback profile rejects every
-non-PEQ field. Every value is checked against its device domain. The apply
-path admits only cuts. Crossover, dynamic EQ, delay, limiter, gain, Input C
+only through `dcx.desired-routing/v1`. A v2 feedback profile targets O4 only
+and rejects every non-PEQ field. Every value is checked against its device
+domain. The apply path admits only cuts, and every apply plan (v1 or v2
+diff, and every reparsed durable carrier) is refused when its desired state
+makes a band active that holds a stored boost and was inactive in the
+baseline, whether by turning PEQ on or raising the band count. The check
+runs after every ordered action and every rollback step, because the device
+passes through each prefix of the frame: a cut must precede the count or
+on/off write that activates its band. An already active stored boost is left
+as it is, and a plan may not move or reshape it (frequency, Q, kind or slope)
+while it holds a boost. No policy flag relaxes this. Crossover, dynamic EQ, delay, limiter, gain, Input C
 mode, and every other source, mute, and setup address fail closed, so this
 feature cannot enable Auto Align or phantom power, and it cannot touch any
 mute or route.

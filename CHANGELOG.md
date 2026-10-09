@@ -14,6 +14,18 @@
   runs `feedback import|plan|desired-profile` against the helper's raw
   snapshot, and an AU notch list with explicit staging. Fixture parity with
   dcxctl is checked in `//:check`.
+- Refuse every apply plan whose desired state newly activates a PEQ band that
+  holds a stored boost (gain code above 150), by turning PEQ on or raising the
+  band count, under every policy including `--allow-enable-operator-bands`.
+  The check runs after every ordered action and every rollback step, not only
+  on the final state, and an active operator boost may not be moved or
+  reshaped (`ActiveBoostReshaped`).
+- Restrict `dcx.desired-profile/v2` to O4, the planner's only target.
+- Add offline `dcxctl control verify-containment` and the
+  `scripts/serial-probe.sh` bench harness, which now exits non-zero when any
+  bit changes outside the projected addresses and touched dump trailer (a
+  shared 7-of-8 carrier byte admits only the plan's own bits).
+- Bump the Apple helper and AUv3 bundle version to 0.1.2 (3).
 - Record the first named-device O4 PEQ round trips: the Dump1 trailer balance,
   band-count ordering, and O4 PEQ on/off, count and band 1 locations read back
   exactly and rolled back to the original snapshot.

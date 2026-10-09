@@ -36,7 +36,7 @@ pub const MEASUREMENT_SCHEMA: &str = "dcx.feedback-measurement/v1";
 /// Versioned notch plan carrier.
 pub const NOTCH_PLAN_SCHEMA: &str = "dcx.notch-plan/v1";
 /// The only output the feedback planner writes: O4, the PA feed.
-pub const FEEDBACK_TARGET_OUTPUT: u8 = 4;
+pub const FEEDBACK_TARGET_OUTPUT: u8 = crate::peq_bank::DESIRED_PROFILE_V2_OUTPUT;
 /// Maximum peaks in one measurement.
 pub const MAX_MEASUREMENT_PEAKS: usize = 64;
 /// Maximum frequency-list file size.
@@ -620,7 +620,8 @@ struct Cluster {
 ///
 /// Rejects any output but O4, an invalid policy, a baseline whose PEQ bank
 /// fails to decode, a prior plan the baseline no longer matches, a full bank,
-/// and enabling PEQ over operator bands without the explicit policy flag.
+/// enabling PEQ over operator bands without the explicit policy flag, and
+/// enabling PEQ over an operator band holding a boost under any policy.
 pub fn plan_notches(
     measurement: &FeedbackMeasurementV1,
     baseline: &SnapshotV1,
@@ -645,10 +646,22 @@ pub fn plan_notches(
             prior.operator_band_count
         }
     };
-    if !bank.eq_enabled && operator_band_count > 0 && !policy.allow_enable_operator_bands {
-        return Err(FeedbackPlanError::WouldEnableOperatorBands(
-            operator_band_count,
-        ));
+    if !bank.eq_enabled && operator_band_count > 0 {
+        if !policy.allow_enable_operator_bands {
+            return Err(FeedbackPlanError::WouldEnableOperatorBands(
+                operator_band_count,
+            ));
+        }
+        // The flag admits enabling the operator's cuts, never a stored boost:
+        // apply admission is cut-only and refuses the same plan again.
+        if let Some(band) =
+            (1..=operator_band_count).find(|&band| bank.band(band).gain_code > UNITY_GAIN_CODE)
+        {
+            return Err(FeedbackPlanError::WouldEnableStoredBoost {
+                band,
+                gain_code: bank.band(band).gain_code,
+            });
+        }
     }
     let free = PEQ_BANDS - operator_band_count;
     if free == 0 {
@@ -1088,6 +1101,16 @@ pub enum FeedbackPlanError {
         "O4 PEQ is off with {0} operator bands; enabling it needs --allow-enable-operator-bands"
     )]
     WouldEnableOperatorBands(u8),
+    /// Enabling PEQ would activate an operator band that holds a boost.
+    #[error(
+        "O4 operator band {band} holds stored boost gain code {gain_code}; enabling PEQ is refused even with --allow-enable-operator-bands"
+    )]
+    WouldEnableStoredBoost {
+        /// Operator band holding the boost.
+        band: u8,
+        /// Stored gain code above unity (150).
+        gain_code: u16,
+    },
     /// Every band is in operator use.
     #[error("O4 has no free PEQ band above the operator bands")]
     NoFreeBands,

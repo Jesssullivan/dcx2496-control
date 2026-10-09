@@ -367,6 +367,16 @@ enum ControlCommand {
         #[arg(long)]
         profile: PathBuf,
     },
+    /// Offline gate: exit non-zero if a readback changed any byte outside the
+    /// plan's projected addresses and touched dump trailers.
+    VerifyContainment {
+        /// Strict raw `ApplyPlanV1` produced by `control diff`.
+        #[arg(long)]
+        plan: PathBuf,
+        /// Complete `SnapshotV1` read back after `control apply`.
+        #[arg(long)]
+        readback: PathBuf,
+    },
     /// Verify the live baseline, apply one strict plan, and read back completely.
     #[cfg(all(feature = "live-control", target_os = "macos"))]
     Apply {
@@ -509,6 +519,13 @@ fn control(command: ControlCommand) -> Result<(), Box<dyn Error>> {
             expected_device,
         } => live_control::capture(tty, expected_device),
         ControlCommand::Diff { snapshot, profile } => live_control::diff(&snapshot, &profile),
+        ControlCommand::VerifyContainment { plan, readback } => {
+            if live_control::verify_containment(&plan, &readback)? {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
         #[cfg(all(feature = "live-control", target_os = "macos"))]
         ControlCommand::Apply {
             tty,

@@ -13,12 +13,12 @@ use std::{
 use crate::read_bounded;
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 use dcx_core::ApplyTransactionState;
-#[cfg(all(feature = "live-control", target_os = "macos"))]
-use dcx_core::{ApplyPlanV1, RollbackPlanV1, protocol::DeviceId};
 use dcx_core::{
-    ApplyTransactionV1, DirectParameterAction, SnapshotV1, layout::reviewed_address,
+    ApplyPlanV1, ApplyTransactionV1, DirectParameterAction, SnapshotV1, layout::reviewed_address,
     peq_bank::DesiredProfile,
 };
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+use dcx_core::{RollbackPlanV1, protocol::DeviceId};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 use dcx_darwin_tty::{DarwinSearchSession, PrivateTtyBinding, recover_receive_direct_known_38400};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
@@ -126,6 +126,43 @@ pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+/// Offline containment gate: every bit that differs between an apply plan's
+/// bound baseline and a complete readback must lie inside the plan's projected
+/// bits (plus the touched dump trailers). Returns whether it does.
+pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn Error>> {
+    let plan = ApplyPlanV1::from_json(&read_bounded(
+        plan,
+        MAX_CONTROL_DOCUMENT_BYTES,
+        "apply plan",
+    )?)?;
+    let readback = SnapshotV1::from_json(&read_bounded(
+        readback,
+        MAX_CONTROL_DOCUMENT_BYTES,
+        "readback snapshot",
+    )?)?;
+    let uncontained = plan.uncontained_changes(&readback)?;
+    let projected = plan
+        .projected_masks()
+        .into_iter()
+        .map(|((section, offset), mask)| {
+            serde_json::json!({"section": section, "offset": offset, "mask": mask})
+        })
+        .collect::<Vec<_>>();
+    let contained = uncontained.is_empty();
+    let output = serde_json::json!({
+        "status": if contained { "contained" } else { "uncontained" },
+        "transaction_id": plan.digest(),
+        "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
+        "desired_snapshot_digest": plan.desired_snapshot_digest(),
+        "readback_snapshot_digest": readback.digest(),
+        "readback_matches_desired": readback.digest() == plan.desired_snapshot_digest(),
+        "projected_offsets": projected,
+        "uncontained_changes": uncontained,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(contained)
 }
 
 #[cfg(all(feature = "live-control", target_os = "macos"))]

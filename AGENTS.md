@@ -37,7 +37,10 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   O4 PEQ on/off, band count and band 1 fields have named-device readback, and
   every other address, including all routing addresses, is pending its first
   exact readback. Values must lie in their reviewed domain, the apply path
-  admits only PEQ cuts and writes routing fields mutes first, then the input
+  admits only PEQ cuts and never makes a band active (PEQ on and inside the
+  band count) that holds a stored boost and was inactive in the baseline, nor
+  moves or reshapes an active boost, at any ordered apply or rollback step,
+  under any policy flag; it writes routing fields mutes first, then the input
   sum, then the O4 and O3 sources, and rollback restores the exact baseline in
   reverse order. Dump0 and Dump1 keep their baseline modulo-128 trailer
   balance. Every other output, input, setup (Input C gain/mode at Dump0 121,
@@ -47,12 +50,15 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   in the MVP.
 - Desired profiles are `dcx.desired-profile/v1`, exactly O1/channel 5/PEQ9
   with four ordered actions (`0x3b` through `0x3e`);
-  `dcx.desired-profile/v2`, one output's ordered cut-only PEQ on/off, band
-  count, and band-field actions; or `dcx.desired-routing/v1`
+  `dcx.desired-profile/v2`, exactly O4/channel 8 with ordered cut-only PEQ
+  on/off, band count, and band-field actions, matching the planner; or `dcx.desired-routing/v1`
   (`dcxctl routing desired-profile`), one to six routing actions in the fixed
   apply order above, with `--mvp` the ruling's routing (O5/O6 muted, input sum
   A+B, O4 from C, O3 from SUM). Static feedback notches (`dcxctl feedback`)
-  target O4 only and never write the operator's active bands. Missing
+  target O4 only and never write the operator's active bands.
+  `dcxctl control verify-containment` is the offline gate that fails when a
+  readback changed any bit outside the plan's projected addresses (only its
+  own bits of a shared carrier byte) and touched dump trailer. Missing
   post-write capture remains explicit uncertainty: apply `readback` and
   rollback `restored` may be omitted or null, never synthesized.
 - The AUv3 MIDI FX owns staged desired state and MIDI pass-through only. It has
