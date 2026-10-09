@@ -182,6 +182,26 @@ dcxctl control diff --snapshot snapshot.json --profile desired-profile.json \
   > transaction-plans.json
 ```
 
+### MVP routing (muted bench)
+
+`dcxctl routing` binds the closed routing set admitted by
+`dec-autonomous-muted-bench-20261007`: the O4/O5/O6 mutes, the O4 and O3
+sources, and the setup input sum (off or A+B only). The result is a strict
+`dcx.desired-routing/v1` that goes through the same `control diff`, `apply`,
+and `rollback` carriers. Actions are written mutes first, then the input sum,
+then the O4 and O3 sources; rollback is the exact reverse. Single-field
+profiles serve one-at-a-time probes.
+
+```sh
+dcxctl routing inspect --snapshot snapshot.json
+dcxctl routing desired-profile --o5-mute on --profile-id probe-o5 \
+  --revision 2026-10-08 > probe-o5.json
+dcxctl routing desired-profile --mvp --profile-id mvp-routing \
+  --revision 2026-10-08 > mvp-routing.json
+dcxctl control diff --snapshot snapshot.json --profile mvp-routing.json \
+  > transaction-plans.json
+```
+
 ## Serial boundary
 
 - The caller supplies one exact `/dev/cu.usbserial-*` callout; the program never

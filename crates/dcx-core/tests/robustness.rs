@@ -275,13 +275,16 @@ fn every_unreviewed_direct_address_is_rejected_by_snapshot_projection() {
             let action = DirectParameterAction::new(channel, parameter, 0).unwrap();
             let projected = baseline.project_direct_actions(&[action]);
             // Reviewed: PEQ on/off, band count, and the nine PEQ bands on
-            // every output channel, plus the O4 mute (fixture-derived,
-            // pending WORD-FS-A hardware confirmation).
+            // every output channel; plus, under
+            // dec-autonomous-muted-bench-20261007, the O4/O5/O6 mutes, the
+            // O3/O4 sources, and the setup input sum (value 0 is "off").
             let output_channel = (5..=10).contains(&channel);
             let reviewed_peq = output_channel
                 && (parameter == 0x06 || parameter == 0x07 || (0x13..=0x3f).contains(&parameter));
-            let reviewed_o4_mute = channel == 8 && parameter == 0x03;
-            if reviewed_peq || reviewed_o4_mute {
+            let reviewed_routing = ((8..=10).contains(&channel) && parameter == 0x03)
+                || ((channel == 7 || channel == 8) && parameter == 0x41)
+                || (channel == 0 && parameter == 0x02);
+            if reviewed_peq || reviewed_routing {
                 assert!(projected.is_ok(), "{channel}/{parameter:#04x}");
             } else {
                 assert!(projected.is_err(), "{channel}/{parameter:#04x}");

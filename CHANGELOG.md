@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Admit the MVP routing set under `dec-autonomous-muted-bench-20261007`: the
+  O4/O5/O6 mutes, the O4 and O3 sources, and the setup input sum (off or A+B
+  only), with a closed `dcx.desired-routing/v1` profile, `dcxctl routing
+  desired-profile|inspect`, fixed apply order (mutes, input sum, sources) and
+  reverse rollback. Input C, Mute Outs, crossover, the O1/O2/O5/O6 sources,
+  the O1-O3 mutes, and every other setup address still fail closed.
 - Record the first named-device O4 PEQ round trips: the Dump1 trailer balance,
   band-count ordering, and O4 PEQ on/off, count and band 1 locations read back
   exactly and rolled back to the original snapshot.

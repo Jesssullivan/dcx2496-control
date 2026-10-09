@@ -10,6 +10,7 @@ pub mod peq_bank;
 pub mod profile;
 pub mod protocol;
 pub mod rew;
+pub mod routing;
 pub mod snapshot;
 
 pub use profile::{LabProfileV1, ProfileBinding, ProfileDiff, ProfileError};
