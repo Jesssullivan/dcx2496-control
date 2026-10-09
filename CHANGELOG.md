@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Give the rollback identity step the same paced Search qualification as
+  snapshot and apply: a fresh rollback session now replays empty Search
+  timeouts (attempt one immediate, five-second cadence, at most ten replays)
+  before the inverse write, instead of failing on one unanswered Search. Partial
+  or invalid responses stay terminal, and the rollback envelope is now 90 s.
 - Admit the MVP routing set under `dec-autonomous-muted-bench-20261007`: the
   O4/O5/O6 mutes, the O4 and O3 sources, and the setup input sum (off or A+B
   only), with a closed `dcx.desired-routing/v1` profile, `dcxctl routing

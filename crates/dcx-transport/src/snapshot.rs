@@ -28,6 +28,19 @@ const SEARCH_ATTEMPTS_PER_REQUIRED_IDENTITY: usize = 2;
 /// Maximum attempts allowed to collect the ten persistent Search identities.
 pub const PERSISTENT_SEARCH_ATTEMPT_LIMIT: usize =
     PERSISTENT_SEARCH_COUNT * SEARCH_ATTEMPTS_PER_REQUIRED_IDENTITY;
+/// Empty-timeout Search replays a fresh session may spend before its first
+/// valid identity: the same paced allowance as the persistent snapshot window.
+const SEARCH_EMPTY_REPLAY_LIMIT: usize = PERSISTENT_SEARCH_ATTEMPT_LIMIT - PERSISTENT_SEARCH_COUNT;
+/// Search count for the pre-inverse identity check of a fresh rollback session.
+pub const ROLLBACK_IDENTITY_SEARCH_COUNT: usize = 1;
+/// Maximum paced Search attempts for the fresh rollback session's identity.
+///
+/// A fresh session may go unanswered on its first Search (observed on the
+/// named device), so the rollback identity step replays empty timeouts under
+/// the same allowance as snapshot and apply. Partial, invalid, or
+/// transport-failed responses remain terminal.
+pub const ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT: usize =
+    ROLLBACK_IDENTITY_SEARCH_COUNT + SEARCH_EMPTY_REPLAY_LIMIT;
 /// Search count for post-mutation readback on the already-identified session.
 pub const READBACK_SEARCH_COUNT: usize = 1;
 /// Maximum Search attempts for post-mutation readback.
@@ -47,7 +60,10 @@ pub const PERSISTENT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(120);
 /// dumps, one typed mutation, and its complete readback.
 pub const APPLY_TRANSACTION_BUDGET: Duration = Duration::from_secs(150);
 /// Whole identity-check plus typed-rollback/readback budget.
-pub const ROLLBACK_TRANSACTION_BUDGET: Duration = Duration::from_secs(20);
+///
+/// This includes the maximum paced rollback identity attempts, one typed
+/// inverse, and its complete readback.
+pub const ROLLBACK_TRANSACTION_BUDGET: Duration = Duration::from_secs(90);
 /// Maximum encoded query length among Search, Dump0, and Dump1.
 pub const SNAPSHOT_REQUEST_LIMIT: usize = 11;
 
@@ -1025,9 +1041,12 @@ pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
 /// Verify identity, execute one typed inverse command, then read back.
 ///
 /// The pre-write identity, typed inverse, and one-valid-Search complete readback
-/// all use the same already-open descriptor. That readback may replay one empty
-/// Search timeout without repeating the inverse. No caller-controlled bytes
-/// enter the transport.
+/// all use the same already-open descriptor. The identity step shares the
+/// snapshot/apply Search qualification: attempt one is immediate, each replay is
+/// paced by the device cadence, and only empty timeouts are replayed, up to
+/// [`ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT`] attempts. The readback may replay
+/// one empty Search timeout without repeating the inverse. No caller-controlled
+/// bytes enter the transport.
 ///
 /// # Errors
 ///
@@ -1040,18 +1059,15 @@ pub fn execute_rollback_readback<S: PersistentApplySession, P: RepeatPacer>(
 ) -> Result<RollbackReadbackOutcome, TransactionExecutionError<S::Error, P::Error>> {
     let started = pacer.elapsed();
     let device = transaction.rollback_plan().baseline().device();
-    let identity_kind = SnapshotOperationKind::Search { sequence: 1 };
-    let identity_body = (|| {
-        let operation = SnapshotOperation::search(1, device).map_err(|source| {
-            CaptureBodyError::Validation {
-                operation: identity_kind,
-                source: SnapshotError::Protocol(source),
-            }
-        })?;
-        require_budget::<S::Error, P>(pacer, started, ROLLBACK_TRANSACTION_BUDGET, identity_kind)?;
-        drop(exchange_validated::<S, P::Error>(&mut session, operation)?);
-        require_budget::<S::Error, P>(pacer, started, ROLLBACK_TRANSACTION_BUDGET, identity_kind)
-    })();
+    let identity_body = capture_search_identities(
+        &mut session,
+        pacer,
+        device,
+        ROLLBACK_IDENTITY_SEARCH_COUNT,
+        ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT,
+        started,
+        ROLLBACK_TRANSACTION_BUDGET,
+    );
     if let Err(error) = identity_body {
         let finish_error = session.finish().err();
         return Err(with_finish(error, finish_error).into());
@@ -1809,6 +1825,135 @@ mod tests {
             ]
         );
         assert_eq!(pacer.waits, [REPEAT_SEARCH_GAP]);
+    }
+
+    fn staged_rollback(baseline: &SnapshotV1) -> (ApplyTransactionV1, DirectParameterAction) {
+        let apply = DirectParameterAction::new(5, 0x3c, 40).unwrap();
+        let inverse = DirectParameterAction::new(5, 0x3c, 0).unwrap();
+        let desired = baseline.project_direct_actions(&[apply]).unwrap();
+        let staged =
+            ApplyTransactionV1::stage(baseline.clone(), desired, vec![apply], vec![inverse])
+                .unwrap();
+        let rollback_plan = staged.rollback_plan().clone();
+        (
+            ApplyTransactionV1::resume_rollback(&rollback_plan).unwrap(),
+            inverse,
+        )
+    }
+
+    #[test]
+    fn rollback_identity_replays_an_unanswered_first_search_before_the_inverse() {
+        // Named-device regression (2026-10-09 03:58:40Z and 04:05:18Z): the
+        // first Search of a fresh rollback session went unanswered and the
+        // identity step failed before any write.
+        let baseline = snapshot(0, 0, 0);
+        let (mut transaction, inverse) = staged_rollback(&baseline);
+        let mut steps = vec![
+            Step::Read(SnapshotRead::timed_out(&[]).unwrap()),
+            Step::Read(SnapshotRead::complete(baseline.frame(SnapshotSection::Identity)).unwrap()),
+        ];
+        steps.extend(snapshot_steps(&baseline, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+
+        let outcome = execute_rollback_readback(session, &mut pacer, &mut transaction).unwrap();
+        let RollbackReadbackOutcome::RolledBack(captured) = outcome else {
+            panic!("a replayed identity Search must allow exact rollback")
+        };
+
+        assert_eq!(captured.snapshot(), &baseline);
+        assert_eq!(transaction.state(), ApplyTransactionState::RolledBack);
+        let log = log.borrow();
+        assert_eq!(log.writes.len(), 1);
+        assert_eq!(log.writes[0].actions(), [inverse]);
+        assert_eq!(log.finishes, 1);
+        assert_eq!(
+            log.operations
+                .iter()
+                .map(|operation| operation.kind())
+                .collect::<Vec<_>>(),
+            [
+                SnapshotOperationKind::Search { sequence: 1 },
+                SnapshotOperationKind::Search { sequence: 2 },
+                SnapshotOperationKind::Search { sequence: 1 },
+                SnapshotOperationKind::Dump0,
+                SnapshotOperationKind::Dump1,
+            ]
+        );
+        assert_eq!(pacer.waits, [REPEAT_SEARCH_GAP]);
+    }
+
+    #[test]
+    fn rollback_identity_uses_the_shared_empty_replay_limit_then_writes_nothing() {
+        let baseline = snapshot(0, 0, 0);
+        let (mut transaction, _) = staged_rollback(&baseline);
+        let steps = (0..ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT)
+            .map(|_| Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
+        let (session, log) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+
+        let error = execute_rollback_readback(session, &mut pacer, &mut transaction).unwrap_err();
+        assert!(matches!(
+            error,
+            TransactionExecutionError::Capture(
+                SnapshotCaptureError::SearchQualificationIncomplete {
+                    valid: 0,
+                    required: 1,
+                    attempts: ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT,
+                    finish_error: None,
+                }
+            )
+        ));
+        assert_eq!(
+            ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT,
+            1 + PERSISTENT_SEARCH_ATTEMPT_LIMIT - PERSISTENT_SEARCH_COUNT
+        );
+        assert_eq!(transaction.state(), ApplyTransactionState::RollbackRequired);
+        let log = log.borrow();
+        assert!(log.writes.is_empty());
+        assert!(log.modes.is_empty());
+        assert_eq!(log.finishes, 1);
+        assert_eq!(log.operations.len(), ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT);
+        assert_eq!(
+            pacer.waits,
+            vec![REPEAT_SEARCH_GAP; ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT - 1]
+        );
+    }
+
+    #[test]
+    fn rollback_identity_partial_timeout_stays_terminal_before_the_inverse() {
+        let baseline = snapshot(0, 0, 0);
+        let (mut transaction, _) = staged_rollback(&baseline);
+        let partial = &baseline.frame(SnapshotSection::Identity)[..4];
+        let (session, log) =
+            FakeSession::new([Step::Read(SnapshotRead::timed_out(partial).unwrap())]);
+        let mut pacer = FakePacer::default();
+
+        let error = execute_rollback_readback(session, &mut pacer, &mut transaction).unwrap_err();
+        assert!(matches!(
+            error,
+            TransactionExecutionError::Capture(SnapshotCaptureError::Timeout {
+                operation: SnapshotOperationKind::Search { sequence: 1 },
+                received: 4,
+                finish_error: None,
+            })
+        ));
+        let log = log.borrow();
+        assert!(log.writes.is_empty());
+        assert_eq!(log.operations.len(), 1);
+        assert!(pacer.waits.is_empty());
+    }
+
+    #[test]
+    fn rollback_budget_covers_the_paced_identity_ceiling_and_readback() {
+        let replay_waits = u32::try_from(ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT - 1).unwrap();
+        let identity_ceiling = REPEAT_SEARCH_GAP * replay_waits
+            + SNAPSHOT_OPERATION_TIMEOUT
+                * u32::try_from(ROLLBACK_IDENTITY_SEARCH_ATTEMPT_LIMIT).unwrap();
+        let readback_ceiling = REPEAT_SEARCH_GAP
+            + SNAPSHOT_OPERATION_TIMEOUT * u32::try_from(READBACK_SEARCH_ATTEMPT_LIMIT).unwrap()
+            + SNAPSHOT_DUMP_TIMEOUT * 2;
+        assert!(identity_ceiling + readback_ceiling < ROLLBACK_TRANSACTION_BUDGET);
     }
 
     #[test]
