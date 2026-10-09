@@ -139,14 +139,15 @@ final class BridgeResponseBindingTests: XCTestCase {
     private struct Fixture {
         static let requestID = "synthetic-request"
         let target: DCXTargetReference
-        let profile: DesiredProfileV1
+        let profile: DesiredProfile
+        let feedback: FeedbackPlanRequest
         let baseline: SnapshotV1
         let desired: SnapshotV1
-        let diff: SemanticDiffV1
+        let diff: SemanticDiff
 
         init() throws {
             target = try .init(bindingID: "synthetic-fixture", expectedDeviceAddress: 0)
-            profile = try .init(
+            profile = .v1(try .init(
                 profileID: "pzm-rew-o1-peq9-qualification", revision: "2026-09-01",
                 digest: "sha256/6135022f405de2d172475865d2ecac3479b898eba209c687a0e6e5d92d774ec4",
                 document: .object([
@@ -156,8 +157,11 @@ final class BridgeResponseBindingTests: XCTestCase {
                                  "value": .number(Double(value))])
                     }),
                 ])
-            )
+            ))
             baseline = try Self.snapshot(target: target, digest: Self.digest("0"))
+            feedback = try .init(target: target, baseline: baseline,
+                                 measurement: .frequencyList(Self.ringOut),
+                                 profileID: "o4-feedback", revision: "synthetic-1")
             desired = try Self.snapshot(target: target, digest: Self.digest("4"))
             diff = try .init(
                 baselineSnapshotDigest: baseline.digest, desiredProfileDigest: profile.digest,
@@ -179,6 +183,7 @@ final class BridgeResponseBindingTests: XCTestCase {
             case .rollback: body = .rollback(.init(target: target, plan: try .init(
                 transactionID: diff.applyPlanDigest, baseline: baseline, rollbackPlanDigest: diff.rollbackPlanDigest
             )))
+            case .feedbackPlan: body = .feedbackPlan(feedback)
             }
             return try .init(requestID: requestID, body: body)
         }
@@ -229,6 +234,8 @@ final class BridgeResponseBindingTests: XCTestCase {
                 body = .rollback(.init(transactionID: transactionID, baselineDigest: baselineDigest,
                     restored: snapshot, equalsBaseline: snapshot.digest == baselineDigest,
                     receipt: Self.receipt(operation)))
+            case .feedbackPlan:
+                body = .feedbackPlan(try Self.feedbackResponse(baselineDigest: baselineDigest))
             }
             return .init(requestID: Self.requestID, body: body)
         }
@@ -250,6 +257,30 @@ final class BridgeResponseBindingTests: XCTestCase {
 
         static func receipt(_ operation: BridgeOperation) -> CommandReceiptV1 {
             .init(operation: operation, exitCode: 0, durationMilliseconds: 1, stdoutDigest: digest("c"))
+        }
+
+        static let ringOut = "frequency_hz,level_db\n630,4.0\n"
+
+        /// Synthetic one-notch O4 plan whose v2 profile carries exactly its actions.
+        static func feedbackResponse(
+            baselineDigest: String, measurementDigest: String = digest("d"),
+            profileID: String = "o4-feedback", sourceText: String = ringOut
+        ) throws -> FeedbackPlanResponse {
+            let plan = try NotchPlanSummaryV1(
+                planDigest: digest("e"), baselineSnapshotDigest: baselineDigest,
+                measurementDigest: measurementDigest, eqEnabledBefore: false, eqCountBefore: 0,
+                operatorBandCount: 0,
+                notches: [.init(band: 1, frequencyHz: 630, occurrences: 1, levelDb: 4,
+                                frequencyCode: 159, qCode: 40, gainCode: 90, kindCode: 1, slopeCode: 0)],
+                dropped: [])
+            return .init(
+                measurement: try .init(digest: measurementDigest, source: .frequencyList,
+                    sourceDigest: FeedbackNotchContract.sourceDigest(sourceText), targetOutput: 4, peakCount: 1),
+                plan: plan,
+                desired: try .init(profileID: profileID, revision: "synthetic-1", bank: .init(
+                    targetOutput: 4, parameterChannel: 8, actions: plan.expectedActions)),
+                importReceipt: receipt(.feedbackPlan), planReceipt: receipt(.feedbackPlan),
+                profileReceipt: receipt(.feedbackPlan))
         }
 
         static func digest(_ digit: Character) -> String {

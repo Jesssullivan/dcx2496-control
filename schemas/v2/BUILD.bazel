@@ -1,0 +1,8 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["dcx_logic_bridge.schema.json"])
+
+filegroup(
+    name = "dcx_logic_bridge_schema",
+    srcs = ["dcx_logic_bridge.schema.json"],
+)

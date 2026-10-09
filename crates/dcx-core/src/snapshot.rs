@@ -4,7 +4,10 @@
 //! This module preserves exact validated wire frames and exposes only the
 //! closed reviewed projections in [`crate::layout`], transcribed from the
 //! pinned MIT `DuinoDCX` `00b9d70` layout: PEQ on/off, PEQ band count, and the
-//! nine PEQ bands of every output, plus the O4 output mute. O1/PEQ9 has
+//! nine PEQ bands of every output, plus the O4 output mute, and the MVP
+//! routing addresses admitted by `dec-autonomous-muted-bench-20261007`
+//! (O4/O5/O6 mutes, O3/O4 sources, setup input sum off/A+B), which are
+//! pending their first exact device readback. O1/PEQ9 has
 //! named-device readback; the O4 mute address is fixture-derived and pending
 //! the Legalab WORD-FS-A silent mute-frame rehearsal, O4 PEQ on/off, band
 //! count and band 1 frequency/Q/gain/slope have exact device readback
@@ -12,8 +15,9 @@
 //! readback. Projection preserves the observed modulo-128 balance of the
 //! device-maintained Dump0 and Dump1 trailers; every other dump
 //! byte remains opaque and unappliable. Apply plans accept only explicit
-//! checked direct-parameter actions with cut-only PEQ gains and exact
-//! inverses; they never accept caller-supplied frames.
+//! checked direct-parameter actions with cut-only PEQ gains, routing fields in
+//! their fixed apply order, and exact inverses; they never accept
+//! caller-supplied frames.
 
 use std::{fmt, fmt::Write as _};
 
@@ -25,7 +29,7 @@ use crate::{
     layout::{
         BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, OUTPUT_COUNT, OutputField,
         PACKED_PAYLOAD_START, PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE, band_parameter,
-        output_channel, reviewed_address,
+        output_channel, reviewed_address, routing_rank,
     },
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DirectParameterAction,
@@ -280,9 +284,9 @@ impl SnapshotV1 {
     /// This is intentionally not a general dump mapper. It accepts only the
     /// closed allowlist in [`crate::layout::reviewed_address`]: PEQ on/off,
     /// PEQ band count, and the nine PEQ bands on outputs O1 through O6, plus
-    /// the O4 output mute (fixture-derived, pending hardware confirmation by
-    /// the Legalab WORD-FS-A rehearsal). Each value must lie inside the
-    /// documented device domain of its field. Every other address fails
+    /// the O4/O5/O6 output mutes, the O3/O4 output sources, and the setup
+    /// input sum (off or A+B only). Each value must lie inside the reviewed
+    /// domain of its field. Every other address fails
     /// closed. The identity bytes remain unchanged, both dump trailers keep
     /// their baseline modulo-128 balance, and a fresh snapshot digest is
     /// calculated.
@@ -375,7 +379,8 @@ impl SnapshotV1 {
     ///
     /// The inverse values come from [`Self::inverse_actions_for`]; the order
     /// is reversed so a rollback first restores the PEQ enable and band count
-    /// and only then restores band values that are again inactive.
+    /// and only then restores band values that are again inactive, and
+    /// restores routing sources before the input sum and the mutes.
     ///
     /// # Errors
     ///
@@ -423,8 +428,14 @@ fn require_device_domain(
     field: OutputField,
     value: u16,
 ) -> Result<(), SnapshotProjectionError> {
-    if value <= field.device_max() {
+    if field.admits(value) {
         Ok(())
+    } else if field == OutputField::InputSum {
+        Err(SnapshotProjectionError::ValueNotAdmitted {
+            channel: action.channel(),
+            parameter: action.parameter(),
+            value,
+        })
     } else if field.is_switch() {
         Err(SnapshotProjectionError::ValueNotOnOff {
             parameter: action.parameter(),
@@ -795,6 +806,13 @@ pub enum SnapshotProjectionError {
         value: u16,
         maximum: u16,
     },
+    /// The input sum admits only off (0) and A+B (4).
+    #[error("channel {channel} parameter {parameter:#04x} value {value} is not admitted")]
+    ValueNotAdmitted {
+        channel: u8,
+        parameter: u8,
+        value: u16,
+    },
     /// A reconstructed typed inverse could not be represented.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
@@ -883,6 +901,7 @@ impl ApplyPlanV1 {
         } else {
             let command = DirectParameterCommand::new(diff.device_id, actions)?;
             require_cut_only(command.actions())?;
+            require_routing_order(command.actions())?;
             let projected = baseline.project_direct_actions(command.actions())?;
             require_no_stored_boost_activation(baseline, command.actions())?;
             if projected != *desired {
@@ -1156,6 +1175,27 @@ fn require_cut_only(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanEr
     Ok(())
 }
 
+/// Routing fields must be written mutes first, then the input sum, then the
+/// sources (see [`routing_rank`]). Rollback reverses the order.
+fn require_routing_order(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanError> {
+    let mut previous: Option<u8> = None;
+    for action in actions {
+        let Some(rank) =
+            reviewed_address(action.channel(), action.parameter()).and_then(routing_rank)
+        else {
+            continue;
+        };
+        if previous.is_some_and(|previous| rank <= previous) {
+            return Err(ApplyPlanError::RoutingOrder {
+                channel: action.channel(),
+                parameter: action.parameter(),
+            });
+        }
+        previous = Some(rank);
+    }
+    Ok(())
+}
+
 /// Pending direct writes laid over one immutable snapshot.
 ///
 /// Reads go through the reviewed address map without domain checks, exactly
@@ -1394,6 +1434,12 @@ pub enum ApplyPlanError {
         parameter: u8,
         value: u16,
     },
+    /// Routing fields were not in mutes, input sum, sources apply order.
+    #[error(
+        "channel {channel} parameter {parameter:#04x} breaks the routing apply order \
+         (mutes, then input sum, then O4 and O3 sources)"
+    )]
+    RoutingOrder { channel: u8, parameter: u8 },
     /// The desired state would activate a band that holds a stored boost.
     #[error(
         "O{output} band {band} holds stored boost gain code {gain_code} and would become active; apply is cut-only"
@@ -2489,16 +2535,14 @@ mod tests {
     #[test]
     fn o4_mute_projection_rejects_other_channels_unreviewed_params_and_wide_values() {
         let baseline = muted_o4_baseline();
-        // A mute address on any other channel does not match O4's reviewed
-        // address: O1/O2/O3/O5/O6 mutes and the setup channel fail closed, as
-        // do O4 parameters adjacent to mute and the O4 crossover.
+        // The O1/O2/O3 mutes and the setup channel's 0x03 fail closed, as do
+        // O4 parameters adjacent to mute and the O4 crossover. The O5/O6
+        // mutes are reviewed under dec-autonomous-muted-bench-20261007.
         for (channel, parameter) in [
             (0, 0x03),
             (5, 0x03),
             (6, 0x03),
             (7, 0x03),
-            (9, 0x03),
-            (10, 0x03),
             (8, 0x02),
             (8, 0x04),
             (8, 0x42),

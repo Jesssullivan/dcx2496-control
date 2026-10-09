@@ -1,0 +1,176 @@
+{
+  "schema_version": "dcx.notch-plan/v1",
+  "target_output": 4,
+  "parameter_channel": 8,
+  "baseline_snapshot_digest": "sha256/8f279b3754b4908b6125463f0c4a53f989c3413833b49784f9ecb88321c565f5",
+  "measurement_digest": "sha256/cd1fd9cfc75fa05915486bb9a1484174d8853ff77c5699210857641345d241cd",
+  "policy": {
+    "max_notches": 4,
+    "q_code": 40,
+    "initial_cut_decibels_tenths": -60,
+    "recurrence_step_decibels_tenths": -30,
+    "max_cut_decibels_tenths": -120,
+    "merge_cents": 200,
+    "max_per_octave": 2,
+    "allow_enable_operator_bands": false
+  },
+  "eq_enabled_before": false,
+  "eq_count_before": 0,
+  "operator_band_count": 0,
+  "notches": [
+    {
+      "band": 1,
+      "frequency_hz": 630.0,
+      "occurrences": 1,
+      "level_db": 4.0,
+      "codes": {
+        "frequency_code": 159,
+        "q_code": 40,
+        "gain_code": 90,
+        "kind_code": 1,
+        "slope_code": 0
+      },
+      "encoded_frequency_hz": 626.2861197361281,
+      "encoded_q": 10.0,
+      "encoded_gain_db": -6.0
+    },
+    {
+      "band": 2,
+      "frequency_hz": 1260.0,
+      "occurrences": 1,
+      "level_db": 3.0,
+      "codes": {
+        "frequency_code": 191,
+        "q_code": 40,
+        "gain_code": 90,
+        "kind_code": 1,
+        "slope_code": 0
+      },
+      "encoded_frequency_hz": 1252.5722394722561,
+      "encoded_q": 10.0,
+      "encoded_gain_db": -6.0
+    },
+    {
+      "band": 3,
+      "frequency_hz": 2500.0,
+      "occurrences": 2,
+      "level_db": 9.0,
+      "codes": {
+        "frequency_code": 223,
+        "q_code": 40,
+        "gain_code": 60,
+        "kind_code": 1,
+        "slope_code": 0
+      },
+      "encoded_frequency_hz": 2505.1444789445122,
+      "encoded_q": 10.0,
+      "encoded_gain_db": -9.0
+    }
+  ],
+  "dropped": [],
+  "actions": [
+    {
+      "channel": 8,
+      "parameter": 19,
+      "value": 159,
+      "field": "band1.frequency"
+    },
+    {
+      "channel": 8,
+      "parameter": 20,
+      "value": 40,
+      "field": "band1.q"
+    },
+    {
+      "channel": 8,
+      "parameter": 21,
+      "value": 90,
+      "field": "band1.gain"
+    },
+    {
+      "channel": 8,
+      "parameter": 22,
+      "value": 1,
+      "field": "band1.kind"
+    },
+    {
+      "channel": 8,
+      "parameter": 23,
+      "value": 0,
+      "field": "band1.slope"
+    },
+    {
+      "channel": 8,
+      "parameter": 24,
+      "value": 191,
+      "field": "band2.frequency"
+    },
+    {
+      "channel": 8,
+      "parameter": 25,
+      "value": 40,
+      "field": "band2.q"
+    },
+    {
+      "channel": 8,
+      "parameter": 26,
+      "value": 90,
+      "field": "band2.gain"
+    },
+    {
+      "channel": 8,
+      "parameter": 27,
+      "value": 1,
+      "field": "band2.kind"
+    },
+    {
+      "channel": 8,
+      "parameter": 28,
+      "value": 0,
+      "field": "band2.slope"
+    },
+    {
+      "channel": 8,
+      "parameter": 29,
+      "value": 223,
+      "field": "band3.frequency"
+    },
+    {
+      "channel": 8,
+      "parameter": 30,
+      "value": 40,
+      "field": "band3.q"
+    },
+    {
+      "channel": 8,
+      "parameter": 31,
+      "value": 60,
+      "field": "band3.gain"
+    },
+    {
+      "channel": 8,
+      "parameter": 32,
+      "value": 1,
+      "field": "band3.kind"
+    },
+    {
+      "channel": 8,
+      "parameter": 33,
+      "value": 0,
+      "field": "band3.slope"
+    },
+    {
+      "channel": 8,
+      "parameter": 7,
+      "value": 3,
+      "field": "eq_count"
+    },
+    {
+      "channel": 8,
+      "parameter": 6,
+      "value": 1,
+      "field": "eq_enabled"
+    }
+  ],
+  "plan_digest": "sha256/068fb7563c4ff3cdbe7dd0b647cd8a015edc35246ec8f0479618cacfec9c97a9"
+}

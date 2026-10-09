@@ -142,6 +142,21 @@ fn random_snapshot(rng: &mut Rng, o4: Bank) -> SnapshotV1 {
         }
     }
     write(&mut dump0, &mut dump1, 4, 0x03, 1);
+    // Reviewed routing fields hold in-domain values.
+    for output in 5..=6 {
+        write(
+            &mut dump0,
+            &mut dump1,
+            output,
+            0x03,
+            u16::from(rng.chance(1, 2)),
+        );
+    }
+    for output in 3..=4 {
+        let source = u16::try_from(rng.below(4)).unwrap();
+        write(&mut dump0, &mut dump1, output, 0x41, source);
+    }
+    dump0[crate::layout::INPUT_SUM_LOCATION.low_offset()] = if rng.chance(1, 2) { 4 } else { 0 };
     SnapshotV1::from_frames(&identity(), &dump0, &dump1).unwrap()
 }
 

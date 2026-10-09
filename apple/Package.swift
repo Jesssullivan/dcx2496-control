@@ -33,7 +33,7 @@ let package = Package(
         .testTarget(
             name: "DCXLogicHelperCoreTests",
             dependencies: ["DCXLogicBridge", "DCXLogicHelperCore"],
-            resources: [.copy("Fixtures/DCXChildFixture.c")]
+            resources: [.copy("Fixtures/DCXChildFixture.c"), .copy("Fixtures/feedback")]
         ),
     ]
 )

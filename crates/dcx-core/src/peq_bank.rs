@@ -21,6 +21,7 @@ use crate::{
     rew::{
         DESIRED_PROFILE_SCHEMA, DesiredPeqProfileV1, DesiredProfileError, MAX_DESIRED_PROFILE_BYTES,
     },
+    routing::{DESIRED_ROUTING_SCHEMA, DesiredRoutingProfileV1},
 };
 
 /// Versioned multi-action output PEQ desired-profile envelope.
@@ -470,9 +471,9 @@ fn validate_bank_document(document: &PeqBankDocumentV2) -> Result<(), DesiredPro
                 "v2 profile action escapes PEQ on/off, band count, and band fields",
             ));
         };
-        if address.field == OutputField::Mute {
+        if !address.field.is_peq() {
             return Err(DesiredProfileError::UnsupportedDocument(
-                "v2 PEQ profile cannot carry the output mute",
+                "v2 PEQ profile cannot carry an output mute or source",
             ));
         }
         if action.value() > address.field.device_max() {
@@ -520,6 +521,8 @@ pub enum DesiredProfile {
     V1(DesiredPeqProfileV1),
     /// Multi-band O4 PEQ v2 envelope.
     V2(DesiredPeqBankProfileV2),
+    /// Closed MVP routing envelope.
+    Routing(DesiredRoutingProfileV1),
 }
 
 #[derive(Deserialize)]
@@ -542,6 +545,7 @@ impl DesiredProfile {
         match peek.schema_version.as_str() {
             DESIRED_PROFILE_SCHEMA => Ok(Self::V1(DesiredPeqProfileV1::from_json(bytes)?)),
             DESIRED_PROFILE_V2_SCHEMA => Ok(Self::V2(DesiredPeqBankProfileV2::from_json(bytes)?)),
+            DESIRED_ROUTING_SCHEMA => Ok(Self::Routing(DesiredRoutingProfileV1::from_json(bytes)?)),
             _ => Err(DesiredProfileError::UnsupportedSchema(peek.schema_version)),
         }
     }
@@ -551,6 +555,7 @@ impl DesiredProfile {
         match self {
             Self::V1(profile) => profile.digest(),
             Self::V2(profile) => profile.digest(),
+            Self::Routing(profile) => profile.digest(),
         }
     }
 
@@ -559,6 +564,7 @@ impl DesiredProfile {
         match self {
             Self::V1(profile) => &profile.document().actions,
             Self::V2(profile) => &profile.document().actions,
+            Self::Routing(profile) => &profile.document().actions,
         }
     }
 
@@ -567,6 +573,7 @@ impl DesiredProfile {
         match self {
             Self::V1(_) => DESIRED_PROFILE_SCHEMA,
             Self::V2(_) => DESIRED_PROFILE_V2_SCHEMA,
+            Self::Routing(_) => DESIRED_ROUTING_SCHEMA,
         }
     }
 }
@@ -645,11 +652,12 @@ mod tests {
     fn v2_profile_rejects_boosts_mutes_foreign_outputs_and_unreviewed_addresses() {
         let boost = DirectParameterAction::new(8, band_parameter(1, BandField::Gain), 151).unwrap();
         let mute = DirectParameterAction::new(8, 0x03, 0).unwrap();
+        let source = DirectParameterAction::new(8, 0x41, 2).unwrap();
         let foreign =
             DirectParameterAction::new(5, band_parameter(1, BandField::Gain), 100).unwrap();
         let crossover = DirectParameterAction::new(8, 0x42, 0).unwrap();
         let count = DirectParameterAction::new(8, EQ_COUNT_PARAMETER, 10).unwrap();
-        for action in [boost, mute, foreign, crossover, count] {
+        for action in [boost, mute, source, foreign, crossover, count] {
             assert!(matches!(
                 DesiredPeqBankProfileV2::new("p".into(), "r".into(), document(vec![action])),
                 Err(DesiredProfileError::UnsupportedDocument(_))

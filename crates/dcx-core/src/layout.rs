@@ -17,11 +17,18 @@
 //! all 444 rows and equality with the earlier hand-reviewed O1/PEQ9 and
 //! O4-mute offsets.
 //!
+//! The one reviewed setup address, input sum type (setup channel 0, parameter
+//! `0x02`), is `setupLocations[0]` of the same pinned revision: Dump0 frame
+//! offset 117, low bits only. Its value encoding (0 off, 4 A+B) and the
+//! output source encoding (`0x41`: 0 A, 1 B, 2 C, 3 SUM) follow the public
+//! `UltradrivePi` `protocol.md` notes cited in `NOTICE`.
+//!
 //! These are behavioral-reference transcriptions. The O1/PEQ9 Dump0
 //! locations and the O4 PEQ on/off, band count, and band 1 frequency, Q, gain
 //! and slope Dump1 locations (with the Dump1 trailer balance) have been
-//! exercised on the named device; every other address is an implementation
-//! hypothesis until exact device readback confirms it.
+//! exercised on the named device; every other address, including the MVP
+//! routing addresses admitted by `dec-autonomous-muted-bench-20261007`, is an
+//! implementation hypothesis until exact device readback confirms it.
 
 use thiserror::Error;
 
@@ -45,8 +52,26 @@ pub const FIRST_BAND_PARAMETER: u8 = 0x13;
 pub const BAND_PARAMETER_STRIDE: u8 = 5;
 /// Last band-9 slope parameter.
 pub const LAST_BAND_PARAMETER: u8 = FIRST_BAND_PARAMETER + PEQ_BANDS * BAND_PARAMETER_STRIDE - 1;
-/// Output mute parameter.
+/// Output mute parameter (1 = muted).
 pub const MUTE_PARAMETER: u8 = 0x03;
+/// Output input-source parameter.
+pub const SOURCE_PARAMETER: u8 = 0x41;
+/// Largest output source code: 0 A, 1 B, 2 C, 3 SUM.
+pub const MAX_SOURCE_CODE: u16 = 3;
+/// Output source code selecting the setup input sum.
+pub const SOURCE_SUM_CODE: u16 = 3;
+/// Direct-parameter channel of the setup page.
+pub const SETUP_CHANNEL: u8 = 0;
+/// [`ReviewedAddress::output`] value of the setup input-sum address.
+pub const SETUP_TARGET: u8 = 0;
+/// Setup input sum type parameter.
+pub const INPUT_SUM_PARAMETER: u8 = 0x02;
+/// Input sum type code: off.
+pub const INPUT_SUM_OFF_CODE: u16 = 0;
+/// Input sum type code: A+B. The only non-off value the allowlist admits.
+pub const INPUT_SUM_A_PLUS_B_CODE: u16 = 4;
+/// Pinned `DuinoDCX` `00b9d70` `setupLocations[0]`: setup parameter `0x02`.
+pub const INPUT_SUM_LOCATION: DumpLocation = low(0, 117);
 /// Output PEQ enable parameter.
 pub const EQ_ENABLED_PARAMETER: u8 = 0x06;
 /// Output active PEQ band count parameter.
@@ -302,12 +327,19 @@ pub fn output_channel(output: u8) -> u8 {
     FIRST_OUTPUT_CHANNEL + output - 1
 }
 
-/// Semantic meaning of one reviewed output address.
+/// Semantic meaning of one reviewed address.
+///
+/// Every variant except [`Self::InputSum`] is an output field; the input sum
+/// is the single reviewed setup-channel field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum OutputField {
-    /// Output mute, reviewed on O4 only.
+    /// Output mute (1 = muted), reviewed on O4, O5, and O6 only.
     Mute,
+    /// Output input source, 0 A, 1 B, 2 C, 3 SUM, reviewed on O3 and O4 only.
+    Source,
+    /// Setup input sum type, admitted only as 0 (off) or 4 (A+B).
+    InputSum,
     /// PEQ on/off.
     EqEnabled,
     /// Number of active PEQ bands, 0 through 9.
@@ -327,8 +359,31 @@ impl OutputField {
         match self {
             Self::Mute | Self::EqEnabled => 1,
             Self::EqCount => 9,
+            Self::Source => MAX_SOURCE_CODE,
+            Self::InputSum => INPUT_SUM_A_PLUS_B_CODE,
             Self::Band { field, .. } => field.device_max(),
         }
+    }
+
+    /// Whether the reviewed domain admits this value.
+    ///
+    /// Every field admits `0..=device_max()` except the input sum, which
+    /// admits exactly off (0) and A+B (4).
+    pub const fn admits(self, value: u16) -> bool {
+        match self {
+            Self::InputSum => value == INPUT_SUM_OFF_CODE || value == INPUT_SUM_A_PLUS_B_CODE,
+            _ => value <= self.device_max(),
+        }
+    }
+
+    /// Whether the field belongs to the PEQ bank of an output.
+    pub const fn is_peq(self) -> bool {
+        matches!(self, Self::EqEnabled | Self::EqCount | Self::Band { .. })
+    }
+
+    /// Whether the field is one of the MVP routing fields.
+    pub const fn is_routing(self) -> bool {
+        matches!(self, Self::Mute | Self::Source | Self::InputSum)
     }
 
     /// Whether the field is an on/off switch.
@@ -351,6 +406,8 @@ impl OutputField {
     pub fn label(self) -> String {
         match self {
             Self::Mute => "mute".to_owned(),
+            Self::Source => "source".to_owned(),
+            Self::InputSum => "setup.input_sum".to_owned(),
             Self::EqEnabled => "eq_enabled".to_owned(),
             Self::EqCount => "eq_count".to_owned(),
             Self::Band { band, field } => format!(
@@ -370,7 +427,7 @@ impl OutputField {
 /// One allowlisted direct-parameter address with its dump location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReviewedAddress {
-    /// Physical output, 1 through 6.
+    /// Physical output, 1 through 6, or [`SETUP_TARGET`] for the input sum.
     pub output: u8,
     /// Semantic field.
     pub field: OutputField,
@@ -382,16 +439,27 @@ pub struct ReviewedAddress {
 ///
 /// The allowlist is: PEQ on/off (`0x06`), PEQ band count (`0x07`), and the
 /// nine PEQ bands (`0x13` through `0x3f`) on every output channel 5 through
-/// 10, plus the O4 output mute (channel 8, `0x03`). Crossover, dynamic EQ,
-/// delay, limiter, polarity, gain, source, every input/setup address, and every
-/// other output's mute fail closed.
+/// 10; plus, under `dec-autonomous-muted-bench-20261007`, the O4/O5/O6 output
+/// mutes (channels 8 through 10, `0x03`), the O3/O4 output sources (channels 7
+/// and 8, `0x41`), and the setup input sum type (channel 0, `0x02`).
+/// Crossover, dynamic EQ, delay, limiter, polarity, gain, the O1/O2/O5/O6
+/// sources, the O1/O2/O3 mutes, every input address, and every other setup
+/// address (Input C gain, Mute Outs, links, ...) fail closed.
 pub fn reviewed_address(channel: u8, parameter: u8) -> Option<ReviewedAddress> {
+    if channel == SETUP_CHANNEL {
+        return (parameter == INPUT_SUM_PARAMETER).then_some(ReviewedAddress {
+            output: SETUP_TARGET,
+            field: OutputField::InputSum,
+            location: INPUT_SUM_LOCATION,
+        });
+    }
     if !(FIRST_OUTPUT_CHANNEL..FIRST_OUTPUT_CHANNEL + OUTPUT_COUNT).contains(&channel) {
         return None;
     }
     let output = channel - FIRST_OUTPUT_CHANNEL + 1;
     let field = match parameter {
-        MUTE_PARAMETER if output == 4 => OutputField::Mute,
+        MUTE_PARAMETER if (4..=6).contains(&output) => OutputField::Mute,
+        SOURCE_PARAMETER if output == 3 || output == 4 => OutputField::Source,
         EQ_ENABLED_PARAMETER => OutputField::EqEnabled,
         EQ_COUNT_PARAMETER => OutputField::EqCount,
         FIRST_BAND_PARAMETER..=LAST_BAND_PARAMETER => {
@@ -408,6 +476,22 @@ pub fn reviewed_address(channel: u8, parameter: u8) -> Option<ReviewedAddress> {
         field,
         location: output_location(output, parameter)?,
     })
+}
+
+/// Apply rank of one MVP routing address, or `None` for any other address.
+///
+/// A command must write routing fields in strictly ascending rank: the O4,
+/// O5, then O6 mutes; then the setup input sum; then the O4 and O3 sources.
+/// Mutes therefore precede sources, and the input sum precedes the O3 SUM
+/// source that consumes it. Rollback is the exact reverse.
+pub fn routing_rank(address: ReviewedAddress) -> Option<u8> {
+    match (address.field, address.output) {
+        (OutputField::Mute, output @ 4..=6) => Some(output - 4),
+        (OutputField::InputSum, SETUP_TARGET) => Some(3),
+        (OutputField::Source, 4) => Some(4),
+        (OutputField::Source, 3) => Some(5),
+        _ => None,
+    }
 }
 
 /// Dump layout failures.
@@ -980,22 +1064,134 @@ mod tests {
             let lows = (0..=0x7f_u8)
                 .filter_map(|parameter| reviewed_address(channel, parameter))
                 .count();
-            let expected = 2 + 45 + usize::from(output == 4);
+            let expected = 2
+                + 45
+                + usize::from((4..=6).contains(&output))
+                + usize::from(output == 3 || output == 4);
             assert_eq!(lows, expected);
         }
     }
 
+    fn every_reviewed_address() -> Vec<(u8, u8, ReviewedAddress)> {
+        let mut addresses = Vec::new();
+        for channel in 0..=0x7f_u8 {
+            for parameter in 0..=0x7f_u8 {
+                if let Some(address) = reviewed_address(channel, parameter) {
+                    addresses.push((channel, parameter, address));
+                }
+            }
+        }
+        addresses
+    }
+
+    #[test]
+    fn reviewed_addresses_never_share_a_byte_across_channels() {
+        let mut owned = std::collections::BTreeMap::new();
+        for (channel, parameter, address) in every_reviewed_address() {
+            let part = u8::from(address.location.part() == DumpPart::Part1);
+            for offset in [Some(address.location.low), address.location.high]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    owned.insert((part, offset), (channel, parameter)).is_none(),
+                    "{channel}/{parameter:#04x} reuses {part}:{offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routing_addresses_equal_the_pinned_tables_and_baseline_map() {
+        // DuinoDCX 00b9d70 setupLocations[0] and outputLocations rows 0x03/0x41.
+        let routing = [
+            (0, INPUT_SUM_PARAMETER, SETUP_TARGET, low(0, 117)),
+            (7, SOURCE_PARAMETER, 3, low(1, 195)),
+            (8, SOURCE_PARAMETER, 4, low(1, 365)),
+            (8, MUTE_PARAMETER, 4, low(1, 223)),
+            (9, MUTE_PARAMETER, 5, low(1, 392)),
+            (10, MUTE_PARAMETER, 6, low(1, 561)),
+        ];
+        for (channel, parameter, output, location) in routing {
+            let address = reviewed_address(channel, parameter).unwrap();
+            assert_eq!(address.output, output);
+            assert_eq!(address.location, location);
+            assert!(address.field.is_routing() && !address.field.is_peq());
+            assert!(routing_rank(address).is_some());
+            if channel != 0 {
+                assert_eq!(output_location(output, parameter), Some(location));
+            }
+        }
+        let routing_count = every_reviewed_address()
+            .into_iter()
+            .filter(|(_, _, address)| address.field.is_routing())
+            .count();
+        assert_eq!(routing_count, routing.len());
+    }
+
+    #[test]
+    fn routing_rank_orders_mutes_then_input_sum_then_sources() {
+        let rank = |channel, parameter| routing_rank(reviewed_address(channel, parameter).unwrap());
+        let ordered = [
+            rank(8, MUTE_PARAMETER),
+            rank(9, MUTE_PARAMETER),
+            rank(10, MUTE_PARAMETER),
+            rank(0, INPUT_SUM_PARAMETER),
+            rank(8, SOURCE_PARAMETER),
+            rank(7, SOURCE_PARAMETER),
+        ];
+        assert_eq!(ordered, [0, 1, 2, 3, 4, 5].map(Some));
+        assert_eq!(rank(8, EQ_ENABLED_PARAMETER), None);
+        assert_eq!(rank(8, band_parameter(1, BandField::Gain)), None);
+    }
+
+    #[test]
+    fn input_sum_admits_only_off_and_a_plus_b() {
+        let field = reviewed_address(0, INPUT_SUM_PARAMETER).unwrap().field;
+        let admitted: Vec<u16> = (0..=0x7f).filter(|value| field.admits(*value)).collect();
+        assert_eq!(admitted, [INPUT_SUM_OFF_CODE, INPUT_SUM_A_PLUS_B_CODE]);
+        let source = reviewed_address(7, SOURCE_PARAMETER).unwrap().field;
+        assert!((0..=3).all(|value| source.admits(value)) && !source.admits(4));
+        let mute = reviewed_address(9, MUTE_PARAMETER).unwrap().field;
+        assert!(mute.admits(0) && mute.admits(1) && !mute.admits(2));
+    }
+
+    #[test]
+    fn forbidden_setup_and_input_bytes_are_owned_by_no_reviewed_address() {
+        // Dump0 121 is setup 0x04 Input C gain (line/mic); Dump0 57 is setup
+        // 0x15 Mute Outs. Neither byte, nor the 7-of-8 carrier of either, may
+        // be written by any reviewed address.
+        assert_eq!(packing_carrier(121), Some((124, 4)));
+        for (_, _, address) in every_reviewed_address() {
+            if address.location.part() != DumpPart::Part0 {
+                continue;
+            }
+            for offset in address.location.offsets() {
+                assert!(
+                    ![121, 57, 124].contains(&offset),
+                    "reviewed address writes forbidden Dump0 byte {offset}"
+                );
+            }
+        }
+        assert_eq!(INPUT_SUM_LOCATION.carrier(), None);
+    }
+
     #[test]
     fn allowlist_is_closed() {
-        for channel in 0..=10_u8 {
+        for channel in 0..=0x7f_u8 {
             for parameter in 0..=0x7f_u8 {
                 let reviewed = reviewed_address(channel, parameter).is_some();
                 let output_channel = (5..=10).contains(&channel);
-                let expected = output_channel
+                let reviewed_peq = output_channel
                     && (parameter == EQ_ENABLED_PARAMETER
                         || parameter == EQ_COUNT_PARAMETER
-                        || (FIRST_BAND_PARAMETER..=LAST_BAND_PARAMETER).contains(&parameter)
-                        || (channel == 8 && parameter == MUTE_PARAMETER));
+                        || (FIRST_BAND_PARAMETER..=LAST_BAND_PARAMETER).contains(&parameter));
+                // dec-autonomous-muted-bench-20261007: O4/O5/O6 mute, O3/O4
+                // source, setup input sum. Nothing else.
+                let reviewed_routing = ((8..=10).contains(&channel) && parameter == MUTE_PARAMETER)
+                    || ((channel == 7 || channel == 8) && parameter == SOURCE_PARAMETER)
+                    || (channel == SETUP_CHANNEL && parameter == INPUT_SUM_PARAMETER);
+                let expected = reviewed_peq || reviewed_routing;
                 assert_eq!(
                     reviewed, expected,
                     "channel {channel} parameter {parameter:#04x}"

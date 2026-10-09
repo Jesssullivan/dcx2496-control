@@ -34,6 +34,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     private let runner: any DCXCTLCommandExecuting
     private let snapshotStore: RawSnapshotStore
     private let planStore: RawPlanStore
+    private let notchPlanStore: NotchPlanStore
     private let recoveryLeaseStore: MutationRecoveryLeaseStore
     private let stateLock = NSLock()
     private var foreground = false
@@ -65,6 +66,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         self.runner = runner
         snapshotStore = .init(root: locations.snapshotRootURL)
         planStore = .init(root: locations.planRootURL)
+        notchPlanStore = .init(planRoot: locations.planRootURL)
         let recoveryLeaseStore = MutationRecoveryLeaseStore(root: locations.planRootURL)
         self.recoveryLeaseStore = recoveryLeaseStore
         switch configuration {
@@ -184,6 +186,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         case let .apply(value): target = value.target
         case let .readback(value): target = value.target
         case let .rollback(value): target = value.target
+        case let .feedbackPlan(value): target = value.target
         }
 
         var processLock: MutationRecoveryProcessLock?
@@ -264,9 +267,13 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 false
             )
         }
-        if case .diffPreview = request.body {
+        switch request.body {
+        case .diffPreview, .feedbackPlan:
+            // Offline children never hold the device operation lock.
             processLock?.release()
             processLock = nil
+        default:
+            break
         }
 
         let activeID = UUID().uuidString
@@ -292,6 +299,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         do {
             let workspace = try TransactionWorkspace(root: locations.transactionRootURL)
             defer { workspace.remove() }
+            if case let .feedbackPlan(value) = request.body {
+                return try planFeedbackNotches(
+                    request,
+                    value,
+                    configuration: configuration,
+                    workspace: workspace
+                )
+            }
             let invocation = try buildInvocation(
                 request: request,
                 configuration: configuration,
@@ -373,6 +388,34 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 applyAdmitted: applyAdmitted,
                 .helperNotConfigured,
                 "durable mutation recovery state is unavailable",
+                false
+            )
+        } catch FeedbackRequestError.baselineUnavailable {
+            return failure(
+                request,
+                .invalidRequest,
+                "the baseline snapshot is not in the helper store; capture a snapshot and replan",
+                false
+            )
+        } catch FeedbackRequestError.baselineUnusable {
+            return failure(
+                request,
+                .invalidRequest,
+                "the stored baseline snapshot is unusable for this target (device mismatch or store fault)",
+                false
+            )
+        } catch FeedbackRequestError.invalidMeasurement {
+            return failure(
+                request,
+                .invalidRequest,
+                "the measurement document is not a valid O4 dcx.feedback-measurement/v1",
+                false
+            )
+        } catch NotchPlanStoreError.missingPlan {
+            return failure(
+                request,
+                .invalidRequest,
+                "the named prior notch plan is not in the helper store",
                 false
             )
         } catch ChildResponseError.requestPlanBinding {
@@ -481,7 +524,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 throw MutationRecoveryStateError.recoveryUnavailable
             }
             return try recoveryLease.pinnedConfiguration()
-        case .identitySearch, .snapshotCapture, .diffPreview:
+        case .identitySearch, .snapshotCapture, .diffPreview, .feedbackPlan:
             guard recoveryLease == nil else {
                 throw MutationRecoveryStateError.recoveryInProgress
             }
@@ -571,7 +614,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                   capturedConfiguration == (try recoveryLease.pinnedConfiguration()) else {
                 throw MutationRecoveryStateError.bindingMismatch
             }
-        case .helperStatus, .identitySearch, .snapshotCapture, .diffPreview:
+        case .helperStatus, .identitySearch, .snapshotCapture, .diffPreview, .feedbackPlan:
             return
         }
     }
@@ -702,7 +745,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         ]
         let arguments: [String]
         switch request.body {
-        case .helperStatus:
+        case .helperStatus, .feedbackPlan:
             throw HelperConfigurationError.operationUnavailable
         case .identitySearch:
             arguments = ["discovery", "live-search"] + targetArguments
@@ -713,8 +756,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 digest: value.baseline.digest,
                 expectedDevice: value.target.expectedDeviceAddress
             )
-            // dcxctl validates the versioned profile envelope and its strict
-            // O1/PEQ9 document. The document remains unchanged inside it.
+            // dcxctl revalidates the versioned envelope: exact O1/PEQ9 v1 or
+            // the cut-only reviewed v2 bank. The document is passed unchanged.
             let profile = try workspace.write(value.desired, named: "profile.json")
             arguments = [
                 "control", "diff",
@@ -774,7 +817,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         let receipt = result.receipt(for: request.operation)
         let body: BridgeResponseBody
         switch request.body {
-        case .helperStatus:
+        case .helperStatus, .feedbackPlan:
             throw HelperConfigurationError.operationUnavailable
         case let .identitySearch(value):
             let output = try decoder.decode(LiveSearchOutput.self, from: result.stdout)
@@ -805,6 +848,22 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                   output.desiredProfileDigest == value.desired.digest else {
                 throw ChildResponseError.bindingMismatch
             }
+            if case let .v2(changes) = output.changes {
+                // What the AU shows is exactly what Apply writes and what
+                // Rollback restores: `after` equals the raw apply plan's
+                // ordered actions and `before` its reverse-order inverse.
+                // Checked before either plan is persisted.
+                let after = changes.map {
+                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.after)
+                }
+                let before = changes.reversed().map {
+                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.before)
+                }
+                guard try after == DiffCommandOutput.commandActions(output.applyPlan),
+                      try before == DiffCommandOutput.commandActions(output.rollbackPlan) else {
+                    throw ChildResponseError.bindingMismatch
+                }
+            }
             let apply = try planStore.persistApply(
                 output.applyPlan,
                 expectedDevice: value.target.expectedDeviceAddress,
@@ -817,14 +876,30 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 baselineDigest: value.baseline.digest,
                 applyPlanDigest: apply.digest
             )
-            let diff = try SemanticDiffV1(
-                baselineSnapshotDigest: output.baselineSnapshotDigest,
-                desiredProfileDigest: output.desiredProfileDigest,
-                desiredSnapshotDigest: output.desiredSnapshotDigest,
-                applyPlanDigest: apply.digest,
-                rollbackPlanDigest: rollback.digest,
-                changes: output.changes
-            )
+            let diff: SemanticDiff
+            switch (value.desired, output.changes) {
+            case let (.v1, .v1(changes)):
+                diff = try SemanticDiff(
+                    baselineSnapshotDigest: output.baselineSnapshotDigest,
+                    desiredProfileDigest: output.desiredProfileDigest,
+                    desiredSnapshotDigest: output.desiredSnapshotDigest,
+                    applyPlanDigest: apply.digest,
+                    rollbackPlanDigest: rollback.digest,
+                    changes: changes
+                )
+            case let (.v2, .v2(changes)):
+                diff = try SemanticDiff(
+                    baselineSnapshotDigest: output.baselineSnapshotDigest,
+                    desiredProfileDigest: output.desiredProfileDigest,
+                    desiredSnapshotDigest: output.desiredSnapshotDigest,
+                    applyPlanDigest: apply.digest,
+                    rollbackPlanDigest: rollback.digest,
+                    fieldChanges: changes
+                )
+            default:
+                throw ChildResponseError.bindingMismatch
+            }
+            try diff.validate(against: value.desired)
             body = .diffPreview(.init(diff: diff, receipt: receipt))
         case let .apply(value):
             let output = try decoder.decode(ApplyCommandOutput.self, from: result.stdout)
@@ -974,15 +1049,61 @@ private struct LiveSearchOutput: Decodable {
 }
 
 private struct DiffCommandOutput: Decodable {
+    /// Changes typed by the desired profile's generation: one O1/PEQ9 slot
+    /// (v1) or per-field PEQ changes (v2).
+    enum Changes {
+        case v1([SemanticChangeV1])
+        case v2([FieldChangeV2])
+    }
+
     let baselineSnapshotDigest: String
+    let desiredProfileSchema: String
     let desiredProfileDigest: String
     let desiredSnapshotDigest: String
-    let changes: [SemanticChangeV1]
+    let changes: Changes
     let applyPlan: JSONValue
     let rollbackPlan: JSONValue
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        baselineSnapshotDigest = try container.decode(String.self, forKey: .baselineSnapshotDigest)
+        desiredProfileSchema = try container.decode(String.self, forKey: .desiredProfileSchema)
+        desiredProfileDigest = try container.decode(String.self, forKey: .desiredProfileDigest)
+        desiredSnapshotDigest = try container.decode(String.self, forKey: .desiredSnapshotDigest)
+        switch desiredProfileSchema {
+        case DesiredProfileV1.currentSchemaVersion:
+            changes = .v1(try container.decode([SemanticChangeV1].self, forKey: .changes))
+        case DesiredProfileV2.currentSchemaVersion:
+            changes = .v2(try container.decode([FieldChangeV2].self, forKey: .changes))
+        default:
+            throw ChildResponseError.bindingMismatch
+        }
+        applyPlan = try container.decode(JSONValue.self, forKey: .applyPlan)
+        rollbackPlan = try container.decode(JSONValue.self, forKey: .rollbackPlan)
+    }
+
+    /// Ordered `(channel, parameter, value)` actions a raw apply or rollback
+    /// plan writes; empty when the plan carries no command.
+    static func commandActions(_ plan: JSONValue) throws -> [DirectParameterActionV2] {
+        guard case let .object(fields) = plan else { throw ChildResponseError.bindingMismatch }
+        guard let command = fields["command"], command != .null else { return [] }
+        guard case let .object(body) = command, case let .array(actions)? = body["actions"] else {
+            throw ChildResponseError.bindingMismatch
+        }
+        return try actions.map { action in
+            guard case let .object(values) = action,
+                  let channel = BridgeJSONInteger.uint8(values["channel"]),
+                  let parameter = BridgeJSONInteger.uint8(values["parameter"]),
+                  let value = BridgeJSONInteger.uint16(values["value"]) else {
+                throw ChildResponseError.bindingMismatch
+            }
+            return .init(channel: channel, parameter: parameter, value: value)
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
         case baselineSnapshotDigest = "baseline_snapshot_digest"
+        case desiredProfileSchema = "desired_profile_schema"
         case desiredProfileDigest = "desired_profile_digest"
         case desiredSnapshotDigest = "desired_snapshot_digest"
         case changes
@@ -1040,11 +1161,14 @@ private final class TransactionWorkspace: @unchecked Sendable {
     }
 
     func write<T: Encodable>(_ value: T, named name: String) throws -> URL {
+        try writeData(BridgeJSONCodec.encoder().encode(value), named: name)
+    }
+
+    func writeData(_ data: Data, named name: String) throws -> URL {
         guard !name.contains("/"), !name.contains("..") else {
             throw ChildResponseError.invalidWorkspaceLeaf
         }
         let url = directory.appendingPathComponent(name, isDirectory: false)
-        let data = try BridgeJSONCodec.encoder().encode(value)
         guard data.count <= DCXBridgeContract.maximumFrameBytes else {
             throw AppGroupBoundaryError.frameTooLarge
         }
@@ -1075,4 +1199,311 @@ private enum MutationRecoveryStateError: Error {
     case recoveryInProgress
     case bindingMismatch
     case configurationChanged
+}
+
+// MARK: - Offline static feedback-notch planning
+
+extension DCXHelperCoordinator {
+    /// Per-child deadline for the offline feedback children. Three steps stay
+    /// inside the AU socket's 165-second framing envelope.
+    static let offlineStepTimeoutSeconds: UInt8 = 45
+
+    /// `feedback import` (source text only), `feedback plan` against the
+    /// helper-stored raw baseline, then `feedback desired-profile`. Each child
+    /// is offline; none receives a tty, and none holds the device lock.
+    fileprivate func planFeedbackNotches(
+        _ request: BridgeRequest,
+        _ value: FeedbackPlanRequest,
+        configuration: HelperConfigurationV1,
+        workspace: TransactionWorkspace
+    ) throws -> BridgeResponse {
+        let executable = try runner.resolveExecutable(for: configuration)
+        let timeout = min(configuration.childTimeoutSeconds, Self.offlineStepTimeoutSeconds)
+        let decoder = BridgeJSONCodec.decoder()
+        let snapshotURL: URL
+        do {
+            (snapshotURL, _) = try snapshotStore.load(
+                digest: value.baseline.digest,
+                expectedDevice: value.target.expectedDeviceAddress
+            )
+        } catch RawSnapshotError.missingSnapshot {
+            throw FeedbackRequestError.baselineUnavailable
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            throw FeedbackRequestError.baselineUnavailable
+        } catch {
+            // Present but unusable: another device address, a corrupt carrier,
+            // or a store I/O fault. No child has run.
+            throw FeedbackRequestError.baselineUnusable
+        }
+        let targetOutput = String(FeedbackNotchContract.targetOutput)
+        // Resolve every helper-owned input before the first child runs.
+        let priorPlanURL = try value.priorPlanDigest.map { try notchPlanStore.load(planDigest: $0) }
+        func run(_ arguments: [String]) throws -> OfflineStepOutcome {
+            let result = try runner.run(
+                .init(operation: .feedbackPlan, executableURL: executable, arguments: arguments),
+                timeoutSeconds: timeout,
+                mutationLock: nil
+            )
+            if let failure = result.failurePayload() { return .failure(failure) }
+            return .success(result)
+        }
+        func reply(_ error: BridgeErrorPayload) -> BridgeResponse {
+            BridgeResponse(requestID: request.requestID, operation: request.operation, error: error)
+        }
+
+        var importReceipt: CommandReceiptV1?
+        let measurementData: Data
+        switch value.measurement.kind {
+        case .frequencyList, .rewGenericEq:
+            guard let text = value.measurement.text else { throw ChildResponseError.bindingMismatch }
+            let source = try workspace.writeData(Data(text.utf8), named: "measurement-source.txt")
+            let flag = value.measurement.kind == .frequencyList ? "--frequency-list" : "--rew"
+            switch try run(["feedback", "import", flag, source.path, "--target-output", targetOutput]) {
+            case let .failure(error): return reply(error)
+            case let .success(result):
+                importReceipt = result.receipt(for: .feedbackPlan)
+                measurementData = result.stdout
+            }
+        case .measurement:
+            measurementData = try BridgeJSONCodec.encoder().encode(value.measurement.document)
+        }
+        let summary: FeedbackMeasurementSummaryV1
+        do {
+            summary = try decoder.decode(MeasurementCommandOutput.self, from: measurementData).summary()
+        } catch where value.measurement.kind == .measurement {
+            // An AU-supplied document, not child output, failed here.
+            throw FeedbackRequestError.invalidMeasurement
+        }
+        switch value.measurement.kind {
+        case .measurement:
+            guard summary.digest == value.measurement.documentDigest else {
+                throw ChildResponseError.bindingMismatch
+            }
+        case .frequencyList, .rewGenericEq:
+            guard let text = value.measurement.text,
+                  summary.source.rawValue == value.measurement.kind.rawValue,
+                  summary.sourceDigest == FeedbackNotchContract.sourceDigest(text) else {
+                throw ChildResponseError.bindingMismatch
+            }
+        }
+        let measurementURL = try workspace.writeData(measurementData, named: "measurement.json")
+
+        var planArguments = [
+            "feedback", "plan",
+            "--measurement", measurementURL.path,
+            "--snapshot", snapshotURL.path,
+        ]
+        if let priorPlanURL {
+            planArguments += ["--prior-plan", priorPlanURL.path]
+        }
+        let planResult: DCXCTLProcessResult
+        switch try run(planArguments) {
+        case let .failure(error):
+            guard priorPlanURL != nil else { return reply(error) }
+            return reply(.init(
+                code: error.code,
+                message: "feedback plan refused the request; with a prior plan the baseline must hold that plan's notches exactly",
+                retryable: error.retryable,
+                failureDiagnostic: error.failureDiagnostic
+            ))
+        case let .success(result): planResult = result
+        }
+        let planOutput = try decoder.decode(NotchPlanCommandOutput.self, from: planResult.stdout)
+        let plan = try planOutput.summary()
+        guard plan.baselineSnapshotDigest == value.baseline.digest,
+              plan.measurementDigest == summary.digest else {
+            throw ChildResponseError.bindingMismatch
+        }
+        // The summary and the profile come from the same bytes: this run's
+        // plan. The store keeps the first verified serialization for later
+        // `--prior-plan` use; dcxctl re-verifies whichever bytes it reads.
+        let planURL = try workspace.writeData(planResult.stdout, named: "plan.json")
+        _ = try notchPlanStore.persist(planResult.stdout, planDigest: plan.planDigest)
+
+        let profileResult: DCXCTLProcessResult
+        switch try run([
+            "feedback", "desired-profile",
+            "--plan", planURL.path,
+            "--profile-id", value.profileID,
+            "--revision", value.revision,
+        ]) {
+        case let .failure(error): return reply(error)
+        case let .success(result): profileResult = result
+        }
+        let desired = try decoder.decode(DesiredProfileV2.self, from: profileResult.stdout)
+        try desired.validate()
+
+        let response = FeedbackPlanResponse(
+            measurement: summary,
+            plan: plan,
+            desired: desired,
+            importReceipt: importReceipt,
+            planReceipt: planResult.receipt(for: .feedbackPlan),
+            profileReceipt: profileResult.receipt(for: .feedbackPlan)
+        )
+        try response.validate(for: value)
+        return BridgeResponse(requestID: request.requestID, body: .feedbackPlan(response))
+    }
+}
+
+private enum FeedbackRequestError: Error {
+    case baselineUnavailable
+    case baselineUnusable
+    case invalidMeasurement
+}
+
+private enum OfflineStepOutcome {
+    case success(DCXCTLProcessResult)
+    case failure(BridgeErrorPayload)
+}
+
+private struct MeasurementCommandOutput: Decodable {
+    struct Peak: Decodable {
+        let frequencyHz: Double
+        enum CodingKeys: String, CodingKey { case frequencyHz = "frequency_hz" }
+    }
+
+    let schemaVersion: String
+    let source: FeedbackMeasurementSummaryV1.Source
+    let sourceDigest: String
+    let targetOutput: UInt8
+    let peaks: [Peak]
+    let digest: String
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case source
+        case sourceDigest = "source_digest"
+        case targetOutput = "target_output"
+        case peaks, digest
+    }
+
+    func summary() throws -> FeedbackMeasurementSummaryV1 {
+        guard schemaVersion == FeedbackNotchContract.measurementSchemaVersion else {
+            throw ChildResponseError.bindingMismatch
+        }
+        return try .init(
+            digest: digest,
+            source: source,
+            sourceDigest: sourceDigest,
+            targetOutput: targetOutput,
+            peakCount: peaks.count
+        )
+    }
+}
+
+private struct NotchPlanCommandOutput: Decodable {
+    struct Codes: Decodable {
+        let frequencyCode: UInt16
+        let qCode: UInt16
+        let gainCode: UInt16
+        let kindCode: UInt16
+        let slopeCode: UInt16
+        enum CodingKeys: String, CodingKey {
+            case frequencyCode = "frequency_code"
+            case qCode = "q_code"
+            case gainCode = "gain_code"
+            case kindCode = "kind_code"
+            case slopeCode = "slope_code"
+        }
+    }
+
+    struct Notch: Decodable {
+        let band: UInt8
+        let frequencyHz: Double
+        let occurrences: UInt8
+        let levelDb: Double?
+        let codes: Codes
+        enum CodingKeys: String, CodingKey {
+            case band
+            case frequencyHz = "frequency_hz"
+            case occurrences
+            case levelDb = "level_db"
+            case codes
+        }
+    }
+
+    struct Dropped: Decodable {
+        let frequencyHz: Double
+        let reason: DroppedPeakV1.Reason
+        enum CodingKeys: String, CodingKey {
+            case frequencyHz = "frequency_hz"
+            case reason
+        }
+    }
+
+    struct Action: Decodable {
+        let channel: UInt8
+        let parameter: UInt8
+        let value: UInt16
+        let field: String
+    }
+
+    let schemaVersion: String
+    let targetOutput: UInt8
+    let parameterChannel: UInt8
+    let baselineSnapshotDigest: String
+    let measurementDigest: String
+    let eqEnabledBefore: Bool
+    let eqCountBefore: UInt8
+    let operatorBandCount: UInt8
+    let notches: [Notch]
+    let dropped: [Dropped]
+    let actions: [Action]
+    let planDigest: String
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case targetOutput = "target_output"
+        case parameterChannel = "parameter_channel"
+        case baselineSnapshotDigest = "baseline_snapshot_digest"
+        case measurementDigest = "measurement_digest"
+        case eqEnabledBefore = "eq_enabled_before"
+        case eqCountBefore = "eq_count_before"
+        case operatorBandCount = "operator_band_count"
+        case notches, dropped, actions
+        case planDigest = "plan_digest"
+    }
+
+    /// Sanitize the plan and require its own action list to equal the actions
+    /// its notches imply, field labels included.
+    func summary() throws -> NotchPlanSummaryV1 {
+        guard schemaVersion == FeedbackNotchContract.notchPlanSchemaVersion,
+              targetOutput == FeedbackNotchContract.targetOutput,
+              parameterChannel == FeedbackNotchContract.parameterChannel else {
+            throw ChildResponseError.bindingMismatch
+        }
+        let summary = try NotchPlanSummaryV1(
+            planDigest: planDigest,
+            baselineSnapshotDigest: baselineSnapshotDigest,
+            measurementDigest: measurementDigest,
+            eqEnabledBefore: eqEnabledBefore,
+            eqCountBefore: eqCountBefore,
+            operatorBandCount: operatorBandCount,
+            notches: notches.map {
+                .init(
+                    band: $0.band,
+                    frequencyHz: $0.frequencyHz,
+                    occurrences: $0.occurrences,
+                    levelDb: $0.levelDb,
+                    frequencyCode: $0.codes.frequencyCode,
+                    qCode: $0.codes.qCode,
+                    gainCode: $0.codes.gainCode,
+                    kindCode: $0.codes.kindCode,
+                    slopeCode: $0.codes.slopeCode
+                )
+            },
+            dropped: dropped.map { .init(frequencyHz: $0.frequencyHz, reason: $0.reason) }
+        )
+        let carried = actions.map {
+            DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.value)
+        }
+        guard carried == summary.expectedActions,
+              actions.allSatisfy({
+                  PeqAddressV2(channel: $0.channel, parameter: $0.parameter)?.label == $0.field
+              }) else {
+            throw ChildResponseError.bindingMismatch
+        }
+        return summary
+    }
 }

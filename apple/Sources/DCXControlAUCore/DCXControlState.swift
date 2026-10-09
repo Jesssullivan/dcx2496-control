@@ -1,25 +1,53 @@
 import DCXLogicBridge
 import Foundation
 
+/// Staged desired state carried in a Logic project. A v1 desired profile keeps
+/// the exact `dcx.logic-project-state/v1` bytes existing projects hold; a v2
+/// desired profile is `dcx.logic-project-state/v2` and may carry the notch
+/// plan summary it was staged from, so recall can list the planned notches.
 public struct StagedProjectStateV1: Codable, Equatable, Sendable {
     public static let schemaVersion = "dcx.logic-project-state/v1"
+    public static let v2SchemaVersion = "dcx.logic-project-state/v2"
 
     public let schemaVersion: String
     public let target: DCXTargetReference
-    public let desired: DesiredProfileV1
+    public let desired: DesiredProfile
+    public let notchPlan: NotchPlanSummaryV1?
 
     public init(target: DCXTargetReference, desired: DesiredProfileV1) {
-        schemaVersion = Self.schemaVersion
+        self.init(target: target, desired: .v1(desired))
+    }
+
+    public init(target: DCXTargetReference, desired: DesiredProfile, notchPlan: NotchPlanSummaryV1? = nil) {
+        switch desired {
+        case .v1: schemaVersion = Self.schemaVersion
+        case .v2: schemaVersion = Self.v2SchemaVersion
+        }
         self.target = target
         self.desired = desired
+        self.notchPlan = notchPlan
     }
 
     public func validate() throws {
-        guard schemaVersion == Self.schemaVersion else {
-            throw BridgeValidationError.invalidProfile("unsupported Logic project-state schema")
-        }
         try target.validate()
         try desired.validate()
+        switch desired {
+        case .v1:
+            guard schemaVersion == Self.schemaVersion, notchPlan == nil else {
+                throw BridgeValidationError.invalidProfile("unsupported Logic project-state schema")
+            }
+        case let .v2(profile):
+            guard schemaVersion == Self.v2SchemaVersion else {
+                throw BridgeValidationError.invalidProfile("unsupported Logic project-state schema")
+            }
+            try notchPlan?.requireStaged(by: profile)
+        }
+    }
+
+    /// A staged notch plan is valid only against the snapshot it was planned
+    /// from; previewing it against any other baseline requires replanning.
+    public func admitsBaseline(_ digest: String) -> Bool {
+        notchPlan.map { $0.baselineSnapshotDigest == digest } ?? true
     }
 }
 
@@ -32,7 +60,7 @@ public struct DCXControlPersistedStateV1: Codable, Equatable, Sendable {
     public let schemaVersion: String
     public let projectState: StagedProjectStateV1?
     public let currentSnapshot: SnapshotV1?
-    public let diff: SemanticDiffV1?
+    public let diff: SemanticDiff?
     public let transactionID: String?
     public let rollbackBaseline: SnapshotV1?
     public let deviceStateUncertain: Bool
@@ -40,7 +68,7 @@ public struct DCXControlPersistedStateV1: Codable, Equatable, Sendable {
     public init(
         projectState: StagedProjectStateV1?,
         currentSnapshot: SnapshotV1?,
-        diff: SemanticDiffV1?,
+        diff: SemanticDiff?,
         transactionID: String?,
         rollbackBaseline: SnapshotV1?,
         deviceStateUncertain: Bool
@@ -80,9 +108,8 @@ public struct DCXControlPersistedStateV1: Codable, Equatable, Sendable {
             }
         }
         if let diff {
-            try diff.validate()
-            guard diff.changes.count <= 1,
-                  diff.desiredProfileDigest == projectState.desired.digest,
+            guard (try? diff.validate(against: projectState.desired)) != nil,
+                  projectState.admitsBaseline(diff.baselineSnapshotDigest),
                   currentSnapshot != nil else {
                 throw DCXControlStateError.invalidDiffBinding
             }
@@ -127,7 +154,7 @@ public final class DCXControlState: @unchecked Sendable {
     private let lock = NSLock()
     private var projectState: StagedProjectStateV1?
     private var currentSnapshot: SnapshotV1?
-    private var currentDiff: SemanticDiffV1?
+    private var currentDiff: SemanticDiff?
     private var lastTransactionID: String?
     private var rollbackBaseline: SnapshotV1?
     private var deviceStateUncertain = false
@@ -166,6 +193,27 @@ public final class DCXControlState: @unchecked Sendable {
         deviceStateUncertain = false
     }
 
+    /// Stage a planned desired state together with the exact snapshot it was
+    /// planned against, so the reviewed diff can follow without a recapture.
+    public func stage(_ state: StagedProjectStateV1, baseline: SnapshotV1) throws {
+        try state.validate()
+        try baseline.validate()
+        guard baseline.target == state.target, state.admitsBaseline(baseline.digest) else {
+            throw DCXControlStateError.invalidSnapshotBinding
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !recoveryActiveLocked else {
+            throw DCXControlStateError.recoveryInProgress
+        }
+        projectState = state
+        currentSnapshot = baseline
+        currentDiff = nil
+        lastTransactionID = nil
+        rollbackBaseline = nil
+        deviceStateUncertain = false
+    }
+
     public func stagedProjectState() -> StagedProjectStateV1? {
         lock.lock()
         defer { lock.unlock() }
@@ -194,7 +242,7 @@ public final class DCXControlState: @unchecked Sendable {
     }
 
     public func accept(
-        diff: SemanticDiffV1,
+        diff: SemanticDiff,
         expectedRestorationGeneration: UInt64? = nil
     ) throws {
         try diff.validate()
@@ -203,9 +251,9 @@ public final class DCXControlState: @unchecked Sendable {
         try checkReadGenerationLocked(expectedRestorationGeneration)
         guard let projectState, let currentSnapshot,
               lastTransactionID == nil, rollbackBaseline == nil,
-              diff.changes.count <= 1,
               diff.baselineSnapshotDigest == currentSnapshot.digest,
-              diff.desiredProfileDigest == projectState.desired.digest else {
+              projectState.admitsBaseline(diff.baselineSnapshotDigest),
+              (try? diff.validate(against: projectState.desired)) != nil else {
             throw DCXControlStateError.invalidDiffBinding
         }
         currentDiff = diff
@@ -466,7 +514,7 @@ public final class DCXControlState: @unchecked Sendable {
 public struct DCXControlStateView: Sendable {
     public let projectState: StagedProjectStateV1?
     public let currentSnapshot: SnapshotV1?
-    public let diff: SemanticDiffV1?
+    public let diff: SemanticDiff?
     public let transactionID: String?
     public let rollbackBaseline: SnapshotV1?
     public let deviceStateUncertain: Bool

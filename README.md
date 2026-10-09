@@ -53,7 +53,11 @@ filesystem access, or serial work. Project recall stages desired state only.
 The foreground helper owns one single-flight child transaction and is the only
 Apple process that can execute the bundled `dcxctl`. The separate CoreMIDI
 Commands and Status endpoints have no device-control packet mapping in bridge
-v1.
+v2.
+
+Bridge `dcx.logic-bridge/v2` carries either desired-profile generation and adds
+the offline `feedback.notch.plan` operation, so the AU can list and stage static
+O4 notch plans. See [`docs/logic-notch-surface.md`](docs/logic-notch-surface.md).
 
 On a nonzero child exit, the helper returns a bounded `failureDiagnostic` with
 the exit code, duration, stderr size/digest, and an allowlisted failure category.
@@ -112,7 +116,9 @@ physical output O1, PEQ9: channel 5 parameters `0x3b` through `0x3e`
 editor selection, and shelf slope. One further reviewed direct address exists
 outside the REW path: the O4 output mute (channel 8, parameter `0x03`, Dump1
 byte 223), fixture-derived for Legalab's first-sound preparation and pending
-hardware confirmation by the WORD-FS-A silent mute-frame rehearsal.
+hardware confirmation by the WORD-FS-A silent mute-frame rehearsal. The closed
+MVP routing set (see "MVP routing" below) is reachable only through
+`dcx.desired-routing/v1`.
 
 ```sh
 dcxctl rew plan-slot fixtures/rew/SYNTHETIC-cut-only.txt \
@@ -176,7 +182,9 @@ into bounded cut-only notches on the O4 (PA) PEQ bank, placed only above the
 operator's active bands. It is offline; the result is a strict
 `dcx.desired-profile/v2` (O4 only) that goes through the same `control diff`, `apply`,
 and `rollback` carriers. See
-[`docs/feedback-suppression.md`](docs/feedback-suppression.md).
+[`docs/feedback-suppression.md`](docs/feedback-suppression.md). The Logic AU
+can run the same offline plan through the helper and stage the result; see
+[`docs/logic-notch-surface.md`](docs/logic-notch-surface.md).
 
 ```sh
 dcxctl feedback import --frequency-list ring-out.txt --target-output 4 > measurement.json
@@ -185,6 +193,26 @@ dcxctl feedback plan --measurement measurement.json --snapshot snapshot.json > n
 dcxctl feedback desired-profile --plan notch-plan.json \
   --profile-id o4-feedback --revision 2026-10-07 > desired-profile.json
 dcxctl control diff --snapshot snapshot.json --profile desired-profile.json \
+  > transaction-plans.json
+```
+
+### MVP routing (muted bench)
+
+`dcxctl routing` binds the closed routing set admitted by
+`dec-autonomous-muted-bench-20261007`: the O4/O5/O6 mutes, the O4 and O3
+sources, and the setup input sum (off or A+B only). The result is a strict
+`dcx.desired-routing/v1` that goes through the same `control diff`, `apply`,
+and `rollback` carriers. Actions are written mutes first, then the input sum,
+then the O4 and O3 sources; rollback is the exact reverse. Single-field
+profiles serve one-at-a-time probes.
+
+```sh
+dcxctl routing inspect --snapshot snapshot.json
+dcxctl routing desired-profile --o5-mute on --profile-id probe-o5 \
+  --revision 2026-10-08 > probe-o5.json
+dcxctl routing desired-profile --mvp --profile-id mvp-routing \
+  --revision 2026-10-08 > mvp-routing.json
+dcxctl control diff --snapshot snapshot.json --profile mvp-routing.json \
   > transaction-plans.json
 ```
 

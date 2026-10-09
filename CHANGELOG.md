@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Admit the MVP routing set under `dec-autonomous-muted-bench-20261007`: the
+  O4/O5/O6 mutes, the O4 and O3 sources, and the setup input sum (off or A+B
+  only), with a closed `dcx.desired-routing/v1` profile, `dcxctl routing
+  desired-profile|inspect`, fixed apply order (mutes, input sum, sources) and
+  reverse rollback. Input C, Mute Outs, crossover, the O1/O2/O5/O6 sources,
+  the O1-O3 mutes, and every other setup address still fail closed.
+- Surface O4 feedback notch plans in Logic (bridge `dcx.logic-bridge/v2`):
+  Swift `dcx.desired-profile/v2` and `dcx.semantic-diff/v2` validation that
+  mirrors the Rust core, an offline helper `feedback.notch.plan` request that
+  runs `feedback import|plan|desired-profile` against the helper's raw
+  snapshot, and an AU notch list with explicit staging. Fixture parity with
+  dcxctl is checked in `//:check`.
 - Refuse every apply plan whose desired state newly activates a PEQ band that
   holds a stored boost (gain code above 150), by turning PEQ on or raising the
   band count, under every policy including `--allow-enable-operator-bands`.

@@ -1,0 +1,97 @@
+{
+  "schemaVersion": "dcx.desired-profile/v2",
+  "profileID": "o4-feedback",
+  "revision": "synthetic-1",
+  "digest": "sha256/1a18205e2d89cf0d094da31337c04ae5328a62b9c4fe387a614c89aef6aaa16c",
+  "document": {
+    "target_output": 4,
+    "parameter_channel": 8,
+    "actions": [
+      {
+        "channel": 8,
+        "parameter": 19,
+        "value": 159
+      },
+      {
+        "channel": 8,
+        "parameter": 20,
+        "value": 40
+      },
+      {
+        "channel": 8,
+        "parameter": 21,
+        "value": 90
+      },
+      {
+        "channel": 8,
+        "parameter": 22,
+        "value": 1
+      },
+      {
+        "channel": 8,
+        "parameter": 23,
+        "value": 0
+      },
+      {
+        "channel": 8,
+        "parameter": 24,
+        "value": 191
+      },
+      {
+        "channel": 8,
+        "parameter": 25,
+        "value": 40
+      },
+      {
+        "channel": 8,
+        "parameter": 26,
+        "value": 90
+      },
+      {
+        "channel": 8,
+        "parameter": 27,
+        "value": 1
+      },
+      {
+        "channel": 8,
+        "parameter": 28,
+        "value": 0
+      },
+      {
+        "channel": 8,
+        "parameter": 29,
+        "value": 223
+      },
+      {
+        "channel": 8,
+        "parameter": 30,
+        "value": 40
+      },
+      {
+        "channel": 8,
+        "parameter": 31,
+        "value": 60
+      },
+      {
+        "channel": 8,
+        "parameter": 32,
+        "value": 1
+      },
+      {
+        "channel": 8,
+        "parameter": 33,
+        "value": 0
+      },
+      {
+        "channel": 8,
+        "parameter": 7,
+        "value": 3
+      },
+      {
+        "channel": 8,
+        "parameter": 6,
+        "value": 1
+      }
+    ]
+  }
+}
