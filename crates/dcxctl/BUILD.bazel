@@ -9,6 +9,7 @@ rust_binary(
         "src/feedback_cli.rs",
         "src/live_control.rs",
         "src/main.rs",
+        "src/routing_cli.rs",
     ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
