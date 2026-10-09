@@ -112,7 +112,9 @@ physical output O1, PEQ9: channel 5 parameters `0x3b` through `0x3e`
 editor selection, and shelf slope. One further reviewed direct address exists
 outside the REW path: the O4 output mute (channel 8, parameter `0x03`, Dump1
 byte 223), fixture-derived for Legalab's first-sound preparation and pending
-hardware confirmation by the WORD-FS-A silent mute-frame rehearsal.
+hardware confirmation by the WORD-FS-A silent mute-frame rehearsal. The closed
+MVP routing set (see "MVP routing" below) is reachable only through
+`dcx.desired-routing/v1`.
 
 ```sh
 dcxctl rew plan-slot fixtures/rew/SYNTHETIC-cut-only.txt \

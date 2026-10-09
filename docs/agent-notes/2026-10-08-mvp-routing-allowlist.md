@@ -50,7 +50,18 @@ trailer [1013] = 7; Dump1 trailer [909] = 78.
 - macbook-neo at `45162bb`: `just check` passed (fmt, clippy pedantic, Cargo
   tests, fixtures including the new `tests/routing_pipeline.sh`, lockfiles,
   frontdoor).
-- PZM Bazel and native suites: results are in the PR.
+- petting-zoo-mini at `5b09ea7`, 2026-10-09T02:43Z-02:48Z, run under the neo
+  pzm-bench lockf. No lab switch was running. No serial, install, signing, or
+  HAL work. `just check`, `just bazel-check` (`//:check` including
+  `//:routing_pipeline`, plus a build of `//:dcxctl_live_control`), the native
+  Bazel suites (logic_recall 15, response_binding 7, mutation_recovery 14,
+  process_runner 22, child_failure_diagnostics 10; 0 failures),
+  `just apple-package-check` and `just apple-bundle-check` all passed. Source
+  and temp files were on `/Volumes/LegalabCache`. The Bazel output root was
+  `/Volumes/BazelCache/disk-cache/dcx-mvp-routing-20261007-output-root`: the
+  BazelCache volume root is `root:wheel 775`, so the only user-writable
+  location was this subdirectory. The final head is re-qualified the same way
+  before merge, and the PR records the result.
 
 Everything here is a transcription. Nothing is a device observation until the
 bench lane's exact readback confirms each byte.
