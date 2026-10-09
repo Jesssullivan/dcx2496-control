@@ -102,8 +102,12 @@ echo "APPLY $(ts) secs=$(($(date +%s) - t0)) status=$astat readback_matches_desi
 [[ "$astat" == verified ]] || failures+=("apply status $astat")
 if [[ "$astat" != error ]] && jq -e '.readback != null' "$st/apply.json" >/dev/null; then
   jq '.readback' "$st/apply.json" >"$st/applied.json"
-  "$D" feedback inspect --snapshot "$st/applied.json" --target-output 4 >"$st/o4-applied.json"
-  echo "O4_APPLIED $(jq -c '{eq_enabled,eq_count,active:[.bands[]|select(.active)|{band,frequency_hz,gain_db,q}]}' "$st/o4-applied.json")"
+  # Nothing between apply and rollback may abort the script under `set -e`.
+  if "$D" feedback inspect --snapshot "$st/applied.json" --target-output 4 >"$st/o4-applied.json"; then
+    echo "O4_APPLIED $(jq -c '{eq_enabled,eq_count,active:[.bands[]|select(.active)|{band,frequency_hz,gain_db,q}]}' "$st/o4-applied.json")"
+  else
+    failures+=("apply readback O4 bank did not decode")
+  fi
   if "$D" control verify-containment --plan "$st/apply-plan.json" --readback "$st/applied.json" >"$st/containment.json"; then
     echo "CONTAINMENT contained projected=$(jq -c '[.projected_offsets[]|"\(.section):\(.offset)"]' "$st/containment.json")"
   else
