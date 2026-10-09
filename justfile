@@ -49,6 +49,8 @@ native-logic-recall: repo::native-logic-recall
 
 native-response-binding: repo::native-response-binding
 
+native-feedback-notch: repo::native-feedback-notch
+
 schema-check: repo::schema-check
 
 apple-project-generate: repo::apple-project-generate

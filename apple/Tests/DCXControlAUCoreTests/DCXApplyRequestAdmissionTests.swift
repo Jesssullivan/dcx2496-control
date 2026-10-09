@@ -43,13 +43,13 @@ final class DCXApplyRequestAdmissionTests: XCTestCase {
         let original = fixture.request.plan.diff
         // Each syntactically valid but different immutable plan is rejected.
         for digit in "0123456789abcdef" where digit != "a" {
-            let different = try SemanticDiffV1(
+            let different = try SemanticDiff(
                 baselineSnapshotDigest: original.baselineSnapshotDigest,
                 desiredProfileDigest: original.desiredProfileDigest,
                 desiredSnapshotDigest: original.desiredSnapshotDigest,
                 applyPlanDigest: Fixture.digest(digit),
                 rollbackPlanDigest: original.rollbackPlanDigest,
-                changes: original.changes
+                changes: []
             )
             let request = ApplyRequest(target: fixture.request.target, plan: try .init(
                 baseline: fixture.request.plan.baseline,
@@ -347,7 +347,7 @@ final class DCXApplyRequestAdmissionTests: XCTestCase {
                 capturedAt: Date(timeIntervalSince1970: 0), digest: Self.digest("0"), complete: true,
                 sectionDigests: .init(identity: Self.digest("1"), dump0: Self.digest("2"), dump1: Self.digest("3"))
             )
-            let diff = try SemanticDiffV1(
+            let diff = try SemanticDiff(
                 baselineSnapshotDigest: baseline.digest, desiredProfileDigest: desired.digest,
                 desiredSnapshotDigest: Self.digest("4"), applyPlanDigest: Self.digest("a"),
                 rollbackPlanDigest: Self.digest("b"), changes: []
@@ -357,7 +357,7 @@ final class DCXApplyRequestAdmissionTests: XCTestCase {
                 try state.accept(snapshot: baseline, validSearchResponses: 10)
                 try state.accept(diff: diff)
             }
-            request = ApplyRequest(target: target, plan: try .init(baseline: baseline, desired: desired, diff: diff))
+            request = ApplyRequest(target: target, plan: try .init(baseline: baseline, desired: .v1(desired), diff: diff))
         }
 
         func dispatch(_ transport: () throws -> Void) throws {

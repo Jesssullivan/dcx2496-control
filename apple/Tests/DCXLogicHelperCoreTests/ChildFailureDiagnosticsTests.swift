@@ -172,9 +172,14 @@ final class ChildFailureDiagnosticsTests: XCTestCase {
     }
 
     func testPriorErrorResponseStillDecodesWithoutDiagnostic() throws {
-        let json = #"{"schemaVersion":"dcx.logic-bridge/v1","requestID":"old","operation":"device.snapshot.capture","status":"error","error":{"code":"child_failed","message":"dcxctl exited with status 1","retryable":false}}"#
+        let json = #"{"schemaVersion":"dcx.logic-bridge/v2","requestID":"old","operation":"device.snapshot.capture","status":"error","error":{"code":"child_failed","message":"dcxctl exited with status 1","retryable":false}}"#
         let response = try BridgeJSONCodec.decoder().decode(BridgeResponse.self, from: Data(json.utf8))
         XCTAssertNil(response.error?.failureDiagnostic)
+        // The AU and helper ship in one bundle; a stale v1 peer fails closed.
+        let v1 = json.replacingOccurrences(of: "dcx.logic-bridge/v2", with: "dcx.logic-bridge/v1")
+        XCTAssertThrowsError(try BridgeJSONCodec.decoder().decode(BridgeResponse.self, from: Data(v1.utf8))) {
+            XCTAssertEqual($0 as? BridgeMessageError, .unsupportedSchema("dcx.logic-bridge/v1"))
+        }
     }
 
     func testInvalidDiagnosticIsRejectedAtBridgeBoundary() throws {

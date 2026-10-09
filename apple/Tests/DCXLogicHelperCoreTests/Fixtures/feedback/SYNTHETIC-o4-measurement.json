@@ -1,0 +1,29 @@
+{
+  "schema_version": "dcx.feedback-measurement/v1",
+  "source": "frequency_list",
+  "source_digest": "sha256/2bfdd12874bf6b1d9e45879f22878921d00217781b4bed75f20d3881fcdd2bc2",
+  "target_output": 4,
+  "peaks": [
+    {
+      "frequency_hz": 630.0,
+      "level_db": 4.0,
+      "requested_cut_db": null
+    },
+    {
+      "frequency_hz": 2500.0,
+      "level_db": 9.0,
+      "requested_cut_db": null
+    },
+    {
+      "frequency_hz": 2500.0,
+      "level_db": 7.5,
+      "requested_cut_db": null
+    },
+    {
+      "frequency_hz": 1260.0,
+      "level_db": 3.0,
+      "requested_cut_db": null
+    }
+  ],
+  "digest": "sha256/cd1fd9cfc75fa05915486bb9a1484174d8853ff77c5699210857641345d241cd"
+}

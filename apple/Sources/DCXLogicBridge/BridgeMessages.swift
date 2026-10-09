@@ -8,6 +8,8 @@ public enum BridgeOperation: String, Codable, CaseIterable, Hashable, Sendable {
     case apply = "device.apply"
     case readback = "device.readback"
     case rollback = "device.rollback"
+    /// Offline O4 notch planning from a measurement; opens no device.
+    case feedbackPlan = "feedback.notch.plan"
 
     /// Device mutation is exposed only with both verification and recovery.
     public static let mutationCapabilities: Set<BridgeOperation> = [.apply, .readback, .rollback]
@@ -37,9 +39,9 @@ public struct SnapshotCaptureRequest: Codable, Equatable, Sendable {
 public struct DiffPreviewRequest: Codable, Equatable, Sendable {
     public let target: DCXTargetReference
     public let baseline: SnapshotV1
-    public let desired: DesiredProfileV1
+    public let desired: DesiredProfile
 
-    public init(target: DCXTargetReference, baseline: SnapshotV1, desired: DesiredProfileV1) {
+    public init(target: DCXTargetReference, baseline: SnapshotV1, desired: DesiredProfile) {
         self.target = target
         self.baseline = baseline
         self.desired = desired
@@ -88,6 +90,7 @@ public enum BridgeRequestBody: Equatable, Sendable {
     case apply(ApplyRequest)
     case readback(ReadbackRequest)
     case rollback(RollbackRequest)
+    case feedbackPlan(FeedbackPlanRequest)
 
     public var operation: BridgeOperation {
         switch self {
@@ -98,6 +101,7 @@ public enum BridgeRequestBody: Equatable, Sendable {
         case .apply: .apply
         case .readback: .readback
         case .rollback: .rollback
+        case .feedbackPlan: .feedbackPlan
         }
     }
 
@@ -134,6 +138,8 @@ public enum BridgeRequestBody: Equatable, Sendable {
             guard value.plan.baseline.target == value.target else {
                 throw BridgeValidationError.invalidRollbackBinding
             }
+        case let .feedbackPlan(value):
+            try value.validate()
         }
     }
 }
@@ -185,6 +191,8 @@ public struct BridgeRequest: Codable, Equatable, Sendable {
             body = .readback(try container.decode(ReadbackRequest.self, forKey: .payload))
         case .rollback:
             body = .rollback(try container.decode(RollbackRequest.self, forKey: .payload))
+        case .feedbackPlan:
+            body = .feedbackPlan(try container.decode(FeedbackPlanRequest.self, forKey: .payload))
         }
         try body.validate()
     }
@@ -202,6 +210,7 @@ public struct BridgeRequest: Codable, Equatable, Sendable {
         case let .apply(payload): try container.encode(payload, forKey: .payload)
         case let .readback(payload): try container.encode(payload, forKey: .payload)
         case let .rollback(payload): try container.encode(payload, forKey: .payload)
+        case let .feedbackPlan(payload): try container.encode(payload, forKey: .payload)
         }
     }
 }
@@ -381,9 +390,9 @@ public struct SnapshotCaptureResponse: Codable, Equatable, Sendable {
 }
 
 public struct DiffPreviewResponse: Codable, Equatable, Sendable {
-    public let diff: SemanticDiffV1
+    public let diff: SemanticDiff
     public let receipt: CommandReceiptV1
-    public init(diff: SemanticDiffV1, receipt: CommandReceiptV1) {
+    public init(diff: SemanticDiff, receipt: CommandReceiptV1) {
         self.diff = diff
         self.receipt = receipt
     }
@@ -469,6 +478,7 @@ public enum BridgeResponseBody: Equatable, Sendable {
     case apply(ApplyResponse)
     case readback(ReadbackResponse)
     case rollback(RollbackResponse)
+    case feedbackPlan(FeedbackPlanResponse)
 
     public var operation: BridgeOperation {
         switch self {
@@ -479,6 +489,7 @@ public enum BridgeResponseBody: Equatable, Sendable {
         case .apply: .apply
         case .readback: .readback
         case .rollback: .rollback
+        case .feedbackPlan: .feedbackPlan
         }
     }
 
@@ -543,6 +554,11 @@ public enum BridgeResponseBody: Equatable, Sendable {
                 throw BridgeMessageError.invalidResponse
             }
             try Self.validateReceipt(value.receipt, operation: .rollback)
+        case let .feedbackPlan(value):
+            try value.validate()
+            for receipt in [value.importReceipt, value.planReceipt, value.profileReceipt].compactMap({ $0 }) {
+                try Self.validateReceipt(receipt, operation: .feedbackPlan)
+            }
         }
     }
 
@@ -660,7 +676,7 @@ public struct BridgeResponse: Codable, Equatable, Sendable {
             guard received.snapshot.target == sent.target else { throw BridgeMessageError.invalidResponse }
         case let (.diffPreview(sent), .diffPreview(received)):
             guard received.diff.baselineSnapshotDigest == sent.baseline.digest,
-                  received.diff.desiredProfileDigest == sent.desired.digest else {
+                  (try? received.diff.validate(against: sent.desired)) != nil else {
                 throw BridgeMessageError.invalidResponse
             }
         case let (.apply(sent), .apply(received)):
@@ -680,6 +696,10 @@ public struct BridgeResponse: Codable, Equatable, Sendable {
             guard received.transactionID == sent.plan.transactionID,
                   received.baselineDigest == sent.plan.baseline.digest,
                   received.restored == nil || received.restored?.target == sent.target else {
+                throw BridgeMessageError.invalidResponse
+            }
+        case let (.feedbackPlan(sent), .feedbackPlan(received)):
+            guard (try? received.validate(for: sent)) != nil else {
                 throw BridgeMessageError.invalidResponse
             }
         default:
@@ -726,6 +746,8 @@ public struct BridgeResponse: Codable, Equatable, Sendable {
             body = .readback(try container.decode(ReadbackResponse.self, forKey: .payload))
         case .rollback:
             body = .rollback(try container.decode(RollbackResponse.self, forKey: .payload))
+        case .feedbackPlan:
+            body = .feedbackPlan(try container.decode(FeedbackPlanResponse.self, forKey: .payload))
         }
         try body?.validate()
     }
@@ -745,6 +767,7 @@ public struct BridgeResponse: Codable, Equatable, Sendable {
         case let .apply(payload): try container.encode(payload, forKey: .payload)
         case let .readback(payload): try container.encode(payload, forKey: .payload)
         case let .rollback(payload): try container.encode(payload, forKey: .payload)
+        case let .feedbackPlan(payload): try container.encode(payload, forKey: .payload)
         case nil: break
         }
     }

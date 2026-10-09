@@ -8,6 +8,12 @@
   desired-profile|inspect`, fixed apply order (mutes, input sum, sources) and
   reverse rollback. Input C, Mute Outs, crossover, the O1/O2/O5/O6 sources,
   the O1-O3 mutes, and every other setup address still fail closed.
+- Surface O4 feedback notch plans in Logic (bridge `dcx.logic-bridge/v2`):
+  Swift `dcx.desired-profile/v2` and `dcx.semantic-diff/v2` validation that
+  mirrors the Rust core, an offline helper `feedback.notch.plan` request that
+  runs `feedback import|plan|desired-profile` against the helper's raw
+  snapshot, and an AU notch list with explicit staging. Fixture parity with
+  dcxctl is checked in `//:check`.
 - Record the first named-device O4 PEQ round trips: the Dump1 trailer balance,
   band-count ordering, and O4 PEQ on/off, count and band 1 locations read back
   exactly and rolled back to the original snapshot.

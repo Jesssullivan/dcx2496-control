@@ -36,7 +36,7 @@ alias(
 
 alias(
     name = "dcx_logic_bridge_schema",
-    actual = "//schemas/v1:dcx_logic_bridge_schema",
+    actual = "//schemas/v2:dcx_logic_bridge_schema",
 )
 
 filegroup(
@@ -60,6 +60,7 @@ filegroup(
 test_suite(
     name = "check",
     tests = [
+        ":apple_feedback_fixture_parity",
         ":bazel_frontdoor_rejections",
         ":feedback_pipeline",
         ":fixture_contract",
@@ -141,6 +142,31 @@ sh_test(
     # The script runs bash, grep, dd, and diff out of the host PATH. Those are
     # not inputs the action declares, so this test is not describable to a
     # content-addressed executor and must never be dispatched to one.
+    tags = [
+        "no-remote",
+        "no-remote-exec",
+    ],
+)
+
+# Rust/Swift parity: the Apple bridge v2 fixtures are exact dcxctl outputs.
+sh_test(
+    name = "apple_feedback_fixture_parity",
+    size = "small",
+    srcs = ["tests/apple_feedback_fixture_parity.sh"],
+    args = [
+        "$(location //crates/dcxctl:dcxctl)",
+        "$(location fixtures/feedback/SYNTHETIC-ring-out.txt)",
+        "$(location fixtures/snapshots/SYNTHETIC-blank-snapshot.json)",
+        "$(location //apple:Tests/DCXLogicHelperCoreTests/Fixtures/feedback/SYNTHETIC-o4-measurement.json)",
+    ],
+    data = [
+        "fixtures/feedback/SYNTHETIC-ring-out.txt",
+        "fixtures/snapshots/SYNTHETIC-blank-snapshot.json",
+        "//apple:Tests/DCXLogicHelperCoreTests/Fixtures/feedback/SYNTHETIC-o4-measurement.json",
+        "//apple:feedback_fixtures",
+        "//crates/dcxctl",
+    ],
+    # cmp, jq, and mktemp come from the host PATH; never remote.
     tags = [
         "no-remote",
         "no-remote-exec",

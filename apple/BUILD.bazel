@@ -4,8 +4,16 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "Package.swift",
+    "Tests/DCXLogicHelperCoreTests/Fixtures/feedback/SYNTHETIC-o4-measurement.json",
     "project.yml",
 ])
+
+# Exact dcxctl outputs over synthetic inputs; //:apple_feedback_fixture_parity
+# regenerates and compares them.
+filegroup(
+    name = "feedback_fixtures",
+    srcs = glob(["Tests/DCXLogicHelperCoreTests/Fixtures/feedback/*"]),
+)
 
 # Native-only test. The lab-owned PZM lane supplies the selected Xcode SDK.
 sh_test(
@@ -72,12 +80,37 @@ sh_test(
     target_compatible_with = ["@platforms//os:osx"],
 )
 
+# Bridge v2 feedback-notch surface, with the real dcxctl's offline feedback
+# subcommands end to end. Native only; no tty, serial, audio, or device.
+sh_test(
+    name = "feedback_notch",
+    size = "medium",
+    srcs = ["Tests/run_feedback_notch.sh"],
+    args = [
+        "$(location Package.swift)",
+        "$(location //crates/dcxctl)",
+    ],
+    data = [
+        "Package.swift",
+        ":swift_package_sources",
+        "//crates/dcxctl",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+)
+
 filegroup(
     name = "swift_package_sources",
     srcs = ["Package.swift"] + glob([
         "Sources/**/*.swift",
         "Tests/**/*.swift",
         "Tests/**/Fixtures/*.c",
+        "Tests/**/Fixtures/feedback/*",
     ]),
 )
 

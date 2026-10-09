@@ -53,7 +53,11 @@ filesystem access, or serial work. Project recall stages desired state only.
 The foreground helper owns one single-flight child transaction and is the only
 Apple process that can execute the bundled `dcxctl`. The separate CoreMIDI
 Commands and Status endpoints have no device-control packet mapping in bridge
-v1.
+v2.
+
+Bridge `dcx.logic-bridge/v2` carries either desired-profile generation and adds
+the offline `feedback.notch.plan` operation, so the AU can list and stage static
+O4 notch plans. See [`docs/logic-notch-surface.md`](docs/logic-notch-surface.md).
 
 On a nonzero child exit, the helper returns a bounded `failureDiagnostic` with
 the exit code, duration, stderr size/digest, and an allowlisted failure category.
@@ -172,7 +176,9 @@ into bounded cut-only notches on the O4 (PA) PEQ bank, placed only above the
 operator's active bands. It is offline; the result is a strict
 `dcx.desired-profile/v2` that goes through the same `control diff`, `apply`,
 and `rollback` carriers. See
-[`docs/feedback-suppression.md`](docs/feedback-suppression.md).
+[`docs/feedback-suppression.md`](docs/feedback-suppression.md). The Logic AU
+can run the same offline plan through the helper and stage the result; see
+[`docs/logic-notch-surface.md`](docs/logic-notch-surface.md).
 
 ```sh
 dcxctl feedback import --frequency-list ring-out.txt --target-output 4 > measurement.json
