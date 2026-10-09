@@ -26,11 +26,13 @@ final class NotchPlanStore: @unchecked Sendable {
             attributes: [.posixPermissions: 0o700]
         )
         let destination = try url(for: planDigest)
-        // First stored serialization wins: the bytes behind a staged plan
+        // First verified serialization wins: the bytes behind a staged plan
         // never change. An equal-digest re-serialization (for example after a
-        // formatting change) reuses them; dcxctl re-verifies on every read.
+        // formatting change) reuses them; dcxctl re-verifies on every read. An
+        // entry that no longer loads (truncated, replaced, or a link) heals.
         if fileManager.fileExists(atPath: destination.path) {
-            return destination
+            if (try? load(planDigest: planDigest)) != nil { return destination }
+            try? fileManager.removeItem(at: destination)
         }
         try data.write(to: destination, options: [.atomic, .completeFileProtection])
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)

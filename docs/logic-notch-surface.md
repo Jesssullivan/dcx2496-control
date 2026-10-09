@@ -51,14 +51,19 @@ to 45 seconds, with no tty argument and without the device operation lock:
 2. `feedback plan --measurement ... --snapshot <helper raw snapshot>
    [--prior-plan <helper stored plan>]`. The prior plan is resolved before any
    child runs; a missing prior is `invalid_request`.
-3. `feedback desired-profile --plan <stored plan> --profile-id ... --revision ...`.
+3. `feedback desired-profile --plan <this run's plan> --profile-id ... --revision ...`,
+   so the plan summary and the staged profile always come from the same bytes.
 
-The raw plan is stored immutably under the App Group `Plans/notch/<digest>.json`
+The raw plan is stored first-verified-wins (an entry that no longer loads
+heals) under the App Group `Plans/notch/<digest>.json`
 so a later round can name it as the prior plan by digest. The helper requires
 the plan's own action list to equal what its notches imply (labels included),
 the plan to be bound to the requested baseline and measurement, and the v2
 profile to validate in Swift and carry exactly those actions. Any mismatch is
-`malformed_child_response`. The operation must be enabled in the helper
+`malformed_child_response`. An absent or unusable stored baseline and a
+malformed measurement document are `invalid_request` before any child runs;
+a refused plan step with a prior plan says the baseline must hold that plan's
+notches. The operation must be enabled in the helper
 configuration ("Feedback notch plan (offline)") and is unavailable while a
 mutation recovery is pinned.
 

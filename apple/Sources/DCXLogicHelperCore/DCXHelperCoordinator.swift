@@ -397,6 +397,13 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 "the baseline snapshot is not in the helper store; capture a snapshot and replan",
                 false
             )
+        } catch FeedbackRequestError.baselineUnusable {
+            return failure(
+                request,
+                .invalidRequest,
+                "the stored baseline snapshot is unusable for this target (device mismatch or store fault)",
+                false
+            )
         } catch FeedbackRequestError.invalidMeasurement {
             return failure(
                 request,
@@ -841,6 +848,22 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                   output.desiredProfileDigest == value.desired.digest else {
                 throw ChildResponseError.bindingMismatch
             }
+            if case let .v2(changes) = output.changes {
+                // What the AU shows is exactly what Apply writes and what
+                // Rollback restores: `after` equals the raw apply plan's
+                // ordered actions and `before` its reverse-order inverse.
+                // Checked before either plan is persisted.
+                let after = changes.map {
+                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.after)
+                }
+                let before = changes.reversed().map {
+                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.before)
+                }
+                guard try after == DiffCommandOutput.commandActions(output.applyPlan),
+                      try before == DiffCommandOutput.commandActions(output.rollbackPlan) else {
+                    throw ChildResponseError.bindingMismatch
+                }
+            }
             let apply = try planStore.persistApply(
                 output.applyPlan,
                 expectedDevice: value.target.expectedDeviceAddress,
@@ -865,19 +888,6 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                     changes: changes
                 )
             case let (.v2, .v2(changes)):
-                // What the AU shows is exactly what Apply writes and what
-                // Rollback restores: `after` equals the raw apply plan's
-                // ordered actions and `before` its reverse-order inverse.
-                let after = changes.map {
-                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.after)
-                }
-                let before = changes.reversed().map {
-                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.before)
-                }
-                guard try after == DiffCommandOutput.commandActions(output.applyPlan),
-                      try before == DiffCommandOutput.commandActions(output.rollbackPlan) else {
-                    throw ChildResponseError.bindingMismatch
-                }
                 diff = try SemanticDiff(
                     baselineSnapshotDigest: output.baselineSnapshotDigest,
                     desiredProfileDigest: output.desiredProfileDigest,
@@ -1220,9 +1230,11 @@ extension DCXHelperCoordinator {
             throw FeedbackRequestError.baselineUnavailable
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             throw FeedbackRequestError.baselineUnavailable
+        } catch {
+            // Present but unusable: another device address, a corrupt carrier,
+            // or a store I/O fault. No child has run.
+            throw FeedbackRequestError.baselineUnusable
         }
-        // Any other store failure (device mismatch, corrupt carrier, I/O) is
-        // not an absent baseline and keeps its own fail-closed mapping.
         let targetOutput = String(FeedbackNotchContract.targetOutput)
         // Resolve every helper-owned input before the first child runs.
         let priorPlanURL = try value.priorPlanDigest.map { try notchPlanStore.load(planDigest: $0) }
@@ -1286,7 +1298,14 @@ extension DCXHelperCoordinator {
         }
         let planResult: DCXCTLProcessResult
         switch try run(planArguments) {
-        case let .failure(error): return reply(error)
+        case let .failure(error):
+            guard priorPlanURL != nil else { return reply(error) }
+            return reply(.init(
+                code: error.code,
+                message: "feedback plan refused the request; with a prior plan the baseline must hold that plan's notches exactly",
+                retryable: error.retryable,
+                failureDiagnostic: error.failureDiagnostic
+            ))
         case let .success(result): planResult = result
         }
         let planOutput = try decoder.decode(NotchPlanCommandOutput.self, from: planResult.stdout)
@@ -1295,12 +1314,16 @@ extension DCXHelperCoordinator {
               plan.measurementDigest == summary.digest else {
             throw ChildResponseError.bindingMismatch
         }
-        let storedPlan = try notchPlanStore.persist(planResult.stdout, planDigest: plan.planDigest)
+        // The summary and the profile come from the same bytes: this run's
+        // plan. The store keeps the first verified serialization for later
+        // `--prior-plan` use; dcxctl re-verifies whichever bytes it reads.
+        let planURL = try workspace.writeData(planResult.stdout, named: "plan.json")
+        _ = try notchPlanStore.persist(planResult.stdout, planDigest: plan.planDigest)
 
         let profileResult: DCXCTLProcessResult
         switch try run([
             "feedback", "desired-profile",
-            "--plan", storedPlan.path,
+            "--plan", planURL.path,
             "--profile-id", value.profileID,
             "--revision", value.revision,
         ]) {
@@ -1325,6 +1348,7 @@ extension DCXHelperCoordinator {
 
 private enum FeedbackRequestError: Error {
     case baselineUnavailable
+    case baselineUnusable
     case invalidMeasurement
 }
 

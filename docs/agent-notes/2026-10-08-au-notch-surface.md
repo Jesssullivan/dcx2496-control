@@ -41,6 +41,17 @@ Branch `feat/au-notch-surface-20261007`, PR #51.
   - snapshot store errors are narrowed;
   - one shared JSON-integer rule;
   - the recurrence message is scoped to the request's document context.
+- Third review (medium) fixed in the fourth commit:
+  - the summary and the profile now come from the same plan bytes;
+  - a damaged stored entry heals;
+  - stored-baseline faults are reported as invalid_request;
+  - the recurrence explanation comes only from a failed plan step;
+  - state is re-checked when the file panel closes;
+  - an explicit target-mismatch message;
+  - the diff binding runs before any plan is persisted;
+  - one state-view validity rule.
+  The recurrence offer stays a digest heuristic, because a snapshot summary
+  carries no band fields.
 
 ## Evidence
 

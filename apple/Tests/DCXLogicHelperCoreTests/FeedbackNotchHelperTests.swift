@@ -63,10 +63,13 @@ final class FeedbackNotchHelperTests: XCTestCase {
         let stored = try NotchPlanStore(planRoot: fixtures.locations.planRootURL)
             .load(planDigest: result.plan.planDigest)
         XCTAssertEqual(try Data(contentsOf: stored), fixtures.plan)
-        XCTAssertEqual(calls[2].map(resolved), [
-            "feedback", "desired-profile", "--plan", resolved(stored.path),
-            "--profile-id", "o4-feedback", "--revision", "synthetic-1",
-        ])
+        // desired-profile reads this run's plan bytes from the transaction
+        // workspace, the same bytes the summary was parsed from.
+        XCTAssertEqual(calls[2].count, 8)
+        XCTAssertEqual(calls[2][0...2], ["feedback", "desired-profile", "--plan"])
+        XCTAssertTrue(resolved(calls[2][3]).hasPrefix(resolved(fixtures.locations.transactionRootURL.path)))
+        XCTAssertTrue(calls[2][3].hasSuffix("/plan.json"))
+        XCTAssertEqual(Array(calls[2][4...]), ["--profile-id", "o4-feedback", "--revision", "synthetic-1"])
     }
 
     func testImportedMeasurementSkipsImportAndRecurrenceNamesTheStoredPlan() throws {
@@ -236,6 +239,11 @@ final class FeedbackNotchHelperTests: XCTestCase {
         XCTAssertEqual(try store.persist(compact, planDigest: digest), first)
         XCTAssertEqual(try Data(contentsOf: try store.load(planDigest: digest)), fixtures.plan)
         XCTAssertThrowsError(try store.persist(fixtures.plan, planDigest: "sha256/" + String(repeating: "0", count: 64)))
+        // A damaged entry heals on the next persist instead of wedging the digest.
+        try Data("{".utf8).write(to: first)
+        XCTAssertThrowsError(try store.load(planDigest: digest))
+        XCTAssertEqual(try store.persist(fixtures.plan, planDigest: digest), first)
+        XCTAssertEqual(try Data(contentsOf: try store.load(planDigest: digest)), fixtures.plan)
     }
 
     /// Cross-language end to end with the real dcxctl under test, when the
