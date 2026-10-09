@@ -272,6 +272,20 @@ final class FeedbackNotchHelperTests: XCTestCase {
         // The blank baseline does not hold the prior plan's notches, so the
         // real planner refuses the recurrence rather than stacking notches.
         XCTAssertEqual(recurrence.error?.code, .childFailed)
+
+        // A BOM-prefixed ring-out file keeps its exact bytes end to end, so
+        // dcxctl's source digest equals the file's own digest.
+        let bomFile = Data([0xEF, 0xBB, 0xBF]) + fixtures.ringOut
+        let bomRequest = try fixtures.request(.file(.frequencyList, bytes: bomFile))
+        let bom = fixtures.coordinator(backend).handle(bomRequest)
+        XCTAssertNil(bom.error, "\(String(describing: bom.error))")
+        XCTAssertNoThrow(try bom.validate(for: bomRequest))
+        guard case let .feedbackPlan(bomResult)? = bom.body else { return XCTFail("expected BOM plan") }
+        XCTAssertEqual(
+            bomResult.measurement.sourceDigest,
+            "sha256/" + SHA256.hash(data: bomFile).map { String(format: "%02x", $0) }.joined()
+        )
+        XCTAssertEqual(bomResult.plan.notches, result.plan.notches)
     }
 }
 

@@ -72,3 +72,27 @@ Branch `feat/au-notch-surface-20261007`, PR #51.
   Expected overlap: CHANGELOG/README lines only.
 - The installed signed helper/AU and Logic UI behavior are not qualified here.
   That needs a signed bundle install on PZM, which is a separate lane.
+
+## Post-merge adversarial review (2026-10-09)
+
+Review of merged #51 on main after #49/#52/#53 (R-HOOK-CONVERGENCE-20261004
+R-N13; dec-autonomous-muted-bench-20261007). Two defects, fixed in the
+follow-up PR:
+
+- The AU decoded the selected text file with `String(data:encoding: .utf8)`,
+  which drops a leading UTF-8 BOM. dcxctl's frequency-list importer accepts a
+  BOM and digests the bytes it is handed, so for a BOM file the reported
+  `source_digest` was internally consistent but no longer the digest of the
+  file legalab recorded. The AU now carries the exact bytes
+  (`FeedbackMeasurementInputV1.file`), refusing invalid UTF-8; a real-dcxctl
+  test pins source digest = file digest.
+- The read-only Pending Changes AU parameter kept its v1 range 0-1 while a v2
+  bank diff reports up to 47 changes. Now 0-47.
+
+Checked and held: Swift v2 validation and digest still match Rust after #49
+(O4-only, cut-only; the stored-boost refusal is planner/apply-side and stays
+in dcxctl); plan action order (band fields, count, enable) matches
+`plan_notches` and `verify`; peak bounds (20-20000 Hz, level within 200 dB)
+match `validate_peak`; the render block is unchanged and does no locking or
+I/O; offline children get no tty or device lock; the baseline load is
+device-bound. Not addressed (design scope): the recovery-lease blocker above.
