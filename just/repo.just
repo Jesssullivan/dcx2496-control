@@ -99,6 +99,7 @@ fixtures:
     cargo build --locked --jobs 2 --quiet --package dcxctl
     bash tests/feedback_pipeline.sh target/debug/dcxctl fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/rew/SYNTHETIC-feedback-notches.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json
     bash tests/routing_pipeline.sh target/debug/dcxctl fixtures/snapshots/SYNTHETIC-blank-snapshot.json
+    bash tests/apple_feedback_fixture_parity.sh target/debug/dcxctl fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json apple/Tests/DCXLogicHelperCoreTests/Fixtures/feedback
 
 lockfiles-static:
     test -s Cargo.lock
@@ -155,9 +156,15 @@ native-logic-recall:
 native-response-binding:
     bash scripts/run_bazelisk.sh test //apple:response_binding
 
-# Parse the checked-in bridge schema without introducing another validator stack.
+# Bridge v2 notch surface: v2 bindings, helper planning, AU staging, real dcxctl.
+native-feedback-notch:
+    bash scripts/run_bazelisk.sh test //apple:feedback_notch
+
+# Parse the checked-in bridge schemas without introducing another validator stack.
+# v1 is the frozen prior wire; v2 is current.
 schema-check:
     jq -e . schemas/v1/dcx_logic_bridge.schema.json >/dev/null
+    jq -e . schemas/v2/dcx_logic_bridge.schema.json >/dev/null
 
 # Regenerate the ignored Xcode project from the checked-in XcodeGen source.
 apple-project-generate:

@@ -289,7 +289,7 @@ final class MutationRecoveryFixture {
                 }),
             ])
         )
-        let diff = try SemanticDiffV1(
+        let diff = try SemanticDiff(
             baselineSnapshotDigest: baseline.snapshotDigest,
             desiredProfileDigest: profile.digest,
             desiredSnapshotDigest: desired.snapshotDigest,
@@ -300,7 +300,7 @@ final class MutationRecoveryFixture {
         apply = try .init(target: configuration.target, plan: .init(
             baseline: baseline.summary(target: configuration.target, validSearchResponses: 10,
                                        capturedAt: Date(timeIntervalSince1970: 0)),
-            desired: profile, diff: diff
+            desired: .v1(profile), diff: diff
         ))
         lease = try .init(configuration: configuration, apply: apply)
         try configuration.save(to: locations.helperConfigurationURL)

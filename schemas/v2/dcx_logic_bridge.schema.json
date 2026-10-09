@@ -1,0 +1,2345 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tinyland.io/schemas/dcx.logic-bridge/v2",
+  "title": "DCX Logic bridge v2 request or response",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/response"
+    }
+  ],
+  "$defs": {
+    "operation": {
+      "enum": [
+        "helper.status",
+        "device.identity.search",
+        "device.snapshot.capture",
+        "profile.diff.preview",
+        "device.apply",
+        "device.readback",
+        "device.rollback",
+        "feedback.notch.plan"
+      ]
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256/[0-9a-f]{64}$"
+    },
+    "requestID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "bindingID",
+        "expectedDeviceAddress"
+      ],
+      "properties": {
+        "bindingID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedDeviceAddress": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        }
+      },
+      "additionalProperties": false
+    },
+    "identity": {
+      "type": "object",
+      "required": [
+        "manufacturer",
+        "model",
+        "deviceAddress",
+        "selectedBaud",
+        "validSearchResponses"
+      ],
+      "properties": {
+        "manufacturer": {
+          "const": "Behringer"
+        },
+        "model": {
+          "const": "DCX2496"
+        },
+        "deviceAddress": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "selectedBaud": {
+          "const": 38400
+        },
+        "validSearchResponses": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        }
+      },
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "target",
+        "identity",
+        "capturedAt",
+        "digest",
+        "complete",
+        "sectionDigests"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.snapshot/v1"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "capturedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "complete": {
+          "const": true
+        },
+        "sectionDigests": {
+          "type": "object",
+          "required": [
+            "identity",
+            "dump0",
+            "dump1"
+          ],
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/digest"
+            },
+            "dump0": {
+              "$ref": "#/$defs/digest"
+            },
+            "dump1": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "desiredPeqDocument": {
+      "type": "object",
+      "required": [
+        "target_output",
+        "parameter_channel",
+        "slot",
+        "actions"
+      ],
+      "properties": {
+        "target_output": {
+          "const": 1
+        },
+        "parameter_channel": {
+          "const": 5
+        },
+        "slot": {
+          "const": 9
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/frequencyAction"
+            },
+            {
+              "$ref": "#/$defs/qAction"
+            },
+            {
+              "$ref": "#/$defs/gainAction"
+            },
+            {
+              "$ref": "#/$defs/filterKindAction"
+            }
+          ],
+          "items": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "frequencyAction": {
+      "type": "object",
+      "required": [
+        "channel",
+        "parameter",
+        "value"
+      ],
+      "properties": {
+        "channel": {
+          "const": 5
+        },
+        "parameter": {
+          "const": 59
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 320
+        }
+      },
+      "additionalProperties": false
+    },
+    "qAction": {
+      "type": "object",
+      "required": [
+        "channel",
+        "parameter",
+        "value"
+      ],
+      "properties": {
+        "channel": {
+          "const": 5
+        },
+        "parameter": {
+          "const": 60
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 40
+        }
+      },
+      "additionalProperties": false
+    },
+    "gainAction": {
+      "type": "object",
+      "required": [
+        "channel",
+        "parameter",
+        "value"
+      ],
+      "properties": {
+        "channel": {
+          "const": 5
+        },
+        "parameter": {
+          "const": 61
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 150
+        }
+      },
+      "additionalProperties": false
+    },
+    "filterKindAction": {
+      "type": "object",
+      "required": [
+        "channel",
+        "parameter",
+        "value"
+      ],
+      "properties": {
+        "channel": {
+          "const": 5
+        },
+        "parameter": {
+          "const": 62
+        },
+        "value": {
+          "const": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "semanticChange": {
+      "type": "object",
+      "required": [
+        "path",
+        "before",
+        "after"
+      ],
+      "properties": {
+        "path": {
+          "const": "$.outputs[0].peq[8]"
+        },
+        "before": {
+          "$ref": "#/$defs/peqSlotState"
+        },
+        "after": {
+          "$ref": "#/$defs/peqSlotState"
+        }
+      },
+      "additionalProperties": false
+    },
+    "peqSlotState": {
+      "type": "object",
+      "required": [
+        "frequencyCode",
+        "qCode",
+        "gainCode",
+        "filterKindCode"
+      ],
+      "properties": {
+        "frequencyCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 320
+        },
+        "qCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 40
+        },
+        "gainCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 150
+        },
+        "filterKindCode": {
+          "const": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "applyPlan": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "baseline",
+        "desired",
+        "diff"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.apply-plan/v1"
+        },
+        "baseline": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "desired": {
+          "$ref": "#/$defs/desiredProfile"
+        },
+        "diff": {
+          "$ref": "#/$defs/semanticDiff"
+        }
+      },
+      "additionalProperties": false
+    },
+    "rollbackPlan": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "transactionID",
+        "baseline",
+        "rollbackPlanDigest"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.rollback-plan/v1"
+        },
+        "transactionID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "baseline": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "rollbackPlanDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "helperStatusRequest": {
+      "type": "object",
+      "maxProperties": 0
+    },
+    "identitySearchRequest": {
+      "type": "object",
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        }
+      },
+      "additionalProperties": false
+    },
+    "snapshotCaptureRequest": {
+      "type": "object",
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        }
+      },
+      "additionalProperties": false
+    },
+    "diffPreviewRequest": {
+      "type": "object",
+      "required": [
+        "target",
+        "baseline",
+        "desired"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "baseline": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "desired": {
+          "$ref": "#/$defs/desiredProfile"
+        }
+      },
+      "additionalProperties": false
+    },
+    "applyRequest": {
+      "type": "object",
+      "required": [
+        "target",
+        "plan"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "plan": {
+          "$ref": "#/$defs/applyPlan"
+        }
+      },
+      "additionalProperties": false
+    },
+    "readbackRequest": {
+      "type": "object",
+      "required": [
+        "target",
+        "transactionID",
+        "expectedDesiredDigest"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "transactionID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "expectedDesiredDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "rollbackRequest": {
+      "type": "object",
+      "required": [
+        "target",
+        "plan"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "plan": {
+          "$ref": "#/$defs/rollbackPlan"
+        }
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "requestID",
+        "operation",
+        "payload"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.logic-bridge/v2"
+        },
+        "requestID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "payload": {}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "helper.status"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/helperStatusRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.identity.search"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/identitySearchRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.snapshot.capture"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/snapshotCaptureRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "profile.diff.preview"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/diffPreviewRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.apply"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/applyRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.readback"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/readbackRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.rollback"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/rollbackRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "feedback.notch.plan"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/feedbackPlanRequest"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "required": [
+        "operation",
+        "exitCode",
+        "durationMilliseconds",
+        "stdoutDigest"
+      ],
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "exitCode": {
+          "const": 0
+        },
+        "durationMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stdoutDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "coreMIDIStatus": {
+      "type": "object",
+      "required": [
+        "commandsName",
+        "commandsUniqueID",
+        "statusName",
+        "statusUniqueID",
+        "online"
+      ],
+      "properties": {
+        "commandsName": {
+          "const": "Tinyland DCX Commands"
+        },
+        "commandsUniqueID": {
+          "const": 1145264195
+        },
+        "statusName": {
+          "const": "Tinyland DCX Status"
+        },
+        "statusUniqueID": {
+          "const": 1145264211
+        },
+        "online": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "helperStatusResponse": {
+      "type": "object",
+      "required": [
+        "foreground",
+        "configured",
+        "capabilities",
+        "coreMIDI",
+        "recoveryUnavailable"
+      ],
+      "properties": {
+        "foreground": {
+          "type": "boolean"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/operation"
+          },
+          "allOf": [
+            {
+              "if": {
+                "contains": {
+                  "enum": [
+                    "device.apply",
+                    "device.readback",
+                    "device.rollback"
+                  ]
+                }
+              },
+              "then": {
+                "allOf": [
+                  {
+                    "contains": {
+                      "const": "device.apply"
+                    }
+                  },
+                  {
+                    "contains": {
+                      "const": "device.readback"
+                    }
+                  },
+                  {
+                    "contains": {
+                      "const": "device.rollback"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "coreMIDI": {
+          "$ref": "#/$defs/coreMIDIStatus"
+        },
+        "activeTransactionID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "recovery": {
+          "$ref": "#/$defs/helperRecoveryStatus"
+        },
+        "completion": {
+          "$ref": "#/$defs/helperRecoveryCompletionStatus"
+        },
+        "recoveryUnavailable": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "recovery"
+            ]
+          },
+          "then": {
+            "properties": {
+              "capabilities": {
+                "maxItems": 1,
+                "contains": {
+                  "const": "helper.status"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "recovery",
+              "completion"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "recoveryUnavailable": {
+                "const": true
+              }
+            },
+            "required": [
+              "recoveryUnavailable"
+            ]
+          },
+          "then": {
+            "properties": {
+              "capabilities": {
+                "maxItems": 1,
+                "contains": {
+                  "const": "helper.status"
+                }
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "recovery"
+                  ]
+                },
+                {
+                  "required": [
+                    "completion"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "helperRecoveryStatus": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "target",
+        "capabilities",
+        "baseline",
+        "desiredSnapshotDigest",
+        "rollbackPlanDigest"
+      ],
+      "properties": {
+        "transactionID": {
+          "$ref": "#/$defs/digest"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "device.readback",
+              "device.rollback"
+            ]
+          }
+        },
+        "baseline": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "desiredSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rollbackPlanDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "helperRecoveryCompletionStatus": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "target",
+        "baseline",
+        "verifiedBaseline",
+        "desiredSnapshotDigest",
+        "rollbackPlanDigest"
+      ],
+      "properties": {
+        "transactionID": {
+          "$ref": "#/$defs/digest"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "baseline": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "verifiedBaseline": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "desiredSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rollbackPlanDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "identitySearchResponse": {
+      "type": "object",
+      "required": [
+        "identity",
+        "receipt"
+      ],
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "receipt": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "snapshotCaptureResponse": {
+      "type": "object",
+      "required": [
+        "snapshot",
+        "receipt"
+      ],
+      "properties": {
+        "snapshot": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "receipt": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "diffPreviewResponse": {
+      "type": "object",
+      "required": [
+        "diff",
+        "receipt"
+      ],
+      "properties": {
+        "diff": {
+          "$ref": "#/$defs/semanticDiff"
+        },
+        "receipt": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "applyResponse": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "baselineDigest",
+        "desiredSnapshotDigest",
+        "readbackMatchesDesired",
+        "rollbackRequired",
+        "rollbackAvailable",
+        "receipt"
+      ],
+      "properties": {
+        "transactionID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "baselineDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "desiredSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "readback": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/snapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "readbackMatchesDesired": {
+          "type": "boolean"
+        },
+        "rollbackRequired": {
+          "type": "boolean"
+        },
+        "rollbackAvailable": {
+          "type": "boolean"
+        },
+        "receipt": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "readbackResponse": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "matchesDesired",
+        "snapshot",
+        "receipt"
+      ],
+      "properties": {
+        "transactionID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "matchesDesired": {
+          "type": "boolean"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "receipt": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "rollbackResponse": {
+      "type": "object",
+      "required": [
+        "transactionID",
+        "baselineDigest",
+        "equalsBaseline",
+        "receipt"
+      ],
+      "properties": {
+        "transactionID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "baselineDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "restored": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/snapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "equalsBaseline": {
+          "type": "boolean"
+        },
+        "receipt": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "successResponse": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "requestID",
+        "operation",
+        "status",
+        "payload"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.logic-bridge/v2"
+        },
+        "requestID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "status": {
+          "const": "ok"
+        },
+        "payload": {}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "helper.status"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/helperStatusResponse"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.identity.search"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/identitySearchResponse"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.snapshot.capture"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/snapshotCaptureResponse"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "profile.diff.preview"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/diffPreviewResponse"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.apply"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/applyResponse"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.readback"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/readbackResponse"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "device.rollback"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/rollbackResponse"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "feedback.notch.plan"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/feedbackPlanResponse"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "childFailureDiagnostic": {
+      "type": "object",
+      "required": [
+        "kind",
+        "stage",
+        "exitCode",
+        "durationMilliseconds",
+        "stderrDigest",
+        "stderrByteCount",
+        "inspectionTruncated",
+        "cleanupFailureReported"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "searchIncomplete",
+            "timeout",
+            "transport",
+            "invalidResponse",
+            "responseLimit",
+            "sessionBudget",
+            "sessionCleanup",
+            "serialSystem",
+            "unknown"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "search",
+            "dump0",
+            "dump1",
+            "serial",
+            "remoteMode",
+            "cleanup",
+            "unknown"
+          ]
+        },
+        "exitCode": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647,
+          "not": {
+            "const": 0
+          }
+        },
+        "durationMilliseconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "stderrDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "stderrByteCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576
+        },
+        "inspectionTruncated": {
+          "type": "boolean"
+        },
+        "cleanupFailureReported": {
+          "type": "boolean"
+        },
+        "validSearchCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9
+        },
+        "searchAttempts": {
+          "const": 20
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "searchIncomplete"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "validSearchCount",
+              "searchAttempts"
+            ],
+            "properties": {
+              "stage": {
+                "const": "search"
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "validSearchCount"
+                  ]
+                },
+                {
+                  "required": [
+                    "searchAttempts"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "stderrByteCount": {
+                "maximum": 4096
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "inspectionTruncated": {
+                "const": false
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "inspectionTruncated": {
+                "const": true
+              },
+              "kind": {
+                "const": "unknown"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "timeout",
+                  "invalidResponse",
+                  "responseLimit",
+                  "sessionBudget"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "enum": [
+                  "search",
+                  "dump0",
+                  "dump1"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "transport"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "enum": [
+                  "search",
+                  "dump0",
+                  "dump1",
+                  "remoteMode"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "sessionCleanup"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "const": "cleanup"
+              },
+              "cleanupFailureReported": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "serialSystem"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "const": "serial"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "unknown"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "const": "unknown"
+              },
+              "cleanupFailureReported": {
+                "const": false
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "errorPayload": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request",
+            "unsupported_schema",
+            "helper_not_foreground",
+            "helper_not_configured",
+            "target_not_allowlisted",
+            "operation_unavailable",
+            "operation_in_flight",
+            "child_timed_out",
+            "child_failed",
+            "malformed_child_response",
+            "mutation_not_admitted",
+            "ipc_unavailable",
+            "internal_failure"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "failureDiagnostic": {
+          "$ref": "#/$defs/childFailureDiagnostic"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "failureDiagnostic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "code": {
+                "const": "child_failed"
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "errorResponse": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "requestID",
+        "status",
+        "error"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.logic-bridge/v2"
+        },
+        "requestID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "status": {
+          "const": "error"
+        },
+        "error": {
+          "$ref": "#/$defs/errorPayload"
+        }
+      },
+      "additionalProperties": false
+    },
+    "response": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/successResponse"
+        },
+        {
+          "$ref": "#/$defs/errorResponse"
+        }
+      ]
+    },
+    "desiredProfileV1": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "profileID",
+        "revision",
+        "digest",
+        "document"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.desired-profile/v1"
+        },
+        "profileID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "document": {
+          "$ref": "#/$defs/desiredPeqDocument"
+        }
+      },
+      "additionalProperties": false
+    },
+    "peqBankAction": {
+      "type": "object",
+      "required": [
+        "channel",
+        "parameter",
+        "value"
+      ],
+      "properties": {
+        "channel": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 10
+        },
+        "parameter": {
+          "enum": [
+            6,
+            7,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63
+          ]
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 320
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "parameter": {
+                "enum": [
+                  6
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "parameter": {
+                "enum": [
+                  7
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "maximum": 9
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "parameter": {
+                "enum": [
+                  20,
+                  25,
+                  30,
+                  35,
+                  40,
+                  45,
+                  50,
+                  55,
+                  60
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "maximum": 40
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "parameter": {
+                "enum": [
+                  21,
+                  26,
+                  31,
+                  36,
+                  41,
+                  46,
+                  51,
+                  56,
+                  61
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "maximum": 150
+              }
+            }
+          },
+          "$comment": "cut-only: gain code 150 is 0 dB"
+        },
+        {
+          "if": {
+            "properties": {
+              "parameter": {
+                "enum": [
+                  22,
+                  27,
+                  32,
+                  37,
+                  42,
+                  47,
+                  52,
+                  57,
+                  62
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "maximum": 2
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "parameter": {
+                "enum": [
+                  23,
+                  28,
+                  33,
+                  38,
+                  43,
+                  48,
+                  53,
+                  58,
+                  63
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "maximum": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "desiredPeqBankDocument": {
+      "type": "object",
+      "required": [
+        "target_output",
+        "parameter_channel",
+        "actions"
+      ],
+      "properties": {
+        "target_output": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "parameter_channel": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 10
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 47,
+          "items": {
+            "$ref": "#/$defs/peqBankAction"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "$comment": "parameter_channel = target_output + 4; every action uses that channel; parameters are distinct. The digest binds the ordered actions."
+    },
+    "desiredProfileV2": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "profileID",
+        "revision",
+        "digest",
+        "document"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.desired-profile/v2"
+        },
+        "profileID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "document": {
+          "$ref": "#/$defs/desiredPeqBankDocument"
+        }
+      },
+      "additionalProperties": false
+    },
+    "desiredProfile": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/desiredProfileV1"
+        },
+        {
+          "$ref": "#/$defs/desiredProfileV2"
+        }
+      ]
+    },
+    "semanticDiffV1": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "baselineSnapshotDigest",
+        "desiredProfileDigest",
+        "desiredSnapshotDigest",
+        "applyPlanDigest",
+        "rollbackPlanDigest",
+        "changes"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.semantic-diff/v1"
+        },
+        "baselineSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "desiredProfileDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "desiredSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "applyPlanDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rollbackPlanDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "changes": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/semanticChange"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "fieldChange": {
+      "type": "object",
+      "required": [
+        "output",
+        "field",
+        "channel",
+        "parameter",
+        "before",
+        "after"
+      ],
+      "properties": {
+        "output": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "field": {
+          "type": "string",
+          "pattern": "^(eq_enabled|eq_count|band[1-9]\\.(frequency|q|gain|kind|slope))$"
+        },
+        "channel": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 10
+        },
+        "parameter": {
+          "enum": [
+            6,
+            7,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63
+          ]
+        },
+        "before": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 320
+        },
+        "after": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 320
+        }
+      },
+      "additionalProperties": false
+    },
+    "semanticDiffV2": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "baselineSnapshotDigest",
+        "desiredProfileDigest",
+        "desiredSnapshotDigest",
+        "applyPlanDigest",
+        "rollbackPlanDigest",
+        "changes"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.semantic-diff/v2"
+        },
+        "baselineSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "desiredProfileDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "desiredSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "applyPlanDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rollbackPlanDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "changes": {
+          "type": "array",
+          "maxItems": 47,
+          "items": {
+            "$ref": "#/$defs/fieldChange"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "semanticDiff": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/semanticDiffV1"
+        },
+        {
+          "$ref": "#/$defs/semanticDiffV2"
+        }
+      ]
+    },
+    "feedbackMeasurementInput": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "frequency_list",
+            "rew_generic_eq",
+            "measurement"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536
+        },
+        "document": {
+          "type": "object",
+          "required": [
+            "schema_version",
+            "target_output",
+            "digest"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": "dcx.feedback-measurement/v1"
+            },
+            "target_output": {
+              "const": 4
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            }
+          }
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "frequency_list",
+                "rew_generic_eq"
+              ]
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "not": {
+            "required": [
+              "document"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "measurement"
+            }
+          },
+          "required": [
+            "document"
+          ],
+          "not": {
+            "required": [
+              "text"
+            ]
+          }
+        }
+      ]
+    },
+    "feedbackPlanRequest": {
+      "type": "object",
+      "required": [
+        "target",
+        "baseline",
+        "measurement",
+        "profileID",
+        "revision"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "baseline": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "measurement": {
+          "$ref": "#/$defs/feedbackMeasurementInput"
+        },
+        "priorPlanDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "profileID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\u0000-\\u007f]{1,128}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "feedbackMeasurementSummary": {
+      "type": "object",
+      "required": [
+        "digest",
+        "source",
+        "sourceDigest",
+        "targetOutput",
+        "peakCount"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "source": {
+          "enum": [
+            "frequency_list",
+            "rew_generic_eq"
+          ]
+        },
+        "sourceDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "targetOutput": {
+          "const": 4
+        },
+        "peakCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        }
+      },
+      "additionalProperties": false
+    },
+    "plannedNotch": {
+      "type": "object",
+      "required": [
+        "band",
+        "frequencyHz",
+        "occurrences",
+        "frequencyCode",
+        "qCode",
+        "gainCode",
+        "kindCode",
+        "slopeCode"
+      ],
+      "properties": {
+        "band": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9
+        },
+        "frequencyHz": {
+          "type": "number",
+          "minimum": 20,
+          "maximum": 20000
+        },
+        "occurrences": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 255
+        },
+        "levelDb": {
+          "type": "number",
+          "minimum": -200,
+          "maximum": 200
+        },
+        "frequencyCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 320
+        },
+        "qCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 40
+        },
+        "gainCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 149
+        },
+        "kindCode": {
+          "const": 1
+        },
+        "slopeCode": {
+          "const": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "droppedPeak": {
+      "type": "object",
+      "required": [
+        "frequencyHz",
+        "reason"
+      ],
+      "properties": {
+        "frequencyHz": {
+          "type": "number",
+          "minimum": 20,
+          "maximum": 20000
+        },
+        "reason": {
+          "enum": [
+            "notch_cap",
+            "per_octave_limit",
+            "duplicate_code"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "notchPlanSummary": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "planDigest",
+        "baselineSnapshotDigest",
+        "measurementDigest",
+        "targetOutput",
+        "parameterChannel",
+        "eqEnabledBefore",
+        "eqCountBefore",
+        "operatorBandCount",
+        "notches",
+        "dropped"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.notch-plan/v1"
+        },
+        "planDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "baselineSnapshotDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "measurementDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "targetOutput": {
+          "const": 4
+        },
+        "parameterChannel": {
+          "const": 8
+        },
+        "eqEnabledBefore": {
+          "type": "boolean"
+        },
+        "eqCountBefore": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9
+        },
+        "operatorBandCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8
+        },
+        "notches": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "items": {
+            "$ref": "#/$defs/plannedNotch"
+          }
+        },
+        "dropped": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/droppedPeak"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "$comment": "Notch bands are consecutive from operatorBandCount + 1. The staged desiredProfileV2 carries exactly each notch's five band fields in order, then eq_count = operatorBandCount + notches, then eq_enabled = 1."
+    },
+    "feedbackPlanResponse": {
+      "type": "object",
+      "required": [
+        "measurement",
+        "plan",
+        "desired",
+        "planReceipt",
+        "profileReceipt"
+      ],
+      "properties": {
+        "measurement": {
+          "$ref": "#/$defs/feedbackMeasurementSummary"
+        },
+        "plan": {
+          "$ref": "#/$defs/notchPlanSummary"
+        },
+        "desired": {
+          "$ref": "#/$defs/desiredProfileV2"
+        },
+        "importReceipt": {
+          "$ref": "#/$defs/receipt"
+        },
+        "planReceipt": {
+          "$ref": "#/$defs/receipt"
+        },
+        "profileReceipt": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

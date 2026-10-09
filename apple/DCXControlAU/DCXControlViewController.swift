@@ -14,6 +14,19 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     private let currentLabel = NSTextField(labelWithString: "Current: not captured")
     private let desiredLabel = NSTextField(labelWithString: "Desired: not staged")
     private let diffTextView = NSTextView()
+    private let notchTextView = NSTextView()
+    private let measurementKindPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let recurrenceCheckbox = NSButton(
+        checkboxWithTitle: "Recurrence: build on staged plan",
+        target: nil,
+        action: nil
+    )
+    private var stageNotchButton: NSButton?
+    /// Latest complete snapshot of the configured target, staged or not. A
+    /// notch plan is computed against it; it never leaves this view instance.
+    private var latestSnapshot: SnapshotV1?
+    /// A computed but unstaged plan, kept with the exact baseline and target.
+    private var pendingNotchPlan: PendingNotchPlan?
     private let workQueue = DispatchQueue(label: "io.tinyland.dcx2496.logic.au-ui", qos: .userInitiated)
     private var configuredTarget: DCXTargetReference?
     private var helperCapabilities: Set<BridgeOperation> = []
@@ -26,6 +39,18 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
     private var capabilityButtons: [BridgeOperation: NSButton] = [:]
     private var localActionButtons: [NSButton] = []
 
+    private struct PendingNotchPlan {
+        let response: FeedbackPlanResponse
+        let baseline: SnapshotV1
+        let target: DCXTargetReference
+    }
+
+    private static let measurementKinds: [(title: String, kind: FeedbackMeasurementInputV1.Kind)] = [
+        ("Ring-out list", .frequencyList),
+        ("REW Generic EQ", .rewGenericEq),
+        ("Measurement JSON", .measurement),
+    ]
+
     private struct ReadResponseContext {
         let audioUnit: DCXControlAudioUnit
         let restorationGeneration: UInt64
@@ -35,7 +60,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         // Logic's remote ViewBridge initially asks the extension for a view at
         // zero size. Give the host a usable presentation size and leave the
         // root view under host autoresizing; Auto Layout owns only its content.
-        let contentSize = NSSize(width: 720, height: 420)
+        let contentSize = NSSize(width: 760, height: 640)
         preferredContentSize = contentSize
         let root = NSView(frame: NSRect(origin: .zero, size: contentSize))
         root.autoresizingMask = [.width, .height]
@@ -65,6 +90,27 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         diffScrollView.autohidesScrollers = true
         diffScrollView.borderType = .bezelBorder
 
+        notchTextView.isEditable = false
+        notchTextView.isSelectable = true
+        notchTextView.isRichText = false
+        notchTextView.drawsBackground = false
+        notchTextView.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        notchTextView.textContainerInset = NSSize(width: 6, height: 6)
+        notchTextView.isHorizontallyResizable = false
+        notchTextView.isVerticallyResizable = true
+        notchTextView.textContainer?.widthTracksTextView = true
+        notchTextView.string = "O4 notches: none planned"
+        let notchScrollView = NSScrollView()
+        notchScrollView.documentView = notchTextView
+        notchScrollView.hasVerticalScroller = true
+        notchScrollView.hasHorizontalScroller = false
+        notchScrollView.autohidesScrollers = true
+        notchScrollView.borderType = .bezelBorder
+        let notchTitle = NSTextField(labelWithString: "O4 feedback notches (static, offline plan)")
+        notchTitle.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        measurementKindPopup.addItems(withTitles: Self.measurementKinds.map(\.title))
+        recurrenceCheckbox.state = .off
+
         let refresh = button("Helper Status", action: #selector(helperStatus))
         let identify = button("Identify", action: #selector(identifyDevice))
         let stage = button("Stage Desired Profile…", action: #selector(stageDesiredProfile))
@@ -73,13 +119,24 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         let apply = button("Apply", action: #selector(applyDesired))
         let readback = button("Readback", action: #selector(readback))
         let rollback = button("Rollback", action: #selector(rollback))
+        let planNotches = button("Plan Notches…", action: #selector(planNotches))
+        let stageNotches = button("Stage Notch Plan", action: #selector(stageNotchPlan))
+        stageNotchButton = stageNotches
+        let notchControls = NSStackView(views: [
+            measurementKindPopup, recurrenceCheckbox, planNotches, stageNotches,
+        ])
+        notchControls.orientation = .horizontal
+        notchControls.spacing = 8
         let preparation = NSStackView(views: [refresh, identify, stage, snapshot, preview])
         preparation.orientation = .horizontal
         preparation.spacing = 8
         let mutation = NSStackView(views: [apply, readback, rollback])
         mutation.orientation = .horizontal
         mutation.spacing = 8
-        actionButtons = [refresh, identify, stage, snapshot, preview, apply, readback, rollback]
+        actionButtons = [
+            refresh, identify, stage, snapshot, preview, apply, readback, rollback,
+            planNotches, stageNotches,
+        ]
         capabilityButtons = [
             .helperStatus: refresh,
             .identitySearch: identify,
@@ -88,6 +145,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             .apply: apply,
             .readback: readback,
             .rollback: rollback,
+            .feedbackPlan: planNotches,
         ]
         localActionButtons = [stage]
 
@@ -100,6 +158,9 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             diffScrollView,
             preparation,
             mutation,
+            notchTitle,
+            notchControls,
+            notchScrollView,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -109,6 +170,8 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         NSLayoutConstraint.activate([
             diffScrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
             diffScrollView.heightAnchor.constraint(equalToConstant: 132),
+            notchScrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            notchScrollView.heightAnchor.constraint(equalToConstant: 132),
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
             stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
@@ -161,6 +224,8 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             configuredTarget = status.target
             if targetChanged {
                 identityLabel.stringValue = "Device: not identified"
+                latestSnapshot = nil
+                pendingNotchPlan = nil
             }
             var acceptedCompletion = false
             var rejectedCompletion = false
@@ -251,7 +316,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                     return
                 }
                 let profile = try BridgeJSONCodec.decoder().decode(
-                    DesiredProfileV1.self,
+                    DesiredProfile.self,
                     from: Data(contentsOf: url)
                 )
                 try profile.validate()
@@ -296,6 +361,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                             expectedRestorationGeneration: context.restorationGeneration
                         )
                     }
+                    latestSnapshot = result.snapshot
                     report("Complete snapshot captured and bound to the staged profile", for: context)
                     refreshLabels()
                 } else {
@@ -303,6 +369,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                         report("Helper target changed while snapshot capture was in progress", for: context)
                         return
                     }
+                    latestSnapshot = result.snapshot
                     currentLabel.stringValue = "Current: \(result.snapshot.digest) (read-only; not stored in project state)"
                     report("Complete read-only snapshot captured; stage a profile before previewing a diff", for: context)
                 }
@@ -410,6 +477,129 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         } catch {
             report("An exact snapshot-bound diff is required")
         }
+    }
+
+    /// Read one operator-selected measurement in the UI (never in render) and
+    /// ask the helper for an offline O4 notch plan against the latest complete
+    /// snapshot. The helper owns every child process and stored file.
+    @objc private func planNotches() {
+        guard dcxAudioUnit?.controlState.view().recoveryActive != true,
+              helperRecovery == nil,
+              !helperRecoveryUnavailable else {
+            report("Notch planning is blocked until the active mutation recovery reaches its baseline")
+            return
+        }
+        guard let target = configuredTarget else {
+            report("Request Helper Status before planning notches for the configured DCX target")
+            return
+        }
+        let state = dcxAudioUnit?.controlState.view()
+        guard let baseline = [state?.currentSnapshot, latestSnapshot]
+            .compactMap({ $0 })
+            .first(where: { $0.target == target }) else {
+            report("Capture a complete snapshot before planning notches")
+            return
+        }
+        let index = max(0, measurementKindPopup.indexOfSelectedItem)
+        let kind = Self.measurementKinds[min(index, Self.measurementKinds.count - 1)].kind
+        var priorPlanDigest: String?
+        if recurrenceCheckbox.state == .on {
+            guard let staged = state?.projectState?.notchPlan else {
+                report("Recurrence needs a staged notch plan; stage and apply a plan first")
+                return
+            }
+            priorPlanDigest = staged.planDigest
+        }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = kind == .measurement ? [.json] : [.plainText, .commaSeparatedText, .text]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.begin { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            let limit = kind == .measurement
+                ? FeedbackNotchContract.maximumDocumentBytes
+                : FeedbackNotchContract.maximumSourceBytes
+            do {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                guard values.isRegularFile == true, let size = values.fileSize, size <= limit else {
+                    report("Measurement must be one regular file no larger than \(limit / 1_024) KiB")
+                    return
+                }
+                let data = try Data(contentsOf: url)
+                let input: FeedbackMeasurementInputV1
+                switch kind {
+                case .measurement:
+                    input = try .measurement(BridgeJSONCodec.decoder().decode(JSONValue.self, from: data))
+                case .frequencyList, .rewGenericEq:
+                    guard let text = String(data: data, encoding: .utf8) else {
+                        report("Measurement text must be UTF-8")
+                        return
+                    }
+                    input = kind == .frequencyList ? try .frequencyList(text) : try .rewGenericEq(text)
+                }
+                let request = try FeedbackPlanRequest(
+                    target: target,
+                    baseline: baseline,
+                    measurement: input,
+                    priorPlanDigest: priorPlanDigest,
+                    profileID: "o4-feedback",
+                    revision: Self.revisionStamp()
+                )
+                send(.feedbackPlan(request)) { [weak self] body in
+                    guard let self, case let .feedbackPlan(result) = body else { return }
+                    guard configuredTarget == target else {
+                        report("Helper target changed while notch planning was in progress")
+                        return
+                    }
+                    pendingNotchPlan = .init(response: result, baseline: baseline, target: target)
+                    let dropped = result.plan.dropped.count
+                    report("Offline plan: \(result.plan.notches.count) O4 notch(es), \(dropped) dropped; stage it to preview the diff")
+                    refreshLabels()
+                }
+            } catch {
+                report("Selected file is not a valid bounded O4 measurement")
+            }
+        }
+    }
+
+    /// Stage the computed v2 desired profile with its plan and baseline. This
+    /// is a pure model update; previewing and applying stay explicit.
+    @objc private func stageNotchPlan() {
+        guard let pending = pendingNotchPlan, let audioUnit = dcxAudioUnit else {
+            report("Plan notches before staging them")
+            return
+        }
+        guard helperRecovery == nil, !helperRecoveryUnavailable,
+              configuredTarget == pending.target else {
+            report("Staging is blocked until the helper target and recovery state allow it")
+            return
+        }
+        do {
+            let staged = StagedProjectStateV1(
+                target: pending.target,
+                desired: .v2(pending.response.desired),
+                notchPlan: pending.response.plan
+            )
+            try audioUnit.performControlStateMutation {
+                try $0.stage(staged, baseline: pending.baseline)
+            }
+            pendingNotchPlan = nil
+            report("Notch plan staged with its planning snapshot; preview the diff before Apply. No device call occurred")
+            refreshLabels()
+        } catch DCXControlStateError.recoveryInProgress {
+            report("Staging is blocked until mutation recovery reaches its baseline")
+        } catch {
+            report("Planned profile no longer matches its plan or snapshot")
+        }
+    }
+
+    private static func revisionStamp(_ date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return "logic-" + formatter.string(from: date)
     }
 
     @objc private func readback() {
@@ -757,7 +947,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 phaseAllows = true
             case .readback, .rollback:
                 phaseAllows = recoveryActive && recoveryAuthorityMatches
-            case .identitySearch, .snapshotCapture, .diffPreview, .apply:
+            case .identitySearch, .snapshotCapture, .diffPreview, .apply, .feedbackPlan:
                 phaseAllows = !recoveryActive
             }
             button.isEnabled = !bridgeRequestInFlight
@@ -772,6 +962,13 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 && !recoveryActive
                 && configuredTarget != nil
         }
+        stageNotchButton?.isEnabled = !bridgeRequestInFlight
+            && !recoveryActive
+            && pendingNotchPlan != nil
+            && pendingNotchPlan?.target == configuredTarget
+        let canRecur = state?.projectState?.notchPlan != nil
+        if !canRecur { recurrenceCheckbox.state = .off }
+        recurrenceCheckbox.isEnabled = canRecur && !bridgeRequestInFlight && !recoveryActive
     }
 
     @MainActor
@@ -815,19 +1012,58 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         currentLabel.stringValue = state.deviceStateUncertain
             ? "Current: unresolved after a device write"
             : "Current: " + (state.currentSnapshot?.digest ?? "not captured")
-        desiredLabel.stringValue = "Desired: " + (state.projectState?.desired.digest ?? "not staged")
+        desiredLabel.stringValue = state.projectState.map {
+            "Desired: \($0.desired.schemaVersion) \($0.desired.digest)"
+        } ?? "Desired: not staged"
         diffTextView.string = render(diff: state.diff)
+        notchTextView.string = renderNotches(state: state)
         refreshActionAvailability()
     }
 
-    private func render(diff: SemanticDiffV1?) -> String {
+    private func render(diff: SemanticDiff?) -> String {
         guard let diff else { return "Diff: not previewed" }
         guard !diff.changes.isEmpty else { return "Diff: no semantic changes" }
         let changes = diff.changes.enumerated().map { index, change in
-            "\(index + 1). \(change.path)\n   \(render(change.before)) → \(render(change.after))"
+            switch change {
+            case let .peqSlot(slot):
+                return "\(index + 1). \(slot.path)\n   \(render(slot.before)) → \(render(slot.after))"
+            case let .field(field):
+                return "\(index + 1). O\(field.output) \(field.field) (channel \(field.channel), parameter \(field.parameter)): \(field.before) → \(field.after)"
+            }
         }
         return (["Diff: \(diff.changes.count) semantic change\(diff.changes.count == 1 ? "" : "s")"] + changes)
             .joined(separator: "\n")
+    }
+
+    /// Read-only list: the pending (unstaged) plan when one exists, else the
+    /// plan staged in the Logic project.
+    private func renderNotches(state: DCXControlStateView) -> String {
+        let pending = pendingNotchPlan.map { ($0.response.plan, "planned, not staged") }
+        let staged = state.projectState?.notchPlan.map { ($0, "staged in project") }
+        guard let entry = pending ?? staged else { return "O4 notches: none planned" }
+        let (plan, phase) = entry
+        var lines = [
+            "O4 notches (\(phase)): \(plan.notches.count) planned, \(plan.dropped.count) dropped",
+            "  plan \(plan.planDigest)",
+            "  baseline \(plan.baselineSnapshotDigest)",
+            "  operator bands kept: 1...\(plan.operatorBandCount) (PEQ was \(plan.eqEnabledBefore ? "on" : "off"), count \(plan.eqCountBefore))",
+        ]
+        if let current = state.currentSnapshot?.digest, current != plan.baselineSnapshotDigest,
+           staged != nil, pending == nil {
+            lines.append("  current snapshot differs from the plan baseline; replan before previewing")
+        }
+        for notch in plan.notches {
+            let level = notch.levelDb.map { String(format: ", level %.1f", $0) } ?? ""
+            lines.append(String(
+                format: "  band %d  %8.1f Hz  cut %5.1f dB  Q %.1f  (measured %.1f Hz, seen %d×%@)",
+                Int(notch.band), notch.encodedFrequencyHz, notch.encodedGainDb, notch.encodedQ,
+                notch.frequencyHz, Int(notch.occurrences), level
+            ))
+        }
+        for peak in plan.dropped {
+            lines.append(String(format: "  dropped %8.1f Hz  (%@)", peak.frequencyHz, peak.reason.rawValue))
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func render(_ value: JSONValue) -> String {

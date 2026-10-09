@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 public enum DCXBridgeContract {
-    public static let schemaVersion = "dcx.logic-bridge/v1"
+    public static let schemaVersion = "dcx.logic-bridge/v2"
     public static let appGroupIdentifier = "QP994XQKNH.io.tinyland.dcx2496"
     // Keep the socket at the App Group root and the leaf deliberately short:
     // Darwin's sockaddr_un path limit includes the full container path.
@@ -176,8 +176,67 @@ public struct SemanticChangeV1: Codable, Equatable, Sendable {
     }
 }
 
-public struct SemanticDiffV1: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = "dcx.semantic-diff/v1"
+/// One changed reviewed PEQ field, exactly as `control diff` reports a v2
+/// desired profile: the address, its stable label, and both device codes.
+public struct FieldChangeV2: Codable, Equatable, Sendable {
+    public let output: UInt8
+    public let field: String
+    public let channel: UInt8
+    public let parameter: UInt8
+    public let before: UInt16
+    public let after: UInt16
+
+    public init(
+        output: UInt8,
+        field: String,
+        channel: UInt8,
+        parameter: UInt8,
+        before: UInt16,
+        after: UInt16
+    ) throws {
+        self.output = output
+        self.field = field
+        self.channel = channel
+        self.parameter = parameter
+        self.before = before
+        self.after = after
+        try validate()
+    }
+
+    public func validate() throws {
+        guard let address = PeqAddressV2(channel: channel, parameter: parameter),
+              address.output == output,
+              address.label == field,
+              before <= address.deviceMaximum,
+              address.admits(after),
+              before != after else {
+            throw BridgeValidationError.invalidDiff(
+                "v2 diff changes must be distinct reviewed PEQ fields inside their device domain"
+            )
+        }
+    }
+}
+
+public enum SemanticChange: Equatable, Sendable {
+    /// Exact O1/PEQ9 slot change of a v1 desired profile.
+    case peqSlot(SemanticChangeV1)
+    /// One reviewed PEQ field change of a v2 desired profile.
+    case field(FieldChangeV2)
+
+    public func validate() throws {
+        switch self {
+        case let .peqSlot(change): try change.validate()
+        case let .field(change): try change.validate()
+        }
+    }
+}
+
+/// Sanitized semantic diff. `dcx.semantic-diff/v1` carries at most one exact
+/// O1/PEQ9 slot change; `dcx.semantic-diff/v2` carries the per-field changes
+/// of one output's v2 PEQ bank document.
+public struct SemanticDiff: Codable, Equatable, Sendable {
+    public static let v1SchemaVersion = "dcx.semantic-diff/v1"
+    public static let v2SchemaVersion = "dcx.semantic-diff/v2"
 
     public let schemaVersion: String
     public let baselineSnapshotDigest: String
@@ -185,8 +244,9 @@ public struct SemanticDiffV1: Codable, Equatable, Sendable {
     public let desiredSnapshotDigest: String
     public let applyPlanDigest: String
     public let rollbackPlanDigest: String
-    public let changes: [SemanticChangeV1]
+    public let changes: [SemanticChange]
 
+    /// Bind an exact v1 O1/PEQ9 diff.
     public init(
         baselineSnapshotDigest: String,
         desiredProfileDigest: String,
@@ -195,33 +255,172 @@ public struct SemanticDiffV1: Codable, Equatable, Sendable {
         rollbackPlanDigest: String,
         changes: [SemanticChangeV1]
     ) throws {
-        try BridgeDigest.validate(baselineSnapshotDigest)
-        try BridgeDigest.validate(desiredProfileDigest)
-        try BridgeDigest.validate(desiredSnapshotDigest)
-        try BridgeDigest.validate(applyPlanDigest)
-        try BridgeDigest.validate(rollbackPlanDigest)
-        guard changes.count <= 1 else {
-            throw BridgeValidationError.invalidDiff("the MVP diff contains at most one PEQ slot change")
-        }
-        self.schemaVersion = Self.currentSchemaVersion
+        try self.init(
+            schemaVersion: Self.v1SchemaVersion,
+            baselineSnapshotDigest: baselineSnapshotDigest,
+            desiredProfileDigest: desiredProfileDigest,
+            desiredSnapshotDigest: desiredSnapshotDigest,
+            applyPlanDigest: applyPlanDigest,
+            rollbackPlanDigest: rollbackPlanDigest,
+            changes: changes.map(SemanticChange.peqSlot)
+        )
+    }
+
+    /// Bind a v2 per-field PEQ bank diff.
+    public init(
+        baselineSnapshotDigest: String,
+        desiredProfileDigest: String,
+        desiredSnapshotDigest: String,
+        applyPlanDigest: String,
+        rollbackPlanDigest: String,
+        fieldChanges: [FieldChangeV2]
+    ) throws {
+        try self.init(
+            schemaVersion: Self.v2SchemaVersion,
+            baselineSnapshotDigest: baselineSnapshotDigest,
+            desiredProfileDigest: desiredProfileDigest,
+            desiredSnapshotDigest: desiredSnapshotDigest,
+            applyPlanDigest: applyPlanDigest,
+            rollbackPlanDigest: rollbackPlanDigest,
+            changes: fieldChanges.map(SemanticChange.field)
+        )
+    }
+
+    private init(
+        schemaVersion: String,
+        baselineSnapshotDigest: String,
+        desiredProfileDigest: String,
+        desiredSnapshotDigest: String,
+        applyPlanDigest: String,
+        rollbackPlanDigest: String,
+        changes: [SemanticChange]
+    ) throws {
+        self.schemaVersion = schemaVersion
         self.baselineSnapshotDigest = baselineSnapshotDigest
         self.desiredProfileDigest = desiredProfileDigest
         self.desiredSnapshotDigest = desiredSnapshotDigest
         self.applyPlanDigest = applyPlanDigest
         self.rollbackPlanDigest = rollbackPlanDigest
         self.changes = changes
+        try validate()
     }
 
     public func validate() throws {
-        guard schemaVersion == Self.currentSchemaVersion, changes.count <= 1 else {
-            throw BridgeValidationError.invalidDiff("unexpected schema or too many changes")
-        }
         try BridgeDigest.validate(baselineSnapshotDigest)
         try BridgeDigest.validate(desiredProfileDigest)
         try BridgeDigest.validate(desiredSnapshotDigest)
         try BridgeDigest.validate(applyPlanDigest)
         try BridgeDigest.validate(rollbackPlanDigest)
+        switch schemaVersion {
+        case Self.v1SchemaVersion:
+            guard changes.count <= 1 else {
+                throw BridgeValidationError.invalidDiff("the MVP diff contains at most one PEQ slot change")
+            }
+            for change in changes {
+                guard case .peqSlot = change else {
+                    throw BridgeValidationError.invalidDiff("a v1 diff carries only the O1/PEQ9 slot")
+                }
+            }
+        case Self.v2SchemaVersion:
+            let fields = fieldChanges
+            guard fields.count == changes.count,
+                  fields.count <= DesiredProfileV2.maximumActions,
+                  Set(fields.map(\.channel)).count <= 1,
+                  Set(fields.map(\.parameter)).count == fields.count else {
+                throw BridgeValidationError.invalidDiff(
+                    "a v2 diff carries distinct field changes of one output"
+                )
+            }
+        default:
+            throw BridgeValidationError.invalidDiff("unsupported semantic diff schema")
+        }
         try changes.forEach { try $0.validate() }
+    }
+
+    /// Bind the diff to the exact desired profile it previews: matching
+    /// schema generation and digest, and for v2 every change must land on a
+    /// desired action of the same channel with the desired value.
+    public func validate(against desired: DesiredProfile) throws {
+        try validate()
+        try desired.validate()
+        guard desiredProfileDigest == desired.digest else {
+            throw BridgeValidationError.invalidDiff("diff does not preview the staged desired profile")
+        }
+        switch desired {
+        case .v1:
+            guard schemaVersion == Self.v1SchemaVersion else {
+                throw BridgeValidationError.invalidDiff("a v1 desired profile requires a v1 diff")
+            }
+        case let .v2(profile):
+            guard schemaVersion == Self.v2SchemaVersion else {
+                throw BridgeValidationError.invalidDiff("a v2 desired profile requires a v2 diff")
+            }
+            let bank = try profile.bank()
+            let desiredValues = Dictionary(
+                uniqueKeysWithValues: bank.actions.map { ($0.parameter, $0.value) }
+            )
+            for change in fieldChanges {
+                guard change.channel == bank.parameterChannel,
+                      change.output == bank.targetOutput,
+                      desiredValues[change.parameter] == change.after else {
+                    throw BridgeValidationError.invalidDiff(
+                        "v2 diff change is not an action of the staged desired profile"
+                    )
+                }
+            }
+        }
+    }
+
+    public var fieldChanges: [FieldChangeV2] {
+        changes.compactMap {
+            if case let .field(change) = $0 { return change }
+            return nil
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, baselineSnapshotDigest, desiredProfileDigest, desiredSnapshotDigest
+        case applyPlanDigest, rollbackPlanDigest, changes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(String.self, forKey: .schemaVersion)
+        baselineSnapshotDigest = try container.decode(String.self, forKey: .baselineSnapshotDigest)
+        desiredProfileDigest = try container.decode(String.self, forKey: .desiredProfileDigest)
+        desiredSnapshotDigest = try container.decode(String.self, forKey: .desiredSnapshotDigest)
+        applyPlanDigest = try container.decode(String.self, forKey: .applyPlanDigest)
+        rollbackPlanDigest = try container.decode(String.self, forKey: .rollbackPlanDigest)
+        switch schemaVersion {
+        case Self.v1SchemaVersion:
+            changes = try container.decode([SemanticChangeV1].self, forKey: .changes)
+                .map(SemanticChange.peqSlot)
+        case Self.v2SchemaVersion:
+            changes = try container.decode([FieldChangeV2].self, forKey: .changes)
+                .map(SemanticChange.field)
+        default:
+            throw BridgeValidationError.invalidDiff("unsupported semantic diff schema")
+        }
+        try validate()
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(baselineSnapshotDigest, forKey: .baselineSnapshotDigest)
+        try container.encode(desiredProfileDigest, forKey: .desiredProfileDigest)
+        try container.encode(desiredSnapshotDigest, forKey: .desiredSnapshotDigest)
+        try container.encode(applyPlanDigest, forKey: .applyPlanDigest)
+        try container.encode(rollbackPlanDigest, forKey: .rollbackPlanDigest)
+        if schemaVersion == Self.v2SchemaVersion {
+            try container.encode(fieldChanges, forKey: .changes)
+        } else {
+            let slots: [SemanticChangeV1] = changes.compactMap {
+                if case let .peqSlot(change) = $0 { return change }
+                return nil
+            }
+            try container.encode(slots, forKey: .changes)
+        }
     }
 }
 
@@ -230,17 +429,17 @@ public struct ApplyPlanV1: Codable, Equatable, Sendable {
 
     public let schemaVersion: String
     public let baseline: SnapshotV1
-    public let desired: DesiredProfileV1
-    public let diff: SemanticDiffV1
+    public let desired: DesiredProfile
+    public let diff: SemanticDiff
 
     public init(
         baseline: SnapshotV1,
-        desired: DesiredProfileV1,
-        diff: SemanticDiffV1
+        desired: DesiredProfile,
+        diff: SemanticDiff
     ) throws {
         guard baseline.complete,
               diff.baselineSnapshotDigest == baseline.digest,
-              diff.desiredProfileDigest == desired.digest else {
+              (try? diff.validate(against: desired)) != nil else {
             throw BridgeValidationError.invalidApplyBinding
         }
         self.schemaVersion = Self.currentSchemaVersion
@@ -257,7 +456,7 @@ public struct ApplyPlanV1: Codable, Equatable, Sendable {
         try desired.validate()
         try diff.validate()
         guard diff.baselineSnapshotDigest == baseline.digest,
-              diff.desiredProfileDigest == desired.digest else {
+              (try? diff.validate(against: desired)) != nil else {
             throw BridgeValidationError.invalidApplyBinding
         }
     }
@@ -397,4 +596,6 @@ public enum BridgeValidationError: Error, Equatable, Sendable {
     case incompleteSnapshot
     case invalidApplyBinding
     case invalidRollbackBinding
+    case invalidMeasurement(String)
+    case invalidNotchPlan(String)
 }

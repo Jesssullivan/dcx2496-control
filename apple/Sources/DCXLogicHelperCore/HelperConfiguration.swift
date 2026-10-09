@@ -14,6 +14,7 @@ public enum HelperFeature: String, CaseIterable, Hashable, Identifiable, Sendabl
     case apply = "device.apply"
     case readback = "device.readback"
     case rollback = "device.rollback"
+    case feedbackPlan = "feedback.notch.plan"
 
     public static let mutationFeatures: Set<HelperFeature> = Set(
         BridgeOperation.mutationCapabilities.compactMap { HelperFeature(rawValue: $0.rawValue) }
@@ -32,6 +33,7 @@ public enum HelperFeature: String, CaseIterable, Hashable, Identifiable, Sendabl
         case .apply: "Apply"
         case .readback: "Readback"
         case .rollback: "Rollback"
+        case .feedbackPlan: "Feedback notch plan (offline)"
         }
     }
 
@@ -44,6 +46,7 @@ public enum HelperFeature: String, CaseIterable, Hashable, Identifiable, Sendabl
         case .apply: self = .apply
         case .readback: self = .readback
         case .rollback: self = .rollback
+        case .feedbackPlan: self = .feedbackPlan
         }
     }
 
@@ -55,6 +58,7 @@ public enum HelperFeature: String, CaseIterable, Hashable, Identifiable, Sendabl
         case .apply: .apply
         case .readback: .readback
         case .rollback: .rollback
+        case .feedbackPlan: .feedbackPlan
         }
     }
 }
