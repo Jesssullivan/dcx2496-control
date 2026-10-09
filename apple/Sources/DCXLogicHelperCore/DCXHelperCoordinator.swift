@@ -865,12 +865,17 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                     changes: changes
                 )
             case let (.v2, .v2(changes)):
-                // What the AU shows is exactly what Apply writes: the ordered
-                // changed fields equal the raw apply plan's command actions.
-                let shown = changes.map {
+                // What the AU shows is exactly what Apply writes and what
+                // Rollback restores: `after` equals the raw apply plan's
+                // ordered actions and `before` its reverse-order inverse.
+                let after = changes.map {
                     DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.after)
                 }
-                guard try shown == output.appliedActions() else {
+                let before = changes.reversed().map {
+                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.before)
+                }
+                guard try after == DiffCommandOutput.commandActions(output.applyPlan),
+                      try before == DiffCommandOutput.commandActions(output.rollbackPlan) else {
                     throw ChildResponseError.bindingMismatch
                 }
                 diff = try SemanticDiff(
@@ -1067,32 +1072,23 @@ private struct DiffCommandOutput: Decodable {
         rollbackPlan = try container.decode(JSONValue.self, forKey: .rollbackPlan)
     }
 
-    /// Ordered `(channel, parameter, value)` actions the raw apply plan writes;
-    /// empty when the plan carries no command.
-    func appliedActions() throws -> [DirectParameterActionV2] {
-        guard case let .object(plan) = applyPlan else { throw ChildResponseError.bindingMismatch }
-        guard let command = plan["command"], command != .null else { return [] }
-        guard case let .object(fields) = command, case let .array(actions)? = fields["actions"] else {
+    /// Ordered `(channel, parameter, value)` actions a raw apply or rollback
+    /// plan writes; empty when the plan carries no command.
+    static func commandActions(_ plan: JSONValue) throws -> [DirectParameterActionV2] {
+        guard case let .object(fields) = plan else { throw ChildResponseError.bindingMismatch }
+        guard let command = fields["command"], command != .null else { return [] }
+        guard case let .object(body) = command, case let .array(actions)? = body["actions"] else {
             throw ChildResponseError.bindingMismatch
         }
         return try actions.map { action in
             guard case let .object(values) = action,
-                  let channel = Self.integer(values["channel"]),
-                  let parameter = Self.integer(values["parameter"]),
-                  let value = Self.integer(values["value"]),
-                  channel <= 0xff, parameter <= 0xff else {
+                  let channel = BridgeJSONInteger.uint8(values["channel"]),
+                  let parameter = BridgeJSONInteger.uint8(values["parameter"]),
+                  let value = BridgeJSONInteger.uint16(values["value"]) else {
                 throw ChildResponseError.bindingMismatch
             }
-            return .init(channel: UInt8(channel), parameter: UInt8(parameter), value: value)
+            return .init(channel: channel, parameter: parameter, value: value)
         }
-    }
-
-    private static func integer(_ value: JSONValue?) -> UInt16? {
-        guard case let .number(number)? = value, number.isFinite,
-              number.rounded(.towardZero) == number, (0...Double(UInt16.max)).contains(number) else {
-            return nil
-        }
-        return UInt16(number)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1220,9 +1216,13 @@ extension DCXHelperCoordinator {
                 digest: value.baseline.digest,
                 expectedDevice: value.target.expectedDeviceAddress
             )
-        } catch {
+        } catch RawSnapshotError.missingSnapshot {
+            throw FeedbackRequestError.baselineUnavailable
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             throw FeedbackRequestError.baselineUnavailable
         }
+        // Any other store failure (device mismatch, corrupt carrier, I/O) is
+        // not an absent baseline and keeps its own fail-closed mapping.
         let targetOutput = String(FeedbackNotchContract.targetOutput)
         // Resolve every helper-owned input before the first child runs.
         let priorPlanURL = try value.priorPlanDigest.map { try notchPlanStore.load(planDigest: $0) }

@@ -179,14 +179,21 @@ final class FeedbackNotchHelperTests: XCTestCase {
               case var .array(changes)? = output["changes"] else {
             return XCTFail("expected a diff fixture with changes")
         }
-        changes.removeLast()
-        output["changes"] = .array(changes)
-        let backend = ScriptedBackend([.success(.ok(try BridgeJSONCodec.encoder().encode(JSONValue.object(output))))])
         let request = try BridgeRequest(body: .diffPreview(.init(
             target: fixtures.configuration.target, baseline: fixtures.baseline, desired: .v2(profile))))
-        let response = fixtures.coordinator(backend).handle(request)
-        XCTAssertEqual(response.error?.code, .malformedChildResponse)
-        XCTAssertNil(response.body)
+        // A stale `before` (what Rollback restores) is caught as well.
+        var staleBefore = changes
+        guard case var .object(first) = staleBefore[0] else { return XCTFail("expected a change") }
+        first["before"] = .number(60)
+        staleBefore[0] = .object(first)
+        changes.removeLast()
+        for candidate in [changes, staleBefore] {
+            output["changes"] = .array(candidate)
+            let backend = ScriptedBackend([.success(.ok(try BridgeJSONCodec.encoder().encode(JSONValue.object(output))))])
+            let response = fixtures.coordinator(backend).handle(request)
+            XCTAssertEqual(response.error?.code, .malformedChildResponse)
+            XCTAssertNil(response.body)
+        }
     }
 
     func testRequestSideFailuresAreInvalidRequestsBeforeAnyChild() throws {
@@ -214,7 +221,7 @@ final class FeedbackNotchHelperTests: XCTestCase {
         XCTAssertTrue(backend.invocations.isEmpty)
     }
 
-    func testEqualDigestPlanBytesReplaceTheStoredSerialization() throws {
+    func testEqualDigestPlanBytesKeepTheFirstStoredSerialization() throws {
         let fixtures = try FeedbackFixtures()
         defer { fixtures.remove() }
         let store = NotchPlanStore(planRoot: fixtures.locations.planRootURL)
@@ -227,7 +234,7 @@ final class FeedbackNotchHelperTests: XCTestCase {
             BridgeJSONCodec.decoder().decode(JSONValue.self, from: fixtures.plan))
         XCTAssertNotEqual(compact, fixtures.plan)
         XCTAssertEqual(try store.persist(compact, planDigest: digest), first)
-        XCTAssertEqual(try Data(contentsOf: try store.load(planDigest: digest)), compact)
+        XCTAssertEqual(try Data(contentsOf: try store.load(planDigest: digest)), fixtures.plan)
         XCTAssertThrowsError(try store.persist(fixtures.plan, planDigest: "sha256/" + String(repeating: "0", count: 64)))
     }
 

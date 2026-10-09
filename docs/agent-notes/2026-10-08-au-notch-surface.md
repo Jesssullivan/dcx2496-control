@@ -33,6 +33,14 @@ Branch `feat/au-notch-surface-20261007`, PR #51.
   - duplicated validators;
   - the diff decode round trip.
   The SemanticDiff enum refactor is deferred as cleanup only.
+- Second review (medium) fixed in the third commit:
+  - the planning baseline is now single-sourced from model state;
+  - the pending plan is bound to the staged profile digest;
+  - plan storage is first-write-wins;
+  - v2 `before` values are bound to the rollback plan;
+  - snapshot store errors are narrowed;
+  - one shared JSON-integer rule;
+  - the recurrence message is scoped to the request's document context.
 
 ## Evidence
 

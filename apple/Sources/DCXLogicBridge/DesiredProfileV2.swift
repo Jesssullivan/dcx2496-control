@@ -333,14 +333,15 @@ public enum DesiredProfile: Codable, Equatable, Sendable {
     }
 }
 
-enum BridgeText {
-    static func boundedASCII(_ value: String) -> Bool {
+public enum BridgeText {
+    public static func boundedASCII(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy { $0 < 0x80 }
     }
 }
 
-enum BridgeJSONInteger {
-    static func uint16(_ value: JSONValue?) -> UInt16? {
+/// One JSON-integer rule for every bridge and helper parser.
+public enum BridgeJSONInteger {
+    public static func uint16(_ value: JSONValue?) -> UInt16? {
         guard case let .number(number)? = value, number.isFinite,
               number.rounded(.towardZero) == number,
               (0...Double(UInt16.max)).contains(number) else {
@@ -349,7 +350,7 @@ enum BridgeJSONInteger {
         return UInt16(number)
     }
 
-    static func uint8(_ value: JSONValue?) -> UInt8? {
+    public static func uint8(_ value: JSONValue?) -> UInt8? {
         uint16(value).flatMap { $0 <= UInt16(UInt8.max) ? UInt8($0) : nil }
     }
 }

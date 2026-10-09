@@ -34,7 +34,8 @@ so both ends always ship together; a v1-labelled frame is refused as
   the measurement (ring-out list text, REW Generic EQ text, or an imported
   `dcx.feedback-measurement/v1` document), an optional prior plan digest, and
   the profile identity. A v2 diff preview must show exactly the actions its
-  raw apply plan writes, in order. The reply carries a sanitized measurement summary, the
+  raw apply plan writes, in order, and `before` values equal to the raw
+  rollback plan's reverse-order inverse. The reply carries a sanitized measurement summary, the
   notch plan summary (bands, codes, measured frequency, occurrences, dropped
   peaks and reasons), the v2 desired profile, and one receipt per child.
 
@@ -73,16 +74,19 @@ The AU view gains an O4 notch section:
   Q, measured frequency and occurrence count, followed by dropped peaks.
 
 Plan Notches reads one operator-selected file in the UI (never in the render
-path) against the latest complete snapshot of the configured target. Stage
+path). It plans against the staged state's current snapshot (updated by
+capture, Apply readback, rollback and recovery), or against this document's
+read-only capture when nothing is staged. Stage
 Notch Plan is a pure model update: it stages the v2 profile and the plan
 summary in Logic project state (`dcx.logic-project-state/v2`) together with
 the exact planning snapshot. Previewing the diff is refused if the current
 snapshot differs from the plan's baseline; replan instead. Apply, readback and
 rollback are unchanged and explicit.
 
-The pending plan is dropped on Logic recall, on a newer capture, on a target
-change, and on staging any other profile; a reply that arrives after recall is
-ignored. Recurrence names the staged plan as `--prior-plan`; dcxctl refuses it
+The pending plan is valid only for the recall generation, target, planning
+snapshot, and staged profile it was requested under; a reply that arrives after
+any of them moved on is dropped. Raw plans are stored first-write-wins by
+digest, so the bytes behind a staged plan never change. Recurrence names the staged plan as `--prior-plan`; dcxctl refuses it
 unless the snapshot holds exactly that plan's notches, and the AU says so.
 
 Known limitation (unchanged mutation semantics): after a verified Apply the

@@ -22,12 +22,14 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         action: nil
     )
     private var stageNotchButton: NSButton?
-    /// Latest complete snapshot of the configured target, staged or not, with
-    /// the document recall generation it was captured under. A notch plan is
-    /// computed against it; it never leaves this view instance.
-    private var latestSnapshot: (snapshot: SnapshotV1, generation: UInt64)?
-    /// A computed but unstaged plan, kept with the exact baseline, target, and
-    /// recall generation. It is dropped as soon as any of them moves on.
+    /// Read-only capture taken while nothing is staged, with the recall
+    /// generation it belongs to. Once a profile is staged, the model's current
+    /// snapshot (updated by capture, Apply readback, rollback, and recovery)
+    /// is the only planning baseline. It never leaves this view instance.
+    private var readOnlySnapshot: (snapshot: SnapshotV1, generation: UInt64)?
+    /// A computed but unstaged plan, kept with the exact baseline, target,
+    /// recall generation, and staged profile it was requested under. It is
+    /// dropped as soon as any of them moves on.
     private var pendingNotchPlan: PendingNotchPlan?
     private let workQueue = DispatchQueue(label: "io.tinyland.dcx2496.logic.au-ui", qos: .userInitiated)
     private var configuredTarget: DCXTargetReference?
@@ -46,6 +48,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         let baseline: SnapshotV1
         let target: DCXTargetReference
         let generation: UInt64
+        let projectDigest: String?
     }
 
     private static let measurementKinds: [(title: String, kind: FeedbackMeasurementInputV1.Kind)] = [
@@ -227,7 +230,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
             configuredTarget = status.target
             if targetChanged {
                 identityLabel.stringValue = "Device: not identified"
-                latestSnapshot = nil
+                readOnlySnapshot = nil
                 pendingNotchPlan = nil
             }
             var acceptedCompletion = false
@@ -365,7 +368,6 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                             expectedRestorationGeneration: context.restorationGeneration
                         )
                     }
-                    latestSnapshot = (result.snapshot, context.restorationGeneration)
                     report("Complete snapshot captured and bound to the staged profile", for: context)
                     refreshLabels()
                 } else {
@@ -373,7 +375,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                         report("Helper target changed while snapshot capture was in progress", for: context)
                         return
                     }
-                    latestSnapshot = (result.snapshot, context.restorationGeneration)
+                    readOnlySnapshot = (result.snapshot, context.restorationGeneration)
                     refreshLabels()
                     currentLabel.stringValue = "Current: \(result.snapshot.digest) (read-only; not stored in project state)"
                     report("Complete read-only snapshot captured; stage a profile before previewing a diff", for: context)
@@ -503,14 +505,11 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         let context = ReadResponseContext(
             audioUnit: audioUnit, restorationGeneration: state.restorationGeneration
         )
-        // The newest capture of this document wins over the bound snapshot.
-        let latest = latestSnapshot.flatMap { $0.generation == state.restorationGeneration ? $0.snapshot : nil }
-        guard let baseline = [latest, state.currentSnapshot]
-            .compactMap({ $0 })
-            .first(where: { $0.target == target }) else {
+        guard let baseline = currentPlanningBaseline(for: target) else {
             report("Capture a complete snapshot before planning notches")
             return
         }
+        let projectDigest = state.projectState?.desired.digest
         let index = max(0, measurementKindPopup.indexOfSelectedItem)
         let kind = Self.measurementKinds[min(index, Self.measurementKinds.count - 1)].kind
         var priorPlanDigest: String?
@@ -562,7 +561,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                     onError: { [weak self] error in
                         guard let self else { return }
                         if priorPlanDigest != nil, error.code == .childFailed {
-                            report("The planner refused the recurrence: this snapshot does not hold the staged plan's notches exactly. Plan without recurrence, or apply the staged plan first")
+                            report("\(error.message). With recurrence, the snapshot must hold the staged plan's notches exactly", for: context)
                         } else {
                             report(error.message, for: context)
                         }
@@ -571,13 +570,14 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
                 ) { [weak self] body in
                     guard let self, case let .feedbackPlan(result) = body else { return }
                     guard configuredTarget == target,
-                          currentPlanningBaseline(for: target)?.digest == baseline.digest else {
+                          currentPlanningBaseline(for: target)?.digest == baseline.digest,
+                          dcxAudioUnit?.controlState.view().projectState?.desired.digest == projectDigest else {
                         report("Target or snapshot changed while notch planning was in progress; replan", for: context)
                         return
                     }
                     pendingNotchPlan = .init(
                         response: result, baseline: baseline, target: target,
-                        generation: context.restorationGeneration
+                        generation: context.restorationGeneration, projectDigest: projectDigest
                     )
                     let dropped = result.plan.dropped.count
                     report("Offline plan: \(result.plan.notches.count) O4 notch(es), \(dropped) dropped; stage it to preview the diff", for: context)
@@ -622,12 +622,21 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         }
     }
 
-    /// The snapshot a new plan would use now: the newest capture of this
-    /// document, else the snapshot bound to the staged state.
+    /// The snapshot a new plan would use now: the staged state's current
+    /// snapshot (never while the device state is unresolved), else this
+    /// document's read-only capture.
     private func currentPlanningBaseline(for target: DCXTargetReference) -> SnapshotV1? {
         guard let state = dcxAudioUnit?.controlState.view() else { return nil }
-        let latest = latestSnapshot.flatMap { $0.generation == state.restorationGeneration ? $0.snapshot : nil }
-        return [latest, state.currentSnapshot].compactMap { $0 }.first { $0.target == target }
+        if let project = state.projectState {
+            guard project.target == target, !state.deviceStateUncertain else { return nil }
+            return state.currentSnapshot
+        }
+        guard let capture = readOnlySnapshot,
+              capture.generation == state.restorationGeneration,
+              capture.snapshot.target == target else {
+            return nil
+        }
+        return capture.snapshot
     }
 
     /// A pending plan stays usable only for the same document generation,
@@ -637,6 +646,7 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
               let state = dcxAudioUnit?.controlState.view(),
               pending.generation == state.restorationGeneration,
               pending.target == configuredTarget,
+              state.projectState?.desired.digest == pending.projectDigest,
               currentPlanningBaseline(for: pending.target)?.digest == pending.baseline.digest else {
             return nil
         }
@@ -1014,7 +1024,13 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         stageNotchButton?.isEnabled = !bridgeRequestInFlight
             && !recoveryActive
             && validPendingNotchPlan() != nil
-        let canRecur = state?.projectState?.notchPlan != nil
+        // A prior plan can only be on the device in a snapshot taken after the
+        // one it was planned from.
+        let canRecur = state?.projectState?.notchPlan.map { plan in
+            configuredTarget.flatMap(currentPlanningBaseline(for:)).map {
+                $0.digest != plan.baselineSnapshotDigest
+            } ?? false
+        } ?? false
         if !canRecur { recurrenceCheckbox.state = .off }
         recurrenceCheckbox.isEnabled = canRecur && !bridgeRequestInFlight && !recoveryActive
     }
@@ -1065,9 +1081,6 @@ public final class DCXControlViewController: AUViewController, AUAudioUnitFactor
         } ?? "Desired: not staged"
         diffTextView.string = render(diff: state.diff)
         if validPendingNotchPlan() == nil { pendingNotchPlan = nil }
-        if let latest = latestSnapshot, latest.generation != state.restorationGeneration {
-            latestSnapshot = nil
-        }
         notchTextView.string = renderNotches(state: state)
         refreshActionAvailability()
     }

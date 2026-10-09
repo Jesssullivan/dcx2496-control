@@ -26,11 +26,10 @@ final class NotchPlanStore: @unchecked Sendable {
             attributes: [.posixPermissions: 0o700]
         )
         let destination = try url(for: planDigest)
-        // The plan digest is the semantic identity and dcxctl re-verifies any
-        // stored plan it reads, so equal-digest bytes (for example after a
-        // formatting change) atomically replace the earlier serialization.
-        if fileManager.fileExists(atPath: destination.path),
-           try Data(contentsOf: destination) == data {
+        // First stored serialization wins: the bytes behind a staged plan
+        // never change. An equal-digest re-serialization (for example after a
+        // formatting change) reuses them; dcxctl re-verifies on every read.
+        if fileManager.fileExists(atPath: destination.path) {
             return destination
         }
         try data.write(to: destination, options: [.atomic, .completeFileProtection])
