@@ -18,7 +18,8 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   feature (`live-discovery` remains a compatibility alias) accepts one exact
   `/dev/cu.usbserial-*` callout and holds one fixed 38400 8N1 session. Its
   closed operations collect ten Search identities with at most ten paced
-  empty-timeout replays, typed remote mode, exact Dump0/Dump1
+  empty-timeout replays (rollback's single pre-inverse identity shares that
+  replay allowance), typed remote mode, exact Dump0/Dump1
   snapshot/readback, and reviewed direct-parameter plans.
   It never enumerates ports or accepts caller-supplied frames, baud, retry,
   timeout, remote-mode bytes, or generic writes.
