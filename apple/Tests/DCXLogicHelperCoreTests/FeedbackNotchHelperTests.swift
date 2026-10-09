@@ -171,6 +171,66 @@ final class FeedbackNotchHelperTests: XCTestCase {
         XCTAssertNoThrow(try result.diff.validate(against: .v2(profile)))
     }
 
+    func testV2DiffMustShowEveryActionApplyWrites() throws {
+        let fixtures = try FeedbackFixtures()
+        defer { fixtures.remove() }
+        let profile = try BridgeJSONCodec.decoder().decode(DesiredProfileV2.self, from: fixtures.profile)
+        guard case var .object(output) = try BridgeJSONCodec.decoder().decode(JSONValue.self, from: fixtures.diff),
+              case var .array(changes)? = output["changes"] else {
+            return XCTFail("expected a diff fixture with changes")
+        }
+        changes.removeLast()
+        output["changes"] = .array(changes)
+        let backend = ScriptedBackend([.success(.ok(try BridgeJSONCodec.encoder().encode(JSONValue.object(output))))])
+        let request = try BridgeRequest(body: .diffPreview(.init(
+            target: fixtures.configuration.target, baseline: fixtures.baseline, desired: .v2(profile))))
+        let response = fixtures.coordinator(backend).handle(request)
+        XCTAssertEqual(response.error?.code, .malformedChildResponse)
+        XCTAssertNil(response.body)
+    }
+
+    func testRequestSideFailuresAreInvalidRequestsBeforeAnyChild() throws {
+        let fixtures = try FeedbackFixtures()
+        defer { fixtures.remove() }
+        // A well-labelled document without peaks never came from a child.
+        let document: JSONValue = .object([
+            "schema_version": .string("dcx.feedback-measurement/v1"),
+            "target_output": .number(4), "digest": .string("sha256/" + String(repeating: "d", count: 64)),
+        ])
+        let backend = ScriptedBackend([])
+        let malformed = fixtures.coordinator(backend).handle(try fixtures.request(.measurement(document)))
+        XCTAssertEqual(malformed.error?.code, .invalidRequest)
+        XCTAssertTrue(backend.invocations.isEmpty)
+
+        // A recalled baseline this helper never captured.
+        let foreign = try SnapshotV1(
+            target: fixtures.configuration.target, identity: fixtures.baseline.identity,
+            capturedAt: Date(timeIntervalSince1970: 0), digest: "sha256/" + String(repeating: "7", count: 64),
+            complete: true, sectionDigests: fixtures.baseline.sectionDigests)
+        let missing = fixtures.coordinator(backend).handle(try .init(body: .feedbackPlan(.init(
+            target: fixtures.configuration.target, baseline: foreign,
+            measurement: .frequencyList(fixtures.ringOutText), profileID: "o4-feedback", revision: "r"))))
+        XCTAssertEqual(missing.error?.code, .invalidRequest)
+        XCTAssertTrue(backend.invocations.isEmpty)
+    }
+
+    func testEqualDigestPlanBytesReplaceTheStoredSerialization() throws {
+        let fixtures = try FeedbackFixtures()
+        defer { fixtures.remove() }
+        let store = NotchPlanStore(planRoot: fixtures.locations.planRootURL)
+        guard case let .object(plan) = try BridgeJSONCodec.decoder().decode(JSONValue.self, from: fixtures.plan),
+              case let .string(digest)? = plan["plan_digest"] else {
+            return XCTFail("fixture plan lacks a digest")
+        }
+        let first = try store.persist(fixtures.plan, planDigest: digest)
+        let compact = try BridgeJSONCodec.encoder().encode(
+            BridgeJSONCodec.decoder().decode(JSONValue.self, from: fixtures.plan))
+        XCTAssertNotEqual(compact, fixtures.plan)
+        XCTAssertEqual(try store.persist(compact, planDigest: digest), first)
+        XCTAssertEqual(try Data(contentsOf: try store.load(planDigest: digest)), compact)
+        XCTAssertThrowsError(try store.persist(fixtures.plan, planDigest: "sha256/" + String(repeating: "0", count: 64)))
+    }
+
     /// Cross-language end to end with the real dcxctl under test, when the
     /// native lane supplies it (`DCX_TEST_DCXCTL`). Offline subcommands only.
     func testRealDcxctlProducesTheFixturePlan() throws {

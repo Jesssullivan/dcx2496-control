@@ -551,16 +551,11 @@ private enum DesiredProfileContract {
     }
 
     private static func boundedASCII(_ value: String) -> Bool {
-        !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy { $0 < 0x80 }
+        BridgeText.boundedASCII(value)
     }
 
     private static func integer(_ value: JSONValue?) -> UInt16? {
-        guard case let .number(number)? = value, number.isFinite,
-              number.rounded(.towardZero) == number,
-              (0...Double(UInt16.max)).contains(number) else {
-            return nil
-        }
-        return UInt16(number)
+        BridgeJSONInteger.uint16(value)
     }
 
     private static func digest(profile: DesiredProfileV1, actionValues: [UInt16]) -> String {

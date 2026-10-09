@@ -140,12 +140,16 @@ public struct DesiredPeqBankV2: Equatable, Sendable {
     }
 }
 
-/// `dcx.desired-profile/v2`: one output's ordered cut-only PEQ on/off, band
-/// count, and band-field actions. Validation and the digest mirror
+/// `dcx.desired-profile/v2`: O4's ordered cut-only PEQ on/off, band count,
+/// and band-field actions. Validation and the digest mirror
 /// `DesiredPeqBankProfileV2` in `crates/dcx-core/src/peq_bank.rs` exactly; the
 /// document stays a closed JSON object so unknown keys fail closed here too.
 public struct DesiredProfileV2: Codable, Equatable, Sendable {
     public static let currentSchemaVersion = "dcx.desired-profile/v2"
+    /// The only output a v2 profile may target: O4, matching the static
+    /// feedback-notch planner (`DESIRED_PROFILE_V2_OUTPUT`). Swift admits only
+    /// O4 so it is never wider than the Rust core.
+    public static let targetOutput: UInt8 = 4
     /// On/off, count, and all five fields of nine bands.
     public static let maximumActions = 2 + Int(PeqAddressV2.bandCount) * 5
 
@@ -210,13 +214,13 @@ public struct DesiredProfileV2: Codable, Equatable, Sendable {
         guard case let .object(fields) = document,
               Set(fields.keys) == Self.documentKeys,
               let output = BridgeJSONInteger.uint8(fields["target_output"]),
-              (1...PeqAddressV2.outputCount).contains(output),
+              output == Self.targetOutput,
               let channel = BridgeJSONInteger.uint8(fields["parameter_channel"]),
               channel == PeqAddressV2.channel(output: output),
               case let .array(rawActions)? = fields["actions"],
               (1...Self.maximumActions).contains(rawActions.count) else {
             throw BridgeValidationError.invalidProfile(
-                "v2 profile must be one output 1...6 with its exact channel and 1...47 actions"
+                "v2 profile must target O4 on channel 8 with 1...47 actions"
             )
         }
         var seen = Set<UInt8>()

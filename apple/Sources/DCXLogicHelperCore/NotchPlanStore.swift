@@ -1,7 +1,7 @@
 import DCXLogicBridge
 import Foundation
 
-/// Helper-owned immutable store of raw `dcx.notch-plan/v1` documents keyed by
+/// Helper-owned store of raw `dcx.notch-plan/v1` documents keyed by
 /// their plan digest. The Audio Unit only ever names a plan by digest; a later
 /// round's `--prior-plan` reads the exact bytes dcxctl produced, and dcxctl
 /// re-verifies them. Nothing here opens a device.
@@ -26,10 +26,11 @@ final class NotchPlanStore: @unchecked Sendable {
             attributes: [.posixPermissions: 0o700]
         )
         let destination = try url(for: planDigest)
-        if fileManager.fileExists(atPath: destination.path) {
-            guard try Data(contentsOf: destination) == data else {
-                throw NotchPlanStoreError.immutableCollision
-            }
+        // The plan digest is the semantic identity and dcxctl re-verifies any
+        // stored plan it reads, so equal-digest bytes (for example after a
+        // formatting change) atomically replace the earlier serialization.
+        if fileManager.fileExists(atPath: destination.path),
+           try Data(contentsOf: destination) == data {
             return destination
         }
         try data.write(to: destination, options: [.atomic, .completeFileProtection])
@@ -77,6 +78,5 @@ final class NotchPlanStore: @unchecked Sendable {
 
 enum NotchPlanStoreError: Error, Equatable, Sendable {
     case invalidPlan
-    case immutableCollision
     case missingPlan
 }

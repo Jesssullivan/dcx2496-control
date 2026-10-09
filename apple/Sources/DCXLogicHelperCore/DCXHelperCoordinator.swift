@@ -390,6 +390,20 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 "durable mutation recovery state is unavailable",
                 false
             )
+        } catch FeedbackRequestError.baselineUnavailable {
+            return failure(
+                request,
+                .invalidRequest,
+                "the baseline snapshot is not in the helper store; capture a snapshot and replan",
+                false
+            )
+        } catch FeedbackRequestError.invalidMeasurement {
+            return failure(
+                request,
+                .invalidRequest,
+                "the measurement document is not a valid O4 dcx.feedback-measurement/v1",
+                false
+            )
         } catch NotchPlanStoreError.missingPlan {
             return failure(
                 request,
@@ -840,24 +854,32 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 applyPlanDigest: apply.digest
             )
             let diff: SemanticDiff
-            switch (value.desired, output.desiredProfileSchema) {
-            case (.v1, DesiredProfileV1.currentSchemaVersion):
+            switch (value.desired, output.changes) {
+            case let (.v1, .v1(changes)):
                 diff = try SemanticDiff(
                     baselineSnapshotDigest: output.baselineSnapshotDigest,
                     desiredProfileDigest: output.desiredProfileDigest,
                     desiredSnapshotDigest: output.desiredSnapshotDigest,
                     applyPlanDigest: apply.digest,
                     rollbackPlanDigest: rollback.digest,
-                    changes: try decoder.decode([SemanticChangeV1].self, from: output.changes)
+                    changes: changes
                 )
-            case (.v2, DesiredProfileV2.currentSchemaVersion):
+            case let (.v2, .v2(changes)):
+                // What the AU shows is exactly what Apply writes: the ordered
+                // changed fields equal the raw apply plan's command actions.
+                let shown = changes.map {
+                    DirectParameterActionV2(channel: $0.channel, parameter: $0.parameter, value: $0.after)
+                }
+                guard try shown == output.appliedActions() else {
+                    throw ChildResponseError.bindingMismatch
+                }
                 diff = try SemanticDiff(
                     baselineSnapshotDigest: output.baselineSnapshotDigest,
                     desiredProfileDigest: output.desiredProfileDigest,
                     desiredSnapshotDigest: output.desiredSnapshotDigest,
                     applyPlanDigest: apply.digest,
                     rollbackPlanDigest: rollback.digest,
-                    fieldChanges: try decoder.decode([FieldChangeV2].self, from: output.changes)
+                    fieldChanges: changes
                 )
             default:
                 throw ChildResponseError.bindingMismatch
@@ -1012,13 +1034,18 @@ private struct LiveSearchOutput: Decodable {
 }
 
 private struct DiffCommandOutput: Decodable {
+    /// Changes typed by the desired profile's generation: one O1/PEQ9 slot
+    /// (v1) or per-field PEQ changes (v2).
+    enum Changes {
+        case v1([SemanticChangeV1])
+        case v2([FieldChangeV2])
+    }
+
     let baselineSnapshotDigest: String
     let desiredProfileSchema: String
     let desiredProfileDigest: String
     let desiredSnapshotDigest: String
-    /// Decoded by the desired profile's generation: one O1/PEQ9 slot (v1) or
-    /// per-field PEQ changes (v2).
-    let changes: Data
+    let changes: Changes
     let applyPlan: JSONValue
     let rollbackPlan: JSONValue
 
@@ -1028,11 +1055,44 @@ private struct DiffCommandOutput: Decodable {
         desiredProfileSchema = try container.decode(String.self, forKey: .desiredProfileSchema)
         desiredProfileDigest = try container.decode(String.self, forKey: .desiredProfileDigest)
         desiredSnapshotDigest = try container.decode(String.self, forKey: .desiredSnapshotDigest)
-        changes = try BridgeJSONCodec.encoder().encode(
-            container.decode(JSONValue.self, forKey: .changes)
-        )
+        switch desiredProfileSchema {
+        case DesiredProfileV1.currentSchemaVersion:
+            changes = .v1(try container.decode([SemanticChangeV1].self, forKey: .changes))
+        case DesiredProfileV2.currentSchemaVersion:
+            changes = .v2(try container.decode([FieldChangeV2].self, forKey: .changes))
+        default:
+            throw ChildResponseError.bindingMismatch
+        }
         applyPlan = try container.decode(JSONValue.self, forKey: .applyPlan)
         rollbackPlan = try container.decode(JSONValue.self, forKey: .rollbackPlan)
+    }
+
+    /// Ordered `(channel, parameter, value)` actions the raw apply plan writes;
+    /// empty when the plan carries no command.
+    func appliedActions() throws -> [DirectParameterActionV2] {
+        guard case let .object(plan) = applyPlan else { throw ChildResponseError.bindingMismatch }
+        guard let command = plan["command"], command != .null else { return [] }
+        guard case let .object(fields) = command, case let .array(actions)? = fields["actions"] else {
+            throw ChildResponseError.bindingMismatch
+        }
+        return try actions.map { action in
+            guard case let .object(values) = action,
+                  let channel = Self.integer(values["channel"]),
+                  let parameter = Self.integer(values["parameter"]),
+                  let value = Self.integer(values["value"]),
+                  channel <= 0xff, parameter <= 0xff else {
+                throw ChildResponseError.bindingMismatch
+            }
+            return .init(channel: UInt8(channel), parameter: UInt8(parameter), value: value)
+        }
+    }
+
+    private static func integer(_ value: JSONValue?) -> UInt16? {
+        guard case let .number(number)? = value, number.isFinite,
+              number.rounded(.towardZero) == number, (0...Double(UInt16.max)).contains(number) else {
+            return nil
+        }
+        return UInt16(number)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1154,10 +1214,15 @@ extension DCXHelperCoordinator {
         let executable = try runner.resolveExecutable(for: configuration)
         let timeout = min(configuration.childTimeoutSeconds, Self.offlineStepTimeoutSeconds)
         let decoder = BridgeJSONCodec.decoder()
-        let (snapshotURL, _) = try snapshotStore.load(
-            digest: value.baseline.digest,
-            expectedDevice: value.target.expectedDeviceAddress
-        )
+        let snapshotURL: URL
+        do {
+            (snapshotURL, _) = try snapshotStore.load(
+                digest: value.baseline.digest,
+                expectedDevice: value.target.expectedDeviceAddress
+            )
+        } catch {
+            throw FeedbackRequestError.baselineUnavailable
+        }
         let targetOutput = String(FeedbackNotchContract.targetOutput)
         // Resolve every helper-owned input before the first child runs.
         let priorPlanURL = try value.priorPlanDigest.map { try notchPlanStore.load(planDigest: $0) }
@@ -1190,8 +1255,13 @@ extension DCXHelperCoordinator {
         case .measurement:
             measurementData = try BridgeJSONCodec.encoder().encode(value.measurement.document)
         }
-        let measurement = try decoder.decode(MeasurementCommandOutput.self, from: measurementData)
-        let summary = try measurement.summary()
+        let summary: FeedbackMeasurementSummaryV1
+        do {
+            summary = try decoder.decode(MeasurementCommandOutput.self, from: measurementData).summary()
+        } catch where value.measurement.kind == .measurement {
+            // An AU-supplied document, not child output, failed here.
+            throw FeedbackRequestError.invalidMeasurement
+        }
         switch value.measurement.kind {
         case .measurement:
             guard summary.digest == value.measurement.documentDigest else {
@@ -1251,6 +1321,11 @@ extension DCXHelperCoordinator {
         try response.validate(for: value)
         return BridgeResponse(requestID: request.requestID, body: .feedbackPlan(response))
     }
+}
+
+private enum FeedbackRequestError: Error {
+    case baselineUnavailable
+    case invalidMeasurement
 }
 
 private enum OfflineStepOutcome {

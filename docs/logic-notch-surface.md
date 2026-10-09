@@ -18,8 +18,8 @@ so both ends always ship together; a v1-labelled frame is refused as
 
 - `desired` is `dcx.desired-profile/v1` (unchanged, byte for byte) or
   `dcx.desired-profile/v2`. Swift validation of v2 mirrors
-  `DesiredPeqBankProfileV2`: one output 1-6 with its exact channel (output + 4),
-  1-47 distinct actions on that channel, only PEQ on/off (`0x06`), band count
+  `DesiredPeqBankProfileV2`: O4 only on channel 8 (Swift already matches the
+  O4-only rule of PR #49 and is never wider than Rust), 1-47 distinct actions, only PEQ on/off (`0x06`), band count
   (`0x07`) and band fields (`0x13`-`0x3f`), each value inside its device
   domain, gains cut-only (code 150 = 0 dB is the ceiling), a closed document
   with no unknown keys, and the same domain-separated digest. A test asserts the
@@ -33,7 +33,8 @@ so both ends always ship together; a v1-labelled frame is refused as
   carries the target, a complete helper-stored baseline snapshot reference,
   the measurement (ring-out list text, REW Generic EQ text, or an imported
   `dcx.feedback-measurement/v1` document), an optional prior plan digest, and
-  the profile identity. The reply carries a sanitized measurement summary, the
+  the profile identity. A v2 diff preview must show exactly the actions its
+  raw apply plan writes, in order. The reply carries a sanitized measurement summary, the
   notch plan summary (bands, codes, measured frequency, occurrences, dropped
   peaks and reasons), the v2 desired profile, and one receipt per child.
 
@@ -77,7 +78,19 @@ Notch Plan is a pure model update: it stages the v2 profile and the plan
 summary in Logic project state (`dcx.logic-project-state/v2`) together with
 the exact planning snapshot. Previewing the diff is refused if the current
 snapshot differs from the plan's baseline; replan instead. Apply, readback and
-rollback are unchanged and explicit. Projects holding a v1 profile keep their
+rollback are unchanged and explicit.
+
+The pending plan is dropped on Logic recall, on a newer capture, on a target
+change, and on staging any other profile; a reply that arrives after recall is
+ignored. Recurrence names the staged plan as `--prior-plan`; dcxctl refuses it
+unless the snapshot holds exactly that plan's notches, and the AU says so.
+
+Known limitation (unchanged mutation semantics): after a verified Apply the
+helper keeps the recovery lease until a readback or rollback returns the exact
+baseline, so the AU blocks planning while notches stay applied. Leaving notches
+in place and planning the next round therefore runs through `dcxctl` today
+(the legalab ring-out loop); an explicit "accept applied state" terminal is
+separate work. Projects holding a v1 profile keep their
 exact `dcx.logic-project-state/v1` bytes. **Stage Desired Profile…** now
 accepts either v1 or v2 desired-profile files.
 

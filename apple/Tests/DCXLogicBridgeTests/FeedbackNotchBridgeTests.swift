@@ -45,6 +45,10 @@ final class FeedbackNotchBridgeTests: XCTestCase {
         XCTAssertThrowsError(try DesiredProfileV2(profileID: "p", revision: "r", bank: .init(
             targetOutput: 7, parameterChannel: 11, actions: [.init(channel: 11, parameter: 6, value: 1)]
         )))
+        // v2 is O4-only, even for a well-formed bank on another output.
+        XCTAssertThrowsError(try DesiredProfileV2(profileID: "p", revision: "r", bank: .init(
+            targetOutput: 1, parameterChannel: 5, actions: [.init(channel: 5, parameter: 6, value: 1)]
+        )))
         for identity in ["", String(repeating: "x", count: 129), "notch-é"] {
             XCTAssertThrowsError(try DesiredProfileV2(profileID: identity, revision: "r", bank: .init(
                 targetOutput: 4, parameterChannel: 8, actions: valid

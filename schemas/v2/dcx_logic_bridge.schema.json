@@ -1561,9 +1561,7 @@
       ],
       "properties": {
         "channel": {
-          "type": "integer",
-          "minimum": 5,
-          "maximum": 10
+          "const": 8
         },
         "parameter": {
           "enum": [
@@ -1776,14 +1774,10 @@
       ],
       "properties": {
         "target_output": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 6
+          "const": 4
         },
         "parameter_channel": {
-          "type": "integer",
-          "minimum": 5,
-          "maximum": 10
+          "const": 8
         },
         "actions": {
           "type": "array",
@@ -1795,7 +1789,7 @@
         }
       },
       "additionalProperties": false,
-      "$comment": "parameter_channel = target_output + 4; every action uses that channel; parameters are distinct. The digest binds the ordered actions."
+      "$comment": "v2 targets O4 only (channel 8); parameters are distinct. The digest binds the ordered actions."
     },
     "desiredProfileV2": {
       "type": "object",
@@ -1893,18 +1887,14 @@
       ],
       "properties": {
         "output": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 6
+          "const": 4
         },
         "field": {
           "type": "string",
           "pattern": "^(eq_enabled|eq_count|band[1-9]\\.(frequency|q|gain|kind|slope))$"
         },
         "channel": {
-          "type": "integer",
-          "minimum": 5,
-          "maximum": 10
+          "const": 8
         },
         "parameter": {
           "enum": [
