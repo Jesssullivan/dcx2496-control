@@ -28,12 +28,18 @@ Useful behavioral references reviewed for this offline foundation include:
   establish behavior on Legalab's named unit. Its license is reproduced in
   third_party/duinodcx/LICENSE. The output parameter location table in
   crates/dcx-core/src/layout.rs is transcribed from the pinned
-  Ultradrive.cpp `outputLocations[6][74]` under that MIT license.
+  Ultradrive.cpp `outputLocations[6][74]` under that MIT license, as are the
+  input A-C gain locations (row 0 of `inputLocations[4][62]`).
 - UltradrivePi protocol notes by geftactics; no repository license was present
   when reviewed on 2026-08-22, so it is an incompatible/uncertain-license
   behavioral reference only and no source code or prose was copied. Revision
   259fa83f6555be6c5707b437dfdcafc90bb19de5 was resolved 2026-08-22:
   https://github.com/geftactics/UltradrivePi
+  Its protocol.md (same revision, re-read 2026-10-15) is the behavioral
+  reference for the typed-write value domains and encodings (gain, delay,
+  crossover type order, limiter threshold and release ranges, polarity), and
+  its "in A gain +6dB" example is reproduced as a golden test vector. The
+  encodings remain implementation hypotheses until named-device readback.
 
 Synthetic fixtures in fixtures/ are original test data. They are clearly
 marked and establish deterministic behavior only; they must not be cited as

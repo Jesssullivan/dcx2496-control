@@ -172,9 +172,19 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
         MAX_CONTROL_DOCUMENT_BYTES,
         "apply plan",
     )?)?;
+    apply_loaded(tty, expected_device, &plan)
+}
+
+/// Run one already-validated apply carrier (see [`apply`]).
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn apply_loaded(
+    tty: PathBuf,
+    expected_device: u8,
+    plan: &ApplyPlanV1,
+) -> Result<(), Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.device())?;
-    let mut transaction = ApplyTransactionV1::from_apply_plan(&plan)?;
+    let mut transaction = ApplyTransactionV1::from_apply_plan(plan)?;
     let binding = PrivateTtyBinding::new(tty)?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();
@@ -218,9 +228,19 @@ pub fn rollback(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Bo
         MAX_CONTROL_DOCUMENT_BYTES,
         "rollback plan",
     )?)?;
+    rollback_loaded(tty, expected_device, &plan)
+}
+
+/// Run one already-validated rollback carrier (see [`rollback`]).
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn rollback_loaded(
+    tty: PathBuf,
+    expected_device: u8,
+    plan: &RollbackPlanV1,
+) -> Result<(), Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.baseline().device())?;
-    let mut transaction = ApplyTransactionV1::resume_rollback(&plan)?;
+    let mut transaction = ApplyTransactionV1::resume_rollback(plan)?;
     let binding = PrivateTtyBinding::new(tty)?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();

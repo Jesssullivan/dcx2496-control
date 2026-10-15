@@ -100,6 +100,7 @@ fixtures:
     cargo build --locked --jobs 2 --quiet --package dcxctl
     bash tests/feedback_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/rew/SYNTHETIC-feedback-notches.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json
     bash tests/routing_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json
+    bash tests/write_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json
     bash tests/apple_feedback_fixture_parity.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json apple/Tests/DCXLogicHelperCoreTests/Fixtures/feedback
 
 lockfiles-static:

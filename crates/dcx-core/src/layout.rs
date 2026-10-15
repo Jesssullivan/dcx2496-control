@@ -23,6 +23,17 @@
 //! output source encoding (`0x41`: 0 A, 1 B, 2 C, 3 SUM) follow the public
 //! `UltradrivePi` `protocol.md` notes cited in `NOTICE`.
 //!
+//! The typed-write lane (`dcx.write-plan/v1`, see [`crate::typed_write`])
+//! adds, on O1 through O4 only, the output gain (`0x02`), O1-O3 mutes
+//! (`0x03`), delay switch and long delay (`0x04`, `0x05`), the crossover
+//! high-pass and low-pass type and frequency (`0x42` through `0x45`), the
+//! limiter switch, threshold and release (`0x46` through `0x48`), polarity
+//! (`0x49`), and short delay (`0x4b`), all rows of the same `outputLocations`
+//! table. It also adds the input A, B and C gains (input channels 1 through
+//! 3, parameter `0x02`), transcribed from row 0 of the same revision's
+//! `inputLocations[4][62]`. Value domains follow the public `UltradrivePi`
+//! `protocol.md` notes. None of these addresses has named-device readback.
+//!
 //! These are behavioral-reference transcriptions. The O1/PEQ9 Dump0
 //! locations and the O4 PEQ on/off, band count, and band 1 frequency, Q, gain
 //! and slope Dump1 locations (with the Dump1 trailer balance) have been
@@ -86,6 +97,55 @@ pub const MAX_GAIN_CODE: u16 = 300;
 pub const UNITY_GAIN_CODE: u16 = 150;
 /// Peaking ("bandpass" in the protocol notes) filter kind code.
 pub const BELL_KIND_CODE: u16 = 1;
+/// Output (and input) level gain parameter: 0 through 300, -15 through +15 dB.
+pub const GAIN_PARAMETER: u8 = 0x02;
+/// Output delay on/off parameter.
+pub const DELAY_ENABLED_PARAMETER: u8 = 0x04;
+/// Output long delay parameter: 0 through 4000 in 5 cm steps.
+pub const LONG_DELAY_PARAMETER: u8 = 0x05;
+/// Output crossover high-pass filter type parameter.
+pub const HIGH_PASS_TYPE_PARAMETER: u8 = 0x42;
+/// Output crossover high-pass frequency parameter.
+pub const HIGH_PASS_FREQUENCY_PARAMETER: u8 = 0x43;
+/// Output crossover low-pass filter type parameter.
+pub const LOW_PASS_TYPE_PARAMETER: u8 = 0x44;
+/// Output crossover low-pass frequency parameter.
+pub const LOW_PASS_FREQUENCY_PARAMETER: u8 = 0x45;
+/// Output limiter on/off parameter.
+pub const LIMITER_ENABLED_PARAMETER: u8 = 0x46;
+/// Output limiter threshold parameter: 0 through 240, -24 through 0 dB.
+pub const LIMITER_THRESHOLD_PARAMETER: u8 = 0x47;
+/// Output limiter release parameter: 0 through 251, 20 through 4000 ms.
+pub const LIMITER_RELEASE_PARAMETER: u8 = 0x48;
+/// Output polarity parameter (1 = inverted).
+pub const POLARITY_PARAMETER: u8 = 0x49;
+/// Output short delay parameter: 0 through 2000 in 2 mm steps.
+pub const SHORT_DELAY_PARAMETER: u8 = 0x4b;
+/// Largest crossover filter type code (10 = Linkwitz-Riley 48 dB/oct).
+pub const MAX_CROSSOVER_TYPE_CODE: u16 = 10;
+/// Largest long delay code (200 m).
+pub const MAX_LONG_DELAY_CODE: u16 = 4000;
+/// Largest short delay code (4000 mm).
+pub const MAX_SHORT_DELAY_CODE: u16 = 2000;
+/// Largest limiter threshold code (0 dB).
+pub const MAX_LIMITER_THRESHOLD_CODE: u16 = 240;
+/// Largest limiter release code (4000 ms).
+pub const MAX_LIMITER_RELEASE_CODE: u16 = 251;
+/// Outputs that carry the typed-write fields: O1 through O4. O5/O6 are the
+/// reserved muted outputs and never gain a level, crossover, delay, limiter
+/// or polarity address.
+pub const TYPED_WRITE_OUTPUTS: std::ops::RangeInclusive<u8> = 1..=4;
+/// First input direct-parameter channel (input A).
+pub const FIRST_INPUT_CHANNEL: u8 = 1;
+/// Number of inputs with a reviewed gain address: A, B and C.
+pub const GAIN_INPUT_COUNT: u8 = 3;
+/// Pinned `DuinoDCX` `00b9d70` `inputLocations[0..3][0]`: input A, B and C
+/// gain (parameter `0x02`).
+pub const INPUT_GAIN_LOCATIONS: [DumpLocation; GAIN_INPUT_COUNT as usize] = [
+    split(0, 146, 148, 5, 147),
+    split(0, 288, 292, 3, 289),
+    split(0, 430, 436, 1, 431),
+];
 
 /// One dump location for a direct parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,17 +411,57 @@ pub enum OutputField {
         /// Band field.
         field: BandField,
     },
+    /// Output level gain code, 0 through 300 (150 = 0 dB), O1-O4 only.
+    Gain,
+    /// Output delay on/off, O1-O4 only.
+    DelayEnabled,
+    /// Output long delay code, 0 through 4000 (5 cm steps), O1-O4 only.
+    LongDelay,
+    /// Output short delay code, 0 through 2000 (2 mm steps), O1-O4 only.
+    ShortDelay,
+    /// Crossover high-pass type code, 0 (off) through 10, O1-O4 only.
+    HighPassType,
+    /// Crossover high-pass frequency code, 0 through 320, O1-O4 only.
+    HighPassFrequency,
+    /// Crossover low-pass type code, 0 (off) through 10, O1-O4 only.
+    LowPassType,
+    /// Crossover low-pass frequency code, 0 through 320, O1-O4 only.
+    LowPassFrequency,
+    /// Limiter on/off, O1-O4 only.
+    LimiterEnabled,
+    /// Limiter threshold code, 0 through 240 (240 = 0 dB), O1-O4 only.
+    LimiterThreshold,
+    /// Limiter release code, 0 through 251, O1-O4 only.
+    LimiterRelease,
+    /// Output polarity (1 = inverted), O1-O4 only.
+    Polarity,
+    /// Input level gain code, 0 through 300 (150 = 0 dB), inputs A-C.
+    InputGain {
+        /// Input number: 1 A, 2 B, 3 C.
+        input: u8,
+    },
 }
 
 impl OutputField {
     /// Largest value the device documents for this field.
     pub const fn device_max(self) -> u16 {
         match self {
-            Self::Mute | Self::EqEnabled => 1,
+            Self::Mute
+            | Self::EqEnabled
+            | Self::DelayEnabled
+            | Self::LimiterEnabled
+            | Self::Polarity => 1,
             Self::EqCount => 9,
             Self::Source => MAX_SOURCE_CODE,
             Self::InputSum => INPUT_SUM_A_PLUS_B_CODE,
             Self::Band { field, .. } => field.device_max(),
+            Self::Gain | Self::InputGain { .. } => MAX_GAIN_CODE,
+            Self::LongDelay => MAX_LONG_DELAY_CODE,
+            Self::ShortDelay => MAX_SHORT_DELAY_CODE,
+            Self::HighPassType | Self::LowPassType => MAX_CROSSOVER_TYPE_CODE,
+            Self::HighPassFrequency | Self::LowPassFrequency => MAX_FREQUENCY_CODE,
+            Self::LimiterThreshold => MAX_LIMITER_THRESHOLD_CODE,
+            Self::LimiterRelease => MAX_LIMITER_RELEASE_CODE,
         }
     }
 
@@ -388,7 +488,42 @@ impl OutputField {
 
     /// Whether the field is an on/off switch.
     pub const fn is_switch(self) -> bool {
-        matches!(self, Self::Mute | Self::EqEnabled)
+        matches!(
+            self,
+            Self::Mute
+                | Self::EqEnabled
+                | Self::DelayEnabled
+                | Self::LimiterEnabled
+                | Self::Polarity
+        )
+    }
+
+    /// Whether the field is an output or input level gain.
+    ///
+    /// Apply may never raise a level gain by more than
+    /// [`MAX_LEVEL_STEP_CODES`] in one plan, nor raise it above unity.
+    pub const fn is_level(self) -> bool {
+        matches!(self, Self::Gain | Self::InputGain { .. })
+    }
+
+    /// Whether the field is one of the typed-write lane's additions.
+    pub const fn is_typed_write(self) -> bool {
+        matches!(
+            self,
+            Self::Gain
+                | Self::DelayEnabled
+                | Self::LongDelay
+                | Self::ShortDelay
+                | Self::HighPassType
+                | Self::HighPassFrequency
+                | Self::LowPassType
+                | Self::LowPassFrequency
+                | Self::LimiterEnabled
+                | Self::LimiterThreshold
+                | Self::LimiterRelease
+                | Self::Polarity
+                | Self::InputGain { .. }
+        )
     }
 
     /// Whether the field is a PEQ band gain.
@@ -410,6 +545,26 @@ impl OutputField {
             Self::InputSum => "setup.input_sum".to_owned(),
             Self::EqEnabled => "eq_enabled".to_owned(),
             Self::EqCount => "eq_count".to_owned(),
+            Self::Gain => "gain".to_owned(),
+            Self::DelayEnabled => "delay_enabled".to_owned(),
+            Self::LongDelay => "long_delay".to_owned(),
+            Self::ShortDelay => "short_delay".to_owned(),
+            Self::HighPassType => "high_pass.type".to_owned(),
+            Self::HighPassFrequency => "high_pass.frequency".to_owned(),
+            Self::LowPassType => "low_pass.type".to_owned(),
+            Self::LowPassFrequency => "low_pass.frequency".to_owned(),
+            Self::LimiterEnabled => "limiter.enabled".to_owned(),
+            Self::LimiterThreshold => "limiter.threshold".to_owned(),
+            Self::LimiterRelease => "limiter.release".to_owned(),
+            Self::Polarity => "polarity".to_owned(),
+            Self::InputGain { input } => format!(
+                "input_{}.gain",
+                match input {
+                    1 => "a",
+                    2 => "b",
+                    _ => "c",
+                }
+            ),
             Self::Band { band, field } => format!(
                 "band{band}.{}",
                 match field {
@@ -424,10 +579,14 @@ impl OutputField {
     }
 }
 
+/// Largest level-gain increase one apply plan may make: 30 codes (+3 dB).
+pub const MAX_LEVEL_STEP_CODES: u16 = 30;
+
 /// One allowlisted direct-parameter address with its dump location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReviewedAddress {
-    /// Physical output, 1 through 6, or [`SETUP_TARGET`] for the input sum.
+    /// Physical output, 1 through 6, or [`SETUP_TARGET`] for the input sum
+    /// and the input gains (which are not outputs).
     pub output: u8,
     /// Semantic field.
     pub field: OutputField,
@@ -442,9 +601,16 @@ pub struct ReviewedAddress {
 /// 10; plus, under `dec-autonomous-muted-bench-20261007`, the O4/O5/O6 output
 /// mutes (channels 8 through 10, `0x03`), the O3/O4 output sources (channels 7
 /// and 8, `0x41`), and the setup input sum type (channel 0, `0x02`).
-/// Crossover, dynamic EQ, delay, limiter, polarity, gain, the O1/O2/O5/O6
-/// sources, the O1/O2/O3 mutes, every input address, and every other setup
-/// address (Input C gain, Mute Outs, links, ...) fail closed.
+/// The typed-write lane adds, on O1 through O4 only (channels 5 through 8):
+/// the O1-O3 mutes (`0x03`), output gain (`0x02`), delay switch, long and
+/// short delay (`0x04`, `0x05`, `0x4b`), crossover high-pass and low-pass type
+/// and frequency (`0x42` through `0x45`), limiter switch, threshold and
+/// release (`0x46` through `0x48`), and polarity (`0x49`); plus the input A,
+/// B and C gains (channels 1 through 3, `0x02`). Dynamic EQ, phase, output
+/// name, PEQ editor index, every O5/O6 field except the mute and PEQ, the
+/// O1/O2/O5/O6 sources, the input SUM channel, every other input address, and
+/// every other setup address (Input C line/mic, Mute Outs, links, ...) fail
+/// closed.
 pub fn reviewed_address(channel: u8, parameter: u8) -> Option<ReviewedAddress> {
     if channel == SETUP_CHANNEL {
         return (parameter == INPUT_SUM_PARAMETER).then_some(ReviewedAddress {
@@ -453,15 +619,36 @@ pub fn reviewed_address(channel: u8, parameter: u8) -> Option<ReviewedAddress> {
             location: INPUT_SUM_LOCATION,
         });
     }
+    if (FIRST_INPUT_CHANNEL..FIRST_INPUT_CHANNEL + GAIN_INPUT_COUNT).contains(&channel) {
+        let input = channel - FIRST_INPUT_CHANNEL + 1;
+        return (parameter == GAIN_PARAMETER).then_some(ReviewedAddress {
+            output: SETUP_TARGET,
+            field: OutputField::InputGain { input },
+            location: INPUT_GAIN_LOCATIONS[usize::from(input - 1)],
+        });
+    }
     if !(FIRST_OUTPUT_CHANNEL..FIRST_OUTPUT_CHANNEL + OUTPUT_COUNT).contains(&channel) {
         return None;
     }
     let output = channel - FIRST_OUTPUT_CHANNEL + 1;
+    let typed = TYPED_WRITE_OUTPUTS.contains(&output);
     let field = match parameter {
-        MUTE_PARAMETER if (4..=6).contains(&output) => OutputField::Mute,
+        MUTE_PARAMETER => OutputField::Mute,
         SOURCE_PARAMETER if output == 3 || output == 4 => OutputField::Source,
         EQ_ENABLED_PARAMETER => OutputField::EqEnabled,
         EQ_COUNT_PARAMETER => OutputField::EqCount,
+        GAIN_PARAMETER if typed => OutputField::Gain,
+        DELAY_ENABLED_PARAMETER if typed => OutputField::DelayEnabled,
+        LONG_DELAY_PARAMETER if typed => OutputField::LongDelay,
+        SHORT_DELAY_PARAMETER if typed => OutputField::ShortDelay,
+        HIGH_PASS_TYPE_PARAMETER if typed => OutputField::HighPassType,
+        HIGH_PASS_FREQUENCY_PARAMETER if typed => OutputField::HighPassFrequency,
+        LOW_PASS_TYPE_PARAMETER if typed => OutputField::LowPassType,
+        LOW_PASS_FREQUENCY_PARAMETER if typed => OutputField::LowPassFrequency,
+        LIMITER_ENABLED_PARAMETER if typed => OutputField::LimiterEnabled,
+        LIMITER_THRESHOLD_PARAMETER if typed => OutputField::LimiterThreshold,
+        LIMITER_RELEASE_PARAMETER if typed => OutputField::LimiterRelease,
+        POLARITY_PARAMETER if typed => OutputField::Polarity,
         FIRST_BAND_PARAMETER..=LAST_BAND_PARAMETER => {
             let relative = parameter - FIRST_BAND_PARAMETER;
             OutputField::Band {
@@ -1066,8 +1253,13 @@ mod tests {
                 .count();
             let expected = 2
                 + 45
-                + usize::from((4..=6).contains(&output))
-                + usize::from(output == 3 || output == 4);
+                + 1
+                + usize::from(output == 3 || output == 4)
+                + if TYPED_WRITE_OUTPUTS.contains(&output) {
+                    12
+                } else {
+                    0
+                };
             assert_eq!(lows, expected);
         }
     }
@@ -1124,9 +1316,16 @@ mod tests {
         }
         let routing_count = every_reviewed_address()
             .into_iter()
-            .filter(|(_, _, address)| address.field.is_routing())
+            .filter(|(_, _, address)| routing_rank(*address).is_some())
             .count();
         assert_eq!(routing_count, routing.len());
+        // The O1-O3 mutes belong to the typed-write lane and have no routing
+        // rank, so the routing document still refuses them.
+        for channel in 5..=7 {
+            let address = reviewed_address(channel, MUTE_PARAMETER).unwrap();
+            assert_eq!(address.field, OutputField::Mute);
+            assert_eq!(routing_rank(address), None);
+        }
     }
 
     #[test]
@@ -1187,11 +1386,20 @@ mod tests {
                         || parameter == EQ_COUNT_PARAMETER
                         || (FIRST_BAND_PARAMETER..=LAST_BAND_PARAMETER).contains(&parameter));
                 // dec-autonomous-muted-bench-20261007: O4/O5/O6 mute, O3/O4
-                // source, setup input sum. Nothing else.
-                let reviewed_routing = ((8..=10).contains(&channel) && parameter == MUTE_PARAMETER)
+                // source, setup input sum. The typed-write lane adds the O1-O3
+                // mutes.
+                let reviewed_routing = (output_channel && parameter == MUTE_PARAMETER)
                     || ((channel == 7 || channel == 8) && parameter == SOURCE_PARAMETER)
                     || (channel == SETUP_CHANNEL && parameter == INPUT_SUM_PARAMETER);
-                let expected = reviewed_peq || reviewed_routing;
+                // Typed-write lane: O1-O4 level, delay, crossover, limiter,
+                // polarity; input A-C gain. Nothing else.
+                let reviewed_typed = ((5..=8).contains(&channel)
+                    && [
+                        0x02, 0x04, 0x05, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4b,
+                    ]
+                    .contains(&parameter))
+                    || ((1..=3).contains(&channel) && parameter == 0x02);
+                let expected = reviewed_peq || reviewed_routing || reviewed_typed;
                 assert_eq!(
                     reviewed, expected,
                     "channel {channel} parameter {parameter:#04x}"
@@ -1205,6 +1413,72 @@ mod tests {
                 field: BandField::Gain
             })
         );
+    }
+
+    #[test]
+    fn typed_write_addresses_equal_the_pinned_tables() {
+        // DuinoDCX 00b9d70 outputLocations rows, O1 (Dump0) and O4 (Dump1).
+        for (output, parameter, location) in [
+            (1, GAIN_PARAMETER, split(0, 713, 716, 4, 714)),
+            (1, MUTE_PARAMETER, low(0, 715)),
+            (1, DELAY_ENABLED_PARAMETER, low(0, 718)),
+            (1, LONG_DELAY_PARAMETER, split(0, 720, 724, 3, 721)),
+            (1, HIGH_PASS_TYPE_PARAMETER, low(0, 859)),
+            (1, HIGH_PASS_FREQUENCY_PARAMETER, split(0, 862, 868, 1, 863)),
+            (1, LOW_PASS_TYPE_PARAMETER, low(0, 864)),
+            (1, LOW_PASS_FREQUENCY_PARAMETER, split(0, 866, 868, 5, 867)),
+            (1, LIMITER_ENABLED_PARAMETER, low(0, 869)),
+            (1, LIMITER_THRESHOLD_PARAMETER, carried(0, 871, 876, 2)),
+            (1, LIMITER_RELEASE_PARAMETER, carried(0, 873, 876, 4)),
+            (1, POLARITY_PARAMETER, low(0, 875)),
+            (1, SHORT_DELAY_PARAMETER, split(0, 880, 884, 3, 881)),
+        ] {
+            let address = reviewed_address(output_channel(output), parameter).unwrap();
+            assert_eq!(address.location, location, "O{output} {parameter:#04x}");
+            assert!(address.field.is_typed_write() || address.field == OutputField::Mute);
+        }
+        // DuinoDCX 00b9d70 inputLocations[0..3][0].
+        for (channel, location) in [
+            (1, split(0, 146, 148, 5, 147)),
+            (2, split(0, 288, 292, 3, 289)),
+            (3, split(0, 430, 436, 1, 431)),
+        ] {
+            let address = reviewed_address(channel, GAIN_PARAMETER).unwrap();
+            assert_eq!(address.location, location);
+            assert_eq!(address.output, SETUP_TARGET);
+            assert_eq!(address.field, OutputField::InputGain { input: channel });
+            assert!(address.field.is_level() && !address.field.is_routing());
+            assert_eq!(packing_carrier(location.low), location.carrier);
+        }
+        // Input SUM (channel 4) and every other input parameter fail closed.
+        assert_eq!(reviewed_address(4, GAIN_PARAMETER), None);
+        assert_eq!(reviewed_address(1, MUTE_PARAMETER), None);
+        // O5/O6 never carry a typed-write field.
+        for channel in [9, 10] {
+            for parameter in 0..=0x7f_u8 {
+                if let Some(address) = reviewed_address(channel, parameter) {
+                    assert!(!address.field.is_typed_write());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_write_domains_fit_their_locations_and_wire_range() {
+        for (_, _, address) in every_reviewed_address() {
+            let maximum = address.field.device_max();
+            assert!(maximum <= address.location.max_representable());
+            assert!(maximum <= 0x3fff);
+            assert!(address.field.admits(maximum) || address.field == OutputField::InputSum);
+            assert!(!address.field.admits(maximum + 1));
+        }
+        assert_eq!(OutputField::Gain.device_max(), 300);
+        assert_eq!(OutputField::LongDelay.device_max(), 4000);
+        assert_eq!(OutputField::ShortDelay.device_max(), 2000);
+        assert_eq!(OutputField::HighPassType.device_max(), 10);
+        assert_eq!(OutputField::LimiterThreshold.device_max(), 240);
+        assert_eq!(OutputField::LimiterRelease.device_max(), 251);
+        assert!(OutputField::Polarity.is_switch() && OutputField::LimiterEnabled.is_switch());
     }
 
     #[test]

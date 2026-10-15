@@ -38,20 +38,35 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   the O4/O5/O6 output mutes (channels 8 through 10, `0x03`, Dump1 bytes
   223/392/561), the O4 and O3 output sources (channels 8 and 7, `0x41`, Dump1
   bytes 365/195), and the setup input sum type (channel 0, `0x02`, Dump0 byte
-  117) as off (0) or A+B (4) only. Locations are transcribed from the pinned
-  MIT DuinoDCX `outputLocations` and `setupLocations` tables; O1/PEQ9 and the
-  O4 PEQ on/off, band count and band 1 fields have named-device readback, and
-  every other address, including all routing addresses, is pending its first
-  exact readback. Values must lie in their reviewed domain, the apply path
+  117) as off (0) or A+B (4) only; plus the typed-write lane
+  (`dcx.write-plan/v1`, `docs/typed-writes.md`): the O1-O3 mutes (`0x03`) and,
+  on O1-O4 only, output gain (`0x02`), delay switch, long and short delay
+  (`0x04`, `0x05`, `0x4b`), crossover high/low-pass type and frequency
+  (`0x42`-`0x45`), limiter switch, threshold and release (`0x46`-`0x48`) and
+  polarity (`0x49`), and the input A-C gains (channels 1-3, `0x02`).
+  Locations are transcribed from the pinned MIT DuinoDCX `outputLocations`,
+  `inputLocations` and `setupLocations` tables; O1/PEQ9 and the O4 PEQ on/off,
+  band count and band 1 fields have named-device readback, and every other
+  address, including all routing and typed-write addresses, is pending its
+  first exact readback (`dcxctl write verify`). Values must lie in their
+  reviewed domain, every apply raises a level gain by at most +3 dB and never
+  above unity, raises a limiter threshold by at most +3 dB and never switches
+  an enabled limiter off, the apply path
   admits only PEQ cuts and never makes a band active (PEQ on and inside the
   band count) that holds a stored boost and was inactive in the baseline, nor
   moves or reshapes an active boost, at any ordered apply or rollback step,
   under any policy flag; it writes routing fields mutes first, then the input
   sum, then the O4 and O3 sources, and rollback restores the exact baseline in
   reverse order. Dump0 and Dump1 keep their baseline modulo-128 trailer
-  balance. Every other output, input, setup (Input C gain/mode at Dump0 121,
-  Mute Outs, links), crossover, dynamic-EQ, mute (O1-O3), source (O1, O2, O5,
-  O6), or opaque dump mapping fails closed. Auto Align and +15 V have no
+  balance. Every other output field (dynamic EQ, phase, name, PEQ editor
+  index, every O5/O6 field but mute and PEQ), every other input field, the
+  input SUM channel, every other setup field (Input C line/mic at Dump0 121,
+  Mute Outs, links), the O1/O2/O5/O6 sources, and every opaque dump mapping
+  fail closed. Typed writes refuse every plan while O5 or O6 reads unmuted,
+  never address O5/O6, need explicit plan and command-line consent to unmute
+  O1-O4 or change an O3/O4 source, and never combine the two; their rollback
+  is the exact touched inverse, never a stored-preset recall. Auto Align and
+  +15 V have no
   address and must never gain one. No server or automatic apply path belongs
   in the MVP.
 - Desired profiles are `dcx.desired-profile/v1`, exactly O1/channel 5/PEQ9
