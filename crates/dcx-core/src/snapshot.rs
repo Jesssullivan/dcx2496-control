@@ -27,9 +27,9 @@ use thiserror::Error;
 
 use crate::{
     layout::{
-        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, OUTPUT_COUNT, OutputField,
-        PACKED_PAYLOAD_START, PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE, band_parameter,
-        output_channel, reviewed_address, routing_rank,
+        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, MAX_LEVEL_STEP_CODES, OUTPUT_COUNT,
+        OutputField, PACKED_PAYLOAD_START, PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE,
+        band_parameter, output_channel, reviewed_address, routing_rank,
     },
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DirectParameterAction,
@@ -285,9 +285,10 @@ impl SnapshotV1 {
     /// closed allowlist in [`crate::layout::reviewed_address`]: PEQ on/off,
     /// PEQ band count, and the nine PEQ bands on outputs O1 through O6, plus
     /// the O4/O5/O6 output mutes, the O3/O4 output sources, and the setup
-    /// input sum (off or A+B only). Each value must lie inside the reviewed
-    /// domain of its field. Every other address fails
-    /// closed. The identity bytes remain unchanged, both dump trailers keep
+    /// input sum (off or A+B only), plus the typed-write lane's O1-O3 mutes,
+    /// O1-O4 gain, delay, crossover, limiter and polarity, and input A-C
+    /// gains. Each value must lie inside the reviewed domain of its field.
+    /// Every other address fails closed. The identity bytes remain unchanged, both dump trailers keep
     /// their baseline modulo-128 balance, and a fresh snapshot digest is
     /// calculated.
     ///
@@ -873,6 +874,13 @@ impl ApplyPlanV1 {
     /// `--allow-enable-operator-bands`) relaxes this, because every v1/v2
     /// diff and every durable apply carrier is bound here.
     ///
+    /// Level gains (output gain on O1-O4 and the input A-C gains) may fall
+    /// freely but may rise by at most 30 codes (+3 dB) per plan and never to
+    /// above unity (0 dB); a limiter threshold may rise by at most 30 codes;
+    /// and an enabled limiter may never be switched off. These hold for the
+    /// apply direction only: a rollback restores the verified baseline. Any
+    /// typed-write-lane action also requires O5 and O6 to read muted.
+    ///
     /// # Errors
     ///
     /// Rejects another device, identity changes, missing or surplus actions,
@@ -904,6 +912,8 @@ impl ApplyPlanV1 {
         } else {
             let command = DirectParameterCommand::new(diff.device_id, actions)?;
             require_cut_only(command.actions())?;
+            require_protective_levels(baseline, command.actions())?;
+            require_typed_lane_reserve(baseline, command.actions())?;
             require_routing_order(command.actions())?;
             let projected = baseline.project_direct_actions(command.actions())?;
             require_no_stored_boost_activation(baseline, command.actions())?;
@@ -1178,6 +1188,77 @@ fn require_cut_only(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanEr
     Ok(())
 }
 
+/// Refuse an apply that raises a level too far or switches a limiter off.
+///
+/// Compared against the immutable baseline (each address is written at most
+/// once per command): a level gain may rise by at most
+/// [`MAX_LEVEL_STEP_CODES`] and never to above unity, a limiter threshold may
+/// rise by at most [`MAX_LEVEL_STEP_CODES`], and an enabled limiter may not be
+/// disabled. Decreases are always admitted.
+fn require_protective_levels(
+    baseline: &SnapshotV1,
+    actions: &[DirectParameterAction],
+) -> Result<(), ApplyPlanError> {
+    for action in actions {
+        let Some(address) = reviewed_address(action.channel(), action.parameter()) else {
+            continue;
+        };
+        let before = baseline.read_reviewed(address);
+        let after = action.value();
+        let rising = after > before;
+        let step_limited =
+            address.field.is_level() || address.field == OutputField::LimiterThreshold;
+        if rising && address.field.is_level() && after > UNITY_GAIN_CODE {
+            return Err(ApplyPlanError::LevelAboveUnity {
+                channel: action.channel(),
+                parameter: action.parameter(),
+                before,
+                after,
+            });
+        }
+        if rising && step_limited && after - before > MAX_LEVEL_STEP_CODES {
+            return Err(ApplyPlanError::LevelStepTooLarge {
+                channel: action.channel(),
+                parameter: action.parameter(),
+                before,
+                after,
+            });
+        }
+        if address.field == OutputField::LimiterEnabled && before != 0 && after == 0 {
+            return Err(ApplyPlanError::LimiterDisable {
+                channel: action.channel(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a typed-write-lane apply while O5 or O6 reads unmuted.
+///
+/// Any action on a typed-write-lane address (see
+/// [`ReviewedAddress::is_typed_lane`]) requires both reserved outputs to read
+/// muted in the baseline, so no such carrier, however it was built, runs
+/// against a state where a reserved output is live.
+fn require_typed_lane_reserve(
+    baseline: &SnapshotV1,
+    actions: &[DirectParameterAction],
+) -> Result<(), ApplyPlanError> {
+    let typed = actions.iter().any(|action| {
+        reviewed_address(action.channel(), action.parameter())
+            .is_some_and(ReviewedAddress::is_typed_lane)
+    });
+    if !typed {
+        return Ok(());
+    }
+    for output in 5..=OUTPUT_COUNT {
+        let value = read_output_field(baseline, output, crate::layout::MUTE_PARAMETER)?;
+        if value != 1 {
+            return Err(ApplyPlanError::TypedLaneReservedUnmuted { output, value });
+        }
+    }
+    Ok(())
+}
+
 /// Routing fields must be written mutes first, then the input sum, then the
 /// sources (see [`routing_rank`]). Rollback reverses the order.
 fn require_routing_order(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanError> {
@@ -1437,6 +1518,34 @@ pub enum ApplyPlanError {
         parameter: u8,
         value: u16,
     },
+    /// A level gain would rise above unity (0 dB).
+    #[error(
+        "channel {channel} parameter {parameter:#04x} level code {before} -> {after} rises above unity (150); apply never raises a level above 0 dB"
+    )]
+    LevelAboveUnity {
+        channel: u8,
+        parameter: u8,
+        before: u16,
+        after: u16,
+    },
+    /// A level gain or limiter threshold would rise by more than +3 dB.
+    #[error(
+        "channel {channel} parameter {parameter:#04x} code {before} -> {after} rises by more than 30 codes (+3 dB) in one plan"
+    )]
+    LevelStepTooLarge {
+        channel: u8,
+        parameter: u8,
+        before: u16,
+        after: u16,
+    },
+    /// A typed-write-lane carrier was bound to a baseline with O5 or O6 live.
+    #[error(
+        "O{output} mute code is {value}, not 1 (muted); typed-write-lane actions need O5 and O6 muted"
+    )]
+    TypedLaneReservedUnmuted { output: u8, value: u16 },
+    /// An enabled limiter would be switched off.
+    #[error("channel {channel} limiter is enabled; apply never disables a limiter")]
+    LimiterDisable { channel: u8 },
     /// Routing fields were not in mutes, input sum, sources apply order.
     #[error(
         "channel {channel} parameter {parameter:#04x} breaks the routing apply order \
@@ -2397,19 +2506,25 @@ mod tests {
     #[test]
     fn snapshot_projection_rejects_every_unreviewed_address_and_wide_low_field() {
         let baseline = snapshot(0, 0, 0);
-        // Input sum, output gain, mute off O4, PEQ editor index, dynamic EQ,
-        // crossover, output name, and setup/input channels all fail closed.
+        // Input SUM channel, PEQ editor index, dynamic EQ, output name,
+        // phase, O5/O6 level and crossover, O1/O2 source, input mute and
+        // input PEQ, and other setup addresses all fail closed.
         for (channel, parameter) in [
             (4, 0x3b),
-            (5, 0x02),
-            (5, 0x03),
+            (4, 0x02),
             (5, 0x08),
             (5, 0x09),
             (5, 0x12),
             (5, 0x40),
-            (5, 0x42),
-            (8, 0x45),
+            (5, 0x41),
+            (5, 0x4a),
+            (9, 0x02),
+            (10, 0x42),
+            (10, 0x49),
+            (0, 0x04),
             (0, 0x06),
+            (0, 0x15),
+            (1, 0x03),
             (1, 0x13),
         ] {
             let action = DirectParameterAction::new(channel, parameter, 1).unwrap();
@@ -2538,17 +2653,20 @@ mod tests {
     #[test]
     fn o4_mute_projection_rejects_other_channels_unreviewed_params_and_wide_values() {
         let baseline = muted_o4_baseline();
-        // The O1/O2/O3 mutes and the setup channel's 0x03 fail closed, as do
-        // O4 parameters adjacent to mute and the O4 crossover. The O5/O6
-        // mutes are reviewed under dec-autonomous-muted-bench-20261007.
+        // The setup and input mutes fail closed, as do the O5/O6 neighbours
+        // of mute and the O5/O6 crossover, and the O4 phase and PEQ editor
+        // index. The O1-O3 mutes and O1-O4 gain, delay and crossover belong to
+        // the typed-write lane; the O5/O6 mutes are reviewed under
+        // dec-autonomous-muted-bench-20261007.
         for (channel, parameter) in [
             (0, 0x03),
-            (5, 0x03),
-            (6, 0x03),
-            (7, 0x03),
-            (8, 0x02),
-            (8, 0x04),
-            (8, 0x42),
+            (1, 0x03),
+            (4, 0x03),
+            (9, 0x02),
+            (9, 0x04),
+            (10, 0x42),
+            (8, 0x08),
+            (8, 0x4a),
         ] {
             let action = DirectParameterAction::new(channel, parameter, 1).unwrap();
             assert!(matches!(

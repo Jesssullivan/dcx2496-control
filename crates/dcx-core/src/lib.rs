@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod rew;
 pub mod routing;
 pub mod snapshot;
+pub mod typed_write;
 
 pub use profile::{LabProfileV1, ProfileBinding, ProfileDiff, ProfileError};
 pub use protocol::{

@@ -228,6 +228,22 @@ dcxctl control diff --snapshot snapshot.json --profile mvp-routing.json \
   > transaction-plans.json
 ```
 
+### Typed parameter writes
+
+`dcxctl write` plans typed changes (PEQ band, PEQ on/off and band count,
+crossover, output gain, mute, polarity, delay, limiter on O1-O4; input A-C
+gain; an O3/O4 source behind two consents) into one reviewed frame bound to an
+exact baseline, with an exact touched-address inverse. `write plan` is a dry
+run that prints the exact frame bytes; `write verify` is the offline readback
+check. O5/O6 are never addressed and every plan is refused while either reads
+unmuted. See [`docs/typed-writes.md`](docs/typed-writes.md).
+
+```sh
+dcxctl write show --snapshot snapshot.json
+dcxctl write plan --snapshot snapshot.json --plan changes.json > tx.json
+dcxctl write verify --plan apply-plan.json --readback readback.json
+```
+
 ## Serial boundary
 
 - The caller supplies one exact `/dev/cu.usbserial-*` callout; the program never

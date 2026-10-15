@@ -172,9 +172,20 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
         MAX_CONTROL_DOCUMENT_BYTES,
         "apply plan",
     )?)?;
+    refuse_typed_lane(plan.command(), "write apply")?;
+    apply_loaded(tty, expected_device, &plan)
+}
+
+/// Run one already-validated apply carrier (see [`apply`]).
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn apply_loaded(
+    tty: PathBuf,
+    expected_device: u8,
+    plan: &ApplyPlanV1,
+) -> Result<(), Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.device())?;
-    let mut transaction = ApplyTransactionV1::from_apply_plan(&plan)?;
+    let mut transaction = ApplyTransactionV1::from_apply_plan(plan)?;
     let binding = PrivateTtyBinding::new(tty)?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();
@@ -218,9 +229,44 @@ pub fn rollback(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Bo
         MAX_CONTROL_DOCUMENT_BYTES,
         "rollback plan",
     )?)?;
+    refuse_typed_lane(plan.command(), "write rollback")?;
+    rollback_loaded(tty, expected_device, &plan)
+}
+
+/// `control apply|rollback` carry only the REW, notch, and routing lanes. A
+/// carrier holding a typed-write-lane address must go through `dcxctl write`,
+/// which re-checks it against the write policy first.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+fn refuse_typed_lane(
+    command: Option<&dcx_core::DirectParameterCommand>,
+    replacement: &str,
+) -> Result<(), io::Error> {
+    let typed = command
+        .map_or(&[][..], dcx_core::DirectParameterCommand::actions)
+        .iter()
+        .any(|action| {
+            reviewed_address(action.channel(), action.parameter())
+                .is_some_and(dcx_core::layout::ReviewedAddress::is_typed_lane)
+        });
+    if typed {
+        Err(invalid_input(&format!(
+            "carrier holds typed-write-lane addresses; use dcxctl {replacement}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Run one already-validated rollback carrier (see [`rollback`]).
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn rollback_loaded(
+    tty: PathBuf,
+    expected_device: u8,
+    plan: &RollbackPlanV1,
+) -> Result<(), Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.baseline().device())?;
-    let mut transaction = ApplyTransactionV1::resume_rollback(&plan)?;
+    let mut transaction = ApplyTransactionV1::resume_rollback(plan)?;
     let binding = PrivateTtyBinding::new(tty)?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();

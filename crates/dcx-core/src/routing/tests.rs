@@ -277,17 +277,14 @@ fn every_unreviewed_routing_neighbor_is_refused() {
         (6, 0x41, 0),
         (9, 0x41, 2),
         (10, 0x41, 2),
-        // O1/O2/O3 mutes.
-        (5, 0x03, 1),
-        (6, 0x03, 1),
-        (7, 0x03, 1),
-        // Input A..C and input-sum channel mutes and gains.
+        // Input A..C and input-sum channel mutes, and the input-sum gain.
         (1, 0x03, 1),
+        (3, 0x03, 1),
         (4, 0x03, 1),
-        (3, 0x02, 0),
+        (4, 0x02, 0),
     ];
-    // Crossover on every output.
-    for channel in 5..=10 {
+    // O5/O6 crossover.
+    for channel in 9..=10 {
         for parameter in 0x42..=0x45 {
             refused.push((channel, parameter, 0));
         }
@@ -313,6 +310,21 @@ fn every_unreviewed_routing_neighbor_is_refused() {
     }
     // PEQ fields are reviewed but not routing.
     assert!(profile(vec![action(8, EQ_ENABLED_PARAMETER, 1)]).is_err());
+    // The typed-write lane's O1-O3 mutes, O1-O4 crossovers and input gains
+    // are reviewed addresses, but never routing-document actions.
+    let mut typed_only = vec![(5, 0x03, 1), (6, 0x03, 1), (7, 0x03, 1), (3, 0x02, 140)];
+    for channel in 5..=8 {
+        for parameter in 0x42..=0x45 {
+            typed_only.push((channel, parameter, 0));
+        }
+    }
+    for (channel, parameter, value) in typed_only {
+        let candidate = action(channel, parameter, value);
+        assert!(
+            profile(vec![candidate]).is_err(),
+            "{channel}/{parameter:#04x}"
+        );
+    }
 }
 
 #[test]

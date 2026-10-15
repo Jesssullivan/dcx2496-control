@@ -66,6 +66,7 @@ test_suite(
         ":fixture_contract",
         ":routing_pipeline",
         ":toolchain_pin_parity",
+        ":write_pipeline",
         "//crates/dcx-core:all_tests",
         "//crates/dcx-darwin-tty:all_tests",
         "//crates/dcx-transport:all_tests",
@@ -214,6 +215,26 @@ sh_test(
     # Like feedback_pipeline, the script runs bash, grep, sed, and mktemp from
     # the host PATH, so it must never be dispatched to a content-addressed
     # executor.
+    tags = [
+        "no-remote",
+        "no-remote-exec",
+    ],
+)
+
+sh_test(
+    name = "write_pipeline",
+    size = "small",
+    srcs = ["tests/write_pipeline.sh"],
+    args = [
+        "$(location //crates/dcxctl:dcxctl)",
+        "$(location fixtures/snapshots/SYNTHETIC-blank-snapshot.json)",
+    ],
+    data = [
+        "fixtures/snapshots/SYNTHETIC-blank-snapshot.json",
+        "//crates/dcxctl",
+    ],
+    # The script runs bash, grep, jq, and mktemp from the host PATH, so it must
+    # never be dispatched to a content-addressed executor.
     tags = [
         "no-remote",
         "no-remote-exec",

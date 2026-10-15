@@ -284,7 +284,16 @@ fn every_unreviewed_direct_address_is_rejected_by_snapshot_projection() {
             let reviewed_routing = ((8..=10).contains(&channel) && parameter == 0x03)
                 || ((channel == 7 || channel == 8) && parameter == 0x41)
                 || (channel == 0 && parameter == 0x02);
-            if reviewed_peq || reviewed_routing {
+            // Typed-write lane: O1-O3 mutes; O1-O4 gain, delay, crossover,
+            // limiter, polarity, short delay; input A-C gain.
+            let reviewed_typed = ((5..=7).contains(&channel) && parameter == 0x03)
+                || ((5..=8).contains(&channel)
+                    && [
+                        0x02, 0x04, 0x05, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4b,
+                    ]
+                    .contains(&parameter))
+                || ((1..=3).contains(&channel) && parameter == 0x02);
+            if reviewed_peq || reviewed_routing || reviewed_typed {
                 assert!(projected.is_ok(), "{channel}/{parameter:#04x}");
             } else {
                 assert!(projected.is_err(), "{channel}/{parameter:#04x}");
