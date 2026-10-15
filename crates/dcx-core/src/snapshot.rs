@@ -687,6 +687,9 @@ pub enum SnapshotError {
         /// Supplied section label.
         actual: SnapshotSection,
     },
+    /// A read-only meter reply failed exact typed validation.
+    #[error(transparent)]
+    Meter(#[from] crate::meter::MeterError),
     /// Serialized digest did not match recomputed exact bytes.
     #[error("{field} digest mismatch: expected {expected}, found {actual}")]
     DigestMismatch {

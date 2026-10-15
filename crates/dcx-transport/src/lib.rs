@@ -16,6 +16,7 @@ use dcx_core::{
 };
 use thiserror::Error;
 
+pub mod meter;
 pub mod snapshot;
 
 /// Exact outbound byte count for the only operation this boundary exposes.

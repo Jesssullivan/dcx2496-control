@@ -128,11 +128,13 @@ sh_test(
         "$(location fixtures/rew/SYNTHETIC-cut-only.txt)",
         "$(location fixtures/protocol/SYNTHETIC-o4-mute-on.hex)",
         "$(location fixtures/protocol/SYNTHETIC-o4-mute-off.hex)",
+        "$(location fixtures/protocol/SYNTHETIC-meter-response-25.hex)",
     ],
     data = [
         "fixtures/profiles/SYNTHETIC-control-room-v1.json",
         "fixtures/profiles/safe-muted-v1.json",
         "fixtures/protocol/SYNTHETIC-direct-parameter.hex",
+        "fixtures/protocol/SYNTHETIC-meter-response-25.hex",
         "fixtures/protocol/SYNTHETIC-o4-mute-off.hex",
         "fixtures/protocol/SYNTHETIC-o4-mute-on.hex",
         "fixtures/protocol/SYNTHETIC-search-response-26.hex",

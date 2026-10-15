@@ -13,6 +13,7 @@ use dcx_core::{
     ApplyTransactionError, ApplyTransactionV1, DirectParameterCommand, RemoteMode,
     RemoteModeCommand, SnapshotError, SnapshotSection, SnapshotV1,
     discovery::FALLBACK_BAUD,
+    meter::{METER_RESPONSE_LEN, MeterReadingV1},
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DumpPart, MAX_FRAME_LEN,
         ProtocolError, Query, SEARCH_RESPONSE_LEN, SearchResponse26, decode, parse_frame,
@@ -76,6 +77,8 @@ pub enum SnapshotOperationKind {
     Dump0,
     /// Second complete dump query.
     Dump1,
+    /// One read-only level-meter query (`Query::Ping`). `sequence` is one-based.
+    Meter { sequence: usize },
 }
 
 /// One private, exact, typed query request.
@@ -149,6 +152,15 @@ impl SnapshotOperation {
         })
     }
 
+    pub(crate) fn meter(sequence: usize, expected_device: DeviceId) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            kind: SnapshotOperationKind::Meter { sequence },
+            expected_device,
+            request: SnapshotRequest::from_query(Query::Ping(expected_device))?,
+            response_limit: METER_RESPONSE_LEN,
+        })
+    }
+
     /// Closed operation kind.
     pub const fn kind(self) -> SnapshotOperationKind {
         self.kind
@@ -166,10 +178,7 @@ impl SnapshotOperation {
 
     /// Total operation deadline the carrier must enforce.
     pub const fn timeout(self) -> Duration {
-        match self.kind {
-            SnapshotOperationKind::Search { .. } => SNAPSHOT_OPERATION_TIMEOUT,
-            SnapshotOperationKind::Dump0 | SnapshotOperationKind::Dump1 => SNAPSHOT_DUMP_TIMEOUT,
-        }
+        operation_timeout(self.kind)
     }
 
     /// Exact response byte limit for this response type.
@@ -363,7 +372,10 @@ impl fmt::Debug for CapturedSnapshotV1 {
     }
 }
 
-enum CaptureBodyError<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static> {
+pub(crate) enum CaptureBodyError<
+    E: StdError + Send + Sync + 'static,
+    P: StdError + Send + Sync + 'static,
+> {
     Pacing {
         trial: usize,
         source: P,
@@ -620,7 +632,7 @@ fn capture_body<S: PersistentSnapshotSession, P: RepeatPacer>(
     Ok(snapshot)
 }
 
-fn capture_search_identities<S: PersistentSnapshotSession, P: RepeatPacer>(
+pub(crate) fn capture_search_identities<S: PersistentSnapshotSession, P: RepeatPacer>(
     session: &mut S,
     pacer: &mut P,
     expected_device: DeviceId,
@@ -683,7 +695,7 @@ fn capture_search_identities<S: PersistentSnapshotSession, P: RepeatPacer>(
     })
 }
 
-fn require_budget<E: StdError + Send + Sync + 'static, P: RepeatPacer>(
+pub(crate) fn require_budget<E: StdError + Send + Sync + 'static, P: RepeatPacer>(
     pacer: &mut P,
     started: Duration,
     budget: Duration,
@@ -699,12 +711,17 @@ fn require_budget<E: StdError + Send + Sync + 'static, P: RepeatPacer>(
 
 const fn operation_timeout(operation: SnapshotOperationKind) -> Duration {
     match operation {
-        SnapshotOperationKind::Search { .. } => SNAPSHOT_OPERATION_TIMEOUT,
+        SnapshotOperationKind::Search { .. } | SnapshotOperationKind::Meter { .. } => {
+            SNAPSHOT_OPERATION_TIMEOUT
+        }
         SnapshotOperationKind::Dump0 | SnapshotOperationKind::Dump1 => SNAPSHOT_DUMP_TIMEOUT,
     }
 }
 
-fn exchange_validated<S: PersistentSnapshotSession, P: StdError + Send + Sync + 'static>(
+pub(crate) fn exchange_validated<
+    S: PersistentSnapshotSession,
+    P: StdError + Send + Sync + 'static,
+>(
     session: &mut S,
     operation: SnapshotOperation,
 ) -> Result<Vec<u8>, CaptureBodyError<S::Error, P>> {
@@ -747,11 +764,16 @@ fn validate_response(operation: SnapshotOperation, frame: &[u8]) -> Result<(), S
                 });
             }
         }
+        SnapshotOperationKind::Meter { .. } => {
+            MeterReadingV1::parse(frame, operation.expected_device())?;
+        }
         SnapshotOperationKind::Dump0 | SnapshotOperationKind::Dump1 => {
             let (expected_part, expected_section) = match operation.kind() {
                 SnapshotOperationKind::Dump0 => (DumpPart::Part0, SnapshotSection::Dump0),
                 SnapshotOperationKind::Dump1 => (DumpPart::Part1, SnapshotSection::Dump1),
-                SnapshotOperationKind::Search { .. } => unreachable!(),
+                SnapshotOperationKind::Search { .. } | SnapshotOperationKind::Meter { .. } => {
+                    unreachable!()
+                }
             };
             if frame.len() != operation.response_limit() {
                 return Err(SnapshotError::InvalidDumpLength {
@@ -790,7 +812,10 @@ fn validate_response(operation: SnapshotOperation, frame: &[u8]) -> Result<(), S
     Ok(())
 }
 
-fn with_finish<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>(
+pub(crate) fn with_finish<
+    E: StdError + Send + Sync + 'static,
+    P: StdError + Send + Sync + 'static,
+>(
     error: CaptureBodyError<E, P>,
     finish_error: Option<E>,
 ) -> SnapshotCaptureError<E, P> {

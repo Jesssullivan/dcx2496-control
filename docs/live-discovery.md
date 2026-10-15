@@ -92,6 +92,31 @@ Offline `control diff` is available without a live feature. It validates one
 raw snapshot plus one strict desired profile and emits the immutable apply and
 rollback carriers consumed by the live commands.
 
+## Read-only meter
+
+```sh
+dcxctl discovery live-meter --tty /dev/cu.usbserial-EXACT_DEVICE --expected-device 0
+```
+
+On one persistent 38400 session the meter collects one valid Search identity
+(an empty Search may be replayed at the five-second cadence, at most three
+attempts in all), then issues exactly ten `Query::Ping` frames
+(`F0 00 20 32 <dev> 0E 44 00 00 F7`), each preceded by at least 500 ms. Each
+reply must be one exact 25-byte function-`0x04` frame from the expected
+address. Frame bytes 8-10 decode as inputs A/B/C and bytes 11-16 as outputs
+1-6: the low five bits are a level step 0-6 (5 warn, 6 clip) and bit 5 is the
+limiter. A level above 6 or a set bit 6 fails closed; the other payload bytes
+stay opaque and unserialized. The whole session is bounded by 30 seconds.
+This layout is a lane hypothesis until a named-device capture agrees, and each
+reading carries that evidence class.
+
+The meter never writes remote mode, direct parameters, or any other frame, so
+session finish has no receive-direct quiescence to perform. Any timeout,
+oversized reply, wrong address, or out-of-domain byte stops the run; the JSON
+result (`dcx.live-meter-result/v1`) still lists every reading validated before
+the stop. `dcxctl discovery validate-meter FILE --expected-device N` decodes
+one offline reply with the same rules.
+
 ## Build
 
 On the aarch64 Darwin builder:

@@ -2,6 +2,7 @@ use std::{cell::RefCell, collections::VecDeque, path::PathBuf, rc::Rc, time::Dur
 
 use dcx_core::{
     SnapshotSection,
+    meter::METER_RESPONSE_LEN,
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DeviceId, DirectParameterAction, RemoteMode,
     },
@@ -9,6 +10,7 @@ use dcx_core::{
 use dcx_transport::{
     Known38400SearchError, Known38400SearchOutcome, RepeatPacer, SearchExecutionError,
     SearchOperationKind, SearchOutcome, execute_known_38400_search, execute_search,
+    meter::{LIVE_METER_REQUEST_COUNT, execute_live_meter},
     snapshot::{SNAPSHOT_OPERATION_TIMEOUT, execute_persistent_snapshot},
 };
 
@@ -176,6 +178,7 @@ impl SerialBackend for FakeBackend {
             Some(0x40) => SEARCH_RESPONSE_LIMIT,
             Some(0x50) if bytes.get(9) == Some(&0) => DUMP0_RESPONSE_LEN,
             Some(0x50) if bytes.get(9) == Some(&1) => DUMP1_RESPONSE_LEN,
+            Some(0x44) => METER_RESPONSE_LEN,
             Some(0x20 | 0x3f) => 0,
             _ => panic!("test carrier received an unexpected typed request"),
         };
@@ -1850,6 +1853,50 @@ fn persistent_carrier_captures_exact_search_and_dump_lengths_before_verified_clo
     );
     assert_eq!(captured.snapshot().frame(SnapshotSection::Dump0), dump0);
     assert_eq!(captured.snapshot().frame(SnapshotSection::Dump1), dump1);
+}
+
+#[test]
+fn live_meter_writes_only_search_and_ten_exact_meter_queries_before_verified_close() {
+    let identity = synthetic_response(0);
+    let mut meter = vec![0xf0, 0x00, 0x20, 0x32, 0x00, 0x0e, 0x04, 0x00];
+    meter.extend_from_slice(&[2, 3, 0, 0x21, 3, 0, 0, 0, 0]);
+    meter.extend_from_slice(&[0; 7]);
+    meter.push(0xf7);
+    assert_eq!(meter.len(), METER_RESPONSE_LEN);
+    let mut inbound = identity.to_vec();
+    for _ in 0..LIVE_METER_REQUEST_COUNT {
+        inbound.extend_from_slice(&meter);
+    }
+
+    let writes = Rc::new(RefCell::new(Vec::new()));
+    let mut backend = FakeBackend::with_inbound(inbound).with_shared_writes(Rc::clone(&writes));
+    backend.available_script = std::iter::once(SEARCH_RESPONSE_LIMIT)
+        .chain(std::iter::repeat_n(
+            METER_RESPONSE_LEN,
+            LIVE_METER_REQUEST_COUNT,
+        ))
+        .collect();
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let mut pacer = FastPacer::default();
+
+    let capture = execute_live_meter(carrier, &mut pacer, DeviceId::new(0).unwrap()).unwrap();
+
+    assert_eq!(capture.readings().len(), LIVE_METER_REQUEST_COUNT);
+    assert!(
+        capture
+            .readings()
+            .iter()
+            .all(|reading| { reading.inputs().b.level() == 3 && reading.outputs()[0].limiter() })
+    );
+    let writes = writes.borrow();
+    assert_eq!(writes.len(), 1 + LIVE_METER_REQUEST_COUNT);
+    assert_eq!(writes[0], synthetic_search_request());
+    for write in &writes[1..] {
+        assert_eq!(
+            write.as_slice(),
+            [0xf0, 0x00, 0x20, 0x32, 0x00, 0x0e, 0x44, 0x00, 0x00, 0xf7]
+        );
+    }
 }
 
 #[test]
