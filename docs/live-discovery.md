@@ -114,8 +114,12 @@ The meter never writes remote mode, direct parameters, or any other frame, so
 session finish has no receive-direct quiescence to perform. Any timeout,
 oversized reply, wrong address, or out-of-domain byte stops the run; the JSON
 result (`dcx.live-meter-result/v1`) still lists every reading validated before
-the stop. `dcxctl discovery validate-meter FILE --expected-device N` decodes
-one offline reply with the same rules.
+the stop. Its `designRemoteModeWrites` and `designParameterWrites` fields are
+fixed properties of this closed path, not counts measured from carrier
+receipts. An out-of-domain error names the raw meter byte so a failed first
+run still shows what the device sent for that channel.
+`dcxctl discovery validate-meter FILE --expected-device N` decodes one offline
+reply with the same rules.
 
 ## Build
 

@@ -27,12 +27,29 @@ source; it opened no serial device. R-HOOK-CONVERGENCE-20261004 (R-N13).
   apply path reads or writes it yet. The operator set the front panel to Analog
   at about 22:03 ET on 2026-10-14; the synthetic control-room profile now says
   `analog`.
+- Compatibility: `LabProfileV1` keeps `deny_unknown_fields` and the same
+  `schema_version`/`profile_revision`, so a dcxctl built before this field
+  (for example a legalab-pinned binary) rejects any profile that sets
+  `input_ab_source`, including `SYNTHETIC-control-room-v1.json`. The pinned
+  `safe-muted-v1.json` omits it and is unaffected. Bump the revision when a
+  consumer starts emitting the field.
 
 ## Evidence class
 
 The meter layout and the Dump0[119] map are lane hypotheses. Every fixture is
 synthetic. Nothing here is a named-device observation until a live-meter run
 returns readings that agree with audible signal.
+
+## Review fixups (2026-10-14)
+
+- AGENTS.md now lists `discovery live-meter` among the closed live-control
+  operations.
+- `MeterError::LevelOutOfRange` carries the raw byte, like `ReservedBit`.
+- The result's write fields are renamed `designRemoteModeWrites` and
+  `designParameterWrites`: design properties, not measured receipt counts.
+- `tests/fixture_contract.sh` now refuses `live-meter` in default-build help.
+- Left as is: each meter reply is parsed twice (once in `validate_response`,
+  once in `meter_body`); harmless.
 
 ## Open
 

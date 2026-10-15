@@ -89,8 +89,10 @@ fn result(
         "schemaVersion": RESULT_SCHEMA,
         "status": status,
         "mode": "read_only_meter",
-        "remoteModeWrites": 0,
-        "parameterWrites": 0,
+        // Design properties of this closed path (it has no such write call),
+        // not counts measured from carrier receipts.
+        "designRemoteModeWrites": 0,
+        "designParameterWrites": 0,
         "selectedBaud": FALLBACK_BAUD,
         "expectedDevice": expected_device,
         "identityAttemptLimit": LIVE_METER_IDENTITY_ATTEMPT_LIMIT,

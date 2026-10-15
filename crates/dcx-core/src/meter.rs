@@ -101,6 +101,7 @@ impl MeterValue {
             return Err(MeterError::LevelOutOfRange {
                 channel: channel.label(),
                 level,
+                raw,
             });
         }
         Ok(Self {
@@ -250,8 +251,8 @@ pub enum MeterError {
     #[error("{channel} meter byte {raw:#04x} sets undocumented bit 6")]
     ReservedBit { channel: String, raw: u8 },
     /// A level step exceeded the documented 0 through 6 range.
-    #[error("{channel} meter level {level} is above the documented maximum 6")]
-    LevelOutOfRange { channel: String, level: u8 },
+    #[error("{channel} meter byte {raw:#04x} has level {level}, above the documented maximum 6")]
+    LevelOutOfRange { channel: String, level: u8, raw: u8 },
     /// The envelope failed protocol validation.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
@@ -378,6 +379,7 @@ mod tests {
             Err(MeterError::LevelOutOfRange {
                 channel: "input A".to_owned(),
                 level: 7,
+                raw: 0x07,
             })
         );
         assert_eq!(
@@ -385,6 +387,7 @@ mod tests {
             Err(MeterError::LevelOutOfRange {
                 channel: "output 6".to_owned(),
                 level: 0x1f,
+                raw: 0x3f,
             })
         );
         assert_eq!(

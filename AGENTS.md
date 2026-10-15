@@ -20,7 +20,12 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   closed operations collect ten Search identities with at most ten paced
   empty-timeout replays (rollback's single pre-inverse identity shares that
   replay allowance), typed remote mode, exact Dump0/Dump1
-  snapshot/readback, and reviewed direct-parameter plans.
+  snapshot/readback, reviewed direct-parameter plans, and the read-only
+  `discovery live-meter`: one Search identity (at most three attempts, only
+  empty timeouts replay) then exactly ten paced fixed `Query::Ping` frames,
+  each reply an exact 25-byte function-`0x04` frame, inside a 30 s budget,
+  with no remote-mode or parameter write; its meter-byte layout is a lane
+  hypothesis unverified on the named device.
   It never enumerates ports or accepts caller-supplied frames, baud, retry,
   timeout, remote-mode bytes, or generic writes.
 - Mutation is snapshot -> strict reviewed-address semantic diff -> immutable

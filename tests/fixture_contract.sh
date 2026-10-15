@@ -53,7 +53,7 @@ if "${dcxctl}" discovery validate-meter "${search_fixture}" --expected-device 0 
   exit 1
 fi
 discovery_help=$("${dcxctl}" discovery --help)
-if grep -Eq '(^|[[:space:]])(live-search|prepare|live|repeat)([[:space:]]|$)' <<<"${discovery_help}"; then
+if grep -Eq '(^|[[:space:]])(live-search|live-meter|prepare|live|repeat)([[:space:]]|$)' <<<"${discovery_help}"; then
   echo "default dcxctl unexpectedly exposes live discovery" >&2
   exit 1
 fi
