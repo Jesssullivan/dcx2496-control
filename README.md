@@ -88,8 +88,20 @@ dcxctl discovery live-search \
   --expected-device 0
 ```
 
+A read-only level meter confirms one Search identity, then sends ten fixed
+meter queries 500 ms apart and decodes each exact 25-byte reply. It writes no
+remote mode and no parameter:
+
+```sh
+dcxctl discovery live-meter \
+  --tty /dev/cu.usbserial-EXACT_DEVICE \
+  --expected-device 0
+```
+
 A complete raw `SnapshotV1` contains one validated identity plus exact 1015-byte
-Dump0 and 911-byte Dump1 frames and their canonical digests:
+Dump0 and 911-byte Dump1 frames and their canonical digests. Capture is not
+query-only: it writes transmit remote mode (`3F 08`) before Dump0 and
+receive-direct (`3F 04`) after Dump1:
 
 ```sh
 dcxctl control snapshot \

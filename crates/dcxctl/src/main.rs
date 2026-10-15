@@ -3,6 +3,8 @@
 
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 mod live_discovery;
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+mod live_meter;
 
 mod feedback_cli;
 mod live_control;
@@ -19,6 +21,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use dcx_core::{
     LabProfileV1,
     discovery::QueryOnlyDiscovery,
+    meter::MeterReadingV1,
     protocol::{self, DeviceId, DumpPart, MAX_FRAME_LEN, Query},
     rew::{self, MAX_REW_BYTES},
     routing::{InputSum, OutputSource},
@@ -259,9 +262,29 @@ enum DiscoveryCommand {
         #[arg(long)]
         expected_device: u8,
     },
+    /// Validate and decode one offline 25-byte meter reply.
+    ValidateMeter {
+        file: PathBuf,
+        /// Reviewed DCX profile device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+    },
     /// Run one DCX Search and nine repeats at the MVP 38400 binding.
     #[cfg(all(feature = "live-control", target_os = "macos"))]
     LiveSearch {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+    },
+    /// Read-only: one Search identity, then ten meter queries 500 ms apart.
+    ///
+    /// Issues no remote-mode, parameter, or other write besides the fixed
+    /// Search and meter query frames.
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    LiveMeter {
         /// Exact Darwin FTDI callout node; ports are never enumerated.
         #[arg(long)]
         tty: PathBuf,
@@ -583,11 +606,28 @@ fn discovery(command: DiscoveryCommand) -> Result<(), Box<dyn Error>> {
             let response = discovery.accept_candidates(&[&bytes])?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
+        DiscoveryCommand::ValidateMeter {
+            file,
+            expected_device,
+        } => {
+            let bytes = decode_fixture(&read_bounded(
+                &file,
+                MAX_DECODE_FILE_BYTES,
+                "meter response fixture",
+            )?)?;
+            let reading = MeterReadingV1::parse(&bytes, DeviceId::new(expected_device)?)?;
+            println!("{}", serde_json::to_string_pretty(&reading)?);
+        }
         #[cfg(all(feature = "live-control", target_os = "macos"))]
         DiscoveryCommand::LiveSearch {
             tty,
             expected_device,
         } => live_discovery::run(tty, expected_device)?,
+        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        DiscoveryCommand::LiveMeter {
+            tty,
+            expected_device,
+        } => live_meter::run(tty, expected_device)?,
     }
     Ok(())
 }

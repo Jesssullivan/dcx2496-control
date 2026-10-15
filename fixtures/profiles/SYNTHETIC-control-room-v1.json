@@ -11,6 +11,7 @@
     "auto_eq_enabled": false,
     "phantom_15v_enabled": false
   },
+  "input_ab_source": "analog",
   "outputs": [
     {
       "output": 1,

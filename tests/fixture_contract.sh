@@ -9,6 +9,7 @@ desired_profile=$5
 rew_fixture=$6
 o4_mute_on_fixture=$7
 o4_mute_off_fixture=$8
+meter_fixture=$9
 digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 "${dcxctl}" decode --file "${protocol_fixture}" >/dev/null
@@ -38,8 +39,21 @@ if [[ $(grep -c '"baud":' <<<"${plan_output}") -ne 2 ]]; then
   exit 1
 fi
 "${dcxctl}" discovery validate-response "${search_fixture}" --expected-device 0 >/dev/null
+# Read-only meter reply: inputs A/B/C then outputs 1-6, level in the low five
+# bits and limiter in bit 5; the reply must come from the expected address.
+meter_output=$("${dcxctl}" discovery validate-meter "${meter_fixture}" --expected-device 0)
+grep -q '"evidence_class": "lane_hypothesis_unverified_on_named_device"' <<<"${meter_output}"
+grep -q '"limiter": true' <<<"${meter_output}"
+if "${dcxctl}" discovery validate-meter "${meter_fixture}" --expected-device 1 >/dev/null 2>&1; then
+  echo "meter reply from another device address was accepted" >&2
+  exit 1
+fi
+if "${dcxctl}" discovery validate-meter "${search_fixture}" --expected-device 0 >/dev/null 2>&1; then
+  echo "a Search identity was accepted as a meter reply" >&2
+  exit 1
+fi
 discovery_help=$("${dcxctl}" discovery --help)
-if grep -Eq '(^|[[:space:]])(live-search|prepare|live|repeat)([[:space:]]|$)' <<<"${discovery_help}"; then
+if grep -Eq '(^|[[:space:]])(live-search|live-meter|prepare|live|repeat)([[:space:]]|$)' <<<"${discovery_help}"; then
   echo "default dcxctl unexpectedly exposes live discovery" >&2
   exit 1
 fi

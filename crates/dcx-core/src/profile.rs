@@ -35,8 +35,46 @@ pub struct LabProfileV1 {
     pub device_id: u8,
     /// Safety-critical Input C mode and feature state.
     pub input_c: InputCProfile,
+    /// Input A/B source selector. Absent means the profile does not manage it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_ab_source: Option<InputAbSource>,
     /// Every output 1 through 6, exactly once.
     pub outputs: Vec<OutputProfile>,
+}
+
+/// Dump0 frame byte index carrying the Input A/B source selector.
+///
+/// Lane hypothesis (0 analog, 1 AES/EBU), unverified on the named device; no
+/// snapshot decoder or apply path reads or writes it yet.
+pub const INPUT_AB_SOURCE_DUMP0_INDEX: usize = 119;
+
+/// DCX Input A/B source selector (front-panel setup).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputAbSource {
+    /// Balanced analog inputs A and B.
+    Analog,
+    /// Digital AES/EBU input carrying A and B.
+    AesEbu,
+}
+
+impl InputAbSource {
+    /// Raw Dump0 selector code under the lane hypothesis.
+    pub const fn dump0_code(self) -> u8 {
+        match self {
+            Self::Analog => 0,
+            Self::AesEbu => 1,
+        }
+    }
+
+    /// Decode a raw Dump0 selector code; any other code is unknown.
+    pub const fn from_dump0_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Analog),
+            1 => Some(Self::AesEbu),
+            _ => None,
+        }
+    }
 }
 
 /// Safety-critical Input C configuration.
@@ -668,6 +706,7 @@ mod tests {
                 auto_eq_enabled: false,
                 phantom_15v_enabled: false,
             },
+            input_ab_source: None,
             outputs: (1..=6)
                 .map(|output| OutputProfile {
                     output,
@@ -694,6 +733,42 @@ mod tests {
             output.model_verified = true;
         }
         profile
+    }
+
+    #[test]
+    fn input_ab_source_is_optional_closed_and_diffed() {
+        let mut json = serde_json::to_value(safe_profile()).unwrap();
+        assert!(json.get("input_ab_source").is_none());
+        let absent = LabProfileV1::from_json(json.to_string().as_bytes()).unwrap();
+        assert_eq!(absent.input_ab_source, None);
+
+        json["input_ab_source"] = "analog".into();
+        let analog = LabProfileV1::from_json(json.to_string().as_bytes()).unwrap();
+        assert_eq!(analog.input_ab_source, Some(InputAbSource::Analog));
+        let diff = absent.diff(&analog).unwrap();
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].path, "$.input_ab_source");
+        assert_eq!(diff.changes[0].after, "analog");
+
+        json["input_ab_source"] = "aes_ebu".into();
+        assert_eq!(
+            LabProfileV1::from_json(json.to_string().as_bytes())
+                .unwrap()
+                .input_ab_source,
+            Some(InputAbSource::AesEbu)
+        );
+        json["input_ab_source"] = "spdif".into();
+        assert!(LabProfileV1::from_json(json.to_string().as_bytes()).is_err());
+
+        for source in [InputAbSource::Analog, InputAbSource::AesEbu] {
+            assert_eq!(
+                InputAbSource::from_dump0_code(source.dump0_code()),
+                Some(source)
+            );
+        }
+        assert_eq!(InputAbSource::Analog.dump0_code(), 0);
+        assert_eq!(InputAbSource::AesEbu.dump0_code(), 1);
+        assert_eq!(InputAbSource::from_dump0_code(2), None);
     }
 
     #[test]
