@@ -44,7 +44,7 @@ use crate::{
         MAX_LIMITER_THRESHOLD_CODE, MAX_LONG_DELAY_CODE, MAX_SHORT_DELAY_CODE, MUTE_PARAMETER,
         OUTPUT_COUNT, OutputField, PEQ_BANDS, POLARITY_PARAMETER, ReviewedAddress,
         SHORT_DELAY_PARAMETER, SOURCE_PARAMETER, TYPED_WRITE_OUTPUTS, UNITY_GAIN_CODE,
-        band_parameter, output_channel, reviewed_address,
+        band_parameter, output_channel, reviewed_address, routing_rank,
     },
     peq_bank::{self, PeqBankError, decode_peq_bank, frequency_hz, gain_db, q_value},
     protocol::{DeviceId, DirectParameterAction, DirectParameterCommand, ProtocolError},
@@ -142,42 +142,42 @@ impl CrossoverSide {
     }
 }
 
-/// Crossover filter type, in device code order.
+/// Crossover filter type; the discriminant is the device code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrossoverFilter {
     /// Off, code 0.
     #[serde(rename = "off")]
-    Off,
+    Off = 0,
     /// Butterworth 6 dB/oct, code 1.
     #[serde(rename = "bw6")]
-    Butterworth6,
+    Butterworth6 = 1,
     /// Butterworth 12 dB/oct, code 2.
     #[serde(rename = "bw12")]
-    Butterworth12,
+    Butterworth12 = 2,
     /// Bessel 12 dB/oct, code 3.
     #[serde(rename = "bes12")]
-    Bessel12,
+    Bessel12 = 3,
     /// Linkwitz-Riley 12 dB/oct, code 4.
     #[serde(rename = "lr12")]
-    LinkwitzRiley12,
+    LinkwitzRiley12 = 4,
     /// Butterworth 18 dB/oct, code 5.
     #[serde(rename = "bw18")]
-    Butterworth18,
+    Butterworth18 = 5,
     /// Butterworth 24 dB/oct, code 6.
     #[serde(rename = "bw24")]
-    Butterworth24,
+    Butterworth24 = 6,
     /// Bessel 24 dB/oct, code 7.
     #[serde(rename = "bes24")]
-    Bessel24,
+    Bessel24 = 7,
     /// Linkwitz-Riley 24 dB/oct, code 8.
     #[serde(rename = "lr24")]
-    LinkwitzRiley24,
+    LinkwitzRiley24 = 8,
     /// Butterworth 48 dB/oct, code 9.
     #[serde(rename = "bw48")]
-    Butterworth48,
+    Butterworth48 = 9,
     /// Linkwitz-Riley 48 dB/oct, code 10.
     #[serde(rename = "lr48")]
-    LinkwitzRiley48,
+    LinkwitzRiley48 = 10,
 }
 
 impl CrossoverFilter {
@@ -196,12 +196,8 @@ impl CrossoverFilter {
     ];
 
     /// Device code.
-    pub fn code(self) -> u16 {
-        let index = Self::ALL
-            .iter()
-            .position(|filter| *filter == self)
-            .unwrap_or_default();
-        u16::try_from(index).unwrap_or_default()
+    pub const fn code(self) -> u16 {
+        self as u16
     }
 
     /// Filter of a device code, if it is one.
@@ -305,7 +301,8 @@ pub enum TypedChange {
     OutputGain {
         /// Output, 1 through 4.
         output: u8,
-        /// Gain, -15 through the policy ceiling (at most 0 dB).
+        /// Gain, -15 through +15 dB; a rise is bound by the policy step and
+        /// ceiling.
         gain_db: f64,
     },
     /// Output mute.
@@ -354,7 +351,8 @@ pub enum TypedChange {
     InputGain {
         /// Input A, B, or C.
         input: InputName,
-        /// Gain, -15 through the policy ceiling (at most 0 dB).
+        /// Gain, -15 through +15 dB; a rise is bound by the policy step and
+        /// ceiling.
         gain_db: f64,
     },
     /// Output source, O3 or O4 only. Needs `allow_routing` in the plan and
@@ -381,6 +379,9 @@ pub struct WritePlanV1 {
     /// Explicit plan-level consent to unmuting one of O1 through O4.
     #[serde(default)]
     pub allow_unmute: bool,
+    /// Explicit plan-level consent to loosening an active high-pass.
+    #[serde(default)]
+    pub allow_protection_change: bool,
     /// Ordered typed changes, 1 through [`MAX_WRITE_CHANGES`].
     pub changes: Vec<TypedChange>,
 }
@@ -420,6 +421,9 @@ pub struct WritePolicyV1 {
     pub allow_routing: bool,
     /// Caller consent to unmuting one of O1 through O4.
     pub allow_unmute: bool,
+    /// Caller consent to loosening an active high-pass (type change, off, or
+    /// a lower corner).
+    pub allow_protection_change: bool,
 }
 
 impl Default for WritePolicyV1 {
@@ -430,6 +434,7 @@ impl Default for WritePolicyV1 {
             max_actions: DEFAULT_MAX_ACTIONS,
             allow_routing: false,
             allow_unmute: false,
+            allow_protection_change: false,
         }
     }
 }
@@ -638,16 +643,17 @@ fn action(
 ///
 /// # Errors
 ///
-/// Rejects O5/O6 or another invalid target, values outside their device or
-/// cut-only range, missing crossover frequencies, and empty delay or limiter
-/// changes.
+/// Rejects O5/O6 or another invalid target, values outside their device
+/// range, PEQ boosts, missing crossover frequencies, and empty delay or
+/// limiter changes.
 #[allow(clippy::too_many_lines)]
 pub fn encode_change(
     index: usize,
     change: &TypedChange,
-    policy: &WritePolicyV1,
 ) -> Result<Vec<DirectParameterAction>, TypedWriteError> {
-    let ceiling_db = gain_db(policy.ceiling_code());
+    // Level targets may sit anywhere in the device range here; the policy
+    // ceiling binds rises only, so a cut from above the ceiling is admitted.
+    let level_maximum_db = gain_db(crate::layout::MAX_GAIN_CODE);
     match change {
         TypedChange::PeqBand {
             output,
@@ -775,7 +781,7 @@ pub fn encode_change(
             Ok(vec![action(
                 output_channel(*output),
                 GAIN_PARAMETER,
-                encode_gain(&format!("O{output} gain"), *gain_db, ceiling_db)?,
+                encode_gain(&format!("O{output} gain"), *gain_db, level_maximum_db)?,
             )?])
         }
         TypedChange::OutputMute { output, muted } => {
@@ -875,7 +881,7 @@ pub fn encode_change(
         TypedChange::InputGain { input, gain_db } => Ok(vec![action(
             input.channel(),
             GAIN_PARAMETER,
-            encode_gain(&format!("input {input:?} gain"), *gain_db, ceiling_db)?,
+            encode_gain(&format!("input {input:?} gain"), *gain_db, level_maximum_db)?,
         )?]),
         TypedChange::OutputSource { output, source } => {
             if !(3..=4).contains(output) {
@@ -897,9 +903,10 @@ pub fn encode_change(
 ///
 /// 0 mutes on; 1 level and limiter cuts, limiter on, release; 2 PEQ
 /// deactivation (off, then fewer bands); 3 crossover, delay, polarity and
-/// PEQ band fields (a band's gain first when the cut gets shallower, last
-/// when it deepens); 4 PEQ activation (more bands, then on); 5 level and
-/// threshold rises; 6 sources; 7 unmutes.
+/// PEQ band fields (a band's gain first when its cut deepens, last when it
+/// gets shallower, so the moving band is never louder than either end
+/// state); 4 PEQ activation (more bands, then on); 5 level and threshold
+/// rises; 6 sources in routing rank (O4 before O3); 7 unmutes.
 fn phase(address: ReviewedAddress, before: u16, after: u16) -> (u8, u8) {
     let rising = after > before;
     match address.field {
@@ -922,12 +929,12 @@ fn phase(address: ReviewedAddress, before: u16, after: u16) -> (u8, u8) {
             ..
         } => {
             if rising {
-                (3, 0)
-            } else {
                 (3, 2)
+            } else {
+                (3, 0)
             }
         }
-        OutputField::Source | OutputField::InputSum => (6, 0),
+        OutputField::Source | OutputField::InputSum => (6, routing_rank(address).unwrap_or(0)),
         _ => (3, 1),
     }
 }
@@ -1087,9 +1094,11 @@ pub struct WireBudgetV1 {
 /// Rejects a policy outside its hard bounds, a plan for another device, an
 /// unmuted O5 or O6 in the baseline, any O5/O6 target, out-of-range values,
 /// EQ boosts, duplicate addresses, an unmute or source change without both
-/// consents, an unmute together with a source change, a level rise past the
-/// policy step or ceiling, a limiter switch-off, too many actions, a baseline
-/// value outside its documented domain, and every core carrier refusal.
+/// consents, an unmute together with a source change, a loosened active
+/// high-pass without consent, a summed level rise past the policy step, a
+/// level rise past the ceiling, a limiter switch-off, too many actions, a
+/// baseline value outside its documented domain, and every core carrier
+/// refusal.
 #[allow(clippy::too_many_lines)]
 pub fn plan_writes(
     baseline: &SnapshotV1,
@@ -1105,7 +1114,7 @@ pub fn plan_writes(
     }
     let mut encoded = Vec::new();
     for (index, change) in plan.changes.iter().enumerate() {
-        for action in encode_change(index, change, policy)? {
+        for action in encode_change(index, change)? {
             encoded.push(Encoded {
                 change: index,
                 action,
@@ -1124,10 +1133,10 @@ pub fn plan_writes(
     let effective = WritePolicyV1 {
         allow_routing: policy.allow_routing && plan.allow_routing,
         allow_unmute: policy.allow_unmute && plan.allow_unmute,
+        allow_protection_change: policy.allow_protection_change && plan.allow_protection_change,
         ..*policy
     };
     let mut changed = Vec::new();
-    let mut touched_changes = BTreeSet::new();
     for entry in encoded {
         let address = require_reviewed(entry.action)?;
         let before = baseline.read_reviewed(address);
@@ -1138,55 +1147,38 @@ pub fn plan_writes(
             });
         }
         if before != entry.action.value() {
-            touched_changes.insert(entry.change);
             changed.push((entry, address, before));
         }
     }
-    let actions: Vec<DirectParameterAction> = {
-        let mut ordered: Vec<_> = changed.iter().enumerate().collect();
-        ordered.sort_by_key(|(position, (entry, address, before))| {
-            (phase(*address, *before, entry.action.value()), *position)
-        });
-        ordered
-            .into_iter()
-            .map(|(_, (entry, _, _))| entry.action)
-            .collect()
-    };
+    // Stable: equal phases keep plan order.
+    changed.sort_by_key(|(entry, address, before)| phase(*address, *before, entry.action.value()));
+    let actions: Vec<DirectParameterAction> =
+        changed.iter().map(|(entry, _, _)| entry.action).collect();
     check_policy(baseline, &actions, &effective)?;
+    let touched: BTreeSet<usize> = changed.iter().map(|(entry, _, _)| entry.change).collect();
     let unchanged_changes = (0..plan.changes.len())
-        .filter(|index| !touched_changes.contains(index))
-        .collect();
-    let by_address: BTreeMap<(u8, u8), usize> = changed
-        .iter()
-        .map(|(entry, _, _)| {
-            (
-                (entry.action.channel(), entry.action.parameter()),
-                entry.change,
-            )
-        })
+        .filter(|index| !touched.contains(index))
         .collect();
     let transaction = if actions.is_empty() {
         ApplyTransactionV1::stage(baseline.clone(), baseline.clone(), Vec::new(), Vec::new())?
     } else {
         ApplyTransactionV1::stage_projected(baseline.clone(), actions.clone())?
     };
-    let writes = actions
+    let writes = changed
         .iter()
-        .map(|action| {
-            let address = require_reviewed(*action)?;
-            let before = baseline.read_reviewed(address);
+        .map(|(entry, address, before)| {
             Ok(PlannedWriteV1 {
-                change: by_address[&(action.channel(), action.parameter())],
+                change: entry.change,
                 output: address.output,
                 field: address.field.label(),
-                channel: action.channel(),
-                parameter: action.parameter(),
-                before_code: before,
-                after_code: action.value(),
-                before: describe(address.field, before),
-                after: describe(address.field, action.value()),
-                wire: wire_bytes(*action),
-                dump_offsets: DumpOffsetsV1::of(address),
+                channel: entry.action.channel(),
+                parameter: entry.action.parameter(),
+                before_code: *before,
+                after_code: entry.action.value(),
+                before: describe(address.field, *before),
+                after: describe(address.field, entry.action.value()),
+                wire: wire_bytes(baseline.device(), entry.action)?,
+                dump_offsets: DumpOffsetsV1::of(*address),
             })
         })
         .collect::<Result<Vec<_>, TypedWriteError>>()?;
@@ -1236,10 +1228,15 @@ fn require_reviewed(action: DirectParameterAction) -> Result<ReviewedAddress, Ty
     })
 }
 
-fn wire_bytes(action: DirectParameterAction) -> [u8; 4] {
-    let [high, low] = [action.value() / 128, action.value() % 128]
-        .map(|part| u8::try_from(part).unwrap_or(u8::MAX));
-    [action.channel(), action.parameter(), high, low]
+/// The exact four action bytes of a one-action frame, taken from the same
+/// encoder that builds the frame the device receives.
+fn wire_bytes(device: DeviceId, action: DirectParameterAction) -> Result<[u8; 4], TypedWriteError> {
+    let frame = DirectParameterCommand::new(device, vec![action])?.encode()?;
+    // F0 00 20 32 <dev> 0E 20 01 <channel> <parameter> <hi> <lo> F7
+    frame
+        .get(8..12)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .ok_or(TypedWriteError::FrameLayout(frame.len()))
 }
 
 fn hex_upper(bytes: &[u8]) -> String {
@@ -1274,12 +1271,19 @@ pub fn require_reserved_muted(snapshot: &SnapshotV1) -> Result<(), TypedWriteErr
 /// Check an ordered apply action list against the write policy.
 ///
 /// This is the policy half of [`plan_writes`] and also re-validates a durable
-/// apply carrier before `write apply` sends it: the baseline must hold O5 and
-/// O6 muted; no action may address O5 or O6; unmuting needs
-/// `allow_unmute`; a source write needs `allow_routing` and may not share a
-/// plan with an unmute; level and limiter threshold rises are bounded by the
-/// policy step, level gains by the policy ceiling; an enabled limiter stays
-/// on; and the frame holds at most `max_actions` actions.
+/// apply carrier before `write apply` sends it:
+///
+/// - the baseline must hold O5 and O6 muted, and no action may address them;
+/// - unmuting needs `allow_unmute`; a source write needs `allow_routing` and
+///   may not share a plan with an unmute;
+/// - changing the type of an active high-pass, switching it off, or lowering
+///   its corner needs `allow_protection_change`;
+/// - an enabled limiter stays on;
+/// - the summed rise of every level gain, limiter threshold, and effective
+///   PEQ band gain (a band's gain while active, unity while inactive) is at
+///   most the policy step, so rises on one path cannot add up past it;
+/// - a rising level gain stays at or below the policy ceiling;
+/// - the frame holds at most `max_actions` actions.
 ///
 /// # Errors
 ///
@@ -1299,6 +1303,8 @@ pub fn check_policy(
     }
     let mut unmutes = false;
     let mut sources = false;
+    let mut rise: u32 = 0;
+    let mut peq_outputs = BTreeSet::new();
     for action in actions {
         let address = require_reviewed(*action)?;
         if (5..=OUTPUT_COUNT).contains(&address.output) {
@@ -1331,18 +1337,25 @@ pub fn check_policy(
                     output: address.output,
                 });
             }
+            OutputField::HighPassType | OutputField::HighPassFrequency => {
+                let active = read_field(baseline, address.output, HIGH_PASS_TYPE_PARAMETER)? != 0;
+                let loosens = address.field == OutputField::HighPassType || after < before;
+                if active && loosens && !policy.allow_protection_change {
+                    return Err(TypedWriteError::ProtectionChange {
+                        output: address.output,
+                        field: address.field.label(),
+                    });
+                }
+            }
+            field if field.is_peq() => {
+                peq_outputs.insert(address.output);
+            }
             _ => {}
         }
         let step_limited =
             address.field.is_level() || address.field == OutputField::LimiterThreshold;
-        if step_limited && after > before && after - before > policy.step_codes() {
-            return Err(TypedWriteError::GainStep {
-                field: address.field.label(),
-                output: address.output,
-                before,
-                after,
-                maximum_step_db: policy.max_gain_step_db,
-            });
+        if step_limited && after > before {
+            rise += u32::from(after - before);
         }
         if address.field.is_level() && after > before && after > policy.ceiling_code() {
             return Err(TypedWriteError::GainCeiling {
@@ -1356,7 +1369,49 @@ pub fn check_policy(
     if unmutes && sources {
         return Err(TypedWriteError::UnmuteWithRouting);
     }
+    if !peq_outputs.is_empty() {
+        let desired = baseline.project_direct_actions(actions).map_err(|error| {
+            TypedWriteError::Transaction(ApplyTransactionError::Plan(error.into()))
+        })?;
+        for output in peq_outputs {
+            let before = effective_band_gains(baseline, output)?;
+            let after = effective_band_gains(&desired, output)?;
+            for (before, after) in before.iter().zip(&after) {
+                if after > before {
+                    rise += u32::from(after - before);
+                }
+            }
+        }
+    }
+    if rise > u32::from(policy.step_codes()) {
+        return Err(TypedWriteError::GainStep {
+            rise_db: f64::from(rise) / 10.0,
+            maximum_step_db: policy.max_gain_step_db,
+        });
+    }
     Ok(())
+}
+
+fn read_field(snapshot: &SnapshotV1, output: u8, parameter: u8) -> Result<u16, TypedWriteError> {
+    let channel = output_channel(output);
+    let address = reviewed_address(channel, parameter)
+        .ok_or(TypedWriteError::Unreviewed { channel, parameter })?;
+    Ok(snapshot.read_reviewed(address))
+}
+
+/// Gain code each PEQ band applies: its gain while active, unity otherwise.
+fn effective_band_gains(snapshot: &SnapshotV1, output: u8) -> Result<Vec<u16>, TypedWriteError> {
+    let enabled = read_field(snapshot, output, EQ_ENABLED_PARAMETER)? != 0;
+    let count = read_field(snapshot, output, EQ_COUNT_PARAMETER)?;
+    (1..=PEQ_BANDS)
+        .map(|band| {
+            if enabled && u16::from(band) <= count {
+                read_field(snapshot, output, band_parameter(band, BandField::Gain))
+            } else {
+                Ok(UNITY_GAIN_CODE)
+            }
+        })
+        .collect()
 }
 
 /// Check a rollback carrier against the reserved-output rule.
@@ -1665,17 +1720,19 @@ pub enum TypedWriteError {
     /// Limiter switch-off.
     #[error("O{output} limiter is enabled; typed writes never disable a limiter")]
     LimiterDisable { output: u8 },
-    /// Level or threshold rise past the policy step.
+    /// The plan's summed level rise exceeds the policy step.
     #[error(
-        "O{output} {field} code {before} -> {after} rises by more than the {maximum_step_db} dB policy step"
+        "plan raises levels by {rise_db} dB in total (level gains, limiter thresholds, effective PEQ band gains); the policy step is {maximum_step_db} dB"
     )]
-    GainStep {
-        field: String,
-        output: u8,
-        before: u16,
-        after: u16,
-        maximum_step_db: f64,
-    },
+    GainStep { rise_db: f64, maximum_step_db: f64 },
+    /// An active high-pass would be loosened without consent.
+    #[error(
+        "O{output} {field}: loosening an active high-pass needs allow_protection_change in the plan and --allow-protection-change"
+    )]
+    ProtectionChange { output: u8, field: String },
+    /// The encoded one-action frame had an unexpected layout.
+    #[error("one-action direct frame has unexpected length {0}")]
+    FrameLayout(usize),
     /// Level rise past the policy ceiling.
     #[error("O{output} {field} {after_db} dB rises above the {ceiling_db} dB policy ceiling")]
     GainCeiling {

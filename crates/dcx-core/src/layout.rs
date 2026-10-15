@@ -594,6 +594,15 @@ pub struct ReviewedAddress {
     pub location: DumpLocation,
 }
 
+impl ReviewedAddress {
+    /// Whether the address belongs to the typed-write lane: a typed-write
+    /// field, or one of the O1-O3 mutes. Only `dcxctl write` may send it.
+    pub const fn is_typed_lane(self) -> bool {
+        self.field.is_typed_write()
+            || (matches!(self.field, OutputField::Mute) && self.output >= 1 && self.output <= 3)
+    }
+}
+
 /// Classify one direct-parameter address against the closed allowlist.
 ///
 /// The allowlist is: PEQ on/off (`0x06`), PEQ band count (`0x07`), and the

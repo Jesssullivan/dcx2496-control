@@ -9,13 +9,17 @@
   two consents). The dry-run `dcx.write-transaction/v1` prints the exact
   frame bytes, the dump offsets each value lands at, and the apply/rollback
   carriers. Policy refusals cover O5/O6 (never addressed; every plan refused
-  while either reads unmuted), unmute and routing without consent, level rises
-  past +3 dB or 0 dB, limiter switch-off, EQ boosts, and more than 16 actions.
+  while either reads unmuted), unmute, routing or loosening an active
+  high-pass without consent, a summed level rise (gains, thresholds,
+  effective PEQ band gains) past +3 dB, a level rise past 0 dB, limiter
+  switch-off, EQ boosts, and more than 16 actions. `control apply|rollback`
+  refuse typed-write-lane carriers.
   The reviewed allowlist gains the O1-O3 mutes, the O1-O4 gain, delay,
   crossover, limiter and polarity rows, and the input A-C gains, transcribed
   from the pinned DuinoDCX tables and pending named-device readback. Core apply
-  carriers now refuse level rises past unity or +3 dB and limiter switch-off
-  for every lane. See `docs/typed-writes.md`.
+  carriers now refuse level rises past unity or +3 dB, limiter switch-off,
+  and typed-write-lane actions while O5/O6 read unmuted, for every lane. See
+  `docs/typed-writes.md`.
 - Give the rollback identity step the same paced Search qualification as
   snapshot and apply: a fresh rollback session now replays empty Search
   timeouts (attempt one immediate, five-second cadence, at most ten replays)

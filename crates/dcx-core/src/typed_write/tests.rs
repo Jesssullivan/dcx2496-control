@@ -92,6 +92,7 @@ fn plan(changes: Vec<TypedChange>) -> WritePlanV1 {
         device_id: 0,
         allow_routing: false,
         allow_unmute: false,
+        allow_protection_change: false,
         changes,
     }
 }
@@ -122,7 +123,10 @@ fn protocol_notes_input_a_gain_example_is_reproduced_exactly() {
     let code = encode_gain("input A", 6.0, 15.0).unwrap();
     assert_eq!(code, 210);
     let action = DirectParameterAction::new(InputName::A.channel(), GAIN_PARAMETER, code).unwrap();
-    assert_eq!(wire_bytes(action), [0x01, 0x02, 0x01, 0x52]);
+    assert_eq!(
+        wire_bytes(DeviceId::new(0).unwrap(), action).unwrap(),
+        [0x01, 0x02, 0x01, 0x52]
+    );
     let command = DirectParameterCommand::new(DeviceId::new(0).unwrap(), vec![action]).unwrap();
     assert_eq!(
         hex_upper(&command.encode().unwrap()),
@@ -134,7 +138,7 @@ fn protocol_notes_input_a_gain_example_is_reproduced_exactly() {
             input: InputName::A,
             gain_db: 6.0,
         }]),
-        Err(TypedWriteError::OutOfRange { .. })
+        Err(TypedWriteError::GainCeiling { .. })
     ));
 }
 
@@ -151,11 +155,11 @@ fn peq_band_golden_vector_and_exact_rollback() {
     }])
     .unwrap();
     // Frequency 53 (63.1 Hz), Q 32 (3.98), gain 90 (-6 dB). The kind is
-    // already a bell and is not written. The deepening cut is written last.
+    // already a bell and is not written. The deepening cut is written first.
     let expected = [
+        [0x05, 0x15, 0x00, 0x5a],
         [0x05, 0x13, 0x00, 0x35],
         [0x05, 0x14, 0x00, 0x20],
-        [0x05, 0x15, 0x00, 0x5a],
     ];
     assert_eq!(wires(&transaction), expected);
     assert_eq!(
@@ -163,11 +167,11 @@ fn peq_band_golden_vector_and_exact_rollback() {
         Some(frame(&expected).as_str())
     );
     // Rollback is the exact baseline values of exactly those addresses,
-    // reversed: gain 150, Q 20, frequency 160.
+    // reversed: Q 20, frequency 160, then gain 150 last.
     let rollback = [
-        [0x05, 0x15, 0x01, 0x16],
         [0x05, 0x14, 0x00, 0x14],
         [0x05, 0x13, 0x01, 0x20],
+        [0x05, 0x15, 0x01, 0x16],
     ];
     assert_eq!(
         transaction.rollback_frame_hex.as_deref(),
@@ -181,7 +185,7 @@ fn peq_band_golden_vector_and_exact_rollback() {
     assert!(transaction.dry_run);
     // O1 band 1 lives in Dump0 at the transcribed offsets.
     assert_eq!(transaction.writes[0].dump_offsets.part, 0);
-    assert_eq!(transaction.writes[0].dump_offsets.low, 752);
+    assert_eq!(transaction.writes[1].dump_offsets.low, 752);
 }
 
 #[test]
@@ -203,14 +207,15 @@ fn shallower_cut_writes_gain_first_and_shelves_carry_slope() {
         &WritePolicyV1::default(),
     )
     .unwrap();
-    // Gain 60 -> 120 rises: written first. Frequency 74, kind 0, slope 1.
+    // Gain 60 -> 120 gets shallower: written last, after frequency 74,
+    // kind 0 and slope 1, so the moving band is never louder than its end.
     assert_eq!(
         wires(&transaction),
         [
-            [0x05, 0x1a, 0x00, 0x78],
             [0x05, 0x18, 0x00, 0x4a],
             [0x05, 0x1b, 0x00, 0x00],
             [0x05, 0x1c, 0x00, 0x01],
+            [0x05, 0x1a, 0x00, 0x78],
         ]
     );
 }
@@ -594,7 +599,7 @@ fn peq_activation_writes_fields_then_count_then_enable() {
         .collect();
     assert_eq!(
         order,
-        [0x13, 0x14, 0x15, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER]
+        [0x15, 0x13, 0x14, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER]
     );
     // Rollback deactivates first: enable off, count 0, then the fields.
     let rollback: Vec<_> = transaction
@@ -607,7 +612,7 @@ fn peq_activation_writes_fields_then_count_then_enable() {
         .collect();
     assert_eq!(
         rollback,
-        [EQ_ENABLED_PARAMETER, EQ_COUNT_PARAMETER, 0x15, 0x14, 0x13]
+        [EQ_ENABLED_PARAMETER, EQ_COUNT_PARAMETER, 0x14, 0x13, 0x15]
     );
 }
 
@@ -745,7 +750,7 @@ fn level_rises_are_bounded_by_step_and_ceiling() {
             }],
             tight
         ),
-        Err(TypedWriteError::OutOfRange { .. })
+        Err(TypedWriteError::GainCeiling { .. })
     ));
     assert!(
         attempt(
@@ -1121,11 +1126,183 @@ fn first_bench_write_frames_match_the_documented_procedure() {
     .unwrap();
     assert_eq!(
         transaction.apply_frame_hex.as_deref(),
-        Some("F0002032000E200405150078051300350514002005160001F7")
+        Some("F0002032000E200405130035051400200516000105150078F7")
     );
     assert_eq!(
         transaction.rollback_frame_hex.as_deref(),
-        Some("F0002032000E200405160000051400140513003A0515005FF7")
+        Some("F0002032000E20040515005F05160000051400140513003AF7")
     );
     assert_eq!(transaction.wire_budget.apply_frame_bytes, 25);
+}
+
+#[test]
+fn loosening_an_active_high_pass_needs_both_consents() {
+    let mut builder = Builder::new();
+    builder.set(8, HIGH_PASS_TYPE_PARAMETER, 6);
+    builder.set(8, HIGH_PASS_FREQUENCY_PARAMETER, 180);
+    let base = builder.snapshot();
+    let d4 = TypedChange::Crossover {
+        output: 4,
+        side: CrossoverSide::HighPass,
+        filter: CrossoverFilter::LinkwitzRiley24,
+        frequency_hz: Some(100.0),
+    };
+    let tighten = TypedChange::Crossover {
+        output: 4,
+        side: CrossoverSide::HighPass,
+        filter: CrossoverFilter::Butterworth24,
+        frequency_hz: Some(2000.0),
+    };
+    // Raising the corner of the active filter, same type, is admitted.
+    assert!(plan_writes(&base, &plan(vec![tighten]), &WritePolicyV1::default()).is_ok());
+    let mut document = plan(vec![d4]);
+    let mut policy = WritePolicyV1::default();
+    for (plan_flag, cli_flag) in [(false, false), (true, false), (false, true)] {
+        document.allow_protection_change = plan_flag;
+        policy.allow_protection_change = cli_flag;
+        assert!(matches!(
+            plan_writes(&base, &document, &policy),
+            Err(TypedWriteError::ProtectionChange { output: 4, .. })
+        ));
+    }
+    document.allow_protection_change = true;
+    policy.allow_protection_change = true;
+    let transaction = plan_writes(&base, &document, &policy).unwrap();
+    assert_eq!(
+        wires(&transaction),
+        [[0x08, 0x43, 0x00, 0x4a], [0x08, 0x42, 0x00, 0x08]]
+    );
+    // Switching it off is the same consent.
+    let off = plan(vec![TypedChange::Crossover {
+        output: 4,
+        side: CrossoverSide::HighPass,
+        filter: CrossoverFilter::Off,
+        frequency_hz: None,
+    }]);
+    assert!(matches!(
+        plan_writes(&base, &off, &WritePolicyV1::default()),
+        Err(TypedWriteError::ProtectionChange { .. })
+    ));
+}
+
+#[test]
+fn level_rises_are_summed_across_gains_and_peq_bands() {
+    let mut builder = Builder::new();
+    builder.set(1, GAIN_PARAMETER, 120);
+    builder.set(5, GAIN_PARAMETER, 120);
+    builder.set(5, EQ_ENABLED_PARAMETER, 1);
+    builder.set(5, EQ_COUNT_PARAMETER, 1);
+    builder.set(5, band_parameter(1, BandField::Gain), 100);
+    let base = builder.snapshot();
+    let attempt = |changes| plan_writes(&base, &plan(changes), &WritePolicyV1::default());
+    // +2 dB input A and +2 dB O1 gain are each inside the step, not together.
+    assert!(matches!(
+        attempt(vec![
+            TypedChange::InputGain {
+                input: InputName::A,
+                gain_db: -1.0,
+            },
+            TypedChange::OutputGain {
+                output: 1,
+                gain_db: -1.0,
+            },
+        ]),
+        Err(TypedWriteError::GainStep { .. })
+    ));
+    // A shallower active cut counts: -5 dB to -1 dB is +4 dB.
+    let band = |gain_db| TypedChange::PeqBand {
+        output: 1,
+        band: 1,
+        filter: PeqKind::Bell,
+        frequency_hz: 987.0,
+        gain_db,
+        q: 1.0,
+        shelf_slope_db: None,
+    };
+    assert!(matches!(
+        attempt(vec![band(-1.0)]),
+        Err(TypedWriteError::GainStep { .. })
+    ));
+    assert!(attempt(vec![band(-2.0)]).is_ok());
+    // Switching PEQ off releases the -5 dB cut: also +5 dB.
+    assert!(matches!(
+        attempt(vec![TypedChange::PeqEnabled {
+            output: 1,
+            enabled: false,
+        }]),
+        Err(TypedWriteError::GainStep { .. })
+    ));
+    // Moving an active cut without changing its depth adds nothing.
+    assert!(
+        attempt(vec![TypedChange::PeqBand {
+            output: 1,
+            band: 1,
+            filter: PeqKind::Bell,
+            frequency_hz: 63.0,
+            gain_db: -5.0,
+            q: 4.0,
+            shelf_slope_db: None,
+        }])
+        .is_ok()
+    );
+}
+
+#[test]
+fn sources_follow_routing_rank_and_cuts_from_above_the_ceiling_pass() {
+    let consent = WritePolicyV1 {
+        allow_routing: true,
+        ..WritePolicyV1::default()
+    };
+    let document = WritePlanV1 {
+        allow_routing: true,
+        ..plan(vec![
+            TypedChange::OutputSource {
+                output: 3,
+                source: OutputSource::B,
+            },
+            TypedChange::OutputSource {
+                output: 4,
+                source: OutputSource::B,
+            },
+        ])
+    };
+    let transaction = plan_writes(&baseline(), &document, &consent).unwrap();
+    assert_eq!(
+        wires(&transaction),
+        [[0x08, 0x41, 0x00, 0x01], [0x07, 0x41, 0x00, 0x01]]
+    );
+    // A front-panel +5 dB may be cut to +2 dB; it may not be raised.
+    let mut builder = Builder::new();
+    builder.set(5, GAIN_PARAMETER, 200);
+    let hot = builder.snapshot();
+    let to = |gain_db| {
+        plan_writes(
+            &hot,
+            &plan(vec![TypedChange::OutputGain { output: 1, gain_db }]),
+            &WritePolicyV1::default(),
+        )
+    };
+    assert!(to(2.0).is_ok());
+    assert!(to(5.0).unwrap().writes.is_empty());
+    assert!(matches!(to(6.0), Err(TypedWriteError::GainCeiling { .. })));
+}
+
+#[test]
+fn core_refuses_typed_lane_carriers_while_a_reserved_output_is_live() {
+    let mut builder = Builder::new();
+    builder.set(9, MUTE_PARAMETER, 0);
+    let live = builder.snapshot();
+    let cut = DirectParameterAction::new(5, GAIN_PARAMETER, 140).unwrap();
+    assert!(matches!(
+        ApplyTransactionV1::stage_projected(live.clone(), vec![cut]),
+        Err(ApplyTransactionError::Plan(
+            ApplyPlanError::TypedLaneReservedUnmuted {
+                output: 5,
+                value: 0
+            }
+        ))
+    ));
+    // The older lanes are unchanged: a PEQ cut still plans on that baseline.
+    let peq = DirectParameterAction::new(5, band_parameter(1, BandField::Gain), 140).unwrap();
+    assert!(ApplyTransactionV1::stage_projected(live, vec![peq]).is_ok());
 }

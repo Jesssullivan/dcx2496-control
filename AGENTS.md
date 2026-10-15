@@ -65,7 +65,9 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   fail closed. Typed writes refuse every plan while O5 or O6 reads unmuted,
   never address O5/O6, need explicit plan and command-line consent to unmute
   O1-O4 or change an O3/O4 source, and never combine the two; their rollback
-  is the exact touched inverse, never a stored-preset recall. Auto Align and
+  is the exact touched inverse, never a stored-preset recall. `control
+  apply|rollback` refuse typed-write-lane carriers; only `dcxctl write
+  apply|rollback`, which re-checks the write policy, sends them. Auto Align and
   +15 V have no
   address and must never gain one. No server or automatic apply path belongs
   in the MVP.

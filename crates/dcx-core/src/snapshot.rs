@@ -878,7 +878,8 @@ impl ApplyPlanV1 {
     /// freely but may rise by at most 30 codes (+3 dB) per plan and never to
     /// above unity (0 dB); a limiter threshold may rise by at most 30 codes;
     /// and an enabled limiter may never be switched off. These hold for the
-    /// apply direction only: a rollback restores the verified baseline.
+    /// apply direction only: a rollback restores the verified baseline. Any
+    /// typed-write-lane action also requires O5 and O6 to read muted.
     ///
     /// # Errors
     ///
@@ -912,6 +913,7 @@ impl ApplyPlanV1 {
             let command = DirectParameterCommand::new(diff.device_id, actions)?;
             require_cut_only(command.actions())?;
             require_protective_levels(baseline, command.actions())?;
+            require_typed_lane_reserve(baseline, command.actions())?;
             require_routing_order(command.actions())?;
             let projected = baseline.project_direct_actions(command.actions())?;
             require_no_stored_boost_activation(baseline, command.actions())?;
@@ -1231,6 +1233,32 @@ fn require_protective_levels(
     Ok(())
 }
 
+/// Refuse a typed-write-lane apply while O5 or O6 reads unmuted.
+///
+/// Any action on a typed-write-lane address (see
+/// [`ReviewedAddress::is_typed_lane`]) requires both reserved outputs to read
+/// muted in the baseline, so no such carrier, however it was built, runs
+/// against a state where a reserved output is live.
+fn require_typed_lane_reserve(
+    baseline: &SnapshotV1,
+    actions: &[DirectParameterAction],
+) -> Result<(), ApplyPlanError> {
+    let typed = actions.iter().any(|action| {
+        reviewed_address(action.channel(), action.parameter())
+            .is_some_and(ReviewedAddress::is_typed_lane)
+    });
+    if !typed {
+        return Ok(());
+    }
+    for output in 5..=OUTPUT_COUNT {
+        let value = read_output_field(baseline, output, crate::layout::MUTE_PARAMETER)?;
+        if value != 1 {
+            return Err(ApplyPlanError::TypedLaneReservedUnmuted { output, value });
+        }
+    }
+    Ok(())
+}
+
 /// Routing fields must be written mutes first, then the input sum, then the
 /// sources (see [`routing_rank`]). Rollback reverses the order.
 fn require_routing_order(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanError> {
@@ -1510,6 +1538,11 @@ pub enum ApplyPlanError {
         before: u16,
         after: u16,
     },
+    /// A typed-write-lane carrier was bound to a baseline with O5 or O6 live.
+    #[error(
+        "O{output} mute code is {value}, not 1 (muted); typed-write-lane actions need O5 and O6 muted"
+    )]
+    TypedLaneReservedUnmuted { output: u8, value: u16 },
     /// An enabled limiter would be switched off.
     #[error("channel {channel} limiter is enabled; apply never disables a limiter")]
     LimiterDisable { channel: u8 },

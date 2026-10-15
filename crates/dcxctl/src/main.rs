@@ -93,10 +93,15 @@ struct WritePolicyArgs {
     /// Consent to unmuting O1-O4 (the plan must also set `allow_unmute`).
     #[arg(long)]
     allow_unmute: bool,
+    /// Consent to loosening an active high-pass: type change, off, or a lower
+    /// corner (the plan must also set `allow_protection_change`).
+    #[arg(long)]
+    allow_protection_change: bool,
     /// Absolute output and input gain ceiling in dB, -15 through 0.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     gain_ceiling_db: f64,
-    /// Largest level or limiter-threshold rise per plan in dB, 0 through 3.
+    /// Largest summed level rise per plan in dB (level gains, limiter
+    /// thresholds, effective PEQ band gains), 0 through 3.
     #[arg(long, default_value_t = 3.0)]
     max_gain_step_db: f64,
     /// Largest number of direct-parameter actions in the one apply frame, 1 through 32.
@@ -109,6 +114,7 @@ impl WritePolicyArgs {
         write_cli::PolicyArgs {
             allow_routing: self.allow_routing,
             allow_unmute: self.allow_unmute,
+            allow_protection_change: self.allow_protection_change,
             gain_ceiling_db: self.gain_ceiling_db,
             max_gain_step_db: self.max_gain_step_db,
             max_actions: self.max_actions,

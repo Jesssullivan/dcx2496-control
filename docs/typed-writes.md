@@ -49,6 +49,7 @@ two carriers. Changes whose values already equal the baseline are listed in
   "device_id": 0,
   "allow_routing": false,
   "allow_unmute": false,
+  "allow_protection_change": false,
   "changes": [
     {"kind": "peq_band", "output": 1, "band": 1, "filter": "bell",
      "frequency_hz": 63, "gain_db": -3, "q": 4},
@@ -121,8 +122,8 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
   The default policy refuses it, because +6 dB is above the 0 dB ceiling.
 - D1, O1 HPF LR24 at 80 Hz: `05 43 00 40`, `05 42 00 08`.
 - D4, O4 HPF LR24 at 100 Hz (99.4 Hz): `08 43 00 4A`, `08 42 00 08`.
-- O1 band 1 bell at 63 Hz, -6 dB, Q 4: `05 13 00 35`, `05 14 00 20`,
-  `05 15 00 5A`.
+- O1 band 1 bell at 63 Hz, -6 dB, Q 4, from a flat band: `05 15 00 5A`
+  (the deepening gain goes first), `05 13 00 35`, `05 14 00 20`.
 
 ## Safety design
 
@@ -150,12 +151,23 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
     are set (the O1/O2 sources, the input sum and the input routing have no
     typed address);
   - an unmute and a source change in the same plan;
-  - a level gain or limiter threshold rise of more than `--max-gain-step-db`
-    (default and maximum 3 dB);
-  - an output or input gain above `--gain-ceiling-db` (default and maximum
-    0 dB);
+  - loosening an active high-pass unless both `allow_protection_change` and
+    `--allow-protection-change` are set. Loosening means changing its type,
+    switching it off, or lowering its corner;
+  - a summed level rise of more than `--max-gain-step-db` (default and
+    maximum 3 dB). The sum covers every output and input gain rise, every
+    limiter threshold rise, and every rise in a PEQ band's effective gain
+    (its gain while active, 0 dB while inactive). Shallower cuts, switching
+    PEQ off over a cut, and raising two gains on one path therefore share
+    one budget;
+  - a rising output or input gain above `--gain-ceiling-db` (default and
+    maximum 0 dB). A cut from above the ceiling is admitted;
   - switching an enabled limiter off;
   - more than `--max-actions` actions (default 16, maximum 32).
+
+  Consent is checked twice. At plan time it needs the plan field and the
+  flag. At apply time `write apply` re-checks the carrier with the flags
+  given to it, because the carrier does not store the plan document.
 - **EQ is cut-only.** A PEQ gain above 0 dB is refused, and there is no
   boost flag. The core carrier has refused PEQ boosts under every policy
   since the notch work, and it still refuses any step that would activate a
@@ -163,9 +175,13 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
   not a flag.
 - **Core carrier guards, for every lane.** `ApplyPlanV1` now also refuses a
   level gain rise above unity or of more than +3 dB, a limiter-threshold rise
-  of more than +3 dB, and a limiter switch-off. So a hand-built carrier fed to
-  `control apply` can't get past the policy either. Rollback is exempt
-  because it restores a verified baseline.
+  of more than +3 dB, a limiter switch-off, and any typed-write-lane action
+  (O1-O3 mute or a typed field) while O5 or O6 reads unmuted. Rollback is
+  exempt from the level rules because it restores a verified baseline.
+  `control apply` and `control rollback` refuse any carrier that holds a
+  typed-write-lane address and point to `write apply` / `write rollback`, so
+  the consent and summed-rise policy cannot be skipped by switching
+  commands.
 - **Safe ordering inside the frame.** The device works through one frame in
   order, so the frame is sorted so that every intermediate state is the safer
   one:
@@ -173,10 +189,12 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
   2. level and threshold cuts, limiter on and release;
   3. PEQ deactivation (off, then fewer bands);
   4. crossover, delay, polarity and band fields. A band's gain goes first
-     when the cut gets shallower and last when it gets deeper;
+     when its cut deepens and last when it gets shallower, so a moving band
+     is never louder than either end state. A filter being switched off goes
+     off before its corner moves;
   5. PEQ activation (more bands, then on);
   6. level rises;
-  7. sources;
+  7. sources, O4 before O3 (the routing rank);
   8. unmutes.
 
   Rollback is the exact reverse.

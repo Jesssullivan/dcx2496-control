@@ -29,7 +29,19 @@ device and sent no DCX traffic of any kind, no audio and no driver action.
 - Core `ApplyPlanV1` now refuses, for every lane:
   - a level gain rise above unity, or of more than +3 dB;
   - a limiter threshold rise of more than +3 dB;
-  - a limiter switch-off.
+  - a limiter switch-off;
+  - any typed-write-lane action while O5 or O6 reads unmuted.
+
+  `control apply|rollback` refuse typed-write-lane carriers, so those must go
+  through `write apply|rollback` and its policy re-check.
+- Review fixes made before the PR:
+  - band gain order (deepening first, shallower last);
+  - sources in routing rank;
+  - a summed rise budget that includes effective PEQ band gains;
+  - consent for loosening an active high-pass;
+  - the ceiling binds rises only;
+  - wire bytes come from the frame encoder;
+  - the `control apply` bypass is closed.
 - `dcxctl write show|plan|verify` is offline. `write apply|rollback` exists
   only in the live-control build and wraps `control apply|rollback` after
   policy re-validation.
@@ -61,7 +73,9 @@ field lies inside its documented domain. The values are plausible; they are
 - **O4 (PA):** high-pass type code 6 (BW24 under the hypothesis) at code 180
   (about 1 kHz). O6 has the same.
   - If the front panel confirms it, the PA runs a 1 kHz 24 dB/oct high-pass
-    today, and D4's LR24 at 100 Hz is a large change.
+    today, and D4's LR24 at 100 Hz is a large change. It loosens an active
+    high-pass, so the plan needs `allow_protection_change` and
+    `--allow-protection-change`.
   - If the front panel disagrees, the crossover mapping is wrong.
   - Either way, a front-panel **read** of the O4 crossover page is the
     cheapest independent check of the `0x42`/`0x43` mapping. Look only; don't
@@ -112,14 +126,15 @@ lane, under the PZM build lock, and record its sha256 (`$BIN`).
 
    **Stop** unless S0 shows O1 band 1 inactive (`eq_count` 0, or PEQ off).
    If S0 equals the 10-09 state, the frame is
-   `F0 00 20 32 00 0E 20 04 05 15 00 78 05 13 00 35 05 14 00 20 05 16 00 01 F7`:
-   - gain 95 -> 120 first, because the cut gets shallower;
+   `F0 00 20 32 00 0E 20 04 05 13 00 35 05 14 00 20 05 16 00 01 05 15 00 78 F7`:
    - frequency 58 -> 53 (63.1 Hz);
    - Q 20 -> 32 (3.98);
-   - low shelf -> bell.
+   - low shelf -> bell;
+   - gain 95 -> 120 last, because the cut gets shallower.
 
    The rollback frame is
-   `F0 00 20 32 00 0E 20 04 05 16 00 00 05 14 00 14 05 13 00 3A 05 15 00 5F F7`.
+   `F0 00 20 32 00 0E 20 04 05 15 00 5F 05 16 00 00 05 14 00 14 05 13 00 3A F7`.
+   A unit test pins both frames.
    Check that `writes` is only channel 5 parameters `0x13`-`0x16`, then
    extract the two carriers with `jq -e .apply_plan` and
    `jq -e .rollback_plan`.

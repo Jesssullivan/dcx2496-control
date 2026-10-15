@@ -26,6 +26,7 @@ const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 pub struct PolicyArgs {
     pub allow_routing: bool,
     pub allow_unmute: bool,
+    pub allow_protection_change: bool,
     pub gain_ceiling_db: f64,
     pub max_gain_step_db: f64,
     pub max_actions: usize,
@@ -39,6 +40,7 @@ impl PolicyArgs {
             max_actions: self.max_actions,
             allow_routing: self.allow_routing,
             allow_unmute: self.allow_unmute,
+            allow_protection_change: self.allow_protection_change,
         }
     }
 }
