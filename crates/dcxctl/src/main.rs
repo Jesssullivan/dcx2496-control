@@ -77,7 +77,9 @@ enum Command {
         #[command(subcommand)]
         command: RoutingCommand,
     },
-    /// Typed parameter writes: show, dry-run plan, verify; live apply/rollback.
+    /// Typed parameter writes: show, dry-run plan, verify (offline planning
+    /// only; live apply/rollback need the non-default `typed-write-live`
+    /// feature, which no shipped binary enables, pending an operator ruling).
     Write {
         #[command(subcommand)]
         command: WriteCommand,
@@ -152,9 +154,11 @@ enum WriteCommand {
         #[arg(long)]
         readback: PathBuf,
     },
-    /// Re-check one apply carrier against the write policy, then run the
-    /// `control apply` transaction (fresh baseline, one frame, readback).
-    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    /// Rebuild the carrier from its write plan under the same policy flags,
+    /// require it to match exactly, then run the `control apply` transaction
+    /// (fresh baseline, one frame, readback). Exits non-zero unless verified.
+    /// Not in any shipped binary: needs the `typed-write-live` feature.
+    #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
     Apply {
         /// Exact Darwin FTDI callout node; ports are never enumerated.
         #[arg(long)]
@@ -162,14 +166,20 @@ enum WriteCommand {
         /// Expected DCX device address, 0 through 15.
         #[arg(long)]
         expected_device: u8,
+        /// The strict `dcx.write-plan/v1` document the carrier was planned from.
+        #[arg(long)]
+        write_plan: PathBuf,
         /// Strict raw `ApplyPlanV1` (the `apply_plan` of `write plan`).
         #[arg(long)]
         plan: PathBuf,
         #[command(flatten)]
         policy: WritePolicyArgs,
     },
-    /// Re-check one rollback carrier (never O5/O6), then run `control rollback`.
-    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    /// Re-check one rollback carrier (exact reverse, never O5/O6), then run
+    /// `control rollback`. Restores baseline mutes and levels without
+    /// consent flags. Exits non-zero unless the baseline is restored.
+    /// Not in any shipped binary: needs the `typed-write-live` feature.
+    #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
     Rollback {
         /// Exact Darwin FTDI callout node; ports are never enumerated.
         #[arg(long)]
@@ -190,6 +200,19 @@ enum Switch {
 }
 
 impl Switch {
+    const fn muted(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// The reserved O5/O6 mutes accept only `on`; the core carrier refuses any
+/// O5/O6 unmute on every lane as well.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ReserveMute {
+    On,
+}
+
+impl ReserveMute {
     const fn muted(self) -> bool {
         matches!(self, Self::On)
     }
@@ -242,12 +265,12 @@ enum RoutingCommand {
         /// O4 mute.
         #[arg(long, value_enum)]
         o4_mute: Option<Switch>,
-        /// O5 mute.
+        /// O5 mute: `on` only. O5 and O6 are never unmuted.
         #[arg(long, value_enum)]
-        o5_mute: Option<Switch>,
-        /// O6 mute.
+        o5_mute: Option<ReserveMute>,
+        /// O6 mute: `on` only. O5 and O6 are never unmuted.
         #[arg(long, value_enum)]
-        o6_mute: Option<Switch>,
+        o6_mute: Option<ReserveMute>,
         /// Setup input sum: off or A+B only.
         #[arg(long, value_enum)]
         input_sum: Option<InputSumArg>,
@@ -573,14 +596,21 @@ fn write(command: WriteCommand) -> Result<(), Box<dyn Error>> {
                 std::process::exit(1)
             }
         }
-        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
         WriteCommand::Apply {
             tty,
             expected_device,
+            write_plan,
             plan,
             policy,
-        } => write_cli::apply(tty, expected_device, &plan, &policy.to_policy()),
-        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        } => write_cli::apply(
+            tty,
+            expected_device,
+            &write_plan,
+            &plan,
+            &policy.to_policy(),
+        ),
+        #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
         WriteCommand::Rollback {
             tty,
             expected_device,
@@ -605,8 +635,8 @@ fn routing(command: RoutingCommand) -> Result<(), Box<dyn Error>> {
             &routing_cli::Targets {
                 mvp,
                 o4_mute: o4_mute.map(Switch::muted),
-                o5_mute: o5_mute.map(Switch::muted),
-                o6_mute: o6_mute.map(Switch::muted),
+                o5_mute: o5_mute.map(ReserveMute::muted),
+                o6_mute: o6_mute.map(ReserveMute::muted),
                 input_sum: input_sum.map(|sum| match sum {
                     InputSumArg::Off => InputSum::Off,
                     InputSumArg::APlusB => InputSum::APlusB,

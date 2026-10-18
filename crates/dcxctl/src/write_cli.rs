@@ -1,15 +1,19 @@
-//! Typed parameter writes: `write show|plan|verify` are offline; the
-//! `live-control` feature adds `write apply|rollback`, which re-validate the
-//! carrier against the write policy and then run the ordinary `control
-//! apply|rollback` transaction (fresh baseline, stale-plan refusal, one
-//! direct-parameter frame, complete readback).
+//! Typed parameter writes: `write show|plan|verify` are offline planning
+//! only. The non-default `typed-write-live` feature, which no shipped binary
+//! enables (Legalab ruling D5, front-panel entry, stands for every device
+//! write until the operator rules on software writes), adds `write
+//! apply|rollback`: apply rebuilds the carrier from its write plan under the
+//! same policy flags and requires an exact match, rollback re-checks its
+//! carrier, and both then run the ordinary `control apply|rollback`
+//! transaction (fresh baseline, stale-plan refusal, one direct-parameter
+//! frame, complete readback) and exit non-zero unless it verified.
 
 use std::{error::Error, path::Path};
 
-#[cfg(all(feature = "live-control", target_os = "macos"))]
+#[cfg(all(feature = "typed-write-live", target_os = "macos"))]
 use std::path::PathBuf;
 
-#[cfg(all(feature = "live-control", target_os = "macos"))]
+#[cfg(all(feature = "typed-write-live", target_os = "macos"))]
 use dcx_core::RollbackPlanV1;
 use dcx_core::{
     ApplyPlanV1, SnapshotV1,
@@ -70,13 +74,17 @@ pub fn show(snapshot: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn plan(snapshot: &Path, plan: &Path, policy: &PolicyArgs) -> Result<(), Box<dyn Error>> {
-    let baseline = load_snapshot(snapshot, "control snapshot")?;
-    let plan = WritePlanV1::from_json(&read_bounded(
-        plan,
+fn load_write_plan(path: &Path) -> Result<WritePlanV1, Box<dyn Error>> {
+    Ok(WritePlanV1::from_json(&read_bounded(
+        path,
         dcx_core::typed_write::MAX_WRITE_PLAN_BYTES,
         "write plan",
-    )?)?;
+    )?)?)
+}
+
+pub fn plan(snapshot: &Path, plan: &Path, policy: &PolicyArgs) -> Result<(), Box<dyn Error>> {
+    let baseline = load_snapshot(snapshot, "control snapshot")?;
+    let plan = load_write_plan(plan)?;
     let transaction = plan_writes(&baseline, &plan, &policy.policy())?;
     println!("{}", serde_json::to_string_pretty(&transaction)?);
     Ok(())
@@ -91,22 +99,37 @@ pub fn verify(plan: &Path, readback: &Path) -> Result<bool, Box<dyn Error>> {
     Ok(verification.status == "consistent")
 }
 
-#[cfg(all(feature = "live-control", target_os = "macos"))]
+/// Rebuild the carrier from its write plan and the carrier's own baseline,
+/// under the same command-line policy, and send it only if the rebuilt
+/// carrier is identical. That restores the plan-level consents
+/// (`allow_unmute`, `allow_routing`, `allow_protection_change`), the safe
+/// in-frame order, and the rule that only carriers `write plan` emits are
+/// sent; `check_policy` (inside `plan_writes`) re-checks the actions too.
+#[cfg(all(feature = "typed-write-live", target_os = "macos"))]
 pub fn apply(
     tty: PathBuf,
     expected_device: u8,
+    write_plan_path: &Path,
     plan_path: &Path,
     policy: &PolicyArgs,
 ) -> Result<(), Box<dyn Error>> {
     let plan = load_apply_plan(plan_path)?;
-    let actions = plan
-        .command()
-        .map_or(&[][..], dcx_core::DirectParameterCommand::actions);
-    dcx_core::typed_write::check_policy(plan.baseline(), actions, &policy.policy())?;
-    crate::live_control::apply_loaded(tty, expected_device, &plan)
+    let document = load_write_plan(write_plan_path)?;
+    let rebuilt = plan_writes(plan.baseline(), &document, &policy.policy())?;
+    if rebuilt.apply_plan != plan {
+        return Err(std::io::Error::other(
+            "apply carrier is not the one write plan emits for this write plan and policy",
+        )
+        .into());
+    }
+    if crate::live_control::apply_loaded(tty, expected_device, &plan)? {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("apply did not verify; run dcxctl write rollback").into())
+    }
 }
 
-#[cfg(all(feature = "live-control", target_os = "macos"))]
+#[cfg(all(feature = "typed-write-live", target_os = "macos"))]
 pub fn rollback(tty: PathBuf, expected_device: u8, plan_path: &Path) -> Result<(), Box<dyn Error>> {
     let plan = RollbackPlanV1::from_json(&read_bounded(
         plan_path,
@@ -114,5 +137,9 @@ pub fn rollback(tty: PathBuf, expected_device: u8, plan_path: &Path) -> Result<(
         "rollback plan",
     )?)?;
     dcx_core::typed_write::check_rollback(&plan)?;
-    crate::live_control::rollback_loaded(tty, expected_device, &plan)
+    if crate::live_control::rollback_loaded(tty, expected_device, &plan)? {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("rollback readback does not equal the baseline").into())
+    }
 }

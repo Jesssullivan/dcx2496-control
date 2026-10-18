@@ -16,6 +16,13 @@ live-control = [
 ]
 # Compatibility for callers pinned to the first live Search feature name.
 live-discovery = ["live-control"]
+# Live typed writes (`dcxctl write apply|rollback`). No shipped binary enables
+# it (`//:dcxctl_live_control` and `.#dcxctl-live` build `live-control` only):
+# Legalab ruling D5 (front-panel entry, one parameter per step) stands for
+# every device write until an operator ruling supersedes it for software
+# writes and sets their remote-mode write budget. `write show|plan|verify`
+# are offline and always built.
+typed-write-live = ["live-control"]
 
 [dependencies]
 clap.workspace = true

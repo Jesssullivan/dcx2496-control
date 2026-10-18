@@ -99,8 +99,8 @@ fixtures:
     ! cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 --allow-boost >/dev/null 2>&1
     cargo build --locked --jobs 2 --quiet --package dcxctl
     bash tests/feedback_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/rew/SYNTHETIC-feedback-notches.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json
-    bash tests/routing_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json
-    bash tests/write_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json
+    bash tests/routing_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json
+    bash tests/write_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json
     bash tests/apple_feedback_fixture_parity.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json apple/Tests/DCXLogicHelperCoreTests/Fixtures/feedback
 
 lockfiles-static:

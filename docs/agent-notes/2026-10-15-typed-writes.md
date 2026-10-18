@@ -5,6 +5,13 @@ work for 2026-10-15; OD-3 covers merge on green. Receipts go on Linear
 TIN-5383 and TIN-5379. This lane changed source only. It opened no serial
 device and sent no DCX traffic of any kind, no audio and no driver action.
 
+**Status: offline planning only, pending an operator ruling.** Landing this
+code authorizes no software write to the device. Legalab ruling D5 (option A,
+front-panel entry, one parameter per step, snapshot before and after) stands
+for every DCX write until the operator rules on decisions 1 and 2 below.
+`write apply|rollback` build only with the non-default `typed-write-live`
+feature, which `//:dcxctl_live_control` and `.#dcxctl-live` do not enable.
+
 ## What landed
 
 - `dcx_core::typed_write` adds:
@@ -24,16 +31,24 @@ device and sent no DCX traffic of any kind, no audio and no driver action.
     limiter on/threshold/release, polarity;
   - the input A-C gains.
 
-  All are from the pinned DuinoDCX tables. A unit test checks the full
-  444-row table against the source.
+  All are from the pinned DuinoDCX tables. A test checks the packing rule
+  over all 444 rows; an offline cross-check against the pinned
+  `Ultradrive.cpp` (PR #58 adversarial review, 2026-10-17) matched every row,
+  and the input A-C gain rows, with 0 mismatches.
 - Core `ApplyPlanV1` now refuses, for every lane:
   - a level gain rise above unity, or of more than +3 dB;
   - a limiter threshold rise of more than +3 dB;
   - a limiter switch-off;
-  - any typed-write-lane action while O5 or O6 reads unmuted.
+  - any typed-write-lane action while O5 or O6 reads unmuted;
+  - any apply or rollback action that writes an O5/O6 mute other than 1
+    (`ReservedUnmute`), so no lane can unmute O5 or O6, and a plan that would
+    mute a live O5/O6 cannot be staged (its exact rollback would unmute).
 
-  `control apply|rollback` refuse typed-write-lane carriers, so those must go
-  through `write apply|rollback` and its policy re-check.
+  `control apply|rollback` refuse typed-write-lane carriers (the typed fields
+  and the O1-O3 mutes), so those can go only through `write
+  apply|rollback`. PEQ-only and O4-mute-only carriers on O1-O4 still pass
+  `control apply|rollback` and the Apple helper under the core rules only, as
+  before this lane.
 - Review fixes made before the PR:
   - band gain order (deepening first, shallower last);
   - sources in routing rank;
@@ -43,8 +58,25 @@ device and sent no DCX traffic of any kind, no audio and no driver action.
   - wire bytes come from the frame encoder;
   - the `control apply` bypass is closed.
 - `dcxctl write show|plan|verify` is offline. `write apply|rollback` exists
-  only in the live-control build and wraps `control apply|rollback` after
-  policy re-validation.
+  only in a `typed-write-live` build, which nothing ships, and wraps `control
+  apply|rollback`: apply rebuilds the carrier from `--write-plan` under the
+  same flags and requires an exact match; rollback requires the exact reverse
+  order; both exit non-zero unless the readback verifies.
+- Adversarial review fixes (review of `b543b1a`, 2026-10-17; reviewer PoCs
+  turned into regression tests in `typed_write/tests.rs` and
+  `routing/tests.rs`):
+  - R4 closed in the core carrier: `ReservedUnmute` on every apply and
+    rollback carrier; `routing desired-profile --o5-mute|--o6-mute` accept
+    `on` only; the routing and write pipelines use the new
+    `SYNTHETIC-reserve-muted-snapshot.json` (the blank fixture with only
+    O5/O6 muted, derived with the `b543b1a` binary);
+  - live typed writes moved behind `typed-write-live`;
+  - in-frame order enforced on carriers (`UnsafeOrder`) and exact-reverse
+    rollback (`RollbackOrder`);
+  - moving or reshaping an active PEQ cut spends its released depth from the
+    rise budget;
+  - `write apply|rollback` exit codes; scope of the `control apply` refusal
+    and of the 444-row test reworded.
 - Docs: `docs/typed-writes.md`, a README section, and AGENTS.md (the allowlist
   contract).
 
@@ -56,8 +88,12 @@ device and sent no DCX traffic of any kind, no audio and no driver action.
 - **macOS live-control build:** cross-clippy for `aarch64-apple-darwin` with
   `--features live-control`, on sting with the pinned 1.98.0 toolchain plus
   the darwin std, `-D warnings`.
-- **Not run:** a Bazel or native macOS build on PZM, and anything on the
-  named device.
+- **Not run at `b543b1a`:** a Bazel or native macOS build on PZM, and
+  anything on the named device.
+- **Review fixes:** the six reviewer PoCs passed against `b543b1a` on PZM
+  (finding reproduced), and the inverted regression tests plus the PZM native
+  gate run on the landing head. The head sha, host and targets are in the
+  TIN-5383 merge receipt. Nothing ran on the named device.
 
 ## Offline decode of the existing 2026-10-09 readback (no device contact)
 
@@ -86,7 +122,15 @@ field lies inside its documented domain. The values are plausible; they are
 
 ## Bench procedure: first live write (main session, hardware window)
 
-Gate: legalab qualification packet section 3.3 preconditions.
+**BLOCKED.** This needs an operator ruling that supersedes D5 for software
+writes plus a remote-mode write budget for apply (5) and rollback (3). G1
+covers snapshot remote-mode writes only, and the qualification packet section
+3.3 preconditions are those of the read-only meter run; neither authorizes a
+direct-parameter frame. The procedure is kept as the proposal for that
+ruling. It also needs a `typed-write-live` build, which no shipped binary is.
+
+Gate (after the ruling): legalab qualification packet section 3.3
+preconditions plus the ruling's write budget.
 
 - Hold neo's bench lock and use the quiet-step wrapper.
 - The tty is free, no other `dcxctl-live` is running, and the DCX Logic helper
@@ -95,16 +139,21 @@ Gate: legalab qualification packet section 3.3 preconditions.
 - Record the JBL/Alto power state and the LS56 Monitor knob position.
 - Play no programme material during steps 1-6.
 
-Binary: build `//:dcxctl_live_control` on PZM from merged main containing this
-lane, under the PZM build lock, and record its sha256 (`$BIN`).
+Binary (after the ruling): a `typed-write-live` build of `dcxctl` on PZM
+from merged main, under the PZM build lock, with its sha256 recorded
+(`$BIN`). `//:dcxctl_live_control` does not carry `write apply|rollback`.
 `$OUT=~/.local/state/legalab/dcx2496/typed-write-<UTC>`, private.
 
 1. **Fresh snapshot S0** (G1: 2 remote-mode writes per attempt, at most 3
    attempts, 1 recovery):
    `"$BIN" control snapshot --tty "$TTY" --expected-device 0 > "$OUT/S0.json"`.
-   Diff it against `14c4347c`: the expected changes are Dump0[119] (A/B to
-   analog) and the trailer. Any other byte change needs explanation before
-   continuing.
+   Re-baselined on the 2026-10-18 S0 `be965a63` (TIN-5383 B0 receipt
+   `1b1c4d0b`), not `14c4347c`: diff the fresh S0 against `be965a63`; any
+   byte change needs explanation before continuing. Against `14c4347c`,
+   `be965a63` changed Dump0[119] 1 -> 0 (A/B to analog, as predicted), the
+   trailer [1013] 3 -> 5, and Dump0[101] 1 -> 0, which is in no DuinoDCX
+   table and is unexplained. Per packet section 4.3 nothing is applied until
+   Dump0[101] is explained.
 2. **Offline decode:**
    `"$BIN" write show --snapshot "$OUT/S0.json" > "$OUT/S0-typed.json"`.
    - O5 and O6 must read `muted: true`.
@@ -139,7 +188,7 @@ lane, under the PZM build lock, and record its sha256 (`$BIN`).
    extract the two carriers with `jq -e .apply_plan` and
    `jq -e .rollback_plan`.
 4. **Apply:**
-   `"$BIN" write apply --tty "$TTY" --expected-device 0 --plan p1-apply.json --max-actions 4 > "$OUT/p1-apply.json"`.
+   `"$BIN" write apply --tty "$TTY" --expected-device 0 --write-plan p1.json --plan p1-apply.json --max-actions 4 > "$OUT/p1-apply.json"`.
    Wire traffic is 5 remote-mode writes and 1 direct frame. A stale-baseline
    refusal means someone touched the device: stop. Expect
    `"status": "verified"`.
@@ -192,9 +241,12 @@ UTC times.
    - one attempt each, with no automatic retry;
    - at least 20 s between transactions;
    - at most 3 apply/rollback pairs per window.
-3. **Whether to make "never unmute O5/O6" a core carrier rule** for every
-   lane. Today only the typed-write policy enforces it. The 10-09 routing run
-   left `EMERGENCY-ONLY-unmutes-O5-O6-rollback-plan.json`, which `control
-   rollback` would still accept.
+3. **Settled in code, in line with the operator's "O5/O6 muted forever":**
+   "never unmute O5/O6" is now a core carrier rule for every lane
+   (`ReservedUnmute`). The 10-09 routing run's
+   `EMERGENCY-ONLY-unmutes-O5-O6-rollback-plan.json` carries O5/O6 unmute
+   actions, so `RollbackPlanV1::from_json`, and with it `control rollback`
+   and the Apple helper, refuses it. If the operator ever wants a reserved
+   output unmuted, that is a new ruling and a code change.
 4. **EQ boosts stay unavailable.** There is no boost flag; the core carrier is
    cut-only. Changing that is a contract decision, not a flag.

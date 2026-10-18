@@ -6,6 +6,7 @@ set -euo pipefail
 
 dcxctl=$1
 snapshot=$2
+muted=$3
 
 work=$(mktemp -d)
 trap 'rm -rf "${work}"' EXIT
@@ -32,11 +33,10 @@ if "${dcxctl}" write plan --snapshot "${snapshot}" --plan "${work}/hpf.json" \
 fi
 grep -q 'ReservedOutputUnmuted { output: 5' "${work}/error.txt" || fail "unexpected reserved-output refusal"
 
-# Derive a synthetic baseline with O5/O6 muted through the routing lane.
-"${dcxctl}" routing desired-profile --o5-mute on --o6-mute on --profile-id reserve \
-  --revision synthetic-1 >"${work}/reserve.json"
-"${dcxctl}" control diff --snapshot "${snapshot}" --profile "${work}/reserve.json" \
-  | jq -e '.apply_plan.desired' >"${work}/muted.json"
+# The reserve-muted fixture is the blank snapshot with only O5/O6 muted. It
+# can no longer be derived through a routing apply: the exact rollback of
+# muting a live O5/O6 would unmute it, and no carrier ever does.
+cp "${muted}" "${work}/muted.json"
 
 "${dcxctl}" write plan --snapshot "${work}/muted.json" --plan "${work}/hpf.json" >"${work}/tx.json"
 jq -e '.schema == "dcx.write-transaction/v1" and .dry_run == true' "${work}/tx.json" >/dev/null
@@ -71,3 +71,10 @@ refuse '{"kind":"peq_band","output":1,"band":1,"filter":"bell","frequency_hz":10
 refuse '{"kind":"output_source","output":3,"source":"b"}' 'RoutingNotAllowed'
 refuse '{"kind":"output_gain","output":1,"gain_db":-10}' 'GainStep'
 refuse '{"kind":"output_gain","output":1,"gain_db":-14,"bytes":"F0"}' 'unknown field'
+
+# Offline planning only: no build without the non-default typed-write-live
+# feature exposes a live typed write (Legalab ruling D5 stands).
+write_help=$("${dcxctl}" write --help)
+if grep -Eq '^[[:space:]]+(apply|rollback)([[:space:]]|$)' <<<"${write_help}"; then
+  fail "dcxctl write exposes a live apply or rollback"
+fi

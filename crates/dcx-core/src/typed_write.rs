@@ -1283,7 +1283,14 @@ pub fn require_reserved_muted(snapshot: &SnapshotV1) -> Result<(), TypedWriteErr
 ///   PEQ band gain (a band's gain while active, unity while inactive) is at
 ///   most the policy step, so rises on one path cannot add up past it;
 /// - a rising level gain stays at or below the policy ceiling;
+/// - the actions follow the safe in-frame phase order [`plan_writes`] emits
+///   (mutes on first, unmutes last, a band's gain first when its cut deepens),
+///   so a frame cut short never leaves an output louder than both end states;
 /// - the frame holds at most `max_actions` actions.
+///
+/// Moving or reshaping an active PEQ band (frequency, Q, kind or slope)
+/// counts as releasing its whole baseline cut at the old position, then a
+/// new cut: the released depth is spent from the step budget.
 ///
 /// # Errors
 ///
@@ -1305,6 +1312,7 @@ pub fn check_policy(
     let mut sources = false;
     let mut rise: u32 = 0;
     let mut peq_outputs = BTreeSet::new();
+    let mut previous_phase = None;
     for action in actions {
         let address = require_reviewed(*action)?;
         if (5..=OUTPUT_COUNT).contains(&address.output) {
@@ -1314,6 +1322,14 @@ pub fn check_policy(
         }
         let before = baseline.read_reviewed(address);
         let after = action.value();
+        let key = phase(address, before, after);
+        if previous_phase.is_some_and(|previous| key < previous) {
+            return Err(TypedWriteError::UnsafeOrder {
+                channel: action.channel(),
+                parameter: action.parameter(),
+            });
+        }
+        previous_phase = Some(key);
         match address.field {
             OutputField::Mute if after == 0 => {
                 if !policy.allow_unmute {
@@ -1374,13 +1390,7 @@ pub fn check_policy(
             TypedWriteError::Transaction(ApplyTransactionError::Plan(error.into()))
         })?;
         for output in peq_outputs {
-            let before = effective_band_gains(baseline, output)?;
-            let after = effective_band_gains(&desired, output)?;
-            for (before, after) in before.iter().zip(&after) {
-                if after > before {
-                    rise += u32::from(after - before);
-                }
-            }
+            rise += peq_rise(baseline, &desired, output)?;
         }
     }
     if rise > u32::from(policy.step_codes()) {
@@ -1399,33 +1409,100 @@ fn read_field(snapshot: &SnapshotV1, output: u8, parameter: u8) -> Result<u16, T
     Ok(snapshot.read_reviewed(address))
 }
 
-/// Gain code each PEQ band applies: its gain while active, unity otherwise.
-fn effective_band_gains(snapshot: &SnapshotV1, output: u8) -> Result<Vec<u16>, TypedWriteError> {
+/// Whether a PEQ band is active: PEQ on and the band inside the band count.
+fn band_active(snapshot: &SnapshotV1, output: u8, band: u8) -> Result<bool, TypedWriteError> {
     let enabled = read_field(snapshot, output, EQ_ENABLED_PARAMETER)? != 0;
     let count = read_field(snapshot, output, EQ_COUNT_PARAMETER)?;
-    (1..=PEQ_BANDS)
-        .map(|band| {
-            if enabled && u16::from(band) <= count {
-                read_field(snapshot, output, band_parameter(band, BandField::Gain))
-            } else {
-                Ok(UNITY_GAIN_CODE)
-            }
-        })
-        .collect()
+    Ok(enabled && u16::from(band) <= count)
 }
 
-/// Check a rollback carrier against the reserved-output rule.
+/// Gain code a PEQ band applies: its gain while active, unity otherwise.
+fn effective_band_gain(
+    snapshot: &SnapshotV1,
+    output: u8,
+    band: u8,
+) -> Result<u16, TypedWriteError> {
+    if band_active(snapshot, output, band)? {
+        read_field(snapshot, output, band_parameter(band, BandField::Gain))
+    } else {
+        Ok(UNITY_GAIN_CODE)
+    }
+}
+
+/// Summed rise, in gain codes, of one output's effective PEQ band gains.
+///
+/// A band active in the baseline whose frequency, Q, kind or slope differs in
+/// `desired` releases its whole baseline cut at the old position, whatever
+/// the new cut is, so it counts as a release to unity (`UNITY - before`)
+/// rather than `after - before`. Moving a -15 dB cut off a room mode is a
+/// +15 dB rise at that mode.
+fn peq_rise(
+    baseline: &SnapshotV1,
+    desired: &SnapshotV1,
+    output: u8,
+) -> Result<u32, TypedWriteError> {
+    let mut rise = 0;
+    for band in 1..=PEQ_BANDS {
+        let before = effective_band_gain(baseline, output, band)?;
+        let mut moved = false;
+        if band_active(baseline, output, band)? {
+            for field in BandField::all() {
+                if field == BandField::Gain {
+                    continue;
+                }
+                let parameter = band_parameter(band, field);
+                if read_field(baseline, output, parameter)?
+                    != read_field(desired, output, parameter)?
+                {
+                    moved = true;
+                }
+            }
+        }
+        let after = if moved {
+            UNITY_GAIN_CODE
+        } else {
+            effective_band_gain(desired, output, band)?
+        };
+        rise += u32::from(after.saturating_sub(before));
+    }
+    Ok(rise)
+}
+
+/// Check a rollback carrier against the reserved-output and order rules.
 ///
 /// A rollback re-applies the baseline values of exactly the apply's touched
-/// addresses. It may never address O5 or O6, so it can never unmute either
-/// (the stored-preset rollback that unmutes O6 is the hazard this excludes).
+/// addresses, in the exact reverse of the apply order, so from any prefix a
+/// cut-short apply frame left behind it retraces the earlier apply states
+/// (an unmute is restored only after the level it was raised from). It may
+/// never address O5 or O6, so it can never unmute either (the stored-preset
+/// rollback that unmutes O6 is the hazard this excludes; the core carrier
+/// refuses any O5/O6 unmute on every lane as well).
+///
+/// A rollback carries no policy flags: it restores the baseline's mutes,
+/// levels and high-pass without the consents an apply needs.
 ///
 /// # Errors
 ///
-/// Rejects a rollback whose baseline has O5 or O6 unmuted or which addresses
-/// O5 or O6.
+/// Rejects a rollback whose baseline has O5 or O6 unmuted, which addresses
+/// O5 or O6, or whose order is not the exact reverse of its apply.
 pub fn check_rollback(rollback: &RollbackPlanV1) -> Result<(), TypedWriteError> {
     require_reserved_muted(rollback.baseline())?;
+    let address = |action: &DirectParameterAction| (action.channel(), action.parameter());
+    let apply = rollback
+        .apply_plan()
+        .command()
+        .map_or(&[][..], DirectParameterCommand::actions);
+    let inverse = rollback
+        .command()
+        .map_or(&[][..], DirectParameterCommand::actions);
+    if !apply
+        .iter()
+        .rev()
+        .map(address)
+        .eq(inverse.iter().map(address))
+    {
+        return Err(TypedWriteError::RollbackOrder);
+    }
     for action in rollback
         .command()
         .map_or(&[][..], DirectParameterCommand::actions)
@@ -1744,6 +1821,14 @@ pub enum TypedWriteError {
     /// Too many actions for one frame.
     #[error("plan has {actions} changed actions; the policy admits {maximum} per frame")]
     TooManyActions { actions: usize, maximum: usize },
+    /// A carrier's actions are not in the safe in-frame phase order.
+    #[error(
+        "channel {channel} parameter {parameter:#04x} is out of the safe in-frame order (mutes on, cuts, PEQ off, band fields, PEQ on, rises, sources, unmutes)"
+    )]
+    UnsafeOrder { channel: u8, parameter: u8 },
+    /// A rollback carrier is not the exact reverse of its apply.
+    #[error("rollback actions are not the exact reverse of the apply actions")]
+    RollbackOrder,
     /// A typed action could not be represented.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),

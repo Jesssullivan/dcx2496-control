@@ -43,7 +43,10 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   on O1-O4 only, output gain (`0x02`), delay switch, long and short delay
   (`0x04`, `0x05`, `0x4b`), crossover high/low-pass type and frequency
   (`0x42`-`0x45`), limiter switch, threshold and release (`0x46`-`0x48`) and
-  polarity (`0x49`), and the input A-C gains (channels 1-3, `0x02`).
+  polarity (`0x49`), and the input A-C gains (channels 1-3, `0x02`); the
+  typed-write lane is offline planning only, pending an operator ruling
+  (Legalab D5 front-panel entry stands for device writes; no `dec-*` ruling
+  admits software writes to these addresses yet).
   Locations are transcribed from the pinned MIT DuinoDCX `outputLocations`,
   `inputLocations` and `setupLocations` tables; O1/PEQ9 and the O4 PEQ on/off,
   band count and band 1 fields have named-device readback, and every other
@@ -57,7 +60,9 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   moves or reshapes an active boost, at any ordered apply or rollback step,
   under any policy flag; it writes routing fields mutes first, then the input
   sum, then the O4 and O3 sources, and rollback restores the exact baseline in
-  reverse order. Dump0 and Dump1 keep their baseline modulo-128 trailer
+  reverse order. No apply or rollback carrier on any lane writes an O5/O6
+  mute value other than 1, so nothing ever unmutes O5 or O6 and a plan that
+  mutes a live O5/O6 cannot be staged. Dump0 and Dump1 keep their baseline modulo-128 trailer
   balance. Every other output field (dynamic EQ, phase, name, PEQ editor
   index, every O5/O6 field but mute and PEQ), every other input field, the
   input SUM channel, every other setup field (Input C line/mic at Dump0 121,
@@ -66,8 +71,13 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   never address O5/O6, need explicit plan and command-line consent to unmute
   O1-O4 or change an O3/O4 source, and never combine the two; their rollback
   is the exact touched inverse, never a stored-preset recall. `control
-  apply|rollback` refuse typed-write-lane carriers; only `dcxctl write
-  apply|rollback`, which re-checks the write policy, sends them. Auto Align and
+  apply|rollback` refuse typed-write-lane carriers (the typed fields and the
+  O1-O3 mutes; PEQ-only and O4-mute carriers stay under the core rules only);
+  only `dcxctl write apply|rollback`, which rebuild the carrier from its write
+  plan and enforce the safe in-frame order and exact-reverse rollback, send
+  them, and those exist only behind the non-default `typed-write-live`
+  feature, which `//:dcxctl_live_control` and `.#dcxctl-live` never enable
+  until that ruling. Auto Align and
   +15 V have no
   address and must never gain one. No server or automatic apply path belongs
   in the MVP.

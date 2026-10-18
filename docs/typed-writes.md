@@ -4,9 +4,19 @@
 direct-parameter frame, bound to an exact baseline snapshot, with an exact
 inverse. It covers per-output PEQ, crossover, output gain, mute, polarity,
 delay and limiter on O1-O4, the input A-C gains and, behind two explicit
-flags, the O3/O4 source. Planning, `show` and `verify` are offline. `write
-apply` and `write rollback` exist only in the macOS `live-control` build, and
-they run the same transaction as `control apply` and `control rollback`.
+flags, the O3/O4 source. Planning, `show` and `verify` are offline.
+
+**Offline planning only, pending an operator ruling.** No software write of a
+typed field to the device is authorized. Legalab ruling D5 (option A:
+front-panel entry, one parameter per step, snapshot before and after) stands
+for every DCX write, and G1 covers snapshot remote-mode writes only. `write
+apply` and `write rollback` are compiled only with the non-default macOS
+`typed-write-live` feature. No shipped binary enables it:
+`//:dcxctl_live_control` and `.#dcxctl-live` build `live-control` alone. The
+feature stays off until an operator ruling supersedes D5 for software writes
+and sets their remote-mode write budget (see the wire budget below). Once
+built, they run the same transaction as `control apply` and `control
+rollback`.
 
 Evidence class: every address this lane added is a transcription from the
 pinned MIT DuinoDCX `00b9d70` tables, and its value encoding comes from the
@@ -27,11 +37,19 @@ dcxctl write show --snapshot snapshot.json
 dcxctl write plan --snapshot snapshot.json --plan changes.json > tx.json
 jq -e '.apply_plan' tx.json > apply-plan.json
 jq -e '.rollback_plan' tx.json > rollback-plan.json
-dcxctl write apply --tty /dev/cu.usbserial-EXACT --expected-device 0 --plan apply-plan.json > applied.json
+# typed-write-live builds only; not authorized (D5 stands):
+dcxctl write apply --tty /dev/cu.usbserial-EXACT --expected-device 0 \
+  --write-plan changes.json --plan apply-plan.json > applied.json
 jq -e '.readback' applied.json > readback.json
 dcxctl write verify --plan apply-plan.json --readback readback.json
 dcxctl write rollback --tty /dev/cu.usbserial-EXACT --expected-device 0 --plan rollback-plan.json
 ```
+
+`write apply` exits non-zero unless the readback verified, and `write
+rollback` exits non-zero unless the restored readback equals the baseline,
+so automation never continues past a failed or mismatched write. (`control
+apply|rollback` keep their historical exit 0 after printing a
+`rollback_required` or `state_unresolved` status with a captured readback.)
 
 `write plan` is always a dry run. Its `dcx.write-transaction/v1` output lists
 every changed action in apply order, with the baseline and written codes and
@@ -111,9 +129,12 @@ The limiter release grid is the least certain encoding. `write show` labels
 its decoded value `release_ms_log_hypothesis`.
 
 Every location lives in the 6 x 74 `outputLocations` table and in row 0 of
-`inputLocations[4][62]`. A unit test checks the whole table against the
-pinned source, and other tests check that every field's device maximum fits
-its location and the 14-bit wire range.
+`inputLocations[4][62]`. A unit test checks the 7-of-8 packing rule over all
+444 output rows plus a few hand-reviewed offsets; it does not compare against
+the source. An offline cross-check against the pinned `Ultradrive.cpp`
+(PR #58 adversarial review, 2026-10-17) matched every row, and the input
+A-C gain rows, with 0 mismatches. Other tests check that every field's device
+maximum fits its location and the 14-bit wire range.
 
 Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
 
@@ -128,7 +149,10 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
 ## Safety design
 
 - **Dry run by default.** `write plan` opens no device and prints the exact
-  frame bytes. Only the two carriers it emits can be applied.
+  frame bytes. Only the two carriers it emits can be applied: `write apply`
+  rebuilds the carrier from the same `--write-plan` document, the carrier's
+  own baseline and the same policy flags, and refuses unless the rebuilt
+  carrier is identical.
 - **Plan = typed changes.** Each change encodes to fixed addresses. A plan
   can't name a channel, parameter, raw value or frame.
 - **Fresh snapshot before, complete readback after.** `write apply` runs the
@@ -141,7 +165,12 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
   baseline values of exactly the addresses the apply wrote, in reverse order.
   It is never a stored-preset recall (risk R4: the DCX stored rollback unmutes
   O6). `write rollback` re-checks that the carrier never addresses O5 or O6,
-  so it cannot unmute either.
+  so it cannot unmute either, and that its order is the exact reverse of the
+  apply. A rollback carries no policy flags: it restores the baseline's mutes
+  (including unmuting an O1-O4 output that was live in the baseline), levels
+  and high-pass without the consents an apply needs, and it writes the
+  baseline values without first checking that the live state is the apply's
+  desired state or one of its prefixes.
 - **Hard refusals (policy).** Every plan is refused while O5 or O6 reads
   unmuted in the baseline. Other refusals:
   - any change that targets O5 or O6;
@@ -157,31 +186,48 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
   - a summed level rise of more than `--max-gain-step-db` (default and
     maximum 3 dB). The sum covers every output and input gain rise, every
     limiter threshold rise, and every rise in a PEQ band's effective gain
-    (its gain while active, 0 dB while inactive). Shallower cuts, switching
-    PEQ off over a cut, and raising two gains on one path therefore share
-    one budget;
+    (its gain while active, 0 dB while inactive). Moving or reshaping an
+    active band (its frequency, Q, kind or slope) counts as releasing its
+    whole baseline cut at the old position, then a new cut, so moving a
+    -15 dB cut off a room mode spends 15 dB. Shallower cuts, moved cuts,
+    switching PEQ off over a cut, and raising two gains on one path
+    therefore share one budget;
   - a rising output or input gain above `--gain-ceiling-db` (default and
     maximum 0 dB). A cut from above the ceiling is admitted;
   - switching an enabled limiter off;
-  - more than `--max-actions` actions (default 16, maximum 32).
+  - more than `--max-actions` actions (default 16, maximum 32);
+  - a carrier whose actions are not in the safe in-frame order below.
 
   Consent is checked twice. At plan time it needs the plan field and the
-  flag. At apply time `write apply` re-checks the carrier with the flags
-  given to it, because the carrier does not store the plan document.
+  flag. At apply time `write apply` re-plans from the `--write-plan`
+  document with the flags given to it, so both consents are needed again;
+  the carrier itself does not store the plan document.
 - **EQ is cut-only.** A PEQ gain above 0 dB is refused, and there is no
   boost flag. The core carrier has refused PEQ boosts under every policy
   since the notch work, and it still refuses any step that would activate a
   band holding a stored boost. Allowing boosts would be a contract change,
   not a flag.
-- **Core carrier guards, for every lane.** `ApplyPlanV1` now also refuses a
-  level gain rise above unity or of more than +3 dB, a limiter-threshold rise
-  of more than +3 dB, a limiter switch-off, and any typed-write-lane action
-  (O1-O3 mute or a typed field) while O5 or O6 reads unmuted. Rollback is
-  exempt from the level rules because it restores a verified baseline.
-  `control apply` and `control rollback` refuse any carrier that holds a
-  typed-write-lane address and point to `write apply` / `write rollback`, so
-  the consent and summed-rise policy cannot be skipped by switching
-  commands.
+- **Core carrier guards, for every lane.** No apply or rollback carrier on
+  any lane may write an O5/O6 mute value other than 1 (`ReservedUnmute`), so
+  `control apply|rollback`, `write apply|rollback` and the Apple helper can
+  never unmute O5 or O6, and the stored 10-09
+  `EMERGENCY-ONLY-unmutes-O5-O6-rollback-plan.json` no longer parses. A plan
+  that would mute a live O5/O6 cannot be staged either, because its exact
+  rollback would unmute it; O5 and O6 read muted on the bench since
+  2026-10-09, so this costs nothing operationally. `dcxctl routing
+  desired-profile` accepts `--o5-mute on` and `--o6-mute on` only.
+  `ApplyPlanV1` also refuses a level gain rise above unity or of more than
+  +3 dB, a limiter-threshold rise of more than +3 dB, a limiter switch-off,
+  and any typed-write-lane action (O1-O3 mute or a typed field) while O5 or
+  O6 reads unmuted. Rollback is exempt from the level rules because it
+  restores a verified baseline. `control apply` and `control rollback` refuse
+  any carrier that holds a typed-write-lane address (the typed fields and the
+  O1-O3 mutes), so the write policy cannot be skipped for those addresses by
+  switching commands. That refusal does not cover PEQ or the O4 mute: a
+  carrier that touches only PEQ on O1-O4, or only the O4 mute, still runs
+  through `control apply` and the Apple helper under the core rules only
+  (cut-only, no boost exposure, the reserved-mute rule) with no write policy,
+  as those lanes did before typed writes existed.
 - **Safe ordering inside the frame.** The device works through one frame in
   order, so the frame is sorted so that every intermediate state is the safer
   one:
@@ -197,7 +243,11 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
   7. sources, O4 before O3 (the routing rank);
   8. unmutes.
 
-  Rollback is the exact reverse.
+  Rollback is the exact reverse. The order is enforced on carriers too, not
+  only produced by `write plan`: the policy check refuses an apply carrier
+  whose actions step back to an earlier phase (`UnsafeOrder`), and the
+  rollback check refuses one that is not the exact reverse of its apply
+  (`RollbackOrder`).
 
 ## Wire budget and proposed rate limit
 
@@ -212,9 +262,10 @@ Each live transaction sends exactly one direct-parameter (`0x20`) frame:
 
 A failure after a transmit-capable mode adds at most one `ReceiveDirect`
 quiescence write at finish. G1's limit of at most 2 remote-mode writes per
-attempt covers snapshot attempts, so apply and rollback need their own gate.
+attempt covers snapshot attempts only, so apply (5) and rollback (3) need
+their own operator ruling. Until then `typed-write-live` stays off.
 
-Proposed rate limit, for Legalab to adopt or change:
+Proposed rate limit, for Legalab to adopt or change in that ruling:
 
 - one frame per transaction, with no automatic retry of a frame;
 - at most 4 actions in the first live write, then the default of 16;

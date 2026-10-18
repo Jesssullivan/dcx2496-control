@@ -881,11 +881,16 @@ impl ApplyPlanV1 {
     /// apply direction only: a rollback restores the verified baseline. Any
     /// typed-write-lane action also requires O5 and O6 to read muted.
     ///
+    /// No action on any lane may write an O5/O6 mute value other than 1, and
+    /// the same holds for every rollback carrier (see
+    /// [`ApplyPlanError::ReservedUnmute`]), so O5 and O6 are never unmuted.
+    ///
     /// # Errors
     ///
     /// Rejects another device, identity changes, missing or surplus actions,
-    /// any invalid direct-parameter command, any boost write, and any ordered
-    /// step that newly activates a stored boost or changes an active one.
+    /// any invalid direct-parameter command, any O5/O6 unmute, any boost
+    /// write, and any ordered step that newly activates a stored boost or
+    /// changes an active one.
     pub fn new(
         baseline: &SnapshotV1,
         desired: &SnapshotV1,
@@ -911,6 +916,7 @@ impl ApplyPlanV1 {
             ));
         } else {
             let command = DirectParameterCommand::new(diff.device_id, actions)?;
+            require_reserved_stay_muted(command.actions())?;
             require_cut_only(command.actions())?;
             require_protective_levels(baseline, command.actions())?;
             require_typed_lane_reserve(baseline, command.actions())?;
@@ -1233,6 +1239,30 @@ fn require_protective_levels(
     Ok(())
 }
 
+/// Refuse any write that would leave O5 or O6 unmuted.
+///
+/// O5 and O6 are muted forever (operator ruling; legalab damage invariant).
+/// Every apply and every rollback carrier, on every lane, is bound here, so
+/// no `control apply|rollback`, `write apply|rollback`, or Apple helper path
+/// can send an O5/O6 mute value other than 1. A plan that would mute a live
+/// O5/O6 therefore cannot be staged either: its exact rollback would unmute.
+fn require_reserved_stay_muted(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanError> {
+    for action in actions {
+        let reserved =
+            (5..=OUTPUT_COUNT).find(|&output| output_channel(output) == action.channel());
+        if let Some(output) = reserved
+            && action.parameter() == crate::layout::MUTE_PARAMETER
+            && action.value() != 1
+        {
+            return Err(ApplyPlanError::ReservedUnmute {
+                output,
+                value: action.value(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a typed-write-lane apply while O5 or O6 reads unmuted.
 ///
 /// Any action on a typed-write-lane address (see
@@ -1538,6 +1568,12 @@ pub enum ApplyPlanError {
         before: u16,
         after: u16,
     },
+    /// An apply or rollback action would write an O5/O6 mute value other
+    /// than 1 (muted). O5 and O6 are never unmuted by any carrier.
+    #[error(
+        "O{output} mute would be written {value}, not 1 (muted); no apply or rollback ever unmutes O5 or O6"
+    )]
+    ReservedUnmute { output: u8, value: u16 },
     /// A typed-write-lane carrier was bound to a baseline with O5 or O6 live.
     #[error(
         "O{output} mute code is {value}, not 1 (muted); typed-write-lane actions need O5 and O6 muted"
@@ -1658,6 +1694,7 @@ impl RollbackPlanV1 {
             Some(_) if actions.is_empty() => return Err(ApplyPlanError::MissingRollbackActions),
             Some(apply_command) => {
                 let rollback = DirectParameterCommand::new(apply.device_id, actions)?;
+                require_reserved_stay_muted(rollback.actions())?;
                 let mut apply_addresses: Vec<_> = apply_command
                     .actions()
                     .iter()

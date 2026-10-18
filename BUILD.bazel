@@ -207,9 +207,11 @@ sh_test(
     args = [
         "$(location //crates/dcxctl:dcxctl)",
         "$(location fixtures/snapshots/SYNTHETIC-blank-snapshot.json)",
+        "$(location fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json)",
     ],
     data = [
         "fixtures/snapshots/SYNTHETIC-blank-snapshot.json",
+        "fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json",
         "//crates/dcxctl",
     ],
     # Like feedback_pipeline, the script runs bash, grep, sed, and mktemp from
@@ -228,9 +230,11 @@ sh_test(
     args = [
         "$(location //crates/dcxctl:dcxctl)",
         "$(location fixtures/snapshots/SYNTHETIC-blank-snapshot.json)",
+        "$(location fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json)",
     ],
     data = [
         "fixtures/snapshots/SYNTHETIC-blank-snapshot.json",
+        "fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json",
         "//crates/dcxctl",
     ],
     # The script runs bash, grep, jq, and mktemp from the host PATH, so it must

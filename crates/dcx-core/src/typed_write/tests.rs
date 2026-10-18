@@ -1209,12 +1209,13 @@ fn level_rises_are_summed_across_gains_and_peq_bands() {
         ]),
         Err(TypedWriteError::GainStep { .. })
     ));
-    // A shallower active cut counts: -5 dB to -1 dB is +4 dB.
+    // A shallower active cut counts: -5 dB to -1 dB is +4 dB. The band stays
+    // at its baseline 640 Hz (code 160), Q 1 (code 20), so only its gain moves.
     let band = |gain_db| TypedChange::PeqBand {
         output: 1,
         band: 1,
         filter: PeqKind::Bell,
-        frequency_hz: 987.0,
+        frequency_hz: 640.0,
         gain_db,
         q: 1.0,
         shelf_slope_db: None,
@@ -1232,19 +1233,46 @@ fn level_rises_are_summed_across_gains_and_peq_bands() {
         }]),
         Err(TypedWriteError::GainStep { .. })
     ));
-    // Moving an active cut without changing its depth adds nothing.
+    // Moving an active cut releases its whole depth at the old frequency,
+    // whatever the new cut is: moving the -5 dB cut is +5 dB at 640 Hz.
+    let moved = |gain_db| TypedChange::PeqBand {
+        output: 1,
+        band: 1,
+        filter: PeqKind::Bell,
+        frequency_hz: 63.0,
+        gain_db,
+        q: 4.0,
+        shelf_slope_db: None,
+    };
+    assert!(matches!(
+        attempt(vec![moved(-5.0)]),
+        Err(TypedWriteError::GainStep { .. })
+    ));
+    // A cut no deeper than the step may still be moved: -2 dB releases +2 dB.
+    builder.set(5, band_parameter(1, BandField::Gain), 130);
+    let shallow = builder.snapshot();
     assert!(
-        attempt(vec![TypedChange::PeqBand {
-            output: 1,
-            band: 1,
-            filter: PeqKind::Bell,
-            frequency_hz: 63.0,
-            gain_db: -5.0,
-            q: 4.0,
-            shelf_slope_db: None,
-        }])
+        plan_writes(
+            &shallow,
+            &plan(vec![moved(-2.0)]),
+            &WritePolicyV1::default()
+        )
         .is_ok()
     );
+    // Reshaping alone (a new Q at the same frequency) also releases it.
+    let reshaped = TypedChange::PeqBand {
+        output: 1,
+        band: 1,
+        filter: PeqKind::Bell,
+        frequency_hz: 640.0,
+        gain_db: -5.0,
+        q: 4.0,
+        shelf_slope_db: None,
+    };
+    assert!(matches!(
+        attempt(vec![reshaped]),
+        Err(TypedWriteError::GainStep { .. })
+    ));
 }
 
 #[test]
@@ -1305,4 +1333,172 @@ fn core_refuses_typed_lane_carriers_while_a_reserved_output_is_live() {
     // The older lanes are unchanged: a PEQ cut still plans on that baseline.
     let peq = DirectParameterAction::new(5, band_parameter(1, BandField::Gain), 140).unwrap();
     assert!(ApplyTransactionV1::stage_projected(live, vec![peq]).is_ok());
+}
+
+// Regression tests for the PR #58 adversarial review (2026-10-17). Each one
+// started as a proof of concept that passed against the defect at b543b1a;
+// the assertions are inverted to pin the fix.
+
+#[test]
+fn core_carriers_refuse_every_o5_o6_unmute_on_every_lane() {
+    // Review finding 1 (R4): a routing-lane mute of a live O6 has an exact
+    // rollback that unmutes it, so it can no longer be staged at all.
+    let mut builder = Builder::new();
+    builder.set(10, MUTE_PARAMETER, 0);
+    let live = builder.snapshot();
+    let mute = DirectParameterAction::new(10, MUTE_PARAMETER, 1).unwrap();
+    assert!(
+        !reviewed_address(10, MUTE_PARAMETER)
+            .unwrap()
+            .is_typed_lane()
+    );
+    assert!(matches!(
+        ApplyTransactionV1::stage_projected(live, vec![mute]),
+        Err(ApplyTransactionError::Plan(
+            ApplyPlanError::ReservedUnmute {
+                output: 6,
+                value: 0
+            }
+        ))
+    ));
+    // And an apply that unmutes O6 from a muted baseline is refused before
+    // any carrier exists.
+    let unmute = DirectParameterAction::new(10, MUTE_PARAMETER, 0).unwrap();
+    assert!(matches!(
+        ApplyTransactionV1::stage_projected(baseline(), vec![unmute]),
+        Err(ApplyTransactionError::Plan(
+            ApplyPlanError::ReservedUnmute {
+                output: 6,
+                value: 0
+            }
+        ))
+    ));
+}
+
+#[test]
+fn write_apply_recheck_refuses_an_unsafe_in_frame_order() {
+    // Review finding 3: [raise O1 to 0 dB, then mute] passes the core, but a
+    // frame cut short after action 1 leaves O1 live at 0 dB, louder than
+    // either end state. The `write apply` policy re-check refuses it.
+    let mut builder = Builder::new();
+    builder.set(5, GAIN_PARAMETER, 120); // O1 live at -3 dB
+    let base = builder.snapshot();
+    let rise = DirectParameterAction::new(5, GAIN_PARAMETER, 150).unwrap();
+    let mute = DirectParameterAction::new(5, MUTE_PARAMETER, 1).unwrap();
+    let transaction = ApplyTransactionV1::stage_projected(base.clone(), vec![rise, mute]).unwrap();
+    let carrier = ApplyPlanV1::from_json(&transaction.apply_plan().to_json().unwrap()).unwrap();
+    assert!(matches!(
+        check_policy(
+            carrier.baseline(),
+            carrier.command().unwrap().actions(),
+            &WritePolicyV1::default(),
+        ),
+        Err(TypedWriteError::UnsafeOrder {
+            channel: 5,
+            parameter: MUTE_PARAMETER
+        })
+    ));
+    // Planning the same intent orders the mute first and passes the check.
+    let planned = plan_writes(
+        &base,
+        &plan(vec![
+            TypedChange::OutputGain {
+                output: 1,
+                gain_db: 0.0,
+            },
+            TypedChange::OutputMute {
+                output: 1,
+                muted: true,
+            },
+        ]),
+        &WritePolicyV1::default(),
+    )
+    .unwrap();
+    let actions = planned.apply_plan.command().unwrap().actions();
+    let order: Vec<_> = actions.iter().map(|action| action.parameter()).collect();
+    assert_eq!(order, [MUTE_PARAMETER, GAIN_PARAMETER]);
+    check_policy(&base, actions, &WritePolicyV1::default()).unwrap();
+}
+
+#[test]
+fn write_rollback_refuses_a_non_reverse_order() {
+    // Review finding 3, rollback side: restoring [unmute, then gain] leaves
+    // O1 live at 0 dB between the two writes.
+    let mut builder = Builder::new();
+    builder.set(5, GAIN_PARAMETER, 120);
+    let base = builder.snapshot();
+    let apply = vec![
+        DirectParameterAction::new(5, MUTE_PARAMETER, 1).unwrap(),
+        DirectParameterAction::new(5, GAIN_PARAMETER, 150).unwrap(),
+    ];
+    let desired = base.project_direct_actions(&apply).unwrap();
+    let rollback = vec![
+        DirectParameterAction::new(5, MUTE_PARAMETER, 0).unwrap(),
+        DirectParameterAction::new(5, GAIN_PARAMETER, 120).unwrap(),
+    ];
+    let transaction = ApplyTransactionV1::stage(base, desired, apply, rollback).unwrap();
+    let parsed =
+        RollbackPlanV1::from_json(&transaction.rollback_plan().to_json().unwrap()).unwrap();
+    assert!(matches!(
+        check_rollback(&parsed),
+        Err(TypedWriteError::RollbackOrder)
+    ));
+}
+
+#[test]
+fn moving_a_deep_active_cut_spends_the_rise_budget() {
+    // Review finding 4: moving an active -15 dB bell off the 63 Hz front
+    // mode releases all 15 dB at 63 Hz, exactly as releasing it by gain.
+    let mut builder = Builder::new();
+    builder.set(5, EQ_ENABLED_PARAMETER, 1);
+    builder.set(5, EQ_COUNT_PARAMETER, 1);
+    builder.set(5, band_parameter(1, BandField::Frequency), 53); // ~63 Hz
+    builder.set(5, band_parameter(1, BandField::Q), 32); // ~4
+    builder.set(5, band_parameter(1, BandField::Gain), 0); // -15 dB
+    let base = builder.snapshot();
+    let band = |frequency_hz, gain_db, q| TypedChange::PeqBand {
+        output: 1,
+        band: 1,
+        filter: PeqKind::Bell,
+        frequency_hz,
+        gain_db,
+        q,
+        shelf_slope_db: None,
+    };
+    for change in [band(63.0, 0.0, 4.0), band(10_000.0, -15.0, 10.0)] {
+        assert!(matches!(
+            plan_writes(&base, &plan(vec![change]), &WritePolicyV1::default()),
+            Err(TypedWriteError::GainStep { .. })
+        ));
+    }
+}
+
+#[test]
+fn peq_only_carriers_stay_under_core_rules_only() {
+    // Review finding 5 (scope, documented): a PEQ-only carrier on O1-O4 is
+    // not a typed-write-lane carrier. The write policy would refuse this
+    // PEQ-off over a -15 dB cut with O6 live, but the core admits it, as it
+    // did before the typed-write lane existed, and `control apply` does not
+    // route it through the write policy. docs/typed-writes.md says so.
+    let mut builder = Builder::new();
+    builder.set(5, EQ_ENABLED_PARAMETER, 1);
+    builder.set(5, EQ_COUNT_PARAMETER, 1);
+    builder.set(5, band_parameter(1, BandField::Gain), 0);
+    builder.set(10, MUTE_PARAMETER, 0);
+    let base = builder.snapshot();
+    let off = DirectParameterAction::new(5, EQ_ENABLED_PARAMETER, 0).unwrap();
+    assert!(
+        !reviewed_address(5, EQ_ENABLED_PARAMETER)
+            .unwrap()
+            .is_typed_lane()
+    );
+    let transaction = ApplyTransactionV1::stage_projected(base.clone(), vec![off]).unwrap();
+    assert!(
+        check_policy(
+            &base,
+            transaction.apply_plan().command().unwrap().actions(),
+            &WritePolicyV1::default()
+        )
+        .is_err()
+    );
 }

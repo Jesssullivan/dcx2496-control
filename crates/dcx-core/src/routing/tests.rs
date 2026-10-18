@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::{
-    ApplyPlanError, ApplyPlanV1, ApplyTransactionV1, SnapshotProjectionError, SnapshotSection,
+    ApplyPlanError, ApplyPlanV1, ApplyTransactionError, ApplyTransactionV1, PlanCarrierError,
+    RollbackPlanV1, SnapshotProjectionError, SnapshotSection,
     layout::{EQ_ENABLED_PARAMETER, INPUT_SUM_LOCATION},
     peq_bank::DesiredProfile,
     protocol::{DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN},
@@ -60,6 +61,28 @@ fn synthetic_baseline() -> SnapshotV1 {
     dump1[365] = 1;
     dump1[DUMP1_TRAILER] = 78;
     SnapshotV1::from_frames(&identity(), &dump0, &dump1).unwrap()
+}
+
+/// The same routing shape with O5 and O6 already muted, as on the bench
+/// since 2026-10-09: the only baseline a reserved-mute write can be staged
+/// from, because the exact rollback of a mute from live would unmute.
+fn reserve_muted_baseline() -> SnapshotV1 {
+    let mut dump0 = blank_dump(0);
+    let mut dump1 = blank_dump(1);
+    dump0[DUMP0_TRAILER] = 7;
+    dump1[195] = 1;
+    dump1[365] = 1;
+    dump1[392] = 1;
+    dump1[561] = 1;
+    dump1[DUMP1_TRAILER] = 76;
+    SnapshotV1::from_frames(&identity(), &dump0, &dump1).unwrap()
+}
+
+/// Whether any action writes an O5/O6 mute value other than 1.
+fn unmutes_reserve(actions: &[DirectParameterAction]) -> bool {
+    actions.iter().any(|item| {
+        matches!(item.channel(), 9 | 10) && item.parameter() == 0x03 && item.value() != 1
+    })
 }
 
 fn random_baseline(rng: &mut Rng) -> SnapshotV1 {
@@ -209,7 +232,7 @@ fn synthetic_mvp_projection_changes_exactly_the_reviewed_bytes_and_trailers() {
 
 #[test]
 fn staged_mvp_transaction_rolls_back_in_exact_reverse_order() {
-    let baseline = synthetic_baseline();
+    let baseline = reserve_muted_baseline();
     let actions = RoutingTargetsV1::mvp().actions().unwrap();
     let transaction =
         ApplyTransactionV1::stage_projected(baseline.clone(), actions.clone()).unwrap();
@@ -232,8 +255,8 @@ fn staged_mvp_transaction_rolls_back_in_exact_reverse_order() {
             action(7, 0x41, 1),
             action(8, 0x41, 1),
             action(0, 0x02, 0),
-            action(10, 0x03, 0),
-            action(9, 0x03, 0),
+            action(10, 0x03, 1),
+            action(9, 0x03, 1),
         ]
     );
     let desired = transaction.apply_plan().desired().clone();
@@ -244,6 +267,80 @@ fn staged_mvp_transaction_rolls_back_in_exact_reverse_order() {
         &ApplyPlanV1::from_json(&json).unwrap(),
         transaction.apply_plan()
     );
+}
+
+#[test]
+fn no_carrier_on_any_lane_ever_unmutes_o5_or_o6() {
+    // A routing apply that mutes a live O5/O6 cannot be staged: its exact
+    // rollback would unmute it, and the core rollback carrier refuses that.
+    let live = synthetic_baseline();
+    let mvp = RoutingTargetsV1::mvp().actions().unwrap();
+    assert!(matches!(
+        ApplyTransactionV1::stage_projected(live.clone(), mvp),
+        Err(ApplyTransactionError::Plan(
+            ApplyPlanError::ReservedUnmute {
+                output: 6,
+                value: 0
+            }
+        ))
+    ));
+    for channel in [9, 10] {
+        let mute = action(channel, 0x03, 1);
+        let desired = live.project_direct_actions(&[mute]).unwrap();
+        // The apply alone is admitted; no rollback carrier can be bound to it.
+        let apply = ApplyPlanV1::new(&live, &desired, vec![mute]).unwrap();
+        assert!(matches!(
+            ApplyTransactionV1::stage(
+                live.clone(),
+                desired,
+                vec![mute],
+                vec![action(channel, 0x03, 0)]
+            ),
+            Err(ApplyTransactionError::Plan(
+                ApplyPlanError::ReservedUnmute { value: 0, .. }
+            ))
+        ));
+        assert!(ApplyTransactionV1::from_apply_plan(&apply).is_err());
+    }
+    // An apply that unmutes either reserved output is refused outright, on
+    // the routing lane and through the strict carrier parser.
+    let muted = reserve_muted_baseline();
+    for channel in [9, 10] {
+        let unmute = action(channel, 0x03, 0);
+        let desired = muted.project_direct_actions(&[unmute]).unwrap();
+        assert!(matches!(
+            ApplyPlanV1::new(&muted, &desired, vec![unmute]),
+            Err(ApplyPlanError::ReservedUnmute { value: 0, .. })
+        ));
+    }
+    // A durable carrier edited to unmute O5 is refused by the strict parsers
+    // that `control apply|rollback` and the Apple helper use, at the reserved
+    // rule itself and before any digest comparison.
+    let staged =
+        ApplyTransactionV1::stage_projected(muted, RoutingTargetsV1::mvp().actions().unwrap())
+            .unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&staged.apply_plan().to_json().unwrap()).unwrap();
+    assert_eq!(value["command"]["actions"][0]["channel"], 9);
+    value["command"]["actions"][0]["value"] = 0.into();
+    assert!(matches!(
+        ApplyPlanV1::from_json(&serde_json::to_vec(&value).unwrap()),
+        Err(PlanCarrierError::Plan(ApplyPlanError::ReservedUnmute {
+            output: 5,
+            value: 0
+        }))
+    ));
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&staged.rollback_plan().to_json().unwrap()).unwrap();
+    assert_eq!(value["command"]["actions"][4]["channel"], 9);
+    value["command"]["actions"][4]["value"] = 0.into();
+    assert!(matches!(
+        RollbackPlanV1::from_json(&serde_json::to_vec(&value).unwrap()),
+        Err(PlanCarrierError::Plan(ApplyPlanError::ReservedUnmute {
+            output: 5,
+            value: 0
+        }))
+    ));
 }
 
 #[test]
@@ -425,7 +522,22 @@ fn random_routing_subsets_round_trip_and_touch_only_their_bytes() {
         assert_eq!(desired.project_direct_actions(&rollback).unwrap(), baseline);
         assert_eq!(desired.project_direct_actions(&actions).unwrap(), desired);
         if desired != baseline {
-            ApplyTransactionV1::stage_projected(baseline.clone(), actions.clone()).unwrap();
+            let staged = ApplyTransactionV1::stage_projected(baseline.clone(), actions.clone());
+            // A carrier is refused exactly when its apply or its exact
+            // rollback would write an O5/O6 mute other than 1.
+            if unmutes_reserve(&actions) || unmutes_reserve(&rollback) {
+                assert!(
+                    matches!(
+                        staged,
+                        Err(ApplyTransactionError::Plan(
+                            ApplyPlanError::ReservedUnmute { .. }
+                        ))
+                    ),
+                    "case {case}"
+                );
+            } else {
+                staged.unwrap();
+            }
         }
 
         // Any non-identity permutation of two or more actions is refused.

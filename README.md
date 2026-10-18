@@ -216,7 +216,9 @@ sources, and the setup input sum (off or A+B only). The result is a strict
 `dcx.desired-routing/v1` that goes through the same `control diff`, `apply`,
 and `rollback` carriers. Actions are written mutes first, then the input sum,
 then the O4 and O3 sources; rollback is the exact reverse. Single-field
-profiles serve one-at-a-time probes.
+profiles serve one-at-a-time probes. `--o5-mute` and `--o6-mute` accept `on`
+only: no apply or rollback carrier on any lane ever unmutes O5 or O6, so a
+profile that mutes a live O5/O6 cannot be staged either.
 
 ```sh
 dcxctl routing inspect --snapshot snapshot.json
@@ -236,7 +238,11 @@ gain; an O3/O4 source behind two consents) into one reviewed frame bound to an
 exact baseline, with an exact touched-address inverse. `write plan` is a dry
 run that prints the exact frame bytes; `write verify` is the offline readback
 check. O5/O6 are never addressed and every plan is refused while either reads
-unmuted. See [`docs/typed-writes.md`](docs/typed-writes.md).
+unmuted. This is offline planning only: no shipped binary carries `write
+apply|rollback` (they need the non-default `typed-write-live` feature), and
+Legalab ruling D5 (front-panel entry) stands for device writes until the
+operator rules on software writes. See
+[`docs/typed-writes.md`](docs/typed-writes.md).
 
 ```sh
 dcxctl write show --snapshot snapshot.json
