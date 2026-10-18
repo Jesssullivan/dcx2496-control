@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Add typed parameter writes, offline planning only pending an operator
+  ruling: `dcxctl write show|plan|verify` (offline), and `write
+  apply|rollback` only behind the non-default `typed-write-live` feature,
+  which no shipped binary enables (Legalab D5, front-panel entry, stands for
+  device writes). `write apply` rebuilds its carrier from `--write-plan`
+  under the same flags; both live commands exit non-zero unless the readback
+  verifies. A strict `dcx.write-plan/v1` lists
+  typed changes (PEQ band, PEQ on/off and band count, crossover, output gain,
+  mute, polarity, delay, limiter, input A-C gain, and an O3/O4 source behind
+  two consents). The dry-run `dcx.write-transaction/v1` prints the exact
+  frame bytes, the dump offsets each value lands at, and the apply/rollback
+  carriers. Policy refusals cover O5/O6 (never addressed; every plan refused
+  while either reads unmuted), unmute, routing or loosening an active
+  high-pass without consent, a summed level rise (gains, thresholds,
+  effective PEQ band gains) past +3 dB, a level rise past 0 dB, limiter
+  switch-off, EQ boosts, more than 16 actions, and carriers out of the safe
+  in-frame order or (rollback) not its exact reverse. Moving or reshaping an
+  active PEQ cut spends its released depth from the rise budget. `control
+  apply|rollback` refuse typed-write-lane carriers (typed fields and O1-O3
+  mutes); PEQ-only and O4-mute carriers stay under the core rules only.
+  The reviewed allowlist gains the O1-O3 mutes, the O1-O4 gain, delay,
+  crossover, limiter and polarity rows, and the input A-C gains, transcribed
+  from the pinned DuinoDCX tables and pending named-device readback. Core apply
+  carriers now refuse level rises past unity or +3 dB, limiter switch-off,
+  and typed-write-lane actions while O5/O6 read unmuted, for every lane.
+- Never unmute O5/O6 on any lane: every apply and rollback carrier refuses an
+  O5/O6 mute value other than 1 (`ReservedUnmute`), so `control
+  apply|rollback`, `write apply|rollback` and the Apple helper cannot send
+  one, and a plan that mutes a live O5/O6 cannot be staged (its exact
+  rollback would unmute). `routing desired-profile --o5-mute|--o6-mute`
+  accept `on` only. The routing and write pipelines use the new
+  `fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json`. See
+  `docs/typed-writes.md`.
 - Give the rollback identity step the same paced Search qualification as
   snapshot and apply: a fresh rollback session now replays empty Search
   timeouts (attempt one immediate, five-second cadence, at most ten replays)

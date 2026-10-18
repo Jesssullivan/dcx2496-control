@@ -9,6 +9,7 @@ mod live_meter;
 mod feedback_cli;
 mod live_control;
 mod routing_cli;
+mod write_cli;
 
 use std::{
     error::Error,
@@ -76,6 +77,120 @@ enum Command {
         #[command(subcommand)]
         command: RoutingCommand,
     },
+    /// Typed parameter writes: show, dry-run plan, verify (offline planning
+    /// only; live apply/rollback need the non-default `typed-write-live`
+    /// feature, which no shipped binary enables, pending an operator ruling).
+    Write {
+        #[command(subcommand)]
+        command: WriteCommand,
+    },
+}
+
+/// Write-policy limits. Each flag can only tighten its default.
+#[derive(Debug, Args)]
+struct WritePolicyArgs {
+    /// Consent to an O3/O4 source change (the plan must also set `allow_routing`).
+    #[arg(long)]
+    allow_routing: bool,
+    /// Consent to unmuting O1-O4 (the plan must also set `allow_unmute`).
+    #[arg(long)]
+    allow_unmute: bool,
+    /// Consent to loosening an active high-pass: type change, off, or a lower
+    /// corner (the plan must also set `allow_protection_change`).
+    #[arg(long)]
+    allow_protection_change: bool,
+    /// Absolute output and input gain ceiling in dB, -15 through 0.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    gain_ceiling_db: f64,
+    /// Largest summed level rise per plan in dB (level gains, limiter
+    /// thresholds, effective PEQ band gains), 0 through 3.
+    #[arg(long, default_value_t = 3.0)]
+    max_gain_step_db: f64,
+    /// Largest number of direct-parameter actions in the one apply frame, 1 through 32.
+    #[arg(long, default_value_t = 16)]
+    max_actions: usize,
+}
+
+impl WritePolicyArgs {
+    const fn to_policy(&self) -> write_cli::PolicyArgs {
+        write_cli::PolicyArgs {
+            allow_routing: self.allow_routing,
+            allow_unmute: self.allow_unmute,
+            allow_protection_change: self.allow_protection_change,
+            gain_ceiling_db: self.gain_ceiling_db,
+            max_gain_step_db: self.max_gain_step_db,
+            max_actions: self.max_actions,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum WriteCommand {
+    /// Decode every reviewed typed field of a saved snapshot (read-only).
+    Show {
+        /// Complete raw `SnapshotV1` produced by `control snapshot`.
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
+    /// Dry run: encode, check, and order a `dcx.write-plan/v1`; print the
+    /// exact frame bytes plus the apply and rollback carriers. Opens no device.
+    Plan {
+        /// Baseline `SnapshotV1` the plan is computed against.
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Strict `dcx.write-plan/v1` document.
+        #[arg(long)]
+        plan: PathBuf,
+        #[command(flatten)]
+        policy: WritePolicyArgs,
+    },
+    /// Offline gate: exit non-zero unless every written value appears at its
+    /// dump location, nothing else changed, and the readback equals desired.
+    Verify {
+        /// Strict raw `ApplyPlanV1` (the `apply_plan` of `write plan`).
+        #[arg(long)]
+        plan: PathBuf,
+        /// Complete `SnapshotV1` read back after the apply.
+        #[arg(long)]
+        readback: PathBuf,
+    },
+    /// Rebuild the carrier from its write plan under the same policy flags,
+    /// require it to match exactly, then run the `control apply` transaction
+    /// (fresh baseline, one frame, readback). Exits non-zero unless verified.
+    /// Not in any shipped binary: needs the `typed-write-live` feature.
+    #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
+    Apply {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+        /// The strict `dcx.write-plan/v1` document the carrier was planned from.
+        #[arg(long)]
+        write_plan: PathBuf,
+        /// Strict raw `ApplyPlanV1` (the `apply_plan` of `write plan`).
+        #[arg(long)]
+        plan: PathBuf,
+        #[command(flatten)]
+        policy: WritePolicyArgs,
+    },
+    /// Re-check one rollback carrier (exact reverse, never O5/O6), then run
+    /// `control rollback`. Restores baseline mutes and levels without
+    /// consent flags. Exits non-zero unless the baseline is restored.
+    /// Not in any shipped binary: needs the `typed-write-live` feature.
+    #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
+    Rollback {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+        /// Strict `RollbackPlanV1` (the `rollback_plan` of `write plan`).
+        #[arg(long)]
+        plan: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -85,6 +200,19 @@ enum Switch {
 }
 
 impl Switch {
+    const fn muted(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// The reserved O5/O6 mutes accept only `on`; the core carrier refuses any
+/// O5/O6 unmute on every lane as well.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ReserveMute {
+    On,
+}
+
+impl ReserveMute {
     const fn muted(self) -> bool {
         matches!(self, Self::On)
     }
@@ -137,12 +265,12 @@ enum RoutingCommand {
         /// O4 mute.
         #[arg(long, value_enum)]
         o4_mute: Option<Switch>,
-        /// O5 mute.
+        /// O5 mute: `on` only. O5 and O6 are never unmuted.
         #[arg(long, value_enum)]
-        o5_mute: Option<Switch>,
-        /// O6 mute.
+        o5_mute: Option<ReserveMute>,
+        /// O6 mute: `on` only. O5 and O6 are never unmuted.
         #[arg(long, value_enum)]
-        o6_mute: Option<Switch>,
+        o6_mute: Option<ReserveMute>,
         /// Setup input sum: off or A+B only.
         #[arg(long, value_enum)]
         input_sum: Option<InputSumArg>,
@@ -448,8 +576,47 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Control { command } => control(command)?,
         Command::Feedback { command } => feedback(command)?,
         Command::Routing { command } => routing(command)?,
+        Command::Write { command } => write(command)?,
     }
     Ok(())
+}
+
+fn write(command: WriteCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        WriteCommand::Show { snapshot } => write_cli::show(&snapshot),
+        WriteCommand::Plan {
+            snapshot,
+            plan,
+            policy,
+        } => write_cli::plan(&snapshot, &plan, &policy.to_policy()),
+        WriteCommand::Verify { plan, readback } => {
+            if write_cli::verify(&plan, &readback)? {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
+        #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
+        WriteCommand::Apply {
+            tty,
+            expected_device,
+            write_plan,
+            plan,
+            policy,
+        } => write_cli::apply(
+            tty,
+            expected_device,
+            &write_plan,
+            &plan,
+            &policy.to_policy(),
+        ),
+        #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
+        WriteCommand::Rollback {
+            tty,
+            expected_device,
+            plan,
+        } => write_cli::rollback(tty, expected_device, &plan),
+    }
 }
 
 fn routing(command: RoutingCommand) -> Result<(), Box<dyn Error>> {
@@ -468,8 +635,8 @@ fn routing(command: RoutingCommand) -> Result<(), Box<dyn Error>> {
             &routing_cli::Targets {
                 mvp,
                 o4_mute: o4_mute.map(Switch::muted),
-                o5_mute: o5_mute.map(Switch::muted),
-                o6_mute: o6_mute.map(Switch::muted),
+                o5_mute: o5_mute.map(ReserveMute::muted),
+                o6_mute: o6_mute.map(ReserveMute::muted),
                 input_sum: input_sum.map(|sum| match sum {
                     InputSumArg::Off => InputSum::Off,
                     InputSumArg::APlusB => InputSum::APlusB,

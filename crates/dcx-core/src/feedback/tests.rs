@@ -376,6 +376,11 @@ fn every_reviewed_address_round_trips_apply_then_rollback_over_random_baselines(
             if !rng.chance(1, 3) {
                 continue;
             }
+            // A random baseline byte can lie outside a non-PEQ field's
+            // documented domain; exact rollback then fails closed by design.
+            if !address.field.admits(baseline.read_reviewed(address)) {
+                continue;
+            }
             let value =
                 u16::try_from(rng.below(u64::from(address.field.device_max()) + 1)).unwrap();
             actions.push(DirectParameterAction::new(channel, parameter, value).unwrap());

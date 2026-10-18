@@ -172,9 +172,22 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
         MAX_CONTROL_DOCUMENT_BYTES,
         "apply plan",
     )?)?;
+    refuse_typed_lane(plan.command(), "write apply")?;
+    apply_loaded(tty, expected_device, &plan).map(|_| ())
+}
+
+/// Run one already-validated apply carrier (see [`apply`]). Returns whether
+/// the readback matched the desired snapshot; `control apply` keeps its
+/// historical exit 0 after printing a `rollback_required` status.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn apply_loaded(
+    tty: PathBuf,
+    expected_device: u8,
+    plan: &ApplyPlanV1,
+) -> Result<bool, Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.device())?;
-    let mut transaction = ApplyTransactionV1::from_apply_plan(&plan)?;
+    let mut transaction = ApplyTransactionV1::from_apply_plan(plan)?;
     let binding = PrivateTtyBinding::new(tty)?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();
@@ -194,7 +207,7 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
                     "failure": "post_apply_state_uncertain",
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
-                return Ok(());
+                return Ok(false);
             }
             Err(error) => return Err(error.into()),
         };
@@ -208,7 +221,7 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
         "readback_matches_desired": readback_matches_desired,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+    Ok(readback_matches_desired)
 }
 
 #[cfg(all(feature = "live-control", target_os = "macos"))]
@@ -218,9 +231,51 @@ pub fn rollback(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Bo
         MAX_CONTROL_DOCUMENT_BYTES,
         "rollback plan",
     )?)?;
+    refuse_typed_lane(plan.command(), "write rollback")?;
+    rollback_loaded(tty, expected_device, &plan).map(|_| ())
+}
+
+/// `control apply|rollback` refuse carriers holding a typed-write-lane
+/// address (the typed fields and the O1-O3 mutes; see
+/// [`dcx_core::layout::ReviewedAddress::is_typed_lane`]). PEQ and O4-mute
+/// carriers on O1-O4 still pass here under the core rules only, as before the
+/// typed-write lane existed; they get no write-policy check. Typed-lane
+/// carriers go only through `dcxctl write apply|rollback`, which no shipped
+/// binary builds (`typed-write-live`).
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+fn refuse_typed_lane(
+    command: Option<&dcx_core::DirectParameterCommand>,
+    replacement: &str,
+) -> Result<(), io::Error> {
+    let typed = command
+        .map_or(&[][..], dcx_core::DirectParameterCommand::actions)
+        .iter()
+        .any(|action| {
+            reviewed_address(action.channel(), action.parameter())
+                .is_some_and(dcx_core::layout::ReviewedAddress::is_typed_lane)
+        });
+    if typed {
+        Err(invalid_input(&format!(
+            "carrier holds typed-write-lane addresses; use dcxctl {replacement}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Run one already-validated rollback carrier (see [`rollback`]). Returns
+/// whether the restored readback equals the baseline; `control rollback`
+/// keeps its historical exit 0 after printing `state_unresolved` with a
+/// captured readback.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn rollback_loaded(
+    tty: PathBuf,
+    expected_device: u8,
+    plan: &RollbackPlanV1,
+) -> Result<bool, Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.baseline().device())?;
-    let mut transaction = ApplyTransactionV1::resume_rollback(&plan)?;
+    let mut transaction = ApplyTransactionV1::resume_rollback(plan)?;
     let binding = PrivateTtyBinding::new(tty)?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();
@@ -250,7 +305,7 @@ pub fn rollback(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Bo
         "equals_baseline": equals_baseline,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+    Ok(equals_baseline)
 }
 
 fn field_changes(
