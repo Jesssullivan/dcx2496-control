@@ -1318,6 +1318,26 @@ pub fn require_reserved_muted(snapshot: &SnapshotV1) -> Result<(), TypedWriteErr
     Ok(())
 }
 
+/// Refuse loosening an active high-pass (a type change, or a lower corner)
+/// without protection consent.
+fn check_high_pass_protection(
+    baseline: &SnapshotV1,
+    address: ReviewedAddress,
+    before: u16,
+    after: u16,
+    policy: &WritePolicyV1,
+) -> Result<(), TypedWriteError> {
+    let active = read_field(baseline, address.output, HIGH_PASS_TYPE_PARAMETER)? != 0;
+    let loosens = address.field == OutputField::HighPassType || after < before;
+    if active && loosens && !policy.allow_protection_change {
+        return Err(TypedWriteError::ProtectionChange {
+            output: address.output,
+            field: address.field.label(),
+        });
+    }
+    Ok(())
+}
+
 /// Check an ordered apply action list against the write policy.
 ///
 /// This is the policy half of [`plan_writes`] and also re-validates a durable
@@ -1404,14 +1424,7 @@ pub fn check_policy(
                 });
             }
             OutputField::HighPassType | OutputField::HighPassFrequency => {
-                let active = read_field(baseline, address.output, HIGH_PASS_TYPE_PARAMETER)? != 0;
-                let loosens = address.field == OutputField::HighPassType || after < before;
-                if active && loosens && !policy.allow_protection_change {
-                    return Err(TypedWriteError::ProtectionChange {
-                        output: address.output,
-                        field: address.field.label(),
-                    });
-                }
+                check_high_pass_protection(baseline, address, before, after, policy)?;
             }
             field if field.is_peq() => {
                 peq_outputs.insert(address.output);
