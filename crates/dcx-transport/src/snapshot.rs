@@ -1012,7 +1012,8 @@ pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
 /// Ceiling on complete post-apply readbacks per apply transaction: the
 /// same-descriptor readback plus at most two fresh read-only snapshots. The
 /// apply envelope ([`APPLY_TRANSACTION_BUDGET`]) is the binding limit: with
-/// the fixed Search cadence it admits at most one fresh snapshot.
+/// the fixed Search cadence it usually admits one fresh snapshot, and a
+/// second only when the first retry fails early (about 65 s in).
 pub const POST_APPLY_READBACK_ATTEMPT_LIMIT: usize = 3;
 /// Fixed wait before each fresh read-only post-apply readback snapshot.
 pub const POST_APPLY_READBACK_RETRY_GAP: Duration = Duration::from_secs(20);
@@ -2429,8 +2430,9 @@ mod tests {
             REPEAT_SEARCH_GAP * 9 + SNAPSHOT_OPERATION_TIMEOUT * 10 + SNAPSHOT_DUMP_TIMEOUT * 2
         );
         assert_eq!(PERSISTENT_SEARCH_COUNT, 10);
-        // The earliest second retry starts after a ten-Search baseline, one
-        // gap and one ten-Search retry; it can never fit the apply envelope.
+        // A second retry after a first retry that ran all ten Searches can
+        // never fit the apply envelope. One that fails early still can; the
+        // remaining-budget check bounds that path.
         let earliest_second_retry = REPEAT_SEARCH_GAP * 9 * 2 + POST_APPLY_READBACK_RETRY_GAP;
         assert!(
             earliest_second_retry + POST_APPLY_READBACK_RETRY_GAP + POST_APPLY_RETRY_SNAPSHOT_FLOOR

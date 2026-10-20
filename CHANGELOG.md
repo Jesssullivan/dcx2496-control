@@ -6,7 +6,7 @@
   `write apply` and `control apply` retry a readback that failed in
   transport or read (and closed verified) as one ordinary complete G1
   snapshot on a fresh session, 20 s later and only while it fits the
-  existing 150 s apply envelope (in practice one retry; ceiling three
+  existing 150 s apply envelope (usually one retry, two if the first fails early; ceiling three
   readbacks; fixed constants), never re-sending a write frame. Validation,
   mismatch, remote-mode, budget, close and open failures are not retried;
   if every readback fails the result is unchanged (`rollback_required`,

@@ -315,9 +315,10 @@ verified, and only while the retry fits the existing apply envelope:
   snapshot then runs under the remaining envelope, so it stops on its budget
   rather than outliving the helper;
 - the ceiling is 3 readbacks in total, but with the fixed Search cadence the
-  envelope admits at most one fresh snapshot: the earliest second retry
-  would start at 110 s and need 74 s more. In practice a failed readback
-  gets exactly one retry. No bound is caller input;
+  envelope usually admits one fresh snapshot: a second retry after a full
+  first retry would start at 110 s and need 74 s more. A first retry that
+  fails at its first Search (about 65 s in) still leaves room for a second
+  (65 + 74 = 139 s). Every path stays inside 150 s. No bound is caller input;
 - each retry opens a fresh session on the same exact callout and runs one
   ordinary complete G1 snapshot (ten Searches, transmit-only mode, Dump0,
   Dump1, receive-only mode, verified close). The retry session type has no
