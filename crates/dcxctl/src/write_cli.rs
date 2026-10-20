@@ -1,7 +1,7 @@
 //! Typed parameter writes: `write show|plan|verify` are offline planning
-//! only. The non-default `typed-write-live` feature, which no shipped binary
-//! enables (Legalab ruling D5, front-panel entry, stands for every device
-//! write until the operator rules on software writes), adds `write
+//! only. The non-default `typed-write-live` feature, which unattended builds
+//! never enable (Legalab `dec-dcx-attended-software-writes-20261019` admits
+//! attended software writes only), adds `write
 //! apply|rollback`: apply rebuilds the carrier from its write plan under the
 //! same policy flags and requires an exact match, rollback re-checks its
 //! carrier, and both then run the ordinary `control apply|rollback`

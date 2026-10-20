@@ -77,9 +77,9 @@ enum Command {
         #[command(subcommand)]
         command: RoutingCommand,
     },
-    /// Typed parameter writes: show, dry-run plan, verify (offline planning
-    /// only; live apply/rollback need the non-default `typed-write-live`
-    /// feature, which no shipped binary enables, pending an operator ruling).
+    /// Typed parameter writes: show, dry-run plan, verify (offline); live
+    /// apply/rollback need the non-default `typed-write-live` feature, which
+    /// unattended builds never enable (attended use only).
     Write {
         #[command(subcommand)]
         command: WriteCommand,

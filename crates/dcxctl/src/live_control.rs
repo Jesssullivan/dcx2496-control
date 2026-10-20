@@ -25,8 +25,9 @@ use dcx_darwin_tty::{DarwinSearchSession, PrivateTtyBinding, recover_receive_dir
 use dcx_transport::{
     RepeatPacer,
     snapshot::{
-        ApplyReadbackOutcome, RollbackReadbackOutcome, execute_apply_readback,
-        execute_persistent_snapshot, execute_rollback_readback,
+        ApplyReadbackOutcome, ApplyReadbackReport, RollbackReadbackOutcome,
+        execute_apply_readback_with_snapshot_retry, execute_persistent_snapshot,
+        execute_rollback_readback,
     },
 };
 
@@ -130,7 +131,9 @@ pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
 
 /// Offline containment gate: every bit that differs between an apply plan's
 /// bound baseline and a complete readback must lie inside the plan's projected
-/// bits (plus the touched dump trailers). Returns whether it does.
+/// bits (plus the touched dump trailers), or inside a follower field that
+/// moved exactly as a modelled linked crossover predicts; those are listed
+/// under `linked_changes`. Returns whether it does.
 pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn Error>> {
     let plan = ApplyPlanV1::from_json(&read_bounded(
         plan,
@@ -143,6 +146,7 @@ pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn 
         "readback snapshot",
     )?)?;
     let uncontained = plan.uncontained_changes(&readback)?;
+    let linked = plan.linked_changes(&readback)?;
     let projected = plan
         .projected_masks()
         .into_iter()
@@ -160,6 +164,7 @@ pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn 
         "readback_matches_desired": readback.digest() == plan.desired_snapshot_digest(),
         "projected_offsets": projected,
         "uncontained_changes": uncontained,
+        "linked_changes": linked,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(contained)
@@ -179,6 +184,12 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
 /// Run one already-validated apply carrier (see [`apply`]). Returns whether
 /// the readback matched the desired snapshot; `control apply` keeps its
 /// historical exit 0 after printing a `rollback_required` status.
+///
+/// A post-apply readback that fails with a transport or read error is
+/// repeated only as a fresh read-only snapshot on the same exact callout, at
+/// most three readbacks in total and 20 s apart (fixed constants in
+/// `dcx_transport::snapshot`); no write frame is ever re-sent. The output
+/// records `readback_attempts`.
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 pub fn apply_loaded(
     tty: PathBuf,
@@ -188,35 +199,48 @@ pub fn apply_loaded(
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.device())?;
     let mut transaction = ApplyTransactionV1::from_apply_plan(plan)?;
-    let binding = PrivateTtyBinding::new(tty)?;
+    let binding = PrivateTtyBinding::new(tty.clone())?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();
-    let (readback, readback_matches_desired) =
-        match execute_apply_readback(session, &mut pacer, &mut transaction) {
-            Ok(ApplyReadbackOutcome::Verified(captured)) => (captured, true),
-            Ok(ApplyReadbackOutcome::RollbackRequired(captured)) => (captured, false),
-            Err(_) if transaction.state() == ApplyTransactionState::RollbackRequired => {
-                let output = serde_json::json!({
-                    "status": "rollback_required",
-                    "transaction_id": plan.digest(),
-                    "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
-                    "desired_snapshot_digest": plan.desired_snapshot_digest(),
-                    "readback": null,
-                    "rollback_available": plan.command().is_some(),
-                    "readback_matches_desired": false,
-                    "failure": "post_apply_state_uncertain",
-                });
-                println!("{}", serde_json::to_string_pretty(&output)?);
-                return Ok(false);
-            }
-            Err(error) => return Err(error.into()),
-        };
+    // Each read-only retry re-validates and re-binds the same exact callout.
+    let open_readback_session =
+        move || DarwinSearchSession::open_known_38400(PrivateTtyBinding::new(tty.clone())?);
+    let ApplyReadbackReport {
+        result,
+        readback_attempts,
+    } = execute_apply_readback_with_snapshot_retry(
+        session,
+        &mut pacer,
+        &mut transaction,
+        open_readback_session,
+    );
+    let (readback, readback_matches_desired) = match result {
+        Ok(ApplyReadbackOutcome::Verified(captured)) => (captured, true),
+        Ok(ApplyReadbackOutcome::RollbackRequired(captured)) => (captured, false),
+        Err(_) if transaction.state() == ApplyTransactionState::RollbackRequired => {
+            let output = serde_json::json!({
+                "status": "rollback_required",
+                "transaction_id": plan.digest(),
+                "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
+                "desired_snapshot_digest": plan.desired_snapshot_digest(),
+                "readback": null,
+                "readback_attempts": readback_attempts,
+                "rollback_available": plan.command().is_some(),
+                "readback_matches_desired": false,
+                "failure": "post_apply_state_uncertain",
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let output = serde_json::json!({
         "status": if readback_matches_desired { "verified" } else { "rollback_required" },
         "transaction_id": plan.digest(),
         "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
         "desired_snapshot_digest": plan.desired_snapshot_digest(),
         "readback": readback.snapshot(),
+        "readback_attempts": readback_attempts,
         "rollback_available": plan.command().is_some(),
         "readback_matches_desired": readback_matches_desired,
     });

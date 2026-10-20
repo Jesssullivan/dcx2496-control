@@ -929,6 +929,24 @@ pub enum TransactionExecutionError<
         /// Session finish failure, when close also failed.
         finish_error: Option<E>,
     },
+    /// The fixed wait before a read-only post-apply readback retry failed.
+    #[error("post-apply readback retry {attempt} could not wait its fixed gap")]
+    ReadbackRetryPacing {
+        /// One-based readback attempt that did not start.
+        attempt: usize,
+        /// Pacer-specific cause.
+        #[source]
+        source: P,
+    },
+    /// The fresh read-only session for a post-apply readback retry did not open.
+    #[error("post-apply readback retry {attempt} could not open its read-only session")]
+    ReadbackRetryOpen {
+        /// One-based readback attempt that did not start.
+        attempt: usize,
+        /// Platform-specific cause.
+        #[source]
+        source: E,
+    },
     /// Snapshot capture or verified close failed.
     #[error(transparent)]
     Capture(#[from] SnapshotCaptureError<E, P>),
@@ -964,14 +982,184 @@ pub enum MutationPhase {
 /// A stale baseline is rejected before mutation. Any post-mutation capture or
 /// close uncertainty moves the pure transaction to `RollbackRequired`.
 ///
+/// This entry point never retries the readback; see
+/// [`execute_apply_readback_with_snapshot_retry`] for the bounded read-only
+/// retry the live CLI uses.
+///
 /// # Errors
 ///
 /// Returns transaction, mutation, or capture failure.
 pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
-    mut session: S,
+    session: S,
     pacer: &mut P,
     transaction: &mut ApplyTransactionV1,
 ) -> Result<ApplyReadbackOutcome, TransactionExecutionError<S::Error, P::Error>> {
+    let capture = apply_then_capture_readback(session, pacer, transaction)?;
+    settle_apply_readback(transaction, capture)
+}
+
+/// Complete post-apply readback snapshots per apply transaction: the
+/// same-descriptor readback plus at most two fresh read-only snapshots.
+pub const POST_APPLY_READBACK_ATTEMPT_LIMIT: usize = 3;
+/// Fixed wait before each fresh read-only post-apply readback snapshot.
+pub const POST_APPLY_READBACK_RETRY_GAP: Duration = Duration::from_secs(20);
+
+/// Result of [`execute_apply_readback_with_snapshot_retry`].
+#[derive(Debug)]
+pub struct ApplyReadbackReport<
+    E: StdError + Send + Sync + 'static,
+    P: StdError + Send + Sync + 'static,
+> {
+    /// Final outcome, with the same meaning as [`execute_apply_readback`].
+    pub result: Result<ApplyReadbackOutcome, TransactionExecutionError<E, P>>,
+    /// Post-apply readback snapshots started: 0 when the transaction failed
+    /// before its readback, otherwise 1 through
+    /// [`POST_APPLY_READBACK_ATTEMPT_LIMIT`].
+    pub readback_attempts: usize,
+}
+
+/// [`execute_apply_readback`] plus a bounded, read-only readback retry.
+///
+/// When the same-descriptor post-apply readback fails with a transport or
+/// read failure (see [`is_retryable_readback_failure`]) and that session
+/// closed verified, the transaction stays `Applying` and the executor waits
+/// the fixed [`POST_APPLY_READBACK_RETRY_GAP`], opens one fresh session with
+/// `open_readback_session`, and runs one ordinary complete snapshot
+/// ([`execute_persistent_snapshot`]: ten Searches, transmit-only mode,
+/// Dump0, Dump1, receive-only mode, verified close) inside that snapshot's
+/// own budget. At most [`POST_APPLY_READBACK_ATTEMPT_LIMIT`] readbacks run in
+/// total. The retry session is only a [`PersistentSnapshotSession`]: it has
+/// no direct-parameter operation, so no write frame and no
+/// receive-and-transmit mode is ever repeated. The count and gap are fixed
+/// constants, never caller input.
+///
+/// The first complete readback is verified exactly as
+/// [`execute_apply_readback`] does; a mismatch, a wrong-device readback, a
+/// validation failure, a remote-mode failure, a budget or pacing failure, an
+/// unverified close, or a failed open is never retried. When every allowed
+/// readback fails, the result is the last failure and the transaction is
+/// `RollbackRequired`, exactly as without the retry; no readback is ever
+/// synthesized.
+///
+/// # Errors
+///
+/// The report carries transaction, mutation, capture, or retry failure.
+pub fn execute_apply_readback_with_snapshot_retry<S, R, P, O>(
+    session: S,
+    pacer: &mut P,
+    transaction: &mut ApplyTransactionV1,
+    mut open_readback_session: O,
+) -> ApplyReadbackReport<S::Error, P::Error>
+where
+    S: PersistentApplySession,
+    R: PersistentSnapshotSession<Error = S::Error>,
+    P: RepeatPacer,
+    O: FnMut() -> Result<R, S::Error>,
+{
+    let mut capture = match apply_then_capture_readback(session, pacer, transaction) {
+        Ok(capture) => capture,
+        Err(error) => {
+            return ApplyReadbackReport {
+                result: Err(error),
+                readback_attempts: 0,
+            };
+        }
+    };
+    let mut readback_attempts = 1;
+    let device = transaction.apply_plan().device();
+    loop {
+        match capture {
+            Err(error)
+                if readback_attempts < POST_APPLY_READBACK_ATTEMPT_LIMIT
+                    && is_retryable_readback_failure(&error) =>
+            {
+                let attempt = readback_attempts + 1;
+                if let Err(source) = pacer.wait(POST_APPLY_READBACK_RETRY_GAP) {
+                    return ApplyReadbackReport {
+                        result: abandon_readback(
+                            transaction,
+                            TransactionExecutionError::ReadbackRetryPacing { attempt, source },
+                        ),
+                        readback_attempts,
+                    };
+                }
+                let retry_session = match open_readback_session() {
+                    Ok(retry_session) => retry_session,
+                    Err(source) => {
+                        return ApplyReadbackReport {
+                            result: abandon_readback(
+                                transaction,
+                                TransactionExecutionError::ReadbackRetryOpen { attempt, source },
+                            ),
+                            readback_attempts,
+                        };
+                    }
+                };
+                readback_attempts = attempt;
+                capture = execute_persistent_snapshot(retry_session, pacer, device);
+            }
+            capture => {
+                return ApplyReadbackReport {
+                    result: settle_apply_readback(transaction, capture),
+                    readback_attempts,
+                };
+            }
+        }
+    }
+}
+
+/// Whether a failed post-apply readback may be repeated as a fresh read-only
+/// snapshot.
+///
+/// Only a platform transport failure, a bounded timeout, a response over its
+/// exact limit, or an exhausted empty-Search window qualifies, and only when
+/// the failed session itself closed verified (no `finish_error`). Validation
+/// (wrong device, wrong part, malformed frame), remote-mode, pacing, budget,
+/// and unverified-close failures are terminal.
+pub fn is_retryable_readback_failure<
+    E: StdError + Send + Sync + 'static,
+    P: StdError + Send + Sync + 'static,
+>(
+    error: &SnapshotCaptureError<E, P>,
+) -> bool {
+    matches!(
+        error,
+        SnapshotCaptureError::Transport {
+            finish_error: None,
+            ..
+        } | SnapshotCaptureError::Timeout {
+            finish_error: None,
+            ..
+        } | SnapshotCaptureError::ResponseLimit {
+            finish_error: None,
+            ..
+        } | SnapshotCaptureError::SearchQualificationIncomplete {
+            finish_error: None,
+            ..
+        }
+    )
+}
+
+fn abandon_readback<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>(
+    transaction: &mut ApplyTransactionV1,
+    error: TransactionExecutionError<E, P>,
+) -> Result<ApplyReadbackOutcome, TransactionExecutionError<E, P>> {
+    transaction.require_rollback_after_error()?;
+    Err(error)
+}
+
+/// Baseline check, typed write, and same-descriptor readback. A capture
+/// failure after the write is returned inside `Ok` and leaves the transaction
+/// `Applying`, so the caller decides between settling and a read-only retry.
+#[allow(clippy::type_complexity)]
+fn apply_then_capture_readback<S: PersistentApplySession, P: RepeatPacer>(
+    mut session: S,
+    pacer: &mut P,
+    transaction: &mut ApplyTransactionV1,
+) -> Result<
+    Result<CapturedSnapshotV1, SnapshotCaptureError<S::Error, P::Error>>,
+    TransactionExecutionError<S::Error, P::Error>,
+> {
     let started = pacer.elapsed();
     let expected_device = transaction.apply_plan().device();
     let baseline_body = capture_body(
@@ -1039,7 +1227,19 @@ pub fn execute_apply_readback<S: PersistentApplySession, P: RepeatPacer>(
         APPLY_TRANSACTION_BUDGET,
     );
     let finish = session.finish();
-    let captured = match finish_capture(body, finish, READBACK_SEARCH_COUNT) {
+    Ok(finish_capture(body, finish, READBACK_SEARCH_COUNT))
+}
+
+/// Verify one complete post-apply readback, or settle a final capture
+/// failure into `RollbackRequired`.
+fn settle_apply_readback<
+    E: StdError + Send + Sync + 'static,
+    P: StdError + Send + Sync + 'static,
+>(
+    transaction: &mut ApplyTransactionV1,
+    capture: Result<CapturedSnapshotV1, SnapshotCaptureError<E, P>>,
+) -> Result<ApplyReadbackOutcome, TransactionExecutionError<E, P>> {
+    let captured = match capture {
         Ok(captured) => captured,
         Err(error) => {
             transaction.require_rollback_after_error()?;
@@ -1986,5 +2186,319 @@ mod tests {
         let debug = format!("{:?}", SnapshotRead::complete(&identity(0)).unwrap());
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("SYNTHETIC"));
+    }
+
+    fn staged_peq_apply() -> (
+        ApplyTransactionV1,
+        SnapshotV1,
+        SnapshotV1,
+        DirectParameterAction,
+    ) {
+        let baseline = snapshot(0, 0, 0);
+        let apply = DirectParameterAction::new(5, 0x3c, 40).unwrap();
+        let desired = baseline.project_direct_actions(&[apply]).unwrap();
+        let inverse = baseline.inverse_actions_for(&[apply]).unwrap();
+        let transaction =
+            ApplyTransactionV1::stage(baseline.clone(), desired.clone(), vec![apply], inverse)
+                .unwrap();
+        (transaction, baseline, desired, apply)
+    }
+
+    /// One complete snapshot whose Dump1 exchange fails in transport, as the
+    /// 2026-10-20 `UnexpectedTrailingFrame` readback did.
+    fn steps_failing_at_dump1(snapshot: &SnapshotV1, search_count: usize) -> Vec<Step> {
+        let mut steps = snapshot_steps(snapshot, search_count);
+        steps.pop();
+        steps.push(Step::Fail);
+        steps
+    }
+
+    /// Fresh read-only sessions handed out in order, with their logs.
+    #[allow(clippy::type_complexity)]
+    fn retry_sessions(
+        scripts: Vec<Vec<Step>>,
+    ) -> (RefCell<VecDeque<FakeSession>>, Vec<Rc<RefCell<SessionLog>>>) {
+        let mut sessions = VecDeque::new();
+        let mut logs = Vec::new();
+        for script in scripts {
+            let (session, log) = FakeSession::new(script);
+            sessions.push_back(session);
+            logs.push(log);
+        }
+        (RefCell::new(sessions), logs)
+    }
+
+    fn retry_gaps(pacer: &FakePacer) -> usize {
+        pacer
+            .waits
+            .iter()
+            .filter(|wait| **wait == POST_APPLY_READBACK_RETRY_GAP)
+            .count()
+    }
+
+    fn assert_read_only(log: &SessionLog) {
+        assert!(log.writes.is_empty());
+        assert_eq!(
+            log.modes
+                .iter()
+                .map(|command| command.mode())
+                .collect::<Vec<_>>(),
+            [RemoteMode::Transmit, RemoteMode::ReceiveDirect]
+        );
+        assert_eq!(log.finishes, 1);
+    }
+
+    #[test]
+    fn readback_retry_bounds_are_fixed() {
+        assert_eq!(POST_APPLY_READBACK_ATTEMPT_LIMIT, 3);
+        assert_eq!(POST_APPLY_READBACK_RETRY_GAP, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn readback_retry_is_unused_when_the_first_readback_succeeds() {
+        let (mut transaction, baseline, desired, apply) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(snapshot_steps(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut pacer,
+            &mut transaction,
+            || -> Result<FakeSession, FakeSessionError> { panic!("no retry session expected") },
+        );
+        assert!(matches!(
+            report.result,
+            Ok(ApplyReadbackOutcome::Verified(_))
+        ));
+        assert_eq!(report.readback_attempts, 1);
+        assert_eq!(transaction.state(), ApplyTransactionState::Verified);
+        assert_eq!(retry_gaps(&pacer), 0);
+        assert_eq!(log.borrow().writes.len(), 1);
+        assert_eq!(log.borrow().writes[0].actions(), [apply]);
+    }
+
+    #[test]
+    fn failed_readback_is_retried_as_a_fresh_read_only_snapshot_on_try_two() {
+        let (mut transaction, baseline, desired, apply) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(steps_failing_at_dump1(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let (sessions, retry_logs) =
+            retry_sessions(vec![snapshot_steps(&desired, PERSISTENT_SEARCH_COUNT)]);
+        let mut pacer = FakePacer::default();
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut pacer,
+            &mut transaction,
+            || sessions.borrow_mut().pop_front().ok_or(FakeSessionError),
+        );
+        let Ok(ApplyReadbackOutcome::Verified(captured)) = report.result else {
+            panic!("the second, read-only readback must verify")
+        };
+        assert_eq!(captured.snapshot(), &desired);
+        assert_eq!(captured.valid_search_count(), PERSISTENT_SEARCH_COUNT);
+        assert_eq!(report.readback_attempts, 2);
+        assert_eq!(transaction.state(), ApplyTransactionState::Verified);
+        assert_eq!(retry_gaps(&pacer), 1);
+        // Exactly one write frame, on the apply session only.
+        assert_eq!(log.borrow().writes.len(), 1);
+        assert_eq!(log.borrow().writes[0].actions(), [apply]);
+        assert_eq!(log.borrow().finishes, 1);
+        assert_read_only(&retry_logs[0].borrow());
+        assert!(sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_readback_is_retried_until_the_third_snapshot_verifies() {
+        let (mut transaction, baseline, desired, _) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(steps_failing_at_dump1(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let (sessions, retry_logs) = retry_sessions(vec![
+            steps_failing_at_dump1(&desired, PERSISTENT_SEARCH_COUNT),
+            snapshot_steps(&desired, PERSISTENT_SEARCH_COUNT),
+        ]);
+        let mut pacer = FakePacer::default();
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut pacer,
+            &mut transaction,
+            || sessions.borrow_mut().pop_front().ok_or(FakeSessionError),
+        );
+        assert!(matches!(
+            report.result,
+            Ok(ApplyReadbackOutcome::Verified(_))
+        ));
+        assert_eq!(report.readback_attempts, 3);
+        assert_eq!(retry_gaps(&pacer), 2);
+        assert_eq!(log.borrow().writes.len(), 1);
+        for retry_log in &retry_logs {
+            assert!(retry_log.borrow().writes.is_empty());
+            assert_eq!(retry_log.borrow().finishes, 1);
+        }
+        assert_read_only(&retry_logs[1].borrow());
+    }
+
+    #[test]
+    fn three_failed_readbacks_keep_todays_uncertain_rollback_required_result() {
+        let (mut transaction, baseline, desired, _) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(steps_failing_at_dump1(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let (sessions, retry_logs) = retry_sessions(vec![
+            steps_failing_at_dump1(&desired, PERSISTENT_SEARCH_COUNT),
+            steps_failing_at_dump1(&desired, PERSISTENT_SEARCH_COUNT),
+            snapshot_steps(&desired, PERSISTENT_SEARCH_COUNT),
+        ]);
+        let mut pacer = FakePacer::default();
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut pacer,
+            &mut transaction,
+            || sessions.borrow_mut().pop_front().ok_or(FakeSessionError),
+        );
+        assert!(matches!(
+            report.result,
+            Err(TransactionExecutionError::Capture(
+                SnapshotCaptureError::Transport {
+                    operation: SnapshotOperationKind::Dump1,
+                    finish_error: None,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(report.readback_attempts, POST_APPLY_READBACK_ATTEMPT_LIMIT);
+        assert_eq!(transaction.state(), ApplyTransactionState::RollbackRequired);
+        assert_eq!(retry_gaps(&pacer), 2);
+        assert_eq!(log.borrow().writes.len(), 1);
+        // The fourth prepared session is never opened.
+        assert_eq!(sessions.borrow().len(), 1);
+        assert!(retry_logs[2].borrow().operations.is_empty());
+        for retry_log in &retry_logs[..2] {
+            assert!(retry_log.borrow().writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn readback_validation_failure_is_not_retried() {
+        let (mut transaction, baseline, desired, _) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(snapshot_steps(&desired, READBACK_SEARCH_COUNT));
+        steps.pop();
+        // A Dump1 from another device address: identity mismatch.
+        steps.push(Step::Read(SnapshotRead::complete(&dump(1, 1, 0)).unwrap()));
+        let (session, _) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut pacer,
+            &mut transaction,
+            || -> Result<FakeSession, FakeSessionError> { panic!("validation is terminal") },
+        );
+        assert!(matches!(
+            report.result,
+            Err(TransactionExecutionError::Capture(
+                SnapshotCaptureError::Validation { .. }
+            ))
+        ));
+        assert_eq!(report.readback_attempts, 1);
+        assert_eq!(transaction.state(), ApplyTransactionState::RollbackRequired);
+        assert_eq!(retry_gaps(&pacer), 0);
+    }
+
+    #[test]
+    fn readback_mismatch_is_not_retried() {
+        let (mut transaction, baseline, _, _) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(snapshot_steps(&snapshot(0, 0, 1), READBACK_SEARCH_COUNT));
+        let (session, _) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut pacer,
+            &mut transaction,
+            || -> Result<FakeSession, FakeSessionError> { panic!("a mismatch is terminal") },
+        );
+        assert!(matches!(
+            report.result,
+            Ok(ApplyReadbackOutcome::RollbackRequired(_))
+        ));
+        assert_eq!(report.readback_attempts, 1);
+        assert_eq!(transaction.state(), ApplyTransactionState::RollbackRequired);
+        assert_eq!(retry_gaps(&pacer), 0);
+    }
+
+    #[test]
+    fn readback_failure_with_an_unverified_close_is_not_retried() {
+        let (mut transaction, baseline, desired, _) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(steps_failing_at_dump1(&desired, READBACK_SEARCH_COUNT));
+        let (mut session, _) = FakeSession::new(steps);
+        session.fail_finish = true;
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut FakePacer::default(),
+            &mut transaction,
+            || -> Result<FakeSession, FakeSessionError> { panic!("close uncertainty is terminal") },
+        );
+        assert!(matches!(
+            report.result,
+            Err(TransactionExecutionError::Capture(
+                SnapshotCaptureError::Transport {
+                    finish_error: Some(_),
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(report.readback_attempts, 1);
+        assert_eq!(transaction.state(), ApplyTransactionState::RollbackRequired);
+    }
+
+    #[test]
+    fn retry_session_open_failure_is_terminal_and_requires_rollback() {
+        let (mut transaction, baseline, desired, _) = staged_peq_apply();
+        let mut steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        steps.extend(steps_failing_at_dump1(&desired, READBACK_SEARCH_COUNT));
+        let (session, log) = FakeSession::new(steps);
+        let mut opens = 0;
+        let mut pacer = FakePacer::default();
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut pacer,
+            &mut transaction,
+            || -> Result<FakeSession, FakeSessionError> {
+                opens += 1;
+                Err(FakeSessionError)
+            },
+        );
+        assert!(matches!(
+            report.result,
+            Err(TransactionExecutionError::ReadbackRetryOpen { attempt: 2, .. })
+        ));
+        assert_eq!(opens, 1);
+        assert_eq!(report.readback_attempts, 1);
+        assert_eq!(transaction.state(), ApplyTransactionState::RollbackRequired);
+        assert_eq!(retry_gaps(&pacer), 1);
+        assert_eq!(log.borrow().writes.len(), 1);
+    }
+
+    #[test]
+    fn failure_before_the_write_reports_no_readback_attempt() {
+        let (mut transaction, _, _, _) = staged_peq_apply();
+        let observed = snapshot(0, 1, 0);
+        let (session, log) = FakeSession::new(snapshot_steps(&observed, PERSISTENT_SEARCH_COUNT));
+        let report = execute_apply_readback_with_snapshot_retry(
+            session,
+            &mut FakePacer::default(),
+            &mut transaction,
+            || -> Result<FakeSession, FakeSessionError> { panic!("stale baseline is terminal") },
+        );
+        assert!(matches!(
+            report.result,
+            Err(TransactionExecutionError::StaleBaseline { .. })
+        ));
+        assert_eq!(report.readback_attempts, 0);
+        assert!(log.borrow().writes.is_empty());
     }
 }

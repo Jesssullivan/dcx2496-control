@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Repeat a failed post-apply readback only as a fresh read-only snapshot:
+  `write apply` and `control apply` retry a readback that failed in
+  transport or read (and closed verified) as one ordinary complete G1
+  snapshot on a fresh session, at most three readbacks in total and 20 s
+  apart (fixed constants), never re-sending a write frame. Validation,
+  mismatch, remote-mode, budget, close and open failures are not retried;
+  if every readback fails the result is unchanged (`rollback_required`,
+  `post_apply_state_uncertain`, `readback: null`). Apply output gains
+  `readback_attempts`.
+- Model the observed linked O3/O4 crossover: an O4 high-pass frequency
+  write, on a baseline holding O3 low-pass frequency at the same code, also
+  moves O3 low-pass frequency to the written code (2026-10-20 PA leg). The
+  desired snapshot and rollback expect it, `write plan` lists it under
+  `linked_effects`, and `write verify` / `control verify-containment`
+  report it under `linked_changes` instead of as uncontained; any other bit
+  or code stays uncontained. The reverse direction is reported as
+  `inferred_unverified` but never expected. A plan writing both fields of a
+  linked pair is refused.
+- Typed writes are no longer offline-only by ruling: Legalab
+  `dec-dcx-attended-software-writes-20261019` admits attended software
+  writes (at most 5 remote-mode writes per apply, 3 per rollback);
+  `typed-write-live` stays off in unattended builds.
 - Add typed parameter writes, offline planning only pending an operator
   ruling: `dcxctl write show|plan|verify` (offline), and `write
   apply|rollback` only behind the non-default `typed-write-live` feature,

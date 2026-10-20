@@ -44,9 +44,10 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   (`0x04`, `0x05`, `0x4b`), crossover high/low-pass type and frequency
   (`0x42`-`0x45`), limiter switch, threshold and release (`0x46`-`0x48`) and
   polarity (`0x49`), and the input A-C gains (channels 1-3, `0x02`); the
-  typed-write lane is offline planning only, pending an operator ruling
-  (Legalab D5 front-panel entry stands for device writes; no `dec-*` ruling
-  admits software writes to these addresses yet).
+  typed-write lane admits attended software writes only, under Legalab
+  `dec-dcx-attended-software-writes-20261019` (at most 5 remote-mode writes
+  per apply and 3 per rollback, each after a fresh G1 snapshot, exact
+  rollback, O5/O6 never unmuted).
   Locations are transcribed from the pinned MIT DuinoDCX `outputLocations`,
   `inputLocations` and `setupLocations` tables; O1/PEQ9 and the O4 PEQ on/off,
   band count and band 1 fields have named-device readback, and every other
@@ -76,8 +77,8 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   only `dcxctl write apply|rollback`, which rebuild the carrier from its write
   plan and enforce the safe in-frame order and exact-reverse rollback, send
   them, and those exist only behind the non-default `typed-write-live`
-  feature, which `//:dcxctl_live_control` and `.#dcxctl-live` never enable
-  until that ruling. Auto Align and
+  feature, which unattended builds (`//:dcxctl_live_control` and
+  `.#dcxctl-live`) never enable. Auto Align and
   +15 V have no
   address and must never gain one. No server or automatic apply path belongs
   in the MVP.
@@ -91,7 +92,12 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   target O4 only and never write the operator's active bands.
   `dcxctl control verify-containment` is the offline gate that fails when a
   readback changed any bit outside the plan's projected addresses (only its
-  own bits of a shared carrier byte) and touched dump trailer. Missing
+  own bits of a shared carrier byte) and touched dump trailer; the one
+  modelled linked crossover (an O4 high-pass frequency write moving O3
+  low-pass frequency to the same code, `docs/typed-writes.md`) is reported
+  as `linked`, not dropped. An apply readback that fails in transport is
+  repeated only as a fresh read-only G1 snapshot, at most three readbacks
+  20 s apart (fixed constants, no write re-sent). Missing
   post-write capture remains explicit uncertainty: apply `readback` and
   rollback `restored` may be omitted or null, never synthesized.
 - The AUv3 MIDI FX owns staged desired state and MIDI pass-through only. It has

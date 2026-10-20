@@ -6,23 +6,31 @@ inverse. It covers per-output PEQ, crossover, output gain, mute, polarity,
 delay and limiter on O1-O4, the input A-C gains and, behind two explicit
 flags, the O3/O4 source. Planning, `show` and `verify` are offline.
 
-**Offline planning only, pending an operator ruling.** No software write of a
-typed field to the device is authorized. Legalab ruling D5 (option A:
-front-panel entry, one parameter per step, snapshot before and after) stands
-for every DCX write, and G1 covers snapshot remote-mode writes only. `write
-apply` and `write rollback` are compiled only with the non-default macOS
-`typed-write-live` feature. No shipped binary enables it:
-`//:dcxctl_live_control` and `.#dcxctl-live` build `live-control` alone. The
-feature stays off until an operator ruling supersedes D5 for software writes
-and sets their remote-mode write budget (see the wire budget below). Once
-built, they run the same transaction as `control apply` and `control
-rollback`.
+**Attended software writes only.** Legalab ruling
+`dec-dcx-attended-software-writes-20261019` (operator, 2026-10-19, P-TIN-170
+comment `131db306`, ruling 2) allows attended software writes of typed
+fields: an attended `write apply` may send at most 5 remote-mode
+writes and a `write rollback` at most 3, each transaction after a fresh G1
+snapshot, with the exact touched-address rollback, and O5/O6 are never
+unmuted. Legalab owns the attendance and readiness ceremony; this repository
+does not duplicate it. `write apply` and `write rollback` are compiled only
+with the non-default macOS `typed-write-live` feature, which unattended
+builds never enable: `//:dcxctl_live_control` and `.#dcxctl-live` build
+`live-control` alone. Once built, they run the same transaction as `control
+apply` and `control rollback`. The first named-device use was the
+2026-10-20 PA leg (O1-O3 muted, O4 high-pass LR24 100 Hz; O4 already
+unmuted, so its unmute sent nothing).
 
 Evidence class: every address this lane added is a transcription from the
 pinned MIT DuinoDCX `00b9d70` tables, and its value encoding comes from the
-public UltradrivePi protocol notes (both cited in `NOTICE`). None of them has
-been read back from the named device yet. `write verify` is the check a
-readback must pass before an address can be called observed.
+public UltradrivePi protocol notes (both cited in `NOTICE`). `write verify`
+is the check a readback must pass before an address can be called observed.
+Observed 2026-10-20 (PA leg): a separate snapshot after the apply read back
+all five written values (O1-O3 mutes, O4 high-pass type LR24 and frequency
+code 74, 99.35 Hz) at their transcribed offsets, but containment also flagged
+Dump0 byte 101 (`0 -> 1`, unexplained, out of scope here) and the linked O3
+low-pass move described below, so that readback did not pass `write verify`
+and no address is promoted by it.
 
 ## Flow
 
@@ -37,7 +45,7 @@ dcxctl write show --snapshot snapshot.json
 dcxctl write plan --snapshot snapshot.json --plan changes.json > tx.json
 jq -e '.apply_plan' tx.json > apply-plan.json
 jq -e '.rollback_plan' tx.json > rollback-plan.json
-# typed-write-live builds only; not authorized (D5 stands):
+# typed-write-live builds only, attended use under the 2026-10-19 ruling:
 dcxctl write apply --tty /dev/cu.usbserial-EXACT --expected-device 0 \
   --write-plan changes.json --plan apply-plan.json > applied.json
 jq -e '.readback' applied.json > readback.json
@@ -262,10 +270,12 @@ Each live transaction sends exactly one direct-parameter (`0x20`) frame:
 
 A failure after a transmit-capable mode adds at most one `ReceiveDirect`
 quiescence write at finish. G1's limit of at most 2 remote-mode writes per
-attempt covers snapshot attempts only, so apply (5) and rollback (3) need
-their own operator ruling. Until then `typed-write-live` stays off.
+attempt covers snapshot attempts only; the 2026-10-19 ruling sets apply at
+5 and rollback at 3, which is exactly what one transaction sends. A
+read-only readback retry (below) is a separate G1 snapshot session, never
+part of the apply's own remote-mode writes.
 
-Proposed rate limit, for Legalab to adopt or change in that ruling:
+Rate limit proposed before that ruling, for Legalab to keep or change:
 
 - one frame per transaction, with no automatic retry of a frame;
 - at most 4 actions in the first live write, then the default of 16;
@@ -273,14 +283,85 @@ Proposed rate limit, for Legalab to adopt or change in that ruling:
 - at most 3 apply transactions, each with its rollback, per hardware window
   before the operator checks in.
 
+## Post-apply readback retry
+
+On 2026-10-20 the PA-leg apply wrote its frame, but the same-descriptor
+readback failed with a transport error (`UnexpectedTrailingFrame`), so the
+result was `rollback_required` / `post_apply_state_uncertain` with `readback:
+null`. A separate snapshot seconds later was clean. That carrier failure
+leaves the open session refusing every further operation until it is closed,
+so a retry on the same descriptor cannot help.
+
+`write apply` and `control apply` therefore repeat only the read-only
+snapshot when the post-apply readback fails with a transport or read
+failure (platform transport error, bounded timeout, response over its exact
+limit, or an exhausted empty-Search window) and the failed session closed
+verified:
+
+- at most 3 readbacks in total (the same-descriptor readback plus at most two
+  fresh snapshots), each fresh one after a fixed 20 s wait; neither number is
+  caller input;
+- each retry opens a fresh session on the same exact callout and runs one
+  ordinary complete G1 snapshot (ten Searches, transmit-only mode, Dump0,
+  Dump1, receive-only mode, verified close) inside that snapshot's own
+  120 s budget. The retry session type has no direct-parameter operation, so
+  no write frame and no receive-and-transmit mode is ever repeated;
+- the first complete readback is verified exactly as before. A mismatch, a
+  wrong-device or malformed readback, a remote-mode, pacing or budget
+  failure, an unverified close, or a failed open is never retried;
+- if every allowed readback fails, the result is exactly today's:
+  `rollback_required`, `failure: post_apply_state_uncertain`, `readback:
+  null`. A readback is never synthesized.
+
+The apply output records `readback_attempts` (0 when the transaction failed
+before its readback, otherwise 1 through 3). Worst case, two retries add
+2 x (20 s + 120 s) after the 150 s apply envelope.
+
+## Linked O3/O4 crossover
+
+Observed 2026-10-20 (PA leg): writing O4 high-pass frequency code 74 also
+moved the O3 low-pass frequency, which had equalled the O4 high-pass code
+(180) before the write, to 74: Dump1 205 `52 -> 74` (low seven bits) and
+carrier 212 `81 -> 80` (bit 0 is the field's bit 7; bits 4 and 6 are the O3
+limiter threshold and release and did not change). The O3 low-pass type did
+not change. Inferred: the device links adjacent outputs' crossover points
+(its linked, not FREE, crossover adjust mode); that mode has no reviewed
+address.
+
+The model is deliberately narrow:
+
+- only O4 high-pass frequency (channel 8, `0x43`; Dump1 369, carrier 372
+  bit 4, high 370) driving O3 low-pass frequency (channel 7, `0x45`; Dump1
+  205, carrier 212 bit 0, high 206). No O1/O2 or O2/O3 pair and no crossover
+  type is modelled;
+- a link is predicted only when the baseline holds the follower at the
+  driver's code (the only available sign the pair is linked) and the plan
+  does not also write the follower. A plan writing both fields of a pair the
+  baseline shows linked is refused;
+- `write plan` lists the prediction in `linked_effects` and adds no frame
+  byte. The desired snapshot, and so `write verify` and the live readback
+  check, expect the follower at the written code. The rollback, which
+  rewrites only the driver, expects the follower back at its baseline code;
+- `control verify-containment` and `write verify` classify a follower move
+  as `linked` (listed under `linked_changes`, never dropped) only when the
+  follower reads exactly the written driver code and the readback driver
+  holds it too. Any other bit of those bytes (such as the limiter threshold
+  or release high bits in 212) or any other code stays uncontained.
+
+The reverse direction (an O3 low-pass frequency write moving O4 high-pass
+frequency) is inferred and unverified. Containment and `linked_effects`
+report it as `inferred_unverified`, but the desired snapshot never expects
+it, so if the device does follow, the readback does not verify and rollback
+is required.
+
 ## Offline consistency check
 
 `write verify --plan apply-plan.json --readback readback.json` exits non-zero
 unless all three of these hold:
 
 - every written code decodes from the readback at its transcribed location;
-- no bit changed outside the plan's projected bits and the touched dump
-  trailer;
+- no bit changed outside the plan's projected bits, the touched dump
+  trailer and a matched linked-crossover follower field;
 - the readback equals the desired snapshot.
 
 A unit test runs this over all 55 typed addresses (13 on each of O1-O4, plus

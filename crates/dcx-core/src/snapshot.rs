@@ -27,9 +27,10 @@ use thiserror::Error;
 
 use crate::{
     layout::{
-        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, MAX_LEVEL_STEP_CODES, OUTPUT_COUNT,
-        OutputField, PACKED_PAYLOAD_START, PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE,
-        band_parameter, output_channel, reviewed_address, routing_rank,
+        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, LINKED_CROSSOVERS, LinkEvidence,
+        LinkedCrossover, MAX_LEVEL_STEP_CODES, OUTPUT_COUNT, OutputField, PACKED_PAYLOAD_START,
+        PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE, band_parameter, output_channel,
+        reviewed_address, routing_rank,
     },
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DirectParameterAction,
@@ -393,6 +394,146 @@ impl SnapshotV1 {
         let mut inverse = self.inverse_actions_for(actions)?;
         inverse.reverse();
         Ok(inverse)
+    }
+
+    /// [`Self::project_direct_actions`] plus every observed linked-crossover
+    /// side effect of `actions` on this snapshot (see
+    /// [`Self::linked_predictions`]): the exact desired state of an apply.
+    ///
+    /// OBSERVED LINK: the named device moved the O3 low-pass frequency to the
+    /// O4 high-pass code it was sent (2026-10-20). Only observed directions
+    /// shape the desired snapshot; inferred ones are reported by containment
+    /// and the planner but never predicted here.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::project_direct_actions`], plus
+    /// [`SnapshotProjectionError::LinkedCrossoverConflict`].
+    pub fn project_linked_actions(
+        &self,
+        actions: &[DirectParameterAction],
+    ) -> Result<Self, SnapshotProjectionError> {
+        self.require_no_linked_conflict(actions)?;
+        let projected = self.project_direct_actions(actions)?;
+        let follows: Vec<(ReviewedAddress, u8, u16)> = self
+            .linked_predictions(actions)
+            .into_iter()
+            .filter(|prediction| prediction.link.evidence == LinkEvidence::Observed)
+            .map(|prediction| {
+                (
+                    prediction.follower,
+                    prediction.link.follower.1,
+                    prediction.code,
+                )
+            })
+            .collect();
+        projected.with_follower_codes(&follows)
+    }
+
+    /// Patch follower codes (address, parameter, code) onto this snapshot,
+    /// keeping both dump trailers' modulo-128 balance.
+    fn with_follower_codes(
+        &self,
+        follows: &[(ReviewedAddress, u8, u16)],
+    ) -> Result<Self, SnapshotProjectionError> {
+        if follows.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut dump0 = self.dump0.frame.clone();
+        let mut dump1 = self.dump1.frame.clone();
+        for &(follower, parameter, code) in follows {
+            let frame = match follower.location.part() {
+                DumpPart::Part0 => &mut dump0,
+                DumpPart::Part1 => &mut dump1,
+            };
+            follower.location.write(frame, code).map_err(|_| {
+                SnapshotProjectionError::ValueTooWide {
+                    parameter,
+                    value: code,
+                }
+            })?;
+        }
+        preserve_trailer_balance(&self.dump0.frame, &mut dump0);
+        preserve_trailer_balance(&self.dump1.frame, &mut dump1);
+        Ok(Self::from_frames(&self.identity.frame, &dump0, &dump1)?)
+    }
+
+    /// Linked-crossover side effects of writing `actions` onto this
+    /// snapshot, observed and inferred directions alike.
+    ///
+    /// A direction is predicted only when an action writes its driver, no
+    /// action writes its follower, this snapshot holds the follower at the
+    /// driver's code (the only available sign that the pair is linked rather
+    /// than FREE), and the written code differs from the follower's. The
+    /// follower is then predicted to read exactly the written driver code.
+    pub fn linked_predictions(&self, actions: &[DirectParameterAction]) -> Vec<LinkedPrediction> {
+        let written = |(channel, parameter): (u8, u8)| {
+            actions
+                .iter()
+                .find(|action| action.channel() == channel && action.parameter() == parameter)
+                .map(|action| action.value())
+        };
+        let mut predictions = Vec::new();
+        for link in LINKED_CROSSOVERS {
+            let (Some(driver), Some(follower)) = (
+                reviewed_address(link.driver.0, link.driver.1),
+                reviewed_address(link.follower.0, link.follower.1),
+            ) else {
+                continue;
+            };
+            let Some(code) = written(link.driver) else {
+                continue;
+            };
+            if written(link.follower).is_some() {
+                continue;
+            }
+            let before = self.read_reviewed(follower);
+            if before != self.read_reviewed(driver) || before == code {
+                continue;
+            }
+            predictions.push(LinkedPrediction {
+                link,
+                driver,
+                follower,
+                before,
+                code,
+            });
+        }
+        predictions
+    }
+
+    /// Refuse an action list that writes both fields of a linked pair while
+    /// this snapshot shows the pair linked: the device's result for that
+    /// frame is unknown.
+    fn require_no_linked_conflict(
+        &self,
+        actions: &[DirectParameterAction],
+    ) -> Result<(), SnapshotProjectionError> {
+        let writes = |(channel, parameter): (u8, u8)| {
+            actions
+                .iter()
+                .any(|action| action.channel() == channel && action.parameter() == parameter)
+        };
+        for link in LINKED_CROSSOVERS {
+            let (Some(driver), Some(follower)) = (
+                reviewed_address(link.driver.0, link.driver.1),
+                reviewed_address(link.follower.0, link.follower.1),
+            ) else {
+                continue;
+            };
+            if writes(link.driver)
+                && writes(link.follower)
+                && self.read_reviewed(driver) == self.read_reviewed(follower)
+            {
+                return Err(SnapshotProjectionError::LinkedCrossoverConflict {
+                    driver_channel: link.driver.0,
+                    driver_parameter: link.driver.1,
+                    follower_channel: link.follower.0,
+                    follower_parameter: link.follower.1,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Decode one reviewed address from this snapshot without domain checks.
@@ -817,12 +958,38 @@ pub enum SnapshotProjectionError {
         parameter: u8,
         value: u16,
     },
+    /// One action list writes both fields of a pair the baseline shows linked.
+    #[error(
+        "channel {driver_channel} parameter {driver_parameter:#04x} and channel {follower_channel} parameter {follower_parameter:#04x} are a linked crossover pair; write them in separate plans"
+    )]
+    LinkedCrossoverConflict {
+        driver_channel: u8,
+        driver_parameter: u8,
+        follower_channel: u8,
+        follower_parameter: u8,
+    },
     /// A reconstructed typed inverse could not be represented.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     /// Reconstructed snapshot failed exact validation.
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
+}
+
+/// One predicted linked-crossover side effect; see
+/// [`SnapshotV1::linked_predictions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedPrediction {
+    /// Modelled direction.
+    pub link: LinkedCrossover,
+    /// Reviewed driver address the plan writes.
+    pub driver: ReviewedAddress,
+    /// Reviewed follower address the device is predicted to move.
+    pub follower: ReviewedAddress,
+    /// Follower code before the write.
+    pub before: u16,
+    /// Written driver code; the follower is predicted to read it.
+    pub code: u16,
 }
 
 /// One frame byte that changed outside an apply plan's projected offsets.
@@ -837,6 +1004,33 @@ pub struct ByteChangeV1 {
     pub before: u8,
     /// Readback byte.
     pub after: u8,
+}
+
+/// A readback change classified as an expected linked-crossover side effect,
+/// not an uncontained one: the follower field moved to exactly the code the
+/// plan wrote to its driver, and the readback driver holds that code too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkedChangeV1 {
+    /// Always `linked`.
+    pub classification: &'static str,
+    /// `observed` or `inferred_unverified`.
+    pub evidence: &'static str,
+    /// Output whose written field drives the link.
+    pub driver_output: u8,
+    /// Driver field label.
+    pub driver_field: String,
+    /// Output whose field moved.
+    pub follower_output: u8,
+    /// Follower field label.
+    pub follower_field: String,
+    /// Follower code in the baseline.
+    pub before_code: u16,
+    /// Follower code in the readback, equal to the written driver code.
+    pub code: u16,
+    /// Changed bytes of the follower field; only the field's own bits of a
+    /// shared carrier byte count.
+    pub changes: Vec<ByteChangeV1>,
 }
 
 /// Closed, bounded apply plan bound to exact observed and desired snapshots.
@@ -921,7 +1115,7 @@ impl ApplyPlanV1 {
             require_protective_levels(baseline, command.actions())?;
             require_typed_lane_reserve(baseline, command.actions())?;
             require_routing_order(command.actions())?;
-            let projected = baseline.project_direct_actions(command.actions())?;
+            let projected = baseline.project_linked_actions(command.actions())?;
             require_no_stored_boost_activation(baseline, command.actions())?;
             if projected != *desired {
                 return Err(ApplyPlanError::DesiredProjectionMismatch {
@@ -1048,17 +1242,21 @@ impl ApplyPlanV1 {
     /// # Errors
     ///
     /// Rejects a readback from another device.
+    ///
+    /// Bits of a matched [`Self::linked_changes`] follower field are not
+    /// uncontained; any other bit of those bytes, or a follower that moved to
+    /// any other code, still is.
     pub fn uncontained_changes(
         &self,
         readback: &SnapshotV1,
     ) -> Result<Vec<ByteChangeV1>, SnapshotDiffError> {
-        if readback.device() != self.device_id {
-            return Err(SnapshotDiffError::DeviceMismatch {
-                observed: self.device_id.get(),
-                desired: readback.device().get(),
-            });
+        self.require_readback_device(readback)?;
+        let mut allowed = self.projected_masks();
+        for (_, masks) in self.matched_linked_changes(readback) {
+            for (key, mask) in masks {
+                *allowed.entry(key).or_insert(0) |= mask;
+            }
         }
-        let allowed = self.projected_masks();
         let mut changes = Vec::new();
         for section in [
             SnapshotSection::Identity,
@@ -1080,6 +1278,98 @@ impl ApplyPlanV1 {
             }
         }
         Ok(changes)
+    }
+
+    /// Readback changes classified as expected linked-crossover side effects
+    /// of this plan (see [`SnapshotV1::linked_predictions`]).
+    ///
+    /// # Errors
+    ///
+    /// Rejects a readback from another device.
+    pub fn linked_changes(
+        &self,
+        readback: &SnapshotV1,
+    ) -> Result<Vec<LinkedChangeV1>, SnapshotDiffError> {
+        self.require_readback_device(readback)?;
+        Ok(self
+            .matched_linked_changes(readback)
+            .into_iter()
+            .map(|(change, _)| change)
+            .collect())
+    }
+
+    fn require_readback_device(&self, readback: &SnapshotV1) -> Result<(), SnapshotDiffError> {
+        if readback.device() == self.device_id {
+            Ok(())
+        } else {
+            Err(SnapshotDiffError::DeviceMismatch {
+                observed: self.device_id.get(),
+                desired: readback.device().get(),
+            })
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn matched_linked_changes(
+        &self,
+        readback: &SnapshotV1,
+    ) -> Vec<(LinkedChangeV1, Vec<((SnapshotSection, usize), u8)>)> {
+        let Some(command) = &self.command else {
+            return Vec::new();
+        };
+        let mut matched = Vec::new();
+        for prediction in self.baseline.linked_predictions(command.actions()) {
+            let location = prediction.follower.location;
+            if readback.read_reviewed(prediction.follower) != prediction.code
+                || readback.read_reviewed(prediction.driver) != prediction.code
+            {
+                continue;
+            }
+            let section = match location.part() {
+                DumpPart::Part0 => SnapshotSection::Dump0,
+                DumpPart::Part1 => SnapshotSection::Dump1,
+            };
+            let mut masks = vec![(location.low_offset(), 0xff_u8)];
+            if let Some((carrier, bit)) = location.carrier() {
+                masks.push((carrier, 1 << bit));
+            }
+            if let Some(high) = location.high_offset() {
+                masks.push((high, 0xff));
+            }
+            let before = self.baseline.frame(section);
+            let after = readback.frame(section);
+            let changes: Vec<ByteChangeV1> = masks
+                .iter()
+                .filter(|(offset, mask)| (before[*offset] ^ after[*offset]) & mask != 0)
+                .map(|(offset, _)| ByteChangeV1 {
+                    section,
+                    offset: *offset,
+                    before: before[*offset],
+                    after: after[*offset],
+                })
+                .collect();
+            if changes.is_empty() {
+                continue;
+            }
+            matched.push((
+                LinkedChangeV1 {
+                    classification: "linked",
+                    evidence: prediction.link.evidence.label(),
+                    driver_output: prediction.driver.output,
+                    driver_field: prediction.driver.field.label(),
+                    follower_output: prediction.follower.output,
+                    follower_field: prediction.follower.field.label(),
+                    before_code: prediction.before,
+                    code: prediction.code,
+                    changes,
+                },
+                masks
+                    .into_iter()
+                    .map(|(offset, mask)| ((section, offset), mask))
+                    .collect(),
+            ));
+        }
+        matched
     }
 
     /// Serialize the strict durable apply carrier.
@@ -1715,7 +2005,25 @@ impl RollbackPlanV1 {
                     apply_command.actions(),
                     rollback.actions(),
                 )?;
-                let projected = apply.desired.project_direct_actions(rollback.actions())?;
+                // Restoring an observed linked driver moves its follower
+                // back to the driver's baseline code, which the link gate
+                // required to equal the follower's baseline code.
+                let restored_followers: Vec<(ReviewedAddress, u8, u16)> = baseline
+                    .linked_predictions(apply_command.actions())
+                    .into_iter()
+                    .filter(|prediction| prediction.link.evidence == LinkEvidence::Observed)
+                    .map(|prediction| {
+                        (
+                            prediction.follower,
+                            prediction.link.follower.1,
+                            prediction.before,
+                        )
+                    })
+                    .collect();
+                let projected = apply
+                    .desired
+                    .project_direct_actions(rollback.actions())?
+                    .with_follower_codes(&restored_followers)?;
                 if projected != *baseline {
                     return Err(ApplyPlanError::RollbackProjectionMismatch {
                         projected: projected.digest().to_owned(),
@@ -1953,7 +2261,7 @@ impl ApplyTransactionV1 {
         apply_actions: Vec<DirectParameterAction>,
     ) -> Result<Self, ApplyTransactionError> {
         let desired = baseline
-            .project_direct_actions(&apply_actions)
+            .project_linked_actions(&apply_actions)
             .map_err(ApplyPlanError::from)?;
         let rollback_actions = baseline
             .rollback_actions_for(&apply_actions)

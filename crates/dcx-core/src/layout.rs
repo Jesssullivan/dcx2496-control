@@ -690,6 +690,61 @@ pub fn routing_rank(address: ReviewedAddress) -> Option<u8> {
     }
 }
 
+/// Evidence class of one modelled linked-crossover direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEvidence {
+    /// Seen on the named device: the 2026-10-20 PA-leg `write apply` of O4
+    /// high-pass LR24 100 Hz (code 74) moved the O3 low-pass frequency from
+    /// code 180 (equal to the O4 high-pass code before the write) to 74
+    /// (Dump1 205 `52 -> 74`, carrier 212 bit 0 `1 -> 0`).
+    Observed,
+    /// Inferred from the observed direction only; never seen on a device.
+    Inferred,
+}
+
+impl LinkEvidence {
+    /// Stable label for reports.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Inferred => "inferred_unverified",
+        }
+    }
+}
+
+/// One direction of an adjacent-output linked crossover: writing the
+/// driver's frequency moves the follower's frequency to the same code, as in
+/// the device's linked (not FREE) crossover adjust mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedCrossover {
+    /// Direct-parameter channel and parameter whose write drives the link.
+    pub driver: (u8, u8),
+    /// Channel and parameter the device moves to the driver's written code.
+    pub follower: (u8, u8),
+    /// Evidence class of this direction.
+    pub evidence: LinkEvidence,
+}
+
+/// The only modelled linked-crossover pair: O4 high-pass frequency and O3
+/// low-pass frequency. The O1/O2 and O2/O3 pairs, and the crossover types,
+/// are deliberately not modelled.
+///
+/// The device's crossover adjust mode has no reviewed address, so a link is
+/// treated as active only while the pre-write snapshot holds the follower at
+/// the driver's code (see `SnapshotV1::linked_predictions`).
+pub const LINKED_CROSSOVERS: [LinkedCrossover; 2] = [
+    LinkedCrossover {
+        driver: (8, HIGH_PASS_FREQUENCY_PARAMETER),
+        follower: (7, LOW_PASS_FREQUENCY_PARAMETER),
+        evidence: LinkEvidence::Observed,
+    },
+    LinkedCrossover {
+        driver: (7, LOW_PASS_FREQUENCY_PARAMETER),
+        follower: (8, HIGH_PASS_FREQUENCY_PARAMETER),
+        evidence: LinkEvidence::Inferred,
+    },
+];
+
 /// Dump layout failures.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum LayoutError {
@@ -1468,6 +1523,54 @@ mod tests {
                 if let Some(address) = reviewed_address(channel, parameter) {
                     assert!(!address.field.is_typed_write());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn linked_crossover_pair_is_o4_high_pass_and_o3_low_pass_frequency_only() {
+        // DuinoDCX 00b9d70 outputLocations: O3 low-pass frequency is Dump1
+        // 205 with carrier 212 bit 0 and high byte 206 (212 bits 4 and 6
+        // carry the O3 limiter threshold and release); O4 high-pass frequency
+        // is Dump1 369 with carrier 372 bit 4 and high byte 370.
+        let o3_low_pass = reviewed_address(7, LOW_PASS_FREQUENCY_PARAMETER).unwrap();
+        assert_eq!(o3_low_pass.output, 3);
+        assert_eq!(o3_low_pass.location, split(1, 205, 212, 0, 206));
+        assert_eq!(
+            reviewed_address(7, LIMITER_THRESHOLD_PARAMETER)
+                .unwrap()
+                .location,
+            carried(1, 209, 212, 4)
+        );
+        assert_eq!(
+            reviewed_address(7, LIMITER_RELEASE_PARAMETER)
+                .unwrap()
+                .location,
+            carried(1, 211, 212, 6)
+        );
+        let o4_high_pass = reviewed_address(8, HIGH_PASS_FREQUENCY_PARAMETER).unwrap();
+        assert_eq!(o4_high_pass.output, 4);
+        assert_eq!(o4_high_pass.location, split(1, 369, 372, 4, 370));
+
+        assert_eq!(
+            LINKED_CROSSOVERS
+                .iter()
+                .filter(|link| link.evidence == LinkEvidence::Observed)
+                .map(|link| (link.driver, link.follower))
+                .collect::<Vec<_>>(),
+            [(
+                (8, HIGH_PASS_FREQUENCY_PARAMETER),
+                (7, LOW_PASS_FREQUENCY_PARAMETER)
+            )]
+        );
+        for link in LINKED_CROSSOVERS {
+            for (channel, parameter) in [link.driver, link.follower] {
+                assert!(matches!(channel, 7 | 8), "only the O3/O4 pair is linked");
+                let address = reviewed_address(channel, parameter).unwrap();
+                assert!(matches!(
+                    address.field,
+                    OutputField::HighPassFrequency | OutputField::LowPassFrequency
+                ));
             }
         }
     }
