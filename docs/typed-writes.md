@@ -271,9 +271,17 @@ Each live transaction sends exactly one direct-parameter (`0x20`) frame:
 A failure after a transmit-capable mode adds at most one `ReceiveDirect`
 quiescence write at finish. G1's limit of at most 2 remote-mode writes per
 attempt covers snapshot attempts only; the 2026-10-19 ruling sets apply at
-5 and rollback at 3, which is exactly what one transaction sends. A
-read-only readback retry (below) is a separate G1 snapshot session, never
-part of the apply's own remote-mode writes.
+5 and rollback at 3, which is what one transaction sends when counted as
+function-`0x3f` commands.
+
+**Pending operator decision:** whether a read-only readback retry (below)
+counts against the apply's 5 is not settled. If remote-mode writes are
+`0x3f` commands, one fresh retry snapshot adds 2 (transmit-only, then
+receive-only), plus at most one `ReceiveDirect` quiescence per failed
+session. If the ruling counts parameter writes (its rationale cites about
+45 for the 2.1 plan), a retry adds none. This repository implements the
+retry as an ordinary read-only G1 snapshot session and does not claim
+either reading; Legalab must confirm it before relying on the retry.
 
 Rate limit proposed before that ruling, for Legalab to keep or change:
 
@@ -296,26 +304,40 @@ so a retry on the same descriptor cannot help.
 snapshot when the post-apply readback fails with a transport or read
 failure (platform transport error, bounded timeout, response over its exact
 limit, or an exhausted empty-Search window) and the failed session closed
-verified:
+verified, and only while the retry fits the existing apply envelope:
 
-- at most 3 readbacks in total (the same-descriptor readback plus at most two
-  fresh snapshots), each fresh one after a fixed 20 s wait; neither number is
-  caller input;
+- the whole transaction keeps the 150 s `APPLY_TRANSACTION_BUDGET`, measured
+  from the start of the apply, so the Apple helper's 155 s child timeout
+  (`HelperConfiguration.swift`) still outlives it unchanged. A retry starts
+  only if the fixed 20 s wait plus `POST_APPLY_RETRY_SNAPSHOT_FLOOR` (54 s:
+  nine paced Search gaps, ten Search deadlines and two dump deadlines, the
+  least a replay-free ten-Search snapshot needs) still fits, and the retry
+  snapshot then runs under the remaining envelope, so it stops on its budget
+  rather than outliving the helper;
+- the ceiling is 3 readbacks in total, but with the fixed Search cadence the
+  envelope admits at most one fresh snapshot: the earliest second retry
+  would start at 110 s and need 74 s more. In practice a failed readback
+  gets exactly one retry. No bound is caller input;
 - each retry opens a fresh session on the same exact callout and runs one
   ordinary complete G1 snapshot (ten Searches, transmit-only mode, Dump0,
-  Dump1, receive-only mode, verified close) inside that snapshot's own
-  120 s budget. The retry session type has no direct-parameter operation, so
-  no write frame and no receive-and-transmit mode is ever repeated;
+  Dump1, receive-only mode, verified close). The retry session type has no
+  direct-parameter operation, so no write frame and no receive-and-transmit
+  mode is ever repeated;
 - the first complete readback is verified exactly as before. A mismatch, a
   wrong-device or malformed readback, a remote-mode, pacing or budget
   failure, an unverified close, or a failed open is never retried;
-- if every allowed readback fails, the result is exactly today's:
+- if every admitted readback fails, the result is exactly today's:
   `rollback_required`, `failure: post_apply_state_uncertain`, `readback:
   null`. A readback is never synthesized.
 
 The apply output records `readback_attempts` (0 when the transaction failed
-before its readback, otherwise 1 through 3). Worst case, two retries add
-2 x (20 s + 120 s) after the 150 s apply envelope.
+before its readback), `readback_failures` (one sanitized receipt per failed
+readback: `kind`, `operation`, the carrier failure class such as
+`unexpected_trailing_frame`, `session_closed_verified`, and the close
+failure class; never bytes or paths), and `readback_retry_stop`
+(`not_retryable`, `attempt_limit`, `apply_envelope`, `pacing_failed`,
+`open_failed`, or null). `session_closed_verified: false` on the first
+failure means the retry was not eligible.
 
 ## Linked O3/O4 crossover
 
@@ -338,21 +360,35 @@ The model is deliberately narrow:
   driver's code (the only available sign the pair is linked) and the plan
   does not also write the follower. A plan writing both fields of a pair the
   baseline shows linked is refused;
+- a predicted follower move on an active filter (type not off in the
+  baseline, or switched on by the plan) needs `allow_protection_change` in
+  the plan and `--allow-protection-change`, whichever direction it moves and
+  whether the direction is observed or inferred, because the device moves it
+  without a frame byte of its own;
 - `write plan` lists the prediction in `linked_effects` and adds no frame
   byte. The desired snapshot, and so `write verify` and the live readback
   check, expect the follower at the written code. The rollback, which
   rewrites only the driver, expects the follower back at its baseline code;
-- `control verify-containment` and `write verify` classify a follower move
-  as `linked` (listed under `linked_changes`, never dropped) only when the
-  follower reads exactly the written driver code and the readback driver
-  holds it too. Any other bit of those bytes (such as the limiter threshold
-  or release high bits in 212) or any other code stays uncontained.
+- `control verify-containment` and `write verify` list a follower move
+  under `linked_changes` (never dropped) only when the follower reads
+  exactly the written driver code and the readback driver holds it too. Only
+  an observed direction counts as contained (`contained: true`). Any other
+  bit of those bytes (such as the limiter threshold or release high bits in
+  212) or any other code stays uncontained.
 
 The reverse direction (an O3 low-pass frequency write moving O4 high-pass
-frequency) is inferred and unverified. Containment and `linked_effects`
-report it as `inferred_unverified`, but the desired snapshot never expects
-it, so if the device does follow, the readback does not verify and rollback
-is required.
+frequency) is inferred and unverified. `linked_effects` and `linked_changes`
+report it as `inferred_unverified` with `contained: false`; its bits stay in
+`uncontained_changes`, so both gates exit non-zero, and the desired snapshot
+never expects it, so a live apply reports `rollback_required`.
+
+The equal-codes gate is a heuristic with a false-positive mode: on a device
+in FREE mode, any state where O4 high-pass and O3 low-pass share a code
+(after an aligning write, or at a shared default) predicts a link on every
+later O4 high-pass write. The device then moves only O4, the readback does
+not equal the desired state, and the apply fails safe into its exact
+rollback; a plan writing both fields is refused. The way out is to write
+the O3 low-pass frequency first, in its own plan, so the codes differ.
 
 ## Offline consistency check
 

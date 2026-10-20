@@ -69,8 +69,10 @@ command when needed, and attempt complete readback. The full apply envelope is 1
 seconds so the maximum qualified baseline path plus mutation readback remains
 bounded with room for complete cleanup. A readback that fails in transport or
 read, with a verified close, is repeated only as a fresh complete read-only
-snapshot session (its own 120-second budget) after a fixed 20-second wait,
-at most three readbacks in total; the mutation is never repeated. Rollback opens a fresh session whose
+snapshot session after a fixed 20-second wait, and only while that wait plus
+a 54-second replay-free snapshot still fits inside the same 150-second apply
+envelope (the retry runs under the remaining envelope); in practice that is
+at most one retry. The mutation is never repeated. Rollback opens a fresh session whose
 first Search may go unanswered, so its pre-inverse identity check uses the same
 paced qualification: one valid identity, at most ten empty-timeout replays,
 inside a 90-second rollback envelope.

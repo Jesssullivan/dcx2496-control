@@ -1435,6 +1435,7 @@ pub fn check_policy(
     if unmutes && sources {
         return Err(TypedWriteError::UnmuteWithRouting);
     }
+    check_linked_followers(baseline, actions, policy)?;
     if !peq_outputs.is_empty() {
         let desired = baseline.project_direct_actions(actions).map_err(|error| {
             TypedWriteError::Transaction(ApplyTransactionError::Plan(error.into()))
@@ -1448,6 +1449,42 @@ pub fn check_policy(
             rise_db: f64::from(rise) / 10.0,
             maximum_step_db: policy.max_gain_step_db,
         });
+    }
+    Ok(())
+}
+
+/// Policy for predicted linked-crossover follower moves (observed and
+/// inferred): a follower whose filter is active in the baseline, or switched
+/// on by the plan, needs both protection consents, as loosening an active
+/// high-pass does for a direct write. The device would move it without a
+/// frame byte of its own.
+fn check_linked_followers(
+    baseline: &SnapshotV1,
+    actions: &[DirectParameterAction],
+    policy: &WritePolicyV1,
+) -> Result<(), TypedWriteError> {
+    for prediction in baseline.linked_predictions(actions) {
+        let type_parameter = match prediction.follower.field {
+            OutputField::HighPassFrequency => HIGH_PASS_TYPE_PARAMETER,
+            OutputField::LowPassFrequency => LOW_PASS_TYPE_PARAMETER,
+            _ => continue,
+        };
+        let channel = prediction.link.follower.0;
+        let planned_on = actions.iter().any(|action| {
+            action.channel() == channel
+                && action.parameter() == type_parameter
+                && action.value() != 0
+        });
+        let active =
+            read_field(baseline, prediction.follower.output, type_parameter)? != 0 || planned_on;
+        if active && !policy.allow_protection_change {
+            return Err(TypedWriteError::LinkedProtectionChange {
+                driver_output: prediction.driver.output,
+                follower_output: prediction.follower.output,
+                field: prediction.follower.field.label(),
+                evidence: prediction.link.evidence.label(),
+            });
+        }
     }
     Ok(())
 }
@@ -1863,6 +1900,16 @@ pub enum TypedWriteError {
         "O{output} {field}: loosening an active high-pass needs allow_protection_change in the plan and --allow-protection-change"
     )]
     ProtectionChange { output: u8, field: String },
+    /// A predicted linked-crossover follower move on an active filter.
+    #[error(
+        "the O{driver_output} write is predicted ({evidence}) to move O{follower_output} {field} on an active filter (linked crossover); it needs allow_protection_change in the plan and --allow-protection-change"
+    )]
+    LinkedProtectionChange {
+        driver_output: u8,
+        follower_output: u8,
+        field: String,
+        evidence: &'static str,
+    },
     /// The encoded one-action frame had an unexpected layout.
     #[error("one-action direct frame has unexpected length {0}")]
     FrameLayout(usize),

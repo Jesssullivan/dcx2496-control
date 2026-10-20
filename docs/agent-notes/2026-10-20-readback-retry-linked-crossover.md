@@ -27,9 +27,15 @@ and PZM LegalabCache is below the 10 GiB build floor. Gate: blocked.
 ## What changed
 
 - `dcx_transport::snapshot::execute_apply_readback_with_snapshot_retry`:
-  at most 3 readbacks, 20 s apart, retries as fresh `PersistentSnapshotSession`
-  snapshots only (the type has no write operation). `dcxctl` apply output
-  gains `readback_attempts`.
+  retries as fresh `PersistentSnapshotSession` snapshots only (the type has
+  no write operation), 20 s apart, only while the retry fits the 150 s apply
+  envelope (so the Apple helper's 155 s child timeout still holds; in
+  practice one retry; ceiling 3 readbacks). `dcxctl` apply output gains
+  `readback_attempts`, sanitized `readback_failures` and
+  `readback_retry_stop`.
+- OD-3 round 1 (2026-10-20) fixes: envelope-bounded retry; inferred linked
+  moves stay uncontained; follower moves on an active filter need
+  protection consent; budget reading marked pending; failure receipts.
 - `layout::LINKED_CROSSOVERS`, `SnapshotV1::linked_predictions` and
   `project_linked_actions`, `ApplyPlanV1::linked_changes`; planner
   `linked_effects`; verify and containment `linked_changes`.
@@ -38,8 +44,10 @@ and PZM LegalabCache is below the 10 GiB build floor. Gate: blocked.
 
 ## Open
 
-- Whether the ruling counts read-only retry snapshots against the apply's
-  5 remote-mode writes (this lane treats them as separate G1 snapshots).
+- PENDING operator decision: whether the ruling counts read-only retry
+  snapshots against the apply's 5 remote-mode writes. This lane implements
+  them as separate G1 snapshots and claims neither reading
+  (`docs/typed-writes.md`).
 - Carriers staged before this change that write O4 high-pass frequency on a
   linked baseline no longer reconstruct; re-run `write plan`.
 - Dump0 101 remains unexplained.

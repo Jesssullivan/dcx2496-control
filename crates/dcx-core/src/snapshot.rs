@@ -1006,9 +1006,10 @@ pub struct ByteChangeV1 {
     pub after: u8,
 }
 
-/// A readback change classified as an expected linked-crossover side effect,
-/// not an uncontained one: the follower field moved to exactly the code the
-/// plan wrote to its driver, and the readback driver holds that code too.
+/// A readback change classified as a linked-crossover side effect: the
+/// follower field moved to exactly the code the plan wrote to its driver, and
+/// the readback driver holds that code too. Only an observed direction is
+/// expected and contained; an inferred one is reported and stays uncontained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkedChangeV1 {
@@ -1031,6 +1032,9 @@ pub struct LinkedChangeV1 {
     /// Changed bytes of the follower field; only the field's own bits of a
     /// shared carrier byte count.
     pub changes: Vec<ByteChangeV1>,
+    /// Whether these bits count as contained: true only for an observed
+    /// direction. An inferred move stays in `uncontained_changes` too.
+    pub contained: bool,
 }
 
 /// Closed, bounded apply plan bound to exact observed and desired snapshots.
@@ -1243,16 +1247,20 @@ impl ApplyPlanV1 {
     ///
     /// Rejects a readback from another device.
     ///
-    /// Bits of a matched [`Self::linked_changes`] follower field are not
-    /// uncontained; any other bit of those bytes, or a follower that moved to
-    /// any other code, still is.
+    /// Bits of a matched observed [`Self::linked_changes`] follower field are
+    /// not uncontained; any other bit of those bytes, a follower that moved to
+    /// any other code, and every inferred-direction move still are.
     pub fn uncontained_changes(
         &self,
         readback: &SnapshotV1,
     ) -> Result<Vec<ByteChangeV1>, SnapshotDiffError> {
         self.require_readback_device(readback)?;
         let mut allowed = self.projected_masks();
-        for (_, masks) in self.matched_linked_changes(readback) {
+        for (change, masks) in self.matched_linked_changes(readback) {
+            // An inferred direction is reported but never contained.
+            if !change.contained {
+                continue;
+            }
             for (key, mask) in masks {
                 *allowed.entry(key).or_insert(0) |= mask;
             }
@@ -1362,6 +1370,7 @@ impl ApplyPlanV1 {
                     before_code: prediction.before,
                     code: prediction.code,
                     changes,
+                    contained: prediction.link.evidence == LinkEvidence::Observed,
                 },
                 masks
                     .into_iter()

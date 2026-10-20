@@ -5,12 +5,14 @@
 - Repeat a failed post-apply readback only as a fresh read-only snapshot:
   `write apply` and `control apply` retry a readback that failed in
   transport or read (and closed verified) as one ordinary complete G1
-  snapshot on a fresh session, at most three readbacks in total and 20 s
-  apart (fixed constants), never re-sending a write frame. Validation,
+  snapshot on a fresh session, 20 s later and only while it fits the
+  existing 150 s apply envelope (in practice one retry; ceiling three
+  readbacks; fixed constants), never re-sending a write frame. Validation,
   mismatch, remote-mode, budget, close and open failures are not retried;
   if every readback fails the result is unchanged (`rollback_required`,
   `post_apply_state_uncertain`, `readback: null`). Apply output gains
-  `readback_attempts`.
+  `readback_attempts`, sanitized `readback_failures` and
+  `readback_retry_stop`.
 - Model the observed linked O3/O4 crossover: an O4 high-pass frequency
   write, on a baseline holding O3 low-pass frequency at the same code, also
   moves O3 low-pass frequency to the written code (2026-10-20 PA leg). The
@@ -18,8 +20,9 @@
   `linked_effects`, and `write verify` / `control verify-containment`
   report it under `linked_changes` instead of as uncontained; any other bit
   or code stays uncontained. The reverse direction is reported as
-  `inferred_unverified` but never expected. A plan writing both fields of a
-  linked pair is refused.
+  `inferred_unverified`, never expected and never contained. A follower move
+  on an active filter needs both protection consents, and a plan writing
+  both fields of a linked pair is refused.
 - Typed writes are no longer offline-only by ruling: Legalab
   `dec-dcx-attended-software-writes-20261019` admits attended software
   writes (at most 5 remote-mode writes per apply, 3 per rollback);
