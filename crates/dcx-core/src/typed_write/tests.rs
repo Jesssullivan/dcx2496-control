@@ -1502,3 +1502,402 @@ fn peq_only_carriers_stay_under_core_rules_only() {
         .is_err()
     );
 }
+
+/// Synthetic baseline shaped like the 2026-10-20 PA-leg pre-write state at
+/// the linked-crossover bytes only: O4 high-pass BW24 at code 180 and O3
+/// low-pass frequency at the same code 180 (Dump1 205 = 52, carrier 212 bit 0
+/// set), with the O3 limiter threshold (240) and release (141) high bits
+/// setting carrier 212 bits 4 and 6, so 212 = 81. Nothing else is device data.
+fn linked_baseline() -> SnapshotV1 {
+    let mut builder = Builder::new();
+    builder.set(8, HIGH_PASS_TYPE_PARAMETER, 6);
+    builder.set(8, HIGH_PASS_FREQUENCY_PARAMETER, 180);
+    builder.set(7, LOW_PASS_FREQUENCY_PARAMETER, 180);
+    builder.set(7, LIMITER_RELEASE_PARAMETER, 141);
+    builder.snapshot()
+}
+
+fn o4_hpf_lr24_100hz(base: &SnapshotV1) -> WriteTransactionV1 {
+    let mut document = plan(vec![TypedChange::Crossover {
+        output: 4,
+        side: CrossoverSide::HighPass,
+        filter: CrossoverFilter::LinkwitzRiley24,
+        frequency_hz: Some(100.0),
+    }]);
+    document.allow_protection_change = true;
+    let policy = WritePolicyV1 {
+        allow_protection_change: true,
+        ..WritePolicyV1::default()
+    };
+    plan_writes(base, &document, &policy).unwrap()
+}
+
+fn with_dump1(snapshot: &SnapshotV1, patch: impl FnOnce(&mut Vec<u8>)) -> SnapshotV1 {
+    let mut dump1 = snapshot.frame(crate::SnapshotSection::Dump1).to_vec();
+    patch(&mut dump1);
+    SnapshotV1::from_frames(
+        snapshot.frame(crate::SnapshotSection::Identity),
+        snapshot.frame(crate::SnapshotSection::Dump0),
+        &dump1,
+    )
+    .unwrap()
+}
+
+#[test]
+fn o4_high_pass_write_predicts_the_linked_o3_low_pass_move() {
+    let base = linked_baseline();
+    let dump1 = base.frame(crate::SnapshotSection::Dump1);
+    assert_eq!((dump1[205], dump1[206], dump1[212]), (52, 0, 81));
+    let transaction = o4_hpf_lr24_100hz(&base);
+    // The frame is unchanged: the link adds no write.
+    assert_eq!(
+        wires(&transaction),
+        [[0x08, 0x43, 0x00, 0x4a], [0x08, 0x42, 0x00, 0x08]]
+    );
+    assert_eq!(
+        transaction.rollback_frame_hex.as_deref(),
+        Some("F0002032000E20020842000608430134F7")
+    );
+    let [effect] = transaction.linked_effects.as_slice() else {
+        panic!("one linked effect expected")
+    };
+    assert_eq!(effect.evidence, "observed");
+    assert_eq!((effect.driver_output, effect.follower_output), (4, 3));
+    assert_eq!((effect.before_code, effect.after_code), (180, 74));
+    assert!(effect.in_desired_snapshot);
+    assert_eq!(
+        (
+            effect.dump_offsets.low,
+            effect.dump_offsets.carrier,
+            effect.dump_offsets.high
+        ),
+        (205, Some((212, 0)), Some(206))
+    );
+    // The desired snapshot expects 52/81 -> 74/80 and the O4 bytes.
+    let desired = transaction.apply_plan.desired();
+    let after = desired.frame(crate::SnapshotSection::Dump1);
+    assert_eq!((after[205], after[206], after[212]), (74, 0, 80));
+    assert_eq!((after[369], after[370], after[372] & 0x10), (74, 0, 0));
+    // A readback equal to it is consistent; the O3 move is reported as linked.
+    let verification = verify_written_values(&transaction.apply_plan, desired).unwrap();
+    assert_eq!(verification.status, "consistent");
+    assert_eq!(verification.uncontained_changes, 0);
+    let [linked] = verification.linked_changes.as_slice() else {
+        panic!("one linked change expected")
+    };
+    assert_eq!(linked.classification, "linked");
+    assert_eq!(linked.evidence, "observed");
+    assert_eq!((linked.before_code, linked.code), (180, 74));
+    assert_eq!(
+        linked
+            .changes
+            .iter()
+            .map(|change| (change.offset, change.before, change.after))
+            .collect::<Vec<_>>(),
+        [(205, 52, 74), (212, 81, 80)]
+    );
+    // The rollback carrier restores the exact baseline: re-writing O4 moves
+    // the linked O3 field back to the shared baseline code.
+    check_rollback(&transaction.rollback_plan).unwrap();
+    assert_eq!(transaction.rollback_plan.baseline(), &base);
+}
+
+#[test]
+fn linked_containment_is_exact_to_the_field_bits_and_the_written_code() {
+    let base = linked_baseline();
+    let transaction = o4_hpf_lr24_100hz(&base);
+    let plan = &transaction.apply_plan;
+    let desired = plan.desired();
+
+    // O3 low-pass moved to another code (75): uncontained, not linked.
+    let other_code = with_dump1(desired, |dump1| dump1[205] = 75);
+    assert!(plan.linked_changes(&other_code).unwrap().is_empty());
+    let uncontained = plan.uncontained_changes(&other_code).unwrap();
+    assert!(uncontained.iter().any(|change| change.offset == 205));
+    assert_eq!(
+        verify_written_values(plan, &other_code).unwrap().status,
+        "inconsistent"
+    );
+
+    // The O3 limiter threshold high bit (212 bit 4) also flipped: the field
+    // move stays linked, but that neighbouring bit is uncontained.
+    let neighbour = with_dump1(desired, |dump1| dump1[212] &= !0x10);
+    assert_eq!(plan.linked_changes(&neighbour).unwrap().len(), 1);
+    assert_eq!(
+        plan.uncontained_changes(&neighbour)
+            .unwrap()
+            .iter()
+            .map(|change| (change.offset, change.before, change.after))
+            .collect::<Vec<_>>(),
+        [(212, 81, 64)]
+    );
+
+    // The O3 low-pass high byte moved too: that is another code, uncontained.
+    let high_byte = with_dump1(desired, |dump1| dump1[206] = 1);
+    assert!(plan.linked_changes(&high_byte).unwrap().is_empty());
+    assert!(!plan.uncontained_changes(&high_byte).unwrap().is_empty());
+
+    // The device did not follow (FREE mode): nothing uncontained, nothing
+    // linked, but the readback is not the desired state.
+    let unlinked = with_dump1(desired, |dump1| {
+        dump1[205] = 52;
+        dump1[212] |= 0x01;
+    });
+    assert!(plan.linked_changes(&unlinked).unwrap().is_empty());
+    let verification = verify_written_values(plan, &unlinked).unwrap();
+    assert!(!verification.readback_matches_desired);
+    assert_eq!(verification.status, "inconsistent");
+
+    // The O4 driver did not land at the written code: the O3 move is not
+    // explained by the link.
+    let no_driver = with_dump1(desired, |dump1| dump1[369] = 73);
+    assert!(plan.linked_changes(&no_driver).unwrap().is_empty());
+    assert!(
+        plan.uncontained_changes(&no_driver)
+            .unwrap()
+            .iter()
+            .any(|change| change.offset == 205)
+    );
+}
+
+#[test]
+fn linked_prediction_needs_the_baseline_to_show_the_pair_linked() {
+    // O3 low-pass at 320 while O4 high-pass is 180: the pair is not linked
+    // in this baseline, so nothing is predicted and an O3 move is uncontained.
+    let mut builder = Builder::new();
+    builder.set(8, HIGH_PASS_TYPE_PARAMETER, 6);
+    builder.set(8, HIGH_PASS_FREQUENCY_PARAMETER, 180);
+    let base = builder.snapshot();
+    let transaction = o4_hpf_lr24_100hz(&base);
+    assert!(transaction.linked_effects.is_empty());
+    let desired = transaction.apply_plan.desired();
+    let o3_low_pass = reviewed_address(7, LOW_PASS_FREQUENCY_PARAMETER).unwrap();
+    assert_eq!(desired.read_reviewed(o3_low_pass), 320);
+    let moved = with_dump1(desired, |dump1| {
+        o3_low_pass.location.write(dump1, 74).unwrap();
+    });
+    assert!(
+        transaction
+            .apply_plan
+            .linked_changes(&moved)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !transaction
+            .apply_plan
+            .uncontained_changes(&moved)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Aligning a FREE pair (O4 high-pass written to the O3 low-pass code):
+    // the written code lands, the readback verifies, and the rollback
+    // restores the exact baseline. No link is inferred from the desired state.
+    let aligned = plan_writes(
+        &base,
+        &plan(vec![TypedChange::Crossover {
+            output: 4,
+            side: CrossoverSide::HighPass,
+            filter: CrossoverFilter::Butterworth24,
+            frequency_hz: Some(20_480.0),
+        }]),
+        &WritePolicyV1::default(),
+    )
+    .unwrap();
+    assert!(aligned.linked_effects.is_empty());
+    let actions = aligned.apply_plan.command().unwrap().actions();
+    assert_eq!(
+        actions
+            .iter()
+            .map(|action| (action.channel(), action.parameter(), action.value()))
+            .collect::<Vec<_>>(),
+        [(8, HIGH_PASS_FREQUENCY_PARAMETER, 320)]
+    );
+    let desired = aligned.apply_plan.desired();
+    let o4_high_pass = reviewed_address(8, HIGH_PASS_FREQUENCY_PARAMETER).unwrap();
+    assert_eq!(desired.read_reviewed(o4_high_pass), 320);
+    assert_eq!(desired.read_reviewed(o3_low_pass), 320);
+    assert_eq!(
+        verify_written_values(&aligned.apply_plan, desired)
+            .unwrap()
+            .status,
+        "consistent"
+    );
+    let rollback = aligned.rollback_plan.command().unwrap().actions();
+    assert_eq!(desired.project_direct_actions(rollback).unwrap(), base);
+}
+
+#[test]
+fn equal_codes_on_a_free_device_fail_safe_into_an_exact_rollback() {
+    // The heuristic's false-positive mode: the baseline holds O3 low-pass and
+    // O4 high-pass at one code, but the device is in FREE mode. The plan
+    // expects the O3 move; the device writes only O4.
+    let base = linked_baseline();
+    let transaction = o4_hpf_lr24_100hz(&base);
+    assert_eq!(transaction.linked_effects.len(), 1);
+    let actions = transaction.apply_plan.command().unwrap().actions();
+    assert!(actions.iter().any(|action| {
+        (action.channel(), action.parameter(), action.value())
+            == (8, HIGH_PASS_FREQUENCY_PARAMETER, 74)
+    }));
+    let free_readback = base.project_direct_actions(actions).unwrap();
+    let verification = verify_written_values(&transaction.apply_plan, &free_readback).unwrap();
+    // Not the desired state, so a live apply reports rollback_required.
+    assert!(!verification.readback_matches_desired);
+    assert_eq!(verification.status, "inconsistent");
+    assert_eq!(verification.uncontained_changes, 0);
+    assert!(verification.linked_changes.is_empty());
+    assert!(verification.values.iter().all(|value| value.matches));
+    // The bound rollback restores the exact baseline from that state.
+    let rollback = transaction.rollback_plan.command().unwrap().actions();
+    assert_eq!(
+        free_readback.project_direct_actions(rollback).unwrap(),
+        base
+    );
+}
+
+#[test]
+fn a_linked_follower_on_an_active_filter_needs_protection_consent() {
+    // Raising O4 high-pass (same type) needs no consent of its own, but it is
+    // predicted to move an active O3 low-pass too.
+    let tighten = || {
+        plan(vec![TypedChange::Crossover {
+            output: 4,
+            side: CrossoverSide::HighPass,
+            filter: CrossoverFilter::Butterworth24,
+            frequency_hz: Some(2000.0),
+        }])
+    };
+    assert!(plan_writes(&linked_baseline(), &tighten(), &WritePolicyV1::default()).is_ok());
+    let mut builder = Builder::new();
+    builder.set(8, HIGH_PASS_TYPE_PARAMETER, 6);
+    builder.set(8, HIGH_PASS_FREQUENCY_PARAMETER, 180);
+    builder.set(7, LOW_PASS_FREQUENCY_PARAMETER, 180);
+    builder.set(7, LOW_PASS_TYPE_PARAMETER, 8);
+    let base = builder.snapshot();
+    let mut document = tighten();
+    let mut policy = WritePolicyV1::default();
+    for (plan_flag, cli_flag) in [(false, false), (true, false), (false, true)] {
+        document.allow_protection_change = plan_flag;
+        policy.allow_protection_change = cli_flag;
+        assert!(matches!(
+            plan_writes(&base, &document, &policy),
+            Err(TypedWriteError::LinkedProtectionChange {
+                driver_output: 4,
+                follower_output: 3,
+                evidence: "observed",
+                ..
+            })
+        ));
+    }
+    document.allow_protection_change = true;
+    policy.allow_protection_change = true;
+    let transaction = plan_writes(&base, &document, &policy).unwrap();
+    assert_eq!(transaction.linked_effects.len(), 1);
+}
+
+#[test]
+fn writing_both_fields_of_a_linked_pair_is_refused() {
+    let base = linked_baseline();
+    let mut document = plan(vec![
+        TypedChange::Crossover {
+            output: 4,
+            side: CrossoverSide::HighPass,
+            filter: CrossoverFilter::Butterworth24,
+            frequency_hz: Some(2000.0),
+        },
+        TypedChange::Crossover {
+            output: 3,
+            side: CrossoverSide::LowPass,
+            filter: CrossoverFilter::Off,
+            frequency_hz: Some(80.0),
+        },
+    ]);
+    document.allow_protection_change = true;
+    let error = plan_writes(&base, &document, &WritePolicyV1::default()).unwrap_err();
+    assert!(
+        error.to_string().contains("linked crossover pair"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_reverse_link_is_reported_as_inferred_and_never_contained() {
+    // O3 low-pass 80 Hz (code 64) on the linked baseline. The reverse
+    // direction (O3 low-pass moving O4 high-pass) has never been observed,
+    // and here it would lower O4's active BW24 high-pass.
+    let base = linked_baseline();
+    let mut document = plan(vec![TypedChange::Crossover {
+        output: 3,
+        side: CrossoverSide::LowPass,
+        filter: CrossoverFilter::Off,
+        frequency_hz: Some(80.0),
+    }]);
+    assert!(matches!(
+        plan_writes(&base, &document, &WritePolicyV1::default()),
+        Err(TypedWriteError::LinkedProtectionChange {
+            driver_output: 3,
+            follower_output: 4,
+            evidence: "inferred_unverified",
+            ..
+        })
+    ));
+    document.allow_protection_change = true;
+    let policy = WritePolicyV1 {
+        allow_protection_change: true,
+        ..WritePolicyV1::default()
+    };
+    let transaction = plan_writes(&base, &document, &policy).unwrap();
+    assert_eq!(wires(&transaction), [[0x07, 0x45, 0x00, 0x40]]);
+    let [effect] = transaction.linked_effects.as_slice() else {
+        panic!("one inferred effect expected")
+    };
+    assert_eq!(effect.evidence, "inferred_unverified");
+    assert!(!effect.in_desired_snapshot);
+    let desired = transaction.apply_plan.desired();
+    let o4_high_pass = reviewed_address(8, HIGH_PASS_FREQUENCY_PARAMETER).unwrap();
+    assert_eq!(desired.read_reviewed(o4_high_pass), 180);
+    // The predicted O3 bytes match the legalab offline prediction for an O3
+    // low-pass 80 Hz write: 205 52 -> 64, 212 bit 0 cleared.
+    let after = desired.frame(crate::SnapshotSection::Dump1);
+    assert_eq!((after[205], after[212] & 0x01), (64, 0));
+    // If the device does follow, the O4 move is reported as an inferred
+    // linked change and still counts as uncontained: the gate fails.
+    let followed = with_dump1(desired, |dump1| {
+        o4_high_pass.location.write(dump1, 64).unwrap();
+    });
+    let verification = verify_written_values(&transaction.apply_plan, &followed).unwrap();
+    assert!(verification.uncontained_changes > 0);
+    let [linked] = verification.linked_changes.as_slice() else {
+        panic!("one inferred linked change expected")
+    };
+    assert_eq!(linked.evidence, "inferred_unverified");
+    assert!(!linked.contained);
+    assert_eq!(verification.status, "inconsistent");
+    assert!(
+        transaction
+            .apply_plan
+            .uncontained_changes(&followed)
+            .unwrap()
+            .iter()
+            .any(|change| change.offset == 369)
+    );
+}
+
+#[test]
+fn no_other_output_pair_is_linked() {
+    // O2 low-pass equal to O3 high-pass, and O1 low-pass equal to O2
+    // high-pass: writing either high-pass predicts nothing.
+    let mut builder = Builder::new();
+    builder.set(6, LOW_PASS_FREQUENCY_PARAMETER, 100);
+    builder.set(7, HIGH_PASS_FREQUENCY_PARAMETER, 100);
+    builder.set(5, LOW_PASS_FREQUENCY_PARAMETER, 90);
+    builder.set(6, HIGH_PASS_FREQUENCY_PARAMETER, 90);
+    let base = builder.snapshot();
+    for channel in [6, 7] {
+        let action =
+            DirectParameterAction::new(channel, HIGH_PASS_FREQUENCY_PARAMETER, 120).unwrap();
+        assert!(base.linked_predictions(&[action]).is_empty());
+    }
+}

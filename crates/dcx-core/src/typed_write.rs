@@ -39,7 +39,7 @@ use crate::{
         BandField, DELAY_ENABLED_PARAMETER, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER,
         GAIN_INPUT_COUNT, GAIN_PARAMETER, HIGH_PASS_FREQUENCY_PARAMETER, HIGH_PASS_TYPE_PARAMETER,
         LIMITER_ENABLED_PARAMETER, LIMITER_RELEASE_PARAMETER, LIMITER_THRESHOLD_PARAMETER,
-        LONG_DELAY_PARAMETER, LOW_PASS_FREQUENCY_PARAMETER, LOW_PASS_TYPE_PARAMETER,
+        LONG_DELAY_PARAMETER, LOW_PASS_FREQUENCY_PARAMETER, LOW_PASS_TYPE_PARAMETER, LinkEvidence,
         MAX_FREQUENCY_CODE, MAX_LEVEL_STEP_CODES, MAX_LIMITER_RELEASE_CODE,
         MAX_LIMITER_THRESHOLD_CODE, MAX_LONG_DELAY_CODE, MAX_SHORT_DELAY_CODE, MUTE_PARAMETER,
         OUTPUT_COUNT, OutputField, PEQ_BANDS, POLARITY_PARAMETER, ReviewedAddress,
@@ -993,6 +993,35 @@ impl DumpOffsetsV1 {
     }
 }
 
+/// One linked-crossover side effect a typed write plan predicts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkedEffectV1 {
+    /// `observed` or `inferred_unverified`.
+    pub evidence: &'static str,
+    /// Output whose written field drives the link.
+    pub driver_output: u8,
+    /// Driver field label.
+    pub driver_field: String,
+    /// Output whose field the device is predicted to move.
+    pub follower_output: u8,
+    /// Follower field label.
+    pub follower_field: String,
+    /// Follower baseline code.
+    pub before_code: u16,
+    /// Predicted follower code, equal to the written driver code.
+    pub after_code: u16,
+    /// Human value of the baseline code.
+    pub before: serde_json::Value,
+    /// Human value of the predicted code.
+    pub after: serde_json::Value,
+    /// Whether the desired snapshot, and so `write verify` and the live
+    /// readback check, expect the change. Only observed directions do.
+    pub in_desired_snapshot: bool,
+    /// Dump part and frame offsets of the follower field.
+    pub dump_offsets: DumpOffsetsV1,
+}
+
 /// Human value of one reviewed field code.
 pub fn describe(field: OutputField, code: u16) -> serde_json::Value {
     use serde_json::json;
@@ -1054,6 +1083,9 @@ pub struct WriteTransactionV1 {
     pub writes: Vec<PlannedWriteV1>,
     /// Typed changes whose every encoded value already equals the baseline.
     pub unchanged_changes: Vec<usize>,
+    /// Predicted linked-crossover side effects (O4 high-pass frequency and
+    /// O3 low-pass frequency); no frame byte is added for them.
+    pub linked_effects: Vec<LinkedEffectV1>,
     /// Exact apply frame, uppercase hexadecimal, or `None` for a no-op plan.
     pub apply_frame_hex: Option<String>,
     /// Exact rollback frame, uppercase hexadecimal, or `None`.
@@ -1182,6 +1214,23 @@ pub fn plan_writes(
             })
         })
         .collect::<Result<Vec<_>, TypedWriteError>>()?;
+    let linked_effects = baseline
+        .linked_predictions(&actions)
+        .into_iter()
+        .map(|prediction| LinkedEffectV1 {
+            evidence: prediction.link.evidence.label(),
+            driver_output: prediction.driver.output,
+            driver_field: prediction.driver.field.label(),
+            follower_output: prediction.follower.output,
+            follower_field: prediction.follower.field.label(),
+            before_code: prediction.before,
+            after_code: prediction.code,
+            before: describe(prediction.follower.field, prediction.before),
+            after: describe(prediction.follower.field, prediction.code),
+            in_desired_snapshot: prediction.link.evidence == LinkEvidence::Observed,
+            dump_offsets: DumpOffsetsV1::of(prediction.follower),
+        })
+        .collect();
     let apply_plan = transaction.apply_plan().clone();
     let rollback_plan = transaction.rollback_plan().clone();
     check_rollback(&rollback_plan)?;
@@ -1216,6 +1265,7 @@ pub fn plan_writes(
         rollback_frame_hex: rollback_frame.as_deref().map(hex_upper),
         writes,
         unchanged_changes,
+        linked_effects,
         apply_plan,
         rollback_plan,
     })
@@ -1264,6 +1314,26 @@ pub fn require_reserved_muted(snapshot: &SnapshotV1) -> Result<(), TypedWriteErr
         if value != 1 {
             return Err(TypedWriteError::ReservedOutputUnmuted { output, value });
         }
+    }
+    Ok(())
+}
+
+/// Refuse loosening an active high-pass (a type change, or a lower corner)
+/// without protection consent.
+fn check_high_pass_protection(
+    baseline: &SnapshotV1,
+    address: ReviewedAddress,
+    before: u16,
+    after: u16,
+    policy: &WritePolicyV1,
+) -> Result<(), TypedWriteError> {
+    let active = read_field(baseline, address.output, HIGH_PASS_TYPE_PARAMETER)? != 0;
+    let loosens = address.field == OutputField::HighPassType || after < before;
+    if active && loosens && !policy.allow_protection_change {
+        return Err(TypedWriteError::ProtectionChange {
+            output: address.output,
+            field: address.field.label(),
+        });
     }
     Ok(())
 }
@@ -1354,14 +1424,7 @@ pub fn check_policy(
                 });
             }
             OutputField::HighPassType | OutputField::HighPassFrequency => {
-                let active = read_field(baseline, address.output, HIGH_PASS_TYPE_PARAMETER)? != 0;
-                let loosens = address.field == OutputField::HighPassType || after < before;
-                if active && loosens && !policy.allow_protection_change {
-                    return Err(TypedWriteError::ProtectionChange {
-                        output: address.output,
-                        field: address.field.label(),
-                    });
-                }
+                check_high_pass_protection(baseline, address, before, after, policy)?;
             }
             field if field.is_peq() => {
                 peq_outputs.insert(address.output);
@@ -1385,6 +1448,7 @@ pub fn check_policy(
     if unmutes && sources {
         return Err(TypedWriteError::UnmuteWithRouting);
     }
+    check_linked_followers(baseline, actions, policy)?;
     if !peq_outputs.is_empty() {
         let desired = baseline.project_direct_actions(actions).map_err(|error| {
             TypedWriteError::Transaction(ApplyTransactionError::Plan(error.into()))
@@ -1398,6 +1462,42 @@ pub fn check_policy(
             rise_db: f64::from(rise) / 10.0,
             maximum_step_db: policy.max_gain_step_db,
         });
+    }
+    Ok(())
+}
+
+/// Policy for predicted linked-crossover follower moves (observed and
+/// inferred): a follower whose filter is active in the baseline, or switched
+/// on by the plan, needs both protection consents, as loosening an active
+/// high-pass does for a direct write. The device would move it without a
+/// frame byte of its own.
+fn check_linked_followers(
+    baseline: &SnapshotV1,
+    actions: &[DirectParameterAction],
+    policy: &WritePolicyV1,
+) -> Result<(), TypedWriteError> {
+    for prediction in baseline.linked_predictions(actions) {
+        let type_parameter = match prediction.follower.field {
+            OutputField::HighPassFrequency => HIGH_PASS_TYPE_PARAMETER,
+            OutputField::LowPassFrequency => LOW_PASS_TYPE_PARAMETER,
+            _ => continue,
+        };
+        let channel = prediction.link.follower.0;
+        let planned_on = actions.iter().any(|action| {
+            action.channel() == channel
+                && action.parameter() == type_parameter
+                && action.value() != 0
+        });
+        let active =
+            read_field(baseline, prediction.follower.output, type_parameter)? != 0 || planned_on;
+        if active && !policy.allow_protection_change {
+            return Err(TypedWriteError::LinkedProtectionChange {
+                driver_output: prediction.driver.output,
+                follower_output: prediction.follower.output,
+                field: prediction.follower.field.label(),
+                evidence: prediction.link.evidence.label(),
+            });
+        }
     }
     Ok(())
 }
@@ -1554,8 +1654,12 @@ pub struct WriteVerificationV1 {
     pub readback_matches_desired: bool,
     /// Per-action written values.
     pub values: Vec<WrittenValueCheckV1>,
-    /// Bytes that changed outside the plan's projected bits.
+    /// Bytes that changed outside the plan's projected bits and outside
+    /// every matched linked-crossover follower field.
     pub uncontained_changes: usize,
+    /// Matched linked-crossover side effects (see
+    /// [`ApplyPlanV1::linked_changes`]); reported, never silently dropped.
+    pub linked_changes: Vec<crate::LinkedChangeV1>,
 }
 
 /// Check that every value an apply plan wrote appears at its transcribed dump
@@ -1570,6 +1674,7 @@ pub fn verify_written_values(
     readback: &SnapshotV1,
 ) -> Result<WriteVerificationV1, TypedWriteError> {
     let uncontained = plan.uncontained_changes(readback)?;
+    let linked_changes = plan.linked_changes(readback)?;
     let mut values = Vec::new();
     for action in plan
         .command()
@@ -1603,6 +1708,7 @@ pub fn verify_written_values(
         readback_matches_desired,
         values,
         uncontained_changes: uncontained.len(),
+        linked_changes,
     })
 }
 
@@ -1807,6 +1913,16 @@ pub enum TypedWriteError {
         "O{output} {field}: loosening an active high-pass needs allow_protection_change in the plan and --allow-protection-change"
     )]
     ProtectionChange { output: u8, field: String },
+    /// A predicted linked-crossover follower move on an active filter.
+    #[error(
+        "the O{driver_output} write is predicted ({evidence}) to move O{follower_output} {field} on an active filter (linked crossover); it needs allow_protection_change in the plan and --allow-protection-change"
+    )]
+    LinkedProtectionChange {
+        driver_output: u8,
+        follower_output: u8,
+        field: String,
+        evidence: &'static str,
+    },
     /// The encoded one-action frame had an unexpected layout.
     #[error("one-action direct frame has unexpected length {0}")]
     FrameLayout(usize),

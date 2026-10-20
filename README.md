@@ -238,10 +238,10 @@ gain; an O3/O4 source behind two consents) into one reviewed frame bound to an
 exact baseline, with an exact touched-address inverse. `write plan` is a dry
 run that prints the exact frame bytes; `write verify` is the offline readback
 check. O5/O6 are never addressed and every plan is refused while either reads
-unmuted. This is offline planning only: no shipped binary carries `write
-apply|rollback` (they need the non-default `typed-write-live` feature), and
-Legalab ruling D5 (front-panel entry) stands for device writes until the
-operator rules on software writes. See
+unmuted. `write apply|rollback` exist only behind the non-default
+`typed-write-live` feature, which unattended builds never enable; Legalab
+ruling `dec-dcx-attended-software-writes-20261019` admits attended software
+writes only (at most 5 remote-mode writes per apply, 3 per rollback). See
 [`docs/typed-writes.md`](docs/typed-writes.md).
 
 ```sh

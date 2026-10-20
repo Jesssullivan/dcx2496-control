@@ -20,13 +20,17 @@ use dcx_core::{
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 use dcx_core::{RollbackPlanV1, protocol::DeviceId};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
-use dcx_darwin_tty::{DarwinSearchSession, PrivateTtyBinding, recover_receive_direct_known_38400};
+use dcx_darwin_tty::{
+    DarwinCarrierError, DarwinSearchSession, PrivateTtyBinding, recover_receive_direct_known_38400,
+};
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 use dcx_transport::{
     RepeatPacer,
     snapshot::{
-        ApplyReadbackOutcome, RollbackReadbackOutcome, execute_apply_readback,
-        execute_persistent_snapshot, execute_rollback_readback,
+        ApplyReadbackOutcome, ApplyReadbackReport, ReadbackRetryStop, RollbackReadbackOutcome,
+        SnapshotCaptureError, TransactionExecutionError,
+        execute_apply_readback_with_snapshot_retry, execute_persistent_snapshot,
+        execute_rollback_readback,
     },
 };
 
@@ -130,7 +134,9 @@ pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
 
 /// Offline containment gate: every bit that differs between an apply plan's
 /// bound baseline and a complete readback must lie inside the plan's projected
-/// bits (plus the touched dump trailers). Returns whether it does.
+/// bits (plus the touched dump trailers), or inside a follower field that
+/// moved exactly as a modelled linked crossover predicts; those are listed
+/// under `linked_changes`. Returns whether it does.
 pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn Error>> {
     let plan = ApplyPlanV1::from_json(&read_bounded(
         plan,
@@ -143,6 +149,7 @@ pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn 
         "readback snapshot",
     )?)?;
     let uncontained = plan.uncontained_changes(&readback)?;
+    let linked = plan.linked_changes(&readback)?;
     let projected = plan
         .projected_masks()
         .into_iter()
@@ -160,6 +167,7 @@ pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn 
         "readback_matches_desired": readback.digest() == plan.desired_snapshot_digest(),
         "projected_offsets": projected,
         "uncontained_changes": uncontained,
+        "linked_changes": linked,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(contained)
@@ -179,6 +187,12 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
 /// Run one already-validated apply carrier (see [`apply`]). Returns whether
 /// the readback matched the desired snapshot; `control apply` keeps its
 /// historical exit 0 after printing a `rollback_required` status.
+///
+/// A post-apply readback that fails with a transport or read error is
+/// repeated only as a fresh read-only snapshot on the same exact callout, at
+/// most three readbacks in total and 20 s apart (fixed constants in
+/// `dcx_transport::snapshot`); no write frame is ever re-sent. The output
+/// records `readback_attempts`.
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 pub fn apply_loaded(
     tty: PathBuf,
@@ -188,40 +202,201 @@ pub fn apply_loaded(
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.device())?;
     let mut transaction = ApplyTransactionV1::from_apply_plan(plan)?;
-    let binding = PrivateTtyBinding::new(tty)?;
+    let binding = PrivateTtyBinding::new(tty.clone())?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();
-    let (readback, readback_matches_desired) =
-        match execute_apply_readback(session, &mut pacer, &mut transaction) {
-            Ok(ApplyReadbackOutcome::Verified(captured)) => (captured, true),
-            Ok(ApplyReadbackOutcome::RollbackRequired(captured)) => (captured, false),
-            Err(_) if transaction.state() == ApplyTransactionState::RollbackRequired => {
-                let output = serde_json::json!({
-                    "status": "rollback_required",
-                    "transaction_id": plan.digest(),
-                    "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
-                    "desired_snapshot_digest": plan.desired_snapshot_digest(),
-                    "readback": null,
-                    "rollback_available": plan.command().is_some(),
-                    "readback_matches_desired": false,
-                    "failure": "post_apply_state_uncertain",
-                });
-                println!("{}", serde_json::to_string_pretty(&output)?);
-                return Ok(false);
-            }
-            Err(error) => return Err(error.into()),
-        };
+    // Each read-only retry re-validates and re-binds the same exact callout.
+    let open_readback_session =
+        move || DarwinSearchSession::open_known_38400(PrivateTtyBinding::new(tty.clone())?);
+    let ApplyReadbackReport {
+        result,
+        readback_attempts,
+        earlier_failures,
+        retry_stop,
+    } = execute_apply_readback_with_snapshot_retry(
+        session,
+        &mut pacer,
+        &mut transaction,
+        open_readback_session,
+    );
+    let mut readback_failures: Vec<serde_json::Value> = earlier_failures
+        .iter()
+        .map(capture_failure_receipt)
+        .collect();
+    let retry_stop = retry_stop.map(ReadbackRetryStop::label);
+    let (readback, readback_matches_desired) = match result {
+        Ok(ApplyReadbackOutcome::Verified(captured)) => (captured, true),
+        Ok(ApplyReadbackOutcome::RollbackRequired(captured)) => (captured, false),
+        Err(error) if transaction.state() == ApplyTransactionState::RollbackRequired => {
+            readback_failures.push(transaction_failure_receipt(&error));
+            let output = serde_json::json!({
+                "status": "rollback_required",
+                "transaction_id": plan.digest(),
+                "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
+                "desired_snapshot_digest": plan.desired_snapshot_digest(),
+                "readback": null,
+                "readback_attempts": readback_attempts,
+                "readback_failures": readback_failures,
+                "readback_retry_stop": retry_stop,
+                "rollback_available": plan.command().is_some(),
+                "readback_matches_desired": false,
+                "failure": "post_apply_state_uncertain",
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let output = serde_json::json!({
         "status": if readback_matches_desired { "verified" } else { "rollback_required" },
         "transaction_id": plan.digest(),
         "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
         "desired_snapshot_digest": plan.desired_snapshot_digest(),
         "readback": readback.snapshot(),
+        "readback_attempts": readback_attempts,
+        "readback_failures": readback_failures,
+        "readback_retry_stop": retry_stop,
         "rollback_available": plan.command().is_some(),
         "readback_matches_desired": readback_matches_desired,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(readback_matches_desired)
+}
+
+/// Sanitized class of one carrier failure: a fixed label, never bytes or
+/// paths.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+fn carrier_failure_kind(error: &DarwinCarrierError) -> &'static str {
+    match error {
+        DarwinCarrierError::UnexpectedTrailingFrame { .. } => "unexpected_trailing_frame",
+        DarwinCarrierError::InputRecoveryRequired => "input_recovery_required",
+        DarwinCarrierError::Deadline { .. } => "deadline",
+        DarwinCarrierError::Overflow { .. } => "overflow",
+        DarwinCarrierError::EndOfFile { .. } => "end_of_file",
+        DarwinCarrierError::PreexistingInput { .. } => "preexisting_input",
+        DarwinCarrierError::ShortWrite { .. } => "short_write",
+        DarwinCarrierError::System { .. } => "system",
+        DarwinCarrierError::Cleanup { .. } => "cleanup",
+        DarwinCarrierError::Binding(_) => "binding",
+        _ => "other",
+    }
+}
+
+/// Sanitized receipt of one failed readback capture: its class, the
+/// operation, the carrier failure class, and whether that session closed
+/// verified (the precondition for a retry).
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+fn capture_failure_receipt(
+    error: &SnapshotCaptureError<DarwinCarrierError, Infallible>,
+) -> serde_json::Value {
+    let (kind, operation, carrier, finish_error) = match error {
+        SnapshotCaptureError::Pacing { finish_error, .. } => {
+            ("pacing", None, None, finish_error.as_ref())
+        }
+        SnapshotCaptureError::BudgetExceeded {
+            operation,
+            finish_error,
+        } => (
+            "budget_exceeded",
+            Some(*operation),
+            None,
+            finish_error.as_ref(),
+        ),
+        SnapshotCaptureError::SearchQualificationIncomplete { finish_error, .. } => (
+            "search_qualification_incomplete",
+            None,
+            None,
+            finish_error.as_ref(),
+        ),
+        SnapshotCaptureError::Transport {
+            operation,
+            source,
+            finish_error,
+        } => (
+            "transport",
+            Some(*operation),
+            Some(carrier_failure_kind(source)),
+            finish_error.as_ref(),
+        ),
+        SnapshotCaptureError::RemoteMode {
+            source,
+            finish_error,
+            ..
+        } => (
+            "remote_mode",
+            None,
+            Some(carrier_failure_kind(source)),
+            finish_error.as_ref(),
+        ),
+        SnapshotCaptureError::Timeout {
+            operation,
+            finish_error,
+            ..
+        } => ("timeout", Some(*operation), None, finish_error.as_ref()),
+        SnapshotCaptureError::ResponseLimit {
+            operation,
+            finish_error,
+            ..
+        } => (
+            "response_limit",
+            Some(*operation),
+            None,
+            finish_error.as_ref(),
+        ),
+        SnapshotCaptureError::Validation {
+            operation,
+            finish_error,
+            ..
+        } => ("validation", Some(*operation), None, finish_error.as_ref()),
+        SnapshotCaptureError::Finish { source } => {
+            return serde_json::json!({
+                "kind": "finish",
+                "operation": null,
+                "carrier": carrier_failure_kind(source),
+                "session_closed_verified": false,
+                "close_failure": carrier_failure_kind(source),
+            });
+        }
+    };
+    serde_json::json!({
+        "kind": kind,
+        "operation": operation.map(|operation| format!("{operation:?}")),
+        "carrier": carrier,
+        "session_closed_verified": finish_error.is_none(),
+        "close_failure": finish_error.map(carrier_failure_kind),
+    })
+}
+
+/// Sanitized receipt of the final apply failure.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+fn transaction_failure_receipt(
+    error: &TransactionExecutionError<DarwinCarrierError, Infallible>,
+) -> serde_json::Value {
+    match error {
+        TransactionExecutionError::Capture(capture) => capture_failure_receipt(capture),
+        TransactionExecutionError::ReadbackRetryOpen { attempt, source } => serde_json::json!({
+            "kind": "retry_open_failed",
+            "attempt": attempt,
+            "carrier": carrier_failure_kind(source),
+        }),
+        TransactionExecutionError::ReadbackRetryPacing { attempt, .. } => serde_json::json!({
+            "kind": "retry_pacing_failed",
+            "attempt": attempt,
+        }),
+        TransactionExecutionError::Mutation {
+            source,
+            finish_error,
+            ..
+        } => serde_json::json!({
+            "kind": "mutation",
+            "carrier": carrier_failure_kind(source),
+            "session_closed_verified": finish_error.is_none(),
+        }),
+        TransactionExecutionError::Transaction { .. } => serde_json::json!({"kind": "transaction"}),
+        TransactionExecutionError::StaleBaseline { .. } => {
+            serde_json::json!({"kind": "stale_baseline"})
+        }
+    }
 }
 
 #[cfg(all(feature = "live-control", target_os = "macos"))]
