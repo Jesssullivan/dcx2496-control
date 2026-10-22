@@ -116,13 +116,19 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
     let steps = chain.steps.len();
     let to_step = args.to_step.unwrap_or(steps);
     if steps == 0 {
+        if args.from_step != 1 || args.to_step.is_some_and(|to| to != 0) {
+            return Err(std::io::Error::other("the chain has no steps to select").into());
+        }
+        // Offline: nothing was sent and nothing was read from the device.
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema": "dcx.profile-apply/v1",
                 "status": "already_matching",
+                "offline": true,
                 "chain_id": chain.chain_id,
                 "steps": [],
+                "next": "nothing was sent; confirm a live snapshot with dcxctl profile verify",
             }))?
         );
         return Ok(());
@@ -141,7 +147,7 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
             thread::sleep(INTER_TRANSACTION_GAP);
         }
         let carrier = &step.transaction.apply_plan;
-        let stop = |receipts: Vec<serde_json::Value>, reason: String| {
+        let header = |receipts: Vec<serde_json::Value>, reason: String| {
             serde_json::json!({
                 "schema": "dcx.profile-apply/v1",
                 "status": "stopped",
@@ -149,9 +155,6 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
                 "stopped_at_step": step.step,
                 "reason": reason,
                 "steps": receipts,
-                "rollback_step": step.step,
-                "rollback_plan": step.transaction.rollback_plan,
-                "next": "take a control snapshot; run dcxctl write rollback --plan with this rollback_plan if the snapshot is not the step's baseline, or re-plan from it",
             })
         };
         match crate::live_control::apply_loaded_report(
@@ -165,7 +168,13 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
             }
             Ok((receipt, false)) => {
                 receipts.push(serde_json::json!({"step": step.step, "receipt": receipt}));
-                let output = stop(receipts, "rollback_required".to_owned());
+                // The step's write was attempted: its exact rollback applies,
+                // but only to this step's own addresses.
+                let mut output = header(receipts, "rollback_required".to_owned());
+                output["applied"] = "rollback_required".into();
+                output["rollback_plan"] = serde_json::to_value(&step.transaction.rollback_plan)?;
+                output["rollback_rise_db"] = step.rollback_rise_db.into();
+                output["next"] = "take a fresh control snapshot. Equal to this step's baseline: nothing changed, re-plan. Equal to its predicted snapshot: it landed, re-plan from it. Otherwise control verify-containment --plan (this step's apply_plan) must pass before write rollback --plan with this rollback_plan".into();
                 println!("{}", serde_json::to_string_pretty(&output)?);
                 return Err(std::io::Error::other(format!(
                     "chain step {} did not verify; the chain stopped",
@@ -174,7 +183,12 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
                 .into());
             }
             Err(error) => {
-                let output = stop(receipts, error.to_string());
+                // The transaction never reached rollback_required, the state
+                // it enters before its write, so this step wrote nothing and
+                // its rollback must not be run.
+                let mut output = header(receipts, error.to_string());
+                output["applied"] = "not_applied".into();
+                output["next"] = "this step wrote nothing; do not run its rollback. Take a fresh snapshot and re-plan from it".into();
                 println!("{}", serde_json::to_string_pretty(&output)?);
                 return Err(error);
             }
@@ -189,14 +203,21 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
     };
     let matches = verification
         .as_ref()
-        .is_none_or(dcx_core::output_profile::ProfileVerificationV1::matches);
+        .is_none_or(|verification| verification.matches_holding_mute(chain.held_muted));
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "schema": "dcx.profile-apply/v1",
-            "status": if to_step == steps { "verified" } else { "verified_partial" },
+            "status": if !matches {
+                "profile_drift"
+            } else if to_step == steps {
+                "verified"
+            } else {
+                "verified_partial"
+            },
             "chain_id": chain.chain_id,
             "steps_run": [args.from_step, to_step],
+            "held_muted": chain.held_muted,
             "steps": receipts,
             "profile_verification": verification,
         }))?

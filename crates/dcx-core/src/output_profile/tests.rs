@@ -253,7 +253,12 @@ fn independent_rise(before: &SnapshotV1, after: &SnapshotV1, output: u8) -> u16 
 }
 
 /// Every invariant one chain must hold, checked step by step.
-fn check_chain(baseline: &SnapshotV1, profile: &DcxOutputProfileV1, chain: &ProfileChainV1) {
+fn check_chain(
+    baseline: &SnapshotV1,
+    profile: &DcxOutputProfileV1,
+    chain: &ProfileChainV1,
+    policy: &WritePolicyV1,
+) {
     let mut previous = baseline.clone();
     for (index, step) in chain.steps.iter().enumerate() {
         assert_eq!(step.step, index + 1);
@@ -267,7 +272,7 @@ fn check_chain(baseline: &SnapshotV1, profile: &DcxOutputProfileV1, chain: &Prof
         assert!(apply.action_count() <= DEFAULT_ACTIONS);
         assert_eq!(rollback.action_count(), apply.action_count());
         // The step re-plans to the same carrier, as `write apply` requires.
-        let rebuilt = plan_writes(&previous, &step.write_plan, &WritePolicyV1::default()).unwrap();
+        let rebuilt = plan_writes(&previous, &step.write_plan, policy).unwrap();
         assert_eq!(&rebuilt.apply_plan, apply);
         let next = apply.desired().clone();
         // At most 3 dB of rise, counted independently.
@@ -277,6 +282,28 @@ fn check_chain(baseline: &SnapshotV1, profile: &DcxOutputProfileV1, chain: &Prof
             step.step
         );
         assert!(step.rise_db <= 3.0);
+        assert!(
+            (step.rise_db * 10.0 - f64::from(independent_rise(&previous, &next, 4))).abs() < 1e-9
+        );
+        assert!(
+            (step.rollback_rise_db * 10.0 - f64::from(independent_rise(&next, &previous, 4))).abs()
+                < 1e-9,
+            "step {} rollback rise",
+            step.step
+        );
+        // O4's verify-only fields never move.
+        for parameter in [
+            SOURCE_PARAMETER,
+            POLARITY_PARAMETER,
+            DELAY_ENABLED_PARAMETER,
+            SHORT_DELAY_PARAMETER,
+            LONG_DELAY_PARAMETER,
+            LIMITER_ENABLED_PARAMETER,
+            LIMITER_THRESHOLD_PARAMETER,
+            crate::layout::LIMITER_RELEASE_PARAMETER,
+        ] {
+            assert_eq!(code(&previous, 4, parameter), code(&next, 4, parameter));
+        }
         for band in 1..=PEQ_BANDS {
             let gain = code(&previous, 4, band_parameter(band, BandField::Gain));
             let was_active = code(&previous, 4, EQ_ENABLED_PARAMETER) == 1
@@ -408,7 +435,12 @@ fn a_minus_six_retune_goes_minus_three_then_zero_then_new() {
     goal.band(4, 1, [141, 22, 100, 1, 1]);
     let (baseline, target) = (base.snapshot(), goal.snapshot());
     let chain = chain(&baseline, &target).unwrap();
-    check_chain(&baseline, &profile_of(&target, 4), &chain);
+    check_chain(
+        &baseline,
+        &profile_of(&target, 4),
+        &chain,
+        &WritePolicyV1::default(),
+    );
     assert_eq!(gains(&chain, 1), vec![(120, 161), (150, 161), (100, 141)]);
     assert_eq!(
         chain
@@ -444,7 +476,12 @@ fn deeper_cuts_and_new_inactive_bands_are_free_and_go_together() {
         .band(4, 5, [274, 20, 30, 2, 1]);
     let (baseline, target) = (base.snapshot(), goal.snapshot());
     let chain = chain(&baseline, &target).unwrap();
-    check_chain(&baseline, &profile_of(&target, 4), &chain);
+    check_chain(
+        &baseline,
+        &profile_of(&target, 4),
+        &chain,
+        &WritePolicyV1::default(),
+    );
     assert_eq!(chain.steps.len(), 1);
     // Band fields go before the count rises, inside the one frame.
     let parameters: Vec<u8> = chain.steps[0]
@@ -467,7 +504,12 @@ fn a_band_leaving_the_active_set_is_released_before_the_count_drops() {
     goal.eq(4, true, 1);
     let (baseline, target) = (base.snapshot(), goal.snapshot());
     let chain = chain(&baseline, &target).unwrap();
-    check_chain(&baseline, &profile_of(&target, 4), &chain);
+    check_chain(
+        &baseline,
+        &profile_of(&target, 4),
+        &chain,
+        &WritePolicyV1::default(),
+    );
     // 6 + 5 dB of release at 3 dB a step (3, 3, 3, 2), then the count.
     assert_eq!(chain.steps.len(), 5);
     let last = chain.steps.last().unwrap().transaction.apply_plan.desired();
@@ -486,7 +528,12 @@ fn switching_peq_off_releases_every_active_cut_first() {
     goal.eq(4, false, 1);
     let (baseline, target) = (base.snapshot(), goal.snapshot());
     let chain = chain(&baseline, &target).unwrap();
-    check_chain(&baseline, &profile_of(&target, 4), &chain);
+    check_chain(
+        &baseline,
+        &profile_of(&target, 4),
+        &chain,
+        &WritePolicyV1::default(),
+    );
     // Release -3 dB, switch PEQ off, then restore the (now inactive) band's
     // profiled cut.
     assert_eq!(chain.steps.len(), 3);
@@ -502,7 +549,12 @@ fn an_output_gain_rise_is_split_into_three_db_steps_and_capped_at_zero() {
     let goal = Builder::new();
     let (baseline, target) = (base.snapshot(), goal.snapshot());
     let chain = chain(&baseline, &target).unwrap();
-    check_chain(&baseline, &profile_of(&target, 4), &chain);
+    check_chain(
+        &baseline,
+        &profile_of(&target, 4),
+        &chain,
+        &WritePolicyV1::default(),
+    );
     // -8 dB to 0 dB: 3 + 3 + 2.
     assert_eq!(chain.steps.len(), 3);
     let mut boost = goal.clone();
@@ -533,6 +585,102 @@ fn verify_only_drift_is_refused_and_never_written() {
             "{parameter:#04x}: {error}"
         );
     }
+}
+
+#[test]
+fn a_muted_output_under_an_unmuted_profile_is_tuned_and_left_muted() {
+    let mut base = Builder::new();
+    base.set(8, MUTE_PARAMETER, 1);
+    let mut goal = Builder::new();
+    goal.eq(4, true, 1).band(4, 1, [161, 36, 90, 1, 1]);
+    let (baseline, target) = (base.snapshot(), goal.snapshot());
+    let profile = profile_of(&target, 4);
+    assert!(!profile.state.muted);
+    let chain = plan_profile_chain(&baseline, &profile, "x", &WritePolicyV1::default()).unwrap();
+    assert!(chain.held_muted);
+    assert_eq!(chain.steps.len(), 1);
+    let last = chain.final_snapshot(&baseline);
+    assert_eq!(code(last, 4, MUTE_PARAMETER), 1);
+    assert_eq!(chain.final_verification.drift, vec!["mute".to_owned()]);
+    assert!(chain.final_verification.matches_holding_mute(true));
+    assert!(!chain.final_verification.matches_holding_mute(false));
+    // The reverse is refused: a live output under a muted profile.
+    let mut muted_goal = goal.clone();
+    muted_goal.set(8, MUTE_PARAMETER, 1);
+    let error = plan_profile_chain(
+        &Builder::new().snapshot(),
+        &profile_of(&muted_goal.snapshot(), 4),
+        "x",
+        &WritePolicyV1::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, OutputProfileError::VerifyOnlyDrift(ref fields) if fields == &["mute"])
+    );
+}
+
+#[test]
+fn loosening_an_active_low_pass_needs_protection_consent() {
+    let mut base = Builder::new();
+    base.set(8, LOW_PASS_TYPE_PARAMETER, 8)
+        .set(8, LOW_PASS_FREQUENCY_PARAMETER, 250);
+    for (parameter, value) in [
+        (LOW_PASS_TYPE_PARAMETER, 0),
+        (LOW_PASS_FREQUENCY_PARAMETER, 260),
+    ] {
+        let mut goal = base.clone();
+        goal.set(8, parameter, value);
+        let profile = profile_of(&goal.snapshot(), 4);
+        assert!(matches!(
+            plan_profile_chain(&base.snapshot(), &profile, "x", &WritePolicyV1::default()),
+            Err(OutputProfileError::LowPassProtection(4))
+        ));
+        let consent = WritePolicyV1 {
+            allow_protection_change: true,
+            ..WritePolicyV1::default()
+        };
+        plan_profile_chain(&base.snapshot(), &profile, "x", &consent).unwrap();
+    }
+    // A lower low-pass corner tightens it and needs no consent.
+    let mut goal = base.clone();
+    goal.set(8, LOW_PASS_FREQUENCY_PARAMETER, 240);
+    let profile = profile_of(&goal.snapshot(), 4);
+    plan_profile_chain(&base.snapshot(), &profile, "x", &WritePolicyV1::default()).unwrap();
+}
+
+#[test]
+fn a_stored_boost_is_lowered_to_zero_before_its_band_is_retuned() {
+    let mut base = Builder::new();
+    base.eq(4, true, 1).band(4, 1, [161, 36, 200, 1, 1]);
+    let mut goal = base.clone();
+    goal.band(4, 1, [141, 22, 100, 1, 1]);
+    let (baseline, target) = (base.snapshot(), goal.snapshot());
+    let chain = chain(&baseline, &target).unwrap();
+    check_chain(
+        &baseline,
+        &profile_of(&target, 4),
+        &chain,
+        &WritePolicyV1::default(),
+    );
+    assert_eq!(gains(&chain, 1), vec![(150, 161), (100, 141)]);
+    // Leaving the active set, it is lowered too.
+    let mut fewer = base.clone();
+    fewer.eq(4, true, 0);
+    let chain = self::chain(&baseline, &fewer.snapshot()).unwrap();
+    assert_eq!(chain.steps.len(), 2);
+}
+
+#[test]
+fn a_step_that_adds_cuts_has_a_larger_rollback_rise() {
+    let base = Builder::new();
+    let mut goal = base.clone();
+    goal.eq(4, true, 2)
+        .band(4, 1, [90, 20, 30, 0, 1])
+        .band(4, 2, [274, 20, 30, 2, 1]);
+    let chain = chain(&base.snapshot(), &goal.snapshot()).unwrap();
+    assert_eq!(chain.steps.len(), 1);
+    assert!((chain.steps[0].rise_db).abs() < f64::EPSILON);
+    assert!((chain.steps[0].rollback_rise_db - 24.0).abs() < 1e-9);
 }
 
 #[test]
@@ -733,22 +881,38 @@ impl Lcg {
         ]
     }
 
-    fn state(&mut self, builder: &mut Builder) {
+    /// A random O4 state. A baseline (`baseline`) may also hold stored
+    /// boosts and an output gain above 0 dB; a target never does.
+    fn state(&mut self, builder: &mut Builder, baseline: bool) {
         let count = self.next(9);
         builder.eq(4, self.next(4) != 0, count);
         for band in 1..=PEQ_BANDS {
             if self.next(3) != 0 {
-                builder.band(4, band, self.band());
+                let mut codes = self.band();
+                if baseline && self.next(6) == 0 {
+                    codes[2] = UNITY_GAIN_CODE + 1 + self.next(150);
+                }
+                builder.band(4, band, codes);
             }
         }
-        builder.set(8, GAIN_PARAMETER, 60 + self.next(91));
+        let gain_span = if baseline { 241 } else { 91 };
+        builder.set(8, GAIN_PARAMETER, 60 + self.next(gain_span));
         if self.next(3) == 0 {
             builder.set(8, LOW_PASS_TYPE_PARAMETER, self.next(11));
             builder.set(8, LOW_PASS_FREQUENCY_PARAMETER, 200 + self.next(121));
         }
         if self.next(4) == 0 {
-            // A tighter high-pass needs no consent.
             builder.set(8, HIGH_PASS_FREQUENCY_PARAMETER, 74 + self.next(20));
+        }
+        if self.next(5) == 0 {
+            builder.set(8, HIGH_PASS_TYPE_PARAMETER, 1 + self.next(10));
+        }
+        if !baseline {
+            for band in 1..=PEQ_BANDS {
+                let gain = band_parameter(band, BandField::Gain);
+                let stored = code(&builder.snapshot(), 4, gain);
+                builder.set(8, gain, stored.min(UNITY_GAIN_CODE));
+            }
         }
     }
 }
@@ -757,27 +921,39 @@ impl Lcg {
 fn property_random_chains_hold_every_invariant() {
     let mut random = Lcg(0x2496_dc04_2026_1021);
     let mut planned = 0;
+    let mut refused = 0;
     for _ in 0..400 {
         let mut base = Builder::new();
-        random.state(&mut base);
+        random.state(&mut base, true);
         let mut goal = base.clone();
-        random.state(&mut goal);
+        random.state(&mut goal, false);
         let (baseline, target) = (base.snapshot(), goal.snapshot());
         let profile = profile_of(&target, 4);
-        match plan_profile_chain(
-            &baseline,
-            &profile,
-            "sha256/synthetic",
-            &WritePolicyV1::default(),
-        ) {
+        let consent = random.next(2) == 0;
+        let policy = WritePolicyV1 {
+            allow_protection_change: consent,
+            max_actions: usize::from(5 + random.next(12)),
+            ..WritePolicyV1::default()
+        };
+        match plan_profile_chain(&baseline, &profile, "sha256/synthetic", &policy) {
             Ok(chain) => {
-                check_chain(&baseline, &profile, &chain);
+                check_chain(&baseline, &profile, &chain, &policy);
+                assert!(chain.steps.iter().all(|step| {
+                    step.transaction.apply_plan.action_count() <= policy.max_actions
+                }));
                 planned += 1;
             }
-            // A random high-pass move may loosen the active O4 high-pass.
-            Err(OutputProfileError::Write(TypedWriteError::ProtectionChange { .. })) => {}
+            // Without consent, a random crossover move may loosen an active
+            // high-pass or low-pass.
+            Err(
+                OutputProfileError::Write(TypedWriteError::ProtectionChange { .. })
+                | OutputProfileError::LowPassProtection(4),
+            ) if !consent => refused += 1,
             Err(error) => panic!("unexpected refusal: {error}"),
         }
     }
-    assert!(planned > 300, "only {planned} of 400 random chains planned");
+    assert!(
+        planned > 250,
+        "only {planned} of 400 random chains planned ({refused} refused)"
+    );
 }

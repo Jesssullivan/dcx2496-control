@@ -464,6 +464,28 @@ fn the_planner_chain_from_143d32b5_to_1dc18140() {
     assert!(chain.steps.iter().all(|step| step.rise_db <= 3.0));
     assert_eq!(chain.budget.transactions, 6);
     assert_eq!(chain.budget.apply_remote_mode_writes_total, 30);
+    // The planned end state is the night's replayed end state, except band
+    // 9's stored values, which the refused count-9 write left behind.
+    let (_, night) = replay().pop().unwrap();
+    let planned = chain.final_snapshot(&baseline);
+    for channel in 1..=10_u8 {
+        for parameter in 0..=0x7f_u8 {
+            let Some(address) = reviewed_address(channel, parameter) else {
+                continue;
+            };
+            let band9 = channel == 8
+                && (band_parameter(9, BandField::Frequency)..=band_parameter(9, BandField::Slope))
+                    .contains(&parameter);
+            if !band9 {
+                assert_eq!(
+                    planned.read_reviewed(address),
+                    night.read_reviewed(address),
+                    "channel {channel} {}",
+                    address.field.label()
+                );
+            }
+        }
+    }
     let first = &chain.steps[0].transaction;
     assert_eq!(code(first.apply_plan.desired(), EQ_COUNT_PARAMETER), 8);
     assert!(first.apply_plan.action_count() <= 16);
@@ -504,15 +526,17 @@ fn a_profile_naming_nine_bands_is_refused() {
 fn an_unmuted_profile_never_unmutes_a_muted_output() {
     let mut builder = state_143d32b5();
     builder.set(8, MUTE_PARAMETER, 1);
-    let error = plan_profile_chain(
-        &builder.snapshot(),
-        &profile(),
-        "x",
-        &WritePolicyV1::default(),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(error, OutputProfileError::VerifyOnlyDrift(ref fields) if fields == &["mute"]),
-        "{error}"
-    );
+    let baseline = builder.snapshot();
+    let chain = plan_profile_chain(&baseline, &profile(), "x", &WritePolicyV1::default()).unwrap();
+    assert!(chain.held_muted);
+    assert_eq!(chain.steps.len(), 6);
+    for step in &chain.steps {
+        assert!(
+            step.transaction
+                .writes
+                .iter()
+                .all(|write| write.field != "mute")
+        );
+    }
+    assert_eq!(code(chain.final_snapshot(&baseline), MUTE_PARAMETER), 1);
 }

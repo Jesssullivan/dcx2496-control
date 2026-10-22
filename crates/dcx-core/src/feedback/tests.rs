@@ -2,6 +2,7 @@
 //! generalized PEQ projection.
 
 use super::*;
+use crate::layout::MAX_ACTIVE_PEQ_BANDS;
 use crate::peq_bank::gain_code;
 use crate::{
     ApplyTransactionV1, SnapshotSection,
@@ -212,7 +213,7 @@ fn planner_properties_hold_over_seeded_random_banks_and_measurements() {
             );
             continue;
         }
-        if n == 9 {
+        if n >= MAX_ACTIVE_PEQ_BANDS {
             assert!(
                 matches!(result, Err(FeedbackPlanError::NoFreeBands)),
                 "case {case}"
@@ -223,7 +224,7 @@ fn planner_properties_hold_over_seeded_random_banks_and_measurements() {
         planned += 1;
         let k = plan.notches().len();
         assert!(
-            k >= 1 && k <= usize::from(policy.max_notches.min(9 - n)),
+            k >= 1 && k <= usize::from(policy.max_notches.min(MAX_ACTIVE_PEQ_BANDS - n)),
             "case {case}"
         );
         assert_eq!(plan.operator_band_count(), n);
@@ -837,7 +838,8 @@ fn random_peq_actions(rng: &mut Rng, channel: u8) -> Vec<DirectParameterAction> 
             .push(DirectParameterAction::new(channel, 0x06, u16::from(rng.chance(3, 4))).unwrap());
     }
     if rng.chance(2, 3) {
-        let count = u16::try_from(rng.below(10)).unwrap();
+        // 0 through 8: every apply refuses a count of 9 (the device does).
+        let count = u16::try_from(rng.below(9)).unwrap();
         actions.push(DirectParameterAction::new(channel, 0x07, count).unwrap());
     }
     for band in 1..=9 {
@@ -940,7 +942,7 @@ fn stored_boost_activation_property_over_seeded_random_banks() {
                 assert!(gain_code > 150, "case {case}");
                 planner_refused += 1;
             }
-            Err(FeedbackPlanError::NoFreeBands) => assert_eq!(bank.count, 9),
+            Err(FeedbackPlanError::NoFreeBands) => assert!(bank.count >= MAX_ACTIVE_PEQ_BANDS),
             Err(error) => panic!("case {case}: {error}"),
         }
     }

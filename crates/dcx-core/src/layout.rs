@@ -62,7 +62,9 @@ pub const PEQ_BANDS: u8 = 9;
 /// Observed 2026-10-21 (Legalab vocal PA tuning, two O4 applies): the device
 /// stored band 9's values but refused a band count of 9 both times, reading
 /// back count 8. Inferred: at most 8 bands can be active, although 9 bands are
-/// addressable. Typed writes and profile chains refuse a count of 9 offline.
+/// addressable. Every apply carrier refuses a count of 9 (the core guard in
+/// `snapshot.rs`), typed writes and profile chains refuse it while planning,
+/// and the feedback lane places notches in bands up to 8.
 pub const MAX_ACTIVE_PEQ_BANDS: u8 = 8;
 /// First band-1 frequency parameter.
 pub const FIRST_BAND_PARAMETER: u8 = 0x13;

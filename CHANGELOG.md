@@ -12,8 +12,9 @@
   and leave the active set safely, and each step carries its predicted
   digest and exact rollback. Apply re-plans, requires the reviewed
   `chain_id`, and stops at the first step that does not verify.
-- Refuse a PEQ band count of 9 in `write plan`: the device stored band 9
-  but refused the count twice on 2026-10-21 (`MAX_ACTIVE_PEQ_BANDS` = 8).
+- Refuse a PEQ band count above 8 on every apply carrier (core guard) and
+  in `write plan`, and cap feedback notches at band 8: the device stored
+  band 9 but refused the count twice on 2026-10-21 (`MAX_ACTIVE_PEQ_BANDS`).
 - Document why there is no preset store, recall or directory command: none
   of the public sources read gives those frames (agent note 2026-10-21). The
   note records the sources and claims, the AUTO-STORE persistence path, and

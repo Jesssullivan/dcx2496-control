@@ -264,10 +264,12 @@ impl DcxOutputProfileV1 {
         Ok(profile)
     }
 
-    /// Check the contract constants, the output, the 8-band device limit, the
-    /// band order, every code's domain, and that each recorded value is the
-    /// value of its code. Codes are authoritative; values are checked to
-    /// within one unit of rounding.
+    /// Check the contract constants and enums, the output, the 8-band device
+    /// limit, the band order, every code's domain, and that each recorded
+    /// value is the value of its code. Codes are authoritative; values are
+    /// checked to within one unit of rounding. This is narrower than the
+    /// Legalab schema in one place: a band boost (gain code above 150) is
+    /// refused, because the apply path is cut-only.
     ///
     /// # Errors
     ///
@@ -287,6 +289,55 @@ impl DcxOutputProfileV1 {
         if !(1..=4).contains(&self.output) {
             return invalid(format!("output {}", self.output));
         }
+        let lower_hex = |text: &str| {
+            text.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        let capture = &self.capture;
+        let observed = capture.observed_at.as_bytes();
+        let observed_ok = observed.len() == 17
+            && observed.starts_with(b"20")
+            && observed
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| match index {
+                    4 | 7 => *byte == b'-',
+                    10 => *byte == b'T',
+                    13 => *byte == b':',
+                    16 => *byte == b'Z',
+                    _ => byte.is_ascii_digit(),
+                });
+        let lengths = [
+            ("title", self.title.chars().count(), 80),
+            ("purpose", self.purpose.chars().count(), 600),
+            ("limitations", self.limitations.chars().count(), 1600),
+            ("capture.tool", capture.tool.chars().count(), 200),
+            ("capture.laneRef", capture.lane_ref.chars().count(), 200),
+        ];
+        if let Some((label, length, maximum)) = lengths
+            .into_iter()
+            .find(|(_, length, maximum)| *length == 0 || length > maximum)
+        {
+            return invalid(format!(
+                "{label} has {length} characters; 1 through {maximum}"
+            ));
+        }
+        if !["jbl-left", "jbl-right", "jbl-sub", "alto-pa"].contains(&self.sink.as_str())
+            || capture.typed_state_schema != "dcx.typed-state/v1"
+            || ![
+                "transcribed_layout_unverified_on_named_device",
+                "transcribed_layout_o1_peq9_device_observed_other_bands_unverified",
+            ]
+            .contains(&capture.evidence_class.as_str())
+            || capture.provenance != "observed-readback"
+            || !observed_ok
+            || capture.lane_file_sha256.len() != 64
+            || !lower_hex(&capture.lane_file_sha256)
+        {
+            return invalid(
+                "sink, capture schema, evidence class, provenance, observedAt or laneFileSha256 is outside the contract".to_owned(),
+            );
+        }
         let digest_hex = self
             .capture
             .snapshot_digest
@@ -300,9 +351,18 @@ impl DcxOutputProfileV1 {
         let Some(digest_hex) = digest_hex else {
             return invalid("capture.snapshotDigest is not sha256/<64 hex>".to_owned());
         };
-        if !self.id.starts_with(&format!("dcx-o{}-", self.output))
-            || !self.id.ends_with(&format!("-{}", &digest_hex[..8]))
-        {
+        let name = self
+            .id
+            .strip_prefix(&format!("dcx-o{}-", self.output))
+            .and_then(|rest| rest.strip_suffix(&format!("-{}", &digest_hex[..8])));
+        let name_ok = name.is_some_and(|name| {
+            (1..=24).contains(&name.len())
+                && name.starts_with(|c: char| c.is_ascii_lowercase())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+        if !name_ok {
             return invalid(format!(
                 "id {:?} does not name output {} and the capture digest",
                 self.id, self.output
@@ -573,6 +633,12 @@ impl ProfileVerificationV1 {
         self.drift.is_empty()
     }
 
+    /// Whether every reviewed profiled field matches, except, when
+    /// `held_muted`, the mute of an output a chain left muted.
+    pub fn matches_holding_mute(&self, held_muted: bool) -> bool {
+        self.drift.iter().all(|field| held_muted && field == "mute")
+    }
+
     fn drift_in(&self, scope: FieldScope) -> Vec<String> {
         self.fields
             .iter()
@@ -749,6 +815,31 @@ fn active(enabled: u16, count: u16, band: u8) -> bool {
     enabled != 0 && u16::from(band) <= count
 }
 
+/// Summed rise, in gain codes, from one output state to another, as the write
+/// policy counts it: the output gain rise plus each band's effective-gain
+/// rise, where an active band whose shape changes releases its whole cut.
+fn rise_codes(before: &OutputState, after: &OutputState) -> u16 {
+    let effective = |state: &OutputState, number: u8| {
+        if active(state.eq_enabled, state.eq_count, number) {
+            state.band(number).gain
+        } else {
+            UNITY_GAIN_CODE
+        }
+    };
+    let mut rise = after.gain.saturating_sub(before.gain);
+    for number in 1..=PEQ_BANDS {
+        let moved = active(before.eq_enabled, before.eq_count, number)
+            && !before.band(number).same_shape(after.band(number));
+        let after_gain = if moved {
+            UNITY_GAIN_CODE
+        } else {
+            effective(after, number)
+        };
+        rise += after_gain.saturating_sub(effective(before, number));
+    }
+    rise
+}
+
 /// The changes one step selects, bounded by the frame's action limit and the
 /// step's rise budget (in gain codes).
 struct Selection {
@@ -821,7 +912,25 @@ impl Selection {
 }
 
 /// Select one step's changes. See the module documentation for the order.
+#[allow(clippy::too_many_lines)]
 fn select_step(state: &OutputState, target: &Target, selection: &mut Selection) {
+    // An active band holding a boost that is retuned or leaves the active
+    // set is first lowered to 0 dB: a cut, so free.
+    for number in 1..=PEQ_BANDS {
+        let current = state.band(number);
+        if current.gain <= UNITY_GAIN_CODE || !active(state.eq_enabled, state.eq_count, number) {
+            continue;
+        }
+        let keeps = active(target.eq_enabled, target.eq_count, number)
+            && target.bands[usize::from(number - 1)].is_some_and(|goal| current.same_shape(goal));
+        if !keeps {
+            let unity = Band {
+                gain: UNITY_GAIN_CODE,
+                ..current
+            };
+            selection.band(number, current, unity, 0);
+        }
+    }
     // Free moves: a lower gain, crossover moves, deeper cuts, inactive bands,
     // and retunes of a band already at 0 dB.
     if state.gain > target.gain {
@@ -969,6 +1078,10 @@ pub struct ProfileChainStepV1 {
     pub predicted_snapshot_digest: String,
     /// Summed level rise of this step in dB, as the write policy counts it.
     pub rise_db: f64,
+    /// Summed level rise of this step's exact rollback in dB, counted the
+    /// same way. A rollback carries no policy, so this can exceed 3 dB: a
+    /// step that adds several new cuts releases all of them on rollback.
+    pub rollback_rise_db: f64,
     /// The `dcx.write-plan/v1` document this step plans.
     pub write_plan: WritePlanV1,
     /// The dry-run transaction, with its apply and rollback carriers.
@@ -1000,6 +1113,11 @@ pub struct ProfileChainV1 {
     pub baseline_snapshot_digest: String,
     /// Predicted snapshot after the last step.
     pub final_snapshot_digest: String,
+    /// The output reads muted and the profile is unmuted. A chain never
+    /// unmutes: it runs on the muted output and leaves it muted, and the only
+    /// drift it leaves is that mute. Unmuting stays with the caller's own
+    /// reviewed mute write, after the chain.
+    pub held_muted: bool,
     /// Policy the chain was planned under.
     pub policy: ChainPolicyV1,
     /// Device traffic on success.
@@ -1067,8 +1185,11 @@ fn chain_id(
 /// # Errors
 ///
 /// Rejects an out-of-bounds policy, O5 or O6 unmuted, a verify-only field
-/// (mute, source, polarity, delay, limiter) that differs from the profile, an
-/// output gain the profile raises above the ceiling, a chain longer than
+/// (mute, source, polarity, delay, limiter) that differs from the profile
+/// (except a muted output under an unmuted profile, see
+/// [`ProfileChainV1::held_muted`]), an
+/// output gain the profile raises above the ceiling, a loosened active
+/// low-pass without protection consent, a chain longer than
 /// [`MAX_CHAIN_STEPS`], a state no admitted step can advance, and every
 /// [`plan_writes`] refusal of a step.
 #[allow(clippy::too_many_lines)]
@@ -1093,7 +1214,12 @@ pub fn plan_profile_chain(
         allow_protection_change: policy.allow_protection_change,
     };
     let start = verify_profile(baseline, profile, profile_digest)?;
-    let verify_only = start.drift_in(FieldScope::VerifyOnly);
+    // A muted output under an unmuted profile is the one verify-only drift a
+    // chain admits: it is the quieter side, and the chain keeps it.
+    let held_muted = !profile.state.muted
+        && read(baseline, output_channel(profile.output), MUTE_PARAMETER)?.1 == 1;
+    let mut verify_only = start.drift_in(FieldScope::VerifyOnly);
+    verify_only.retain(|field| !(held_muted && field == "mute"));
     if !verify_only.is_empty() {
         return Err(OutputProfileError::VerifyOnlyDrift(verify_only));
     }
@@ -1105,6 +1231,14 @@ pub fn plan_profile_chain(
             gain_db: gain_db(target.gain),
             ceiling_db: policy.gain_ceiling_db,
         });
+    }
+    // Crossover moves are not counted in the rise budget, so loosening an
+    // active low-pass needs the same consent as loosening the high-pass.
+    if initial.low_pass.0 != 0
+        && (target.low_pass.0 != initial.low_pass.0 || target.low_pass.1 > initial.low_pass.1)
+        && !policy.allow_protection_change
+    {
+        return Err(OutputProfileError::LowPassProtection(output));
     }
     let budget = step_codes(&policy);
     let mut steps: Vec<ProfileChainStepV1> = Vec::new();
@@ -1129,6 +1263,7 @@ pub fn plan_profile_chain(
         if selection.changes.is_empty() {
             return Err(OutputProfileError::Stuck {
                 step: steps.len() + 1,
+                max_actions: policy.max_actions,
             });
         }
         let write_plan = WritePlanV1 {
@@ -1143,21 +1278,24 @@ pub fn plan_profile_chain(
         if transaction.writes.is_empty() {
             return Err(OutputProfileError::Stuck {
                 step: steps.len() + 1,
+                max_actions: policy.max_actions,
             });
         }
         let next = transaction.apply_plan.desired().clone();
+        let after = OutputState::read(&next, output)?;
         steps.push(ProfileChainStepV1 {
             step: steps.len() + 1,
             baseline_snapshot_digest: state_snapshot.digest().to_owned(),
             predicted_snapshot_digest: next.digest().to_owned(),
-            rise_db: f64::from(selection.rise) / 10.0,
+            rise_db: f64::from(rise_codes(&state, &after)) / 10.0,
+            rollback_rise_db: f64::from(rise_codes(&after, &state)) / 10.0,
             write_plan,
             transaction,
         });
         state_snapshot = next;
     }
     let final_verification = verify_profile(&state_snapshot, profile, profile_digest)?;
-    if !final_verification.matches() {
+    if !final_verification.matches_holding_mute(held_muted) {
         return Err(OutputProfileError::FinalDrift(final_verification.drift));
     }
     let transactions = steps.len();
@@ -1176,6 +1314,7 @@ pub fn plan_profile_chain(
         output,
         baseline_snapshot_digest: baseline.digest().to_owned(),
         final_snapshot_digest: state_snapshot.digest().to_owned(),
+        held_muted,
         policy: echo,
         budget: ChainBudgetV1 {
             transactions,
@@ -1222,9 +1361,14 @@ pub enum OutputProfileError {
     VerifyOnlyDrift(Vec<String>),
     /// No admitted step advances the state.
     #[error(
-        "step {step}: no admitted change advances the output (raise --max-actions or --max-gain-step-db within their bounds)"
+        "step {step}: no admitted change advances the output: the next change does not fit {max_actions} actions (a band needs up to 5, the PEQ switch and count 2) or a 0 dB step budget"
     )]
-    Stuck { step: usize },
+    Stuck { step: usize, max_actions: usize },
+    /// An active low-pass would be loosened without consent.
+    #[error(
+        "O{0} low-pass is active: changing its type, switching it off or raising its corner needs --allow-protection-change"
+    )]
+    LowPassProtection(u8),
     /// The chain would be too long.
     #[error("the chain needs more than {0} transactions")]
     TooManySteps(usize),

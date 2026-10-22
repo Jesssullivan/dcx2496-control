@@ -422,7 +422,11 @@ rule and no boost above 0 dB, readback-verified, with the rollback ready,
 stopping on any `rollback_required`. The profile's other fields (mute,
 source, polarity, delay, limiter) are verify-only: `profile plan` refuses
 while one of them differs (`VerifyOnlyDrift`), so a chain never unmutes,
-routes, or touches a limiter.
+routes, or touches a limiter. The one admitted difference is a muted output
+under an unmuted profile (`held_muted: true`): the chain tunes the output
+while it is muted and leaves it muted, so the caller can apply the EQ before
+its own reviewed unmute write. A live output under a muted profile is
+refused.
 
 ```sh
 dcxctl control snapshot --tty /dev/cu.usbserial-EXACT --expected-device 0 > S.json
@@ -455,16 +459,27 @@ above holds per step. The planner orders what one step may not do:
   0 dB before the count drops; PEQ-off bands are written back to their
   profiled values afterwards;
 - rises share the step budget band by band, then the output gain;
+- an active band holding a stored boost that is retuned or leaves the
+  active set is first lowered to 0 dB (a cut);
+- crossover moves are not counted in the rise budget, so a chain that
+  loosens an active low-pass (type change, off, or a higher corner) needs
+  `--allow-protection-change`, as the high-pass does in every typed write;
 - a profile with a count above 8 is refused: the device refused a count of 9
   twice on 2026-10-21 (stored band 9, read back count 8), so
-  `MAX_ACTIVE_PEQ_BANDS` is 8 and `write plan` now refuses a count of 9 too.
+  `MAX_ACTIVE_PEQ_BANDS` is 8: every apply carrier on every lane refuses a
+  count above 8 (`ApplyPlanError::DeviceBandCount`), `write plan` refuses it
+  while planning, and the feedback lane places notches in bands up to 8.
   The stored values of inactive bands are not profiled and never written.
 
 A high-pass loosening still needs `--allow-protection-change` (set in every
 step's plan as well), and the O4 high-pass to O3 low-pass link is predicted
-per step exactly as for `write plan`. The `dcx.profile-chain/v1` receipt
+per step exactly as for `write plan`. Profile validation follows the Legalab schema's constants, enums, patterns
+and lengths, and is narrower in one place: a band boost is refused. The
+`dcx.profile-chain/v1` receipt
 lists every step with its baseline and predicted digests, rise, write plan
-and full transaction (frames, carriers), the whole chain's budget, the
+and full transaction (frames, carriers), `rollback_rise_db` (a rollback
+carries no policy: a step that adds several new cuts releases all of them
+when rolled back, so this can exceed 3 dB), the whole chain's budget, the
 predicted final snapshot's `final_verification`, and a `chain_id`: a digest
 of the profile bytes, the baseline, the policy and every step's apply and
 rollback carrier digests.
@@ -476,16 +491,31 @@ transactions, 20 s apart (fixed): each takes a fresh baseline and refuses a
 stale one (so a later step runs only on its predicted state), sends one
 frame, and reads back, repeating a readback that failed in transport as a
 separate read-only snapshot (see "Post-apply readback retry"). The first
-step that does not verify stops the chain: the `dcx.profile-apply/v1`
-receipt has `status: stopped`, the step, every receipt so far, and that
-step's `rollback_plan`, for `write rollback --plan` after a fresh snapshot.
-Nothing rolls back automatically. To continue after a stop, take a snapshot
-and plan again from it. A full run ends with `profile_verification` of the
-last readback; the command exits non-zero unless every run step verified
-and, after the last step, the profile matches.
+step that does not verify stops the chain with `status: stopped`, the step
+and every receipt so far:
 
-**Self-check (offline).** From the named unit's `143d32b5` snapshot to
-`dcx-o4-vocal-1dc18140` the chain is 6 transactions, 30 remote-mode writes:
+- `applied: rollback_required` (the write was attempted): the receipt adds
+  that step's `rollback_plan` and `rollback_rise_db`. Take a fresh snapshot:
+  equal to the step's baseline, nothing changed; equal to its prediction, it
+  landed; otherwise `control verify-containment` against the step's apply
+  plan must pass before `write rollback --plan` with that rollback plan;
+- `applied: not_applied` (a stale baseline, a failed capture or open: the
+  transaction never reached its write): no rollback plan is given, because
+  rolling a step back from a state it never touched could raise a level.
+
+Nothing rolls back automatically. To continue after a stop, take a snapshot
+and plan again from it. `--from-step` relies on the stale-baseline refusal
+and does not pace its first step; the caller keeps 20 s since its previous
+transaction. A full run ends with `profile_verification` of the last
+readback (`status: profile_drift` if it does not match); the command exits
+non-zero unless every run step verified and, after the last step, the
+profile matches. A zero-step chain prints `already_matching` with
+`offline: true`: nothing was sent or read.
+
+**Self-check (offline).** `dcxctl profile plan`, run on PZM against the
+saved `143d32b5` snapshot of the named unit (a lane file, not committed;
+no device opened) to `dcx-o4-vocal-1dc18140`, gives 6 transactions and 30
+remote-mode writes (chain `sha256/bd283b5d...` at the first PR head):
 
 | Step | Rise | Changes |
 | --- | --- | --- |
@@ -496,10 +526,14 @@ and, after the last step, the profile matches.
 | 5 | 3 dB | band 3 -> 654 Hz Q 6.3 -6; band 4 -3 -> 0 |
 | 6 | 0 dB | band 4 -> 3393 Hz Q 0.89 -9 |
 
-Its predicted final snapshot matches the profile; it differs from the
-device's `1dc18140` only in the inactive band 9's stored values, which the
-night's refused count-9 write left behind. `crates/dcx-core/tests/profile_chain.rs`
-replays the night's chain on a synthetic snapshot and checks this order.
+Its predicted final snapshot passes `profile verify`. Compared with the
+saved `1dc18140` snapshot it differs only in the inactive band 9's stored
+values (left by the night's refused count-9 write) and the Dump1 trailer
+(observed, offline comparison of the two files).
+`crates/dcx-core/tests/profile_chain.rs` checks the same order on a synthetic
+reconstruction (codes from the Legalab records; bands 6-8 of `24296ae3`
+inferred), including that the planned end state equals the replayed night
+apart from band 9.
 
 ## Preset store and recall
 

@@ -431,11 +431,13 @@ enum PartArg {
     Part1,
 }
 
-/// Chain policy limits. Each flag can only tighten its default.
+/// Chain policy. The level limits can only tighten their hard bounds (3 dB
+/// step, 0 dB ceiling, 32 actions); `--allow-protection-change` is the one
+/// consent.
 #[derive(Debug, Args)]
 struct ChainPolicyFlags {
-    /// Consent to loosening an active high-pass: type change, off, or a lower
-    /// corner (set in every step's write plan too).
+    /// Consent to loosening an active high-pass or low-pass: type change,
+    /// off, or a corner moved outward (set in every step's write plan too).
     #[arg(long)]
     allow_protection_change: bool,
     /// Output gain ceiling in dB, -15 through 0.
