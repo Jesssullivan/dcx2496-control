@@ -40,7 +40,7 @@ use crate::{
         GAIN_INPUT_COUNT, GAIN_PARAMETER, HIGH_PASS_FREQUENCY_PARAMETER, HIGH_PASS_TYPE_PARAMETER,
         LIMITER_ENABLED_PARAMETER, LIMITER_RELEASE_PARAMETER, LIMITER_THRESHOLD_PARAMETER,
         LONG_DELAY_PARAMETER, LOW_PASS_FREQUENCY_PARAMETER, LOW_PASS_TYPE_PARAMETER, LinkEvidence,
-        MAX_FREQUENCY_CODE, MAX_LEVEL_STEP_CODES, MAX_LIMITER_RELEASE_CODE,
+        MAX_ACTIVE_PEQ_BANDS, MAX_FREQUENCY_CODE, MAX_LEVEL_STEP_CODES, MAX_LIMITER_RELEASE_CODE,
         MAX_LIMITER_THRESHOLD_CODE, MAX_LONG_DELAY_CODE, MAX_SHORT_DELAY_CODE, MUTE_PARAMETER,
         OUTPUT_COUNT, OutputField, PEQ_BANDS, POLARITY_PARAMETER, ReviewedAddress,
         SHORT_DELAY_PARAMETER, SOURCE_PARAMETER, TYPED_WRITE_OUTPUTS, UNITY_GAIN_CODE,
@@ -282,7 +282,8 @@ pub enum TypedChange {
     PeqBandCount {
         /// Output, 1 through 4.
         output: u8,
-        /// Bands 1 through `count` are active, 0 through 9.
+        /// Bands 1 through `count` are active, 0 through 8: the device refuses
+        /// a count of 9 (see [`MAX_ACTIVE_PEQ_BANDS`]).
         count: u8,
     },
     /// One crossover side of one output.
@@ -735,6 +736,12 @@ pub fn encode_change(
                 return Err(TypedWriteError::InvalidBand {
                     change: index,
                     band: *count,
+                });
+            }
+            if *count > MAX_ACTIVE_PEQ_BANDS {
+                return Err(TypedWriteError::DeviceBandCount {
+                    change: index,
+                    count: *count,
                 });
             }
             Ok(vec![action(
@@ -1855,6 +1862,11 @@ pub enum TypedWriteError {
     /// Band outside 1 through 9.
     #[error("change {change}: invalid PEQ band or count {band}")]
     InvalidBand { change: usize, band: u8 },
+    /// A band count the device refuses.
+    #[error(
+        "change {change}: PEQ band count {count} is above 8; the DCX2496 refused a count of 9 on 2026-10-21 (stored band 9, read back count 8)"
+    )]
+    DeviceBandCount { change: usize, count: u8 },
     /// PEQ boost requested.
     #[error("change {change}: PEQ gain {gain_db} dB is a boost; the apply path is cut-only")]
     EqBoost { change: usize, gain_db: f64 },

@@ -1115,6 +1115,7 @@ impl ApplyPlanV1 {
         } else {
             let command = DirectParameterCommand::new(diff.device_id, actions)?;
             require_reserved_stay_muted(command.actions())?;
+            require_device_band_count(command.actions())?;
             require_cut_only(command.actions())?;
             require_protective_levels(baseline, command.actions())?;
             require_typed_lane_reserve(baseline, command.actions())?;
@@ -1562,6 +1563,25 @@ fn require_reserved_stay_muted(actions: &[DirectParameterAction]) -> Result<(), 
     Ok(())
 }
 
+/// Refuse any apply that would set a PEQ band count above
+/// [`crate::layout::MAX_ACTIVE_PEQ_BANDS`]: the named device refused a count
+/// of 9 twice on 2026-10-21 (stored band 9, read back count 8), so such a
+/// carrier could only end `rollback_required`. Every apply lane is bound here.
+fn require_device_band_count(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanError> {
+    for action in actions {
+        if reviewed_address(action.channel(), action.parameter())
+            .is_some_and(|address| address.field == OutputField::EqCount)
+            && action.value() > u16::from(crate::layout::MAX_ACTIVE_PEQ_BANDS)
+        {
+            return Err(ApplyPlanError::DeviceBandCount {
+                channel: action.channel(),
+                count: action.value(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a typed-write-lane apply while O5 or O6 reads unmuted.
 ///
 /// Any action on a typed-write-lane address (see
@@ -1878,6 +1898,11 @@ pub enum ApplyPlanError {
         "O{output} mute code is {value}, not 1 (muted); typed-write-lane actions need O5 and O6 muted"
     )]
     TypedLaneReservedUnmuted { output: u8, value: u16 },
+    /// A PEQ band count above the device's 8.
+    #[error(
+        "channel {channel} PEQ band count {count} is above 8; the DCX2496 refused a count of 9 on 2026-10-21"
+    )]
+    DeviceBandCount { channel: u8, count: u16 },
     /// An enabled limiter would be switched off.
     #[error("channel {channel} limiter is enabled; apply never disables a limiter")]
     LimiterDisable { channel: u8 },

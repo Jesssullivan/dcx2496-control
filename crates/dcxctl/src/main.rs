@@ -8,6 +8,7 @@ mod live_meter;
 
 mod feedback_cli;
 mod live_control;
+mod profile_cli;
 mod routing_cli;
 mod write_cli;
 
@@ -52,7 +53,9 @@ enum Command {
         #[command(subcommand)]
         command: DiscoveryCommand,
     },
-    /// Validate or compare strict versioned profiles.
+    /// Validate or compare strict versioned profiles; plan and verify a
+    /// Legalab output profile chain (offline); live chain apply needs the
+    /// non-default `typed-write-live` feature.
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
@@ -428,6 +431,37 @@ enum PartArg {
     Part1,
 }
 
+/// Chain policy. The level limits can only tighten their hard bounds (3 dB
+/// step, 0 dB ceiling, 32 actions); `--allow-protection-change` is the one
+/// consent.
+#[derive(Debug, Args)]
+struct ChainPolicyFlags {
+    /// Consent to loosening an active high-pass or low-pass: type change,
+    /// off, or a corner moved outward (set in every step's write plan too).
+    #[arg(long)]
+    allow_protection_change: bool,
+    /// Output gain ceiling in dB, -15 through 0.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    gain_ceiling_db: f64,
+    /// Largest summed level rise per transaction in dB, 0 through 3.
+    #[arg(long, default_value_t = 3.0)]
+    max_gain_step_db: f64,
+    /// Largest number of direct-parameter actions per frame, 1 through 32.
+    #[arg(long, default_value_t = 16)]
+    max_actions: usize,
+}
+
+impl ChainPolicyFlags {
+    const fn to_policy(&self) -> profile_cli::ChainPolicyArgs {
+        profile_cli::ChainPolicyArgs {
+            allow_protection_change: self.allow_protection_change,
+            gain_ceiling_db: self.gain_ceiling_db,
+            max_gain_step_db: self.max_gain_step_db,
+            max_actions: self.max_actions,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
     /// Parse and validate a strict complete-sink profile.
@@ -440,6 +474,60 @@ enum ProfileCommand {
         /// SHA-256 of the exact reviewed profile representation.
         #[arg(long)]
         profile_digest: String,
+    },
+    /// Dry run: the ordered chain of budgeted `write apply` transactions that
+    /// moves one output from a snapshot to a Legalab `DcxOutputProfileV1`
+    /// (PEQ, gain and crossover only), each with its predicted digest and
+    /// exact rollback. Opens no device.
+    Plan {
+        /// Strict `legalab.dcx-output-profile/v1` document.
+        #[arg(long)]
+        profile: PathBuf,
+        /// Baseline `SnapshotV1` the chain starts from.
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[command(flatten)]
+        policy: ChainPolicyFlags,
+    },
+    /// Offline gate: exit non-zero unless every reviewed profiled field of
+    /// the snapshot matches the profile.
+    Verify {
+        /// Strict `legalab.dcx-output-profile/v1` document.
+        #[arg(long)]
+        profile: PathBuf,
+        /// Complete `SnapshotV1` (a snapshot or a readback).
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
+    /// Re-plan the chain, require the reviewed chain id, then run each step
+    /// as one `write apply` transaction, stopping at the first step that does
+    /// not verify. Exits non-zero unless every run step verified.
+    /// Not in any shipped binary: needs the `typed-write-live` feature.
+    #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
+    Apply {
+        /// Exact Darwin FTDI callout node; ports are never enumerated.
+        #[arg(long)]
+        tty: PathBuf,
+        /// Expected DCX device address, 0 through 15.
+        #[arg(long)]
+        expected_device: u8,
+        /// Strict `legalab.dcx-output-profile/v1` document.
+        #[arg(long)]
+        profile: PathBuf,
+        /// The baseline `SnapshotV1` the reviewed chain was planned from.
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// The reviewed `chain_id` of `profile plan`.
+        #[arg(long)]
+        chain_id: String,
+        /// First step to run (1-based); its baseline must be the live state.
+        #[arg(long, default_value_t = 1)]
+        from_step: usize,
+        /// Last step to run; default the chain's last.
+        #[arg(long)]
+        to_step: Option<usize>,
+        #[command(flatten)]
+        policy: ChainPolicyFlags,
     },
 }
 
@@ -855,6 +943,38 @@ fn profile(command: ProfileCommand) -> Result<(), Box<dyn Error>> {
                 serde_json::to_string_pretty(&profile.binding_for_apply(&profile_digest)?)?
             );
         }
+        ProfileCommand::Plan {
+            profile,
+            snapshot,
+            policy,
+        } => profile_cli::plan(&profile, &snapshot, &policy.to_policy())?,
+        ProfileCommand::Verify { profile, snapshot } => {
+            if !profile_cli::verify(&profile, &snapshot)? {
+                std::process::exit(1)
+            }
+        }
+        #[cfg(all(feature = "typed-write-live", target_os = "macos"))]
+        ProfileCommand::Apply {
+            tty,
+            expected_device,
+            profile,
+            snapshot,
+            chain_id,
+            from_step,
+            to_step,
+            policy,
+        } => profile_cli::apply(
+            &profile_cli::ApplyArgs {
+                tty,
+                expected_device,
+                profile: &profile,
+                snapshot: &snapshot,
+                chain_id: &chain_id,
+                from_step,
+                to_step,
+            },
+            &policy.to_policy(),
+        )?,
     }
     Ok(())
 }

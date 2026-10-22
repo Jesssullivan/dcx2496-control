@@ -101,6 +101,7 @@ fixtures:
     bash tests/feedback_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/rew/SYNTHETIC-feedback-notches.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json
     bash tests/routing_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json
     bash tests/write_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json
+    bash tests/profile_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json
     bash tests/apple_feedback_fixture_parity.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json apple/Tests/DCXLogicHelperCoreTests/Fixtures/feedback
 
 lockfiles-static:

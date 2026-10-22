@@ -199,6 +199,20 @@ pub fn apply_loaded(
     expected_device: u8,
     plan: &ApplyPlanV1,
 ) -> Result<bool, Box<dyn Error>> {
+    let (output, verified) = apply_loaded_report(tty, expected_device, plan)?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(verified)
+}
+
+/// [`apply_loaded`] without printing: the apply receipt and whether the
+/// readback matched the desired snapshot. `dcxctl profile apply` collects one
+/// receipt per chain step.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn apply_loaded_report(
+    tty: PathBuf,
+    expected_device: u8,
+    plan: &ApplyPlanV1,
+) -> Result<(serde_json::Value, bool), Box<dyn Error>> {
     let expected = DeviceId::new(expected_device)?;
     require_device(expected, plan.device())?;
     let mut transaction = ApplyTransactionV1::from_apply_plan(plan)?;
@@ -242,8 +256,7 @@ pub fn apply_loaded(
                 "readback_matches_desired": false,
                 "failure": "post_apply_state_uncertain",
             });
-            println!("{}", serde_json::to_string_pretty(&output)?);
-            return Ok(false);
+            return Ok((output, false));
         }
         Err(error) => return Err(error.into()),
     };
@@ -259,8 +272,7 @@ pub fn apply_loaded(
         "rollback_available": plan.command().is_some(),
         "readback_matches_desired": readback_matches_desired,
     });
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(readback_matches_desired)
+    Ok((output, readback_matches_desired))
 }
 
 /// Sanitized class of one carrier failure: a fixed label, never bytes or

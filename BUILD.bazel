@@ -44,6 +44,12 @@ filegroup(
     srcs = ["fixtures/profiles/safe-muted-v1.json"],
 )
 
+# Verbatim copy of Legalab profiles/dcx-o4-vocal-1dc18140.json (codes only).
+filegroup(
+    name = "legalab_profile_fixture",
+    srcs = ["fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json"],
+)
+
 filegroup(
     name = "synthetic_search_fixture",
     srcs = ["fixtures/protocol/SYNTHETIC-search-response-26.hex"],
@@ -64,6 +70,7 @@ test_suite(
         ":bazel_frontdoor_rejections",
         ":feedback_pipeline",
         ":fixture_contract",
+        ":profile_pipeline",
         ":routing_pipeline",
         ":toolchain_pin_parity",
         ":write_pipeline",
@@ -95,6 +102,7 @@ test_suite(
     name = "remote_eligible",
     tests = [
         ":toolchain_pin_parity",
+        "//crates/dcx-core:profile_chain",
         "//crates/dcx-core:robustness",
         "//crates/dcx-core:unit_tests",
         "//crates/dcx-darwin-tty:unit_tests",
@@ -234,6 +242,28 @@ sh_test(
     ],
     data = [
         "fixtures/snapshots/SYNTHETIC-blank-snapshot.json",
+        "fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json",
+        "//crates/dcxctl",
+    ],
+    # The script runs bash, grep, jq, and mktemp from the host PATH, so it must
+    # never be dispatched to a content-addressed executor.
+    tags = [
+        "no-remote",
+        "no-remote-exec",
+    ],
+)
+
+sh_test(
+    name = "profile_pipeline",
+    size = "small",
+    srcs = ["tests/profile_pipeline.sh"],
+    args = [
+        "$(location //crates/dcxctl:dcxctl)",
+        "$(location fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json)",
+        "$(location fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json)",
+    ],
+    data = [
+        "fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json",
         "fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json",
         "//crates/dcxctl",
     ],

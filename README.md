@@ -250,6 +250,24 @@ dcxctl write plan --snapshot snapshot.json --plan changes.json > tx.json
 dcxctl write verify --plan apply-plan.json --readback readback.json
 ```
 
+### Output profile chains
+
+`dcxctl profile plan` takes a Legalab `DcxOutputProfileV1`
+(`legalab.dcx-output-profile/v1`, one output's typed state with exact codes)
+and a snapshot, and plans the ordered chain of `write apply` transactions
+that moves that output's PEQ, gain and crossover to the profile: each step
+one frame, at most a 3 dB summed rise, no level above 0 dB, cut-only, a cut
+band retuned only from 0 dB, at most 8 active bands, each with its predicted
+digest and exact rollback. Mute, source, polarity, delay and limiter are
+verify-only. `profile verify` is the offline gate; `profile apply` exists
+only behind `typed-write-live` (Legalab `dec-scene-dcx-apply-20261021`). See
+[`docs/typed-writes.md`](docs/typed-writes.md#output-profile-chains).
+
+```sh
+dcxctl profile plan --profile dcx-o4-vocal.json --snapshot snapshot.json > chain.json
+dcxctl profile verify --profile dcx-o4-vocal.json --snapshot readback.json
+```
+
 ## Serial boundary
 
 - The caller supplies one exact `/dev/cu.usbserial-*` callout; the program never

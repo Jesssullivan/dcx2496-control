@@ -19,8 +19,8 @@ use thiserror::Error;
 use crate::{
     SnapshotV1,
     layout::{
-        BELL_KIND_CODE, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, MAX_Q_CODE, PEQ_BANDS,
-        UNITY_GAIN_CODE, output_channel, reviewed_address,
+        BELL_KIND_CODE, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, MAX_ACTIVE_PEQ_BANDS, MAX_Q_CODE,
+        PEQ_BANDS, UNITY_GAIN_CODE, output_channel, reviewed_address,
     },
     peq_bank::{
         BandCodes, DesiredPeqBankProfileV2, PeqBankDocumentV2, PeqBankError, decode_peq_bank,
@@ -663,7 +663,8 @@ pub fn plan_notches(
             });
         }
     }
-    let free = PEQ_BANDS - operator_band_count;
+    // The device refuses a count of 9, so notches fill bands up to 8.
+    let free = MAX_ACTIVE_PEQ_BANDS.saturating_sub(operator_band_count);
     if free == 0 {
         return Err(FeedbackPlanError::NoFreeBands);
     }
@@ -924,9 +925,10 @@ impl NotchPlanV1 {
         if self.schema_version != NOTCH_PLAN_SCHEMA
             || self.target_output != FEEDBACK_TARGET_OUTPUT
             || self.parameter_channel != output_channel(FEEDBACK_TARGET_OUTPUT)
-            || self.operator_band_count >= PEQ_BANDS
+            || self.operator_band_count >= MAX_ACTIVE_PEQ_BANDS
             || self.notches.is_empty()
-            || usize::from(self.operator_band_count) + self.notches.len() > usize::from(PEQ_BANDS)
+            || usize::from(self.operator_band_count) + self.notches.len()
+                > usize::from(MAX_ACTIVE_PEQ_BANDS)
         {
             return Err(FeedbackPlanError::InvalidPlan("plan header"));
         }

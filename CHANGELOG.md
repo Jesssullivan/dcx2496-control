@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Add output profile chains: `dcxctl profile plan|verify` (offline) and
+  `profile apply` (`typed-write-live` only) move one output to a Legalab
+  `DcxOutputProfileV1` (fixture `fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json`)
+  through an ordered chain of `write apply` transactions, PEQ, gain and
+  crossover only (Legalab `dec-scene-dcx-apply-20261021`). Each step keeps
+  the write policy (3 dB summed rise, 0 dB ceiling, cut-only, 5/3
+  remote-mode writes), a cut band is retuned only from 0 dB, bands enter
+  and leave the active set safely, and each step carries its predicted
+  digest and exact rollback. Apply re-plans, requires the reviewed
+  `chain_id`, and stops at the first step that does not verify.
+- Refuse a PEQ band count above 8 on every apply carrier (core guard) and
+  in `write plan`, and cap feedback notches at band 8: the device stored
+  band 9 but refused the count twice on 2026-10-21 (`MAX_ACTIVE_PEQ_BANDS`).
 - Document why there is no preset store, recall or directory command: none
   of the public sources read gives those frames (agent note 2026-10-21). The
   note records the sources and claims, the AUTO-STORE persistence path, and

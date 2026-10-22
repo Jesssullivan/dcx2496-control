@@ -101,6 +101,11 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   it fits the 150 s apply envelope (fixed constants, no write re-sent). Missing
   post-write capture remains explicit uncertainty: apply `readback` and
   rollback `restored` may be omitted or null, never synthesized.
+- `dcxctl profile plan|verify` are offline. `profile apply` (behind
+  `typed-write-live`) runs a reviewed chain of ordinary `write apply`
+  transactions toward a Legalab `DcxOutputProfileV1`, PEQ, gain and
+  crossover only, under Legalab `dec-scene-dcx-apply-20261021`; it stops on
+  the first step that does not verify and never rolls back by itself.
 - The AUv3 MIDI FX owns staged desired state and MIDI pass-through only. It has
   no serial, filesystem, process, or socket work in its render path. The
   foreground helper is the only Apple process allowed to invoke its bundled
