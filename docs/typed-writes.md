@@ -479,7 +479,8 @@ and lengths, and is narrower in one place: a band boost is refused. The
 lists every step with its baseline and predicted digests, rise, write plan
 and full transaction (frames, carriers), `rollback_rise_db` (a rollback
 carries no policy: a step that adds several new cuts releases all of them
-when rolled back, so this can exceed 3 dB), the whole chain's budget, the
+when rolled back, so this can exceed 3 dB; like `rise_db` it counts gains,
+not crossover moves), the whole chain's budget, the
 predicted final snapshot's `final_verification`, and a `chain_id`: a digest
 of the profile bytes, the baseline, the policy and every step's apply and
 rollback carrier digests.

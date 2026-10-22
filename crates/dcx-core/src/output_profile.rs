@@ -305,6 +305,12 @@ impl DcxOutputProfileV1 {
                     10 => *byte == b'T',
                     13 => *byte == b':',
                     16 => *byte == b'Z',
+                    // The schema's ranges: month [01]x, day [0-3]x, hour
+                    // [0-2]x, minute [0-5]x.
+                    5 => (b'0'..=b'1').contains(byte),
+                    8 => (b'0'..=b'3').contains(byte),
+                    11 => (b'0'..=b'2').contains(byte),
+                    14 => (b'0'..=b'5').contains(byte),
                     _ => byte.is_ascii_digit(),
                 });
         let lengths = [
@@ -1081,6 +1087,8 @@ pub struct ProfileChainStepV1 {
     /// Summed level rise of this step's exact rollback in dB, counted the
     /// same way. A rollback carries no policy, so this can exceed 3 dB: a
     /// step that adds several new cuts releases all of them on rollback.
+    /// Like `rise_db` it counts gains only: crossover moves (and so the
+    /// rollback of a low-pass tightening) are not in it.
     pub rollback_rise_db: f64,
     /// The `dcx.write-plan/v1` document this step plans.
     pub write_plan: WritePlanV1,

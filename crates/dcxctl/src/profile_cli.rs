@@ -172,9 +172,10 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
                 // but only to this step's own addresses.
                 let mut output = header(receipts, "rollback_required".to_owned());
                 output["applied"] = "rollback_required".into();
+                output["apply_plan"] = serde_json::to_value(carrier)?;
                 output["rollback_plan"] = serde_json::to_value(&step.transaction.rollback_plan)?;
                 output["rollback_rise_db"] = step.rollback_rise_db.into();
-                output["next"] = "take a fresh control snapshot. Equal to this step's baseline: nothing changed, re-plan. Equal to its predicted snapshot: it landed, re-plan from it. Otherwise control verify-containment --plan (this step's apply_plan) must pass before write rollback --plan with this rollback_plan".into();
+                output["next"] = "take a fresh control snapshot. Equal to this step's baseline: nothing changed, re-plan. Equal to its predicted snapshot: it landed, re-plan from it. Otherwise control verify-containment --plan (the apply_plan above) must pass before write rollback --plan with this rollback_plan".into();
                 println!("{}", serde_json::to_string_pretty(&output)?);
                 return Err(std::io::Error::other(format!(
                     "chain step {} did not verify; the chain stopped",
@@ -183,9 +184,10 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
                 .into());
             }
             Err(error) => {
-                // The transaction never reached rollback_required, the state
-                // it enters before its write, so this step wrote nothing and
-                // its rollback must not be run.
+                // Every failure after the write starts moves the transaction
+                // to rollback_required (the Ok(false) arm above), so an error
+                // here came before the write: this step wrote nothing and its
+                // rollback must not be run.
                 let mut output = header(receipts, error.to_string());
                 output["applied"] = "not_applied".into();
                 output["next"] = "this step wrote nothing; do not run its rollback. Take a fresh snapshot and re-plan from it".into();
@@ -194,16 +196,24 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
             }
         }
     }
-    let verification = match (to_step == steps, last_readback) {
-        (true, Some(readback)) => {
-            let readback = SnapshotV1::from_json(&serde_json::to_vec(&readback)?)?;
-            Some(verify_profile(&readback, &profile, &digest)?)
-        }
-        _ => None,
+    // Every run step has written by now: a verification error becomes part
+    // of the receipt instead of losing it.
+    let (verification, verification_error) = match (to_step == steps, last_readback) {
+        (true, Some(readback)) => match serde_json::to_vec(&readback)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| SnapshotV1::from_json(&bytes).map_err(|error| error.to_string()))
+            .and_then(|readback| {
+                verify_profile(&readback, &profile, &digest).map_err(|error| error.to_string())
+            }) {
+            Ok(verification) => (Some(verification), None),
+            Err(error) => (None, Some(error)),
+        },
+        _ => (None, None),
     };
-    let matches = verification
-        .as_ref()
-        .is_none_or(|verification| verification.matches_holding_mute(chain.held_muted));
+    let matches = verification_error.is_none()
+        && verification
+            .as_ref()
+            .is_none_or(|verification| verification.matches_holding_mute(chain.held_muted));
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -220,6 +230,7 @@ pub fn apply(args: &ApplyArgs<'_>, policy: &ChainPolicyArgs) -> Result<(), Box<d
             "held_muted": chain.held_muted,
             "steps": receipts,
             "profile_verification": verification,
+            "verification_error": verification_error,
         }))?
     );
     if matches {

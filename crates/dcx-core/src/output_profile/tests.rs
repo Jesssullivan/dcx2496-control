@@ -768,6 +768,12 @@ fn profile_validation_refuses_nine_bands_boosts_and_inconsistent_values() {
         reserved.validate(),
         Err(OutputProfileError::ReservedOutput(5))
     ));
+    let mut observed = good.clone();
+    observed.capture.observed_at = "2026-19-41T29:69Z".to_owned();
+    assert!(matches!(
+        observed.validate(),
+        Err(OutputProfileError::Invalid(_))
+    ));
     let mut id = good.clone();
     id.id = "dcx-o4-synthetic-00000000".to_owned();
     assert!(matches!(id.validate(), Err(OutputProfileError::Invalid(_))));
@@ -844,6 +850,34 @@ fn a_tight_action_limit_spreads_the_chain_without_breaking_it() {
     );
     let verification = verify_profile(chain.final_snapshot(&baseline), &profile, "x").unwrap();
     assert!(verification.matches());
+}
+
+#[test]
+fn an_action_limit_below_one_band_write_is_refused_by_name() {
+    let base = Builder::new();
+    let mut goal = base.clone();
+    goal.eq(4, true, 1).band(4, 1, [161, 36, 90, 2, 1]);
+    let policy = WritePolicyV1 {
+        max_actions: 1,
+        ..WritePolicyV1::default()
+    };
+    let error = plan_profile_chain(
+        &base.snapshot(),
+        &profile_of(&goal.snapshot(), 4),
+        "x",
+        &policy,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OutputProfileError::Stuck {
+                step: 1,
+                max_actions: 1
+            }
+        ),
+        "{error}"
+    );
 }
 
 /// Deterministic generator, as in the robustness sweeps.
