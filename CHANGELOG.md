@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-- Document why there is no preset store, recall or directory command: no
-  public source gives those frames (agent note 2026-10-21). The note records
-  the sources and claims, the AUTO-STORE persistence path, the design a
-  future `dcxctl preset` would follow, and a zero-write attended probe
-  (front-panel store, then snapshots) plus a passive-trace step.
+- Document why there is no preset store, recall or directory command: none
+  of the public sources read gives those frames (agent note 2026-10-21). The
+  note records the sources and claims, the AUTO-STORE persistence path, and
+  the design a future `dcxctl preset` would follow. It also gives an
+  attended probe: a front-panel store checked by G1 snapshots, with no
+  direct-parameter write, then a passive DCX2496 -> PC trace.
 - Repeat a failed post-apply readback only as a fresh read-only snapshot:
   `write apply` and `control apply` retry a readback that failed in
   transport or read (and closed verified) as one ordinary complete G1
