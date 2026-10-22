@@ -22,7 +22,6 @@ attended probe that would close the gap, and add no store command.
 
 ## Verdict
 
-
 **Not established. No `dcxctl preset` command was added.** None of the public
 sources read in this lane (section 1) gives a function code, payload or
 response for preset store, recall, directory read or preset-name read. Every
@@ -176,29 +175,35 @@ lane:
 
 Run in this order. P0-P3 send no direct-parameter frame and no preset frame.
 Their only traffic is ordinary G1 snapshots, which do send remote-mode
-`0x3f` writes. P4 is passive. Hardware readiness, audio safety and the bench
+`0x3f` writes. In P4 only the tap is passive. DCX-Remote itself sends
+unmodelled frames to the device (search, remote mode, and current-set and
+bank read requests), whose codes and effects are unverified. P4 therefore
+needs its own decision, with the outputs made safe first. Hardware readiness, audio safety and the bench
 lock belong to Legalab (`legalab-hardware-gate`); this repository does not
 duplicate them.
 
 | Step | Operator action | Software | Expect / decide |
 | --- | --- | --- | --- |
 | P0 | none | `control snapshot` -> S0 | Record the digest, decoded 73 (frame 96, carrier 100 bit 3), frame 101, and the name bytes (frames 103-107 and 109-111). Record whether O5 and O6 read muted. |
-| P0a | Front panel: open RECALL and read CURRENT NR and whether "EDITED" shows. Then CANCEL. Change nothing. | none | Under C4, CURRENT NR corresponds to decoded 73 (23, or 24 if 1-based), and EDITED shows because frame 101 = 0. A mismatch weakens C4 before anything is stored. |
+| P0a | Front panel: open RECALL and read CURRENT NR and whether "EDITED" shows. Then CANCEL. Change nothing. | none | Under C4, CURRENT NR equals the decoded-73 value P0 just recorded (or that value + 1 if 1-based). EDITED shows exactly when frame 101 reads 0. A mismatch weakens C4 before anything is stored. |
 | P1 | Front panel: STORE -> INTERNAL. Pick an **empty** slot N (the store list shows used slots). Name it with 8 characters, e.g. `LGL21OCT`, then OK. Touch nothing else. | snapshot -> S1 | C4 is confirmed if decoded 73 becomes N (or N-1), frame 101 becomes 1, the name bytes read the new name, Dump1 is identical and the trailer stays balanced. Any other change: stop and record it. |
 | P2 (optional) | Wait at least 30 s after P1. Follow the `legalab-hardware-gate` audio-safety step with amplifiers off. Power-cycle the DCX. | snapshot -> S2 | C5 is confirmed if S2 equals S1 byte for byte. |
 | P3 (optional) | Only if S1 shows O5 and O6 muted. Front panel: RECALL -> INT slot N, the slot stored in P1. Never any other slot. | snapshot -> S3 | Recall reproduces the stored image if S3 equals S1. |
-| P4 (separate window, its own decision) | Run DCX-Remote on a Windows host through a passive RS-232 tap, RX-only on both directions and carrying DTR/RTS (the editor depends on them, per the ChongZhiJie0216 README). Use only Direction DCX2496 -> PC: sync Current Set, then Internal Presets. Never use PC -> DCX2496, "Quick Synchronize To DCX", "Stay Synchronized", Store to.., Clear or Lock, and never touch an editor control. Every one of those is an unguarded whole-set or whole-bank write. | Capture privately, outside git. | Publish only the function codes, payload layout and response lengths. This shows whether per-slot functions exist. |
+| P4 (separate window, its own decision) | Run DCX-Remote, from Behringer's own distribution, on a Windows host through a passive RS-232 tap, RX-only on both directions and carrying DTR/RTS (the editor depends on them, per the ChongZhiJie0216 README). Use only Direction DCX2496 -> PC: sync Current Set, then Internal Presets. Never use PC -> DCX2496, "Quick Synchronize To DCX", "Stay Synchronized", Store to.., Clear or Lock, and never touch an editor control. PC -> DCX2496, Store to.., Clear and Lock are unguarded whole-set or whole-bank writes. Quick Synchronize and Stay Synchronized are excluded as a precaution: S12 describes the first as receiving data, and the second pushes PC edits live. | Capture privately, outside git. | Publish only the function codes, payload layout and response lengths. With store and recall forbidden, P4 shows only the current-set and bank read frames. A bank read is the read-only listing a directory would come from. It does not show whether per-slot store or recall functions exist. |
 
 P5 is an alternative to P4 with no device involved, and it needs an operator
 and legal decision. DCX-Remote 1.16a is publicly mirrored
-(`ChongZhiJie0216/Behringer_DCX2496`, no license). Its UI strings include
-"Recall nr..", "Store to..", "Clear Preset" and "Destination Preset is
-Locked". Static analysis of it could identify the frames. Legalab's
+(`ChongZhiJie0216/Behringer_DCX2496`, no license). A one-off `strings` pass over
+that mirrored binary during the PR review shows UI strings including "Recall
+nr..", "Store to..", "Clear Preset" and "Destination Preset is Locked". The
+reviewer's copy was deleted afterwards, and whether even that read fits the
+RE scope is the operator's call. Static analysis could identify the
+frames. Legalab's
 reverse-engineering permission covers the LS56 only
-(`dec-ls56-re-permitted-20261014`), so this is listed as an option and was
+(`dec-ls56-re-permitted-20261014`), so it is listed as an option and was
 not done. Nothing derived from the binary may be committed.
 
-After P4 or P5, a read-only directory read (if one exists) can be built and
+After P4 or P5, a read-only directory or bank read can be built and
 probed once, under the Ping/Search pacing. Store and recall follow only after
 that read is observed and Legalab extends the write ruling. Never probe
 unknown function codes blind: one of them could overwrite, clear or lock a

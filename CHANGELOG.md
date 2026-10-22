@@ -7,7 +7,8 @@
   note records the sources and claims, the AUTO-STORE persistence path, and
   the design a future `dcxctl preset` would follow. It also gives an
   attended probe: a front-panel store checked by G1 snapshots, with no
-  direct-parameter write, then a passive DCX2496 -> PC trace.
+  direct-parameter write, then a passively tapped DCX2496 -> PC sync by the
+  vendor editor (its own decision).
 - Repeat a failed post-apply readback only as a fresh read-only snapshot:
   `write apply` and `control apply` retry a readback that failed in
   transport or read (and closed verified) as one ordinary complete G1

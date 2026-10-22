@@ -411,9 +411,8 @@ promotes an address from transcribed to observed.
 
 `dcxctl` has no preset store, recall or directory read. None of the public
 sources read so far documents those frames, so there is nothing reviewed to
-encode. Writes
-change the current setup only. The device's AUTO-STORE keeps that setup in
-non-volatile memory (a vendor claim, not yet confirmed on the named unit).
-`control snapshot` remains the off-device archive. Research, claims and the
-attended probe plan are in
+encode. Writes change the current setup only. The device's AUTO-STORE keeps
+that setup in non-volatile memory (a vendor claim, not yet confirmed on the
+named unit). `control snapshot` remains the off-device archive. The
+research, claims and attended probe plan are in
 `docs/agent-notes/2026-10-21-preset-store-recall-research.md`.
