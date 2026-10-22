@@ -32,9 +32,20 @@ rust_test(
     deps = [":dcx_core"],
 )
 
+# The Legalab DcxOutputProfileV1 fixture and the 2026-10-21 O4 chains.
+rust_test(
+    name = "profile_chain",
+    size = "small",
+    srcs = ["tests/profile_chain.rs"],
+    compile_data = ["//:legalab_profile_fixture"],
+    edition = "2024",
+    deps = [":dcx_core"] + all_crate_deps(normal = True),
+)
+
 test_suite(
     name = "all_tests",
     tests = [
+        ":profile_chain",
         ":robustness",
         ":unit_tests",
     ],

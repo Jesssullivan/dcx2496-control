@@ -57,6 +57,13 @@ pub const FIRST_OUTPUT_CHANNEL: u8 = 5;
 pub const PACKED_PAYLOAD_START: usize = 13;
 /// Number of PEQ bands per output.
 pub const PEQ_BANDS: u8 = 9;
+/// Largest PEQ band count the named DCX2496 accepts.
+///
+/// Observed 2026-10-21 (Legalab vocal PA tuning, two O4 applies): the device
+/// stored band 9's values but refused a band count of 9 both times, reading
+/// back count 8. Inferred: at most 8 bands can be active, although 9 bands are
+/// addressable. Typed writes and profile chains refuse a count of 9 offline.
+pub const MAX_ACTIVE_PEQ_BANDS: u8 = 8;
 /// First band-1 frequency parameter.
 pub const FIRST_BAND_PARAMETER: u8 = 0x13;
 /// Direct parameters per PEQ band.

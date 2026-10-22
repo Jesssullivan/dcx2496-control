@@ -1,0 +1,166 @@
+{
+  "schemaVersion": "legalab.dcx-output-profile/v1",
+  "contractType": "DcxOutputProfileV1",
+  "id": "dcx-o4-vocal-1dc18140",
+  "title": "DCX O4 vocal PA tuning (Alto), 2026-10-21 final",
+  "purpose": "The final O4 (Alto PA) state of the 2026-10-21 lab day, which the operator asked to keep: LR24 high-pass at the device step nearest 100 Hz, PEQ on with eight active bands (two low shelves, five bells, one high shelf; all cuts) and gain 0 dB. The pa-vocal preset in profiles/dcx-scene-map.json declares it, and the band-practice scenes use that preset (dec-dcx-o4-eq-vocal-cuts-20261021).",
+  "output": 4,
+  "sink": "alto-pa",
+  "capture": {
+    "typedStateSchema": "dcx.typed-state/v1",
+    "snapshotDigest": "sha256/1dc181404497e2c5630c2f2158789643b58f7d3b3d2ebb288846a6b3ccac5ed0",
+    "evidenceClass": "transcribed_layout_unverified_on_named_device",
+    "provenance": "observed-readback",
+    "observedAt": "2026-10-21T22:24Z",
+    "tool": "dcxctl-tw-9c56384-b3b6ac9f write show --snapshot (offline; the show reproduces the saved dcx-final-typed.json byte for byte)",
+    "laneRef": "PZM ~/.local/state/legalab/tuned-20261021/dcx-final-snapshot.json (SHA256SUMS verified)",
+    "laneFileSha256": "5609a716918dc628b0fade40b01cb4a7d4e7bae0dfe1ed2bf66581469dafa21d"
+  },
+  "state": {
+    "muted": false,
+    "source": "c",
+    "gainDbTenths": 0,
+    "polarityInverted": false,
+    "highPass": {
+      "type": "lr24",
+      "frequencyMilliHz": 99349,
+      "code": 74
+    },
+    "lowPass": {
+      "type": "off",
+      "frequencyMilliHz": 20041156,
+      "code": 319
+    },
+    "delay": {
+      "enabled": false,
+      "shortMm": 0,
+      "longMm": 0
+    },
+    "limiter": {
+      "enabled": false,
+      "thresholdDbTenths": 0
+    },
+    "peq": {
+      "enabled": true,
+      "count": 8,
+      "bands": [
+        {
+          "band": 1,
+          "kind": "low_shelf",
+          "frequencyMilliHz": 140500,
+          "gainDbTenths": -120,
+          "qThousandths": 1000,
+          "shelfSlopeDb": 12,
+          "codes": {
+            "frequency": 90,
+            "gain": 30,
+            "q": 20,
+            "kind": 0,
+            "slope": 1
+          }
+        },
+        {
+          "band": 2,
+          "kind": "low_shelf",
+          "frequencyMilliHz": 198697,
+          "gainDbTenths": -150,
+          "qThousandths": 1000,
+          "shelfSlopeDb": 12,
+          "codes": {
+            "frequency": 106,
+            "gain": 0,
+            "q": 20,
+            "kind": 0,
+            "slope": 1
+          }
+        },
+        {
+          "band": 3,
+          "kind": "bell",
+          "frequencyMilliHz": 654014,
+          "gainDbTenths": -60,
+          "qThousandths": 6310,
+          "codes": {
+            "frequency": 161,
+            "gain": 90,
+            "q": 36,
+            "kind": 1,
+            "slope": 1
+          }
+        },
+        {
+          "band": 4,
+          "kind": "bell",
+          "frequencyMilliHz": 3392606,
+          "gainDbTenths": -90,
+          "qThousandths": 891,
+          "codes": {
+            "frequency": 237,
+            "gain": 60,
+            "q": 19,
+            "kind": 1,
+            "slope": 1
+          }
+        },
+        {
+          "band": 5,
+          "kind": "high_shelf",
+          "frequencyMilliHz": 7561350,
+          "gainDbTenths": -120,
+          "qThousandths": 1000,
+          "shelfSlopeDb": 12,
+          "codes": {
+            "frequency": 274,
+            "gain": 30,
+            "q": 20,
+            "kind": 2,
+            "slope": 1
+          }
+        },
+        {
+          "band": 6,
+          "kind": "bell",
+          "frequencyMilliHz": 1053284,
+          "gainDbTenths": -50,
+          "qThousandths": 1995,
+          "codes": {
+            "frequency": 183,
+            "gain": 100,
+            "q": 26,
+            "kind": 1,
+            "slope": 1
+          }
+        },
+        {
+          "band": 7,
+          "kind": "bell",
+          "frequencyMilliHz": 424076,
+          "gainDbTenths": -50,
+          "qThousandths": 1259,
+          "codes": {
+            "frequency": 141,
+            "gain": 100,
+            "q": 22,
+            "kind": 1,
+            "slope": 1
+          }
+        },
+        {
+          "band": 8,
+          "kind": "bell",
+          "frequencyMilliHz": 2791700,
+          "gainDbTenths": -60,
+          "qThousandths": 7943,
+          "codes": {
+            "frequency": 228,
+            "gain": 90,
+            "q": 38,
+            "kind": 1,
+            "slope": 1
+          }
+        }
+      ]
+    }
+  },
+  "limitations": "Values and codes are the typed show of one control snapshot (observed readback), saved by the main session as the final tuned state; observedAt is when that durable copy was made, and the snapshot predates it. The show labels its field layout transcribed and not verified field by field on this unit, so a code here is the device byte the tool decodes, and its meaning in dB, Hz or Q is the tool model. Values are integer fixed point (milli-Hz, tenths of a dB, thousandths of Q) rounded from the show; the codes are exact. The stored values of the inactive band 9 are not recorded. Power-cycle persistence of this state is not shown. No acoustic claim is made here; the vocal measurements are in docs/agent-notes/2026-10-21-lab-day-vocal-pa-tuning.md. The apply path for PEQ and gain stays outside scene.sh: a profile is verified against write show, never written by a scene."
+}

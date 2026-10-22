@@ -9,6 +9,7 @@ rust_binary(
         "src/feedback_cli.rs",
         "src/live_control.rs",
         "src/main.rs",
+        "src/profile_cli.rs",
         "src/routing_cli.rs",
         "src/write_cli.rs",
     ],

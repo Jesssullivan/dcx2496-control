@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod feedback;
 pub mod layout;
 pub mod meter;
+pub mod output_profile;
 pub mod peq_bank;
 pub mod profile;
 pub mod protocol;
