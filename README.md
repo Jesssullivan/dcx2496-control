@@ -15,9 +15,12 @@ surface, MIDI-to-device mapping, or automatic project-recall apply.
 
 Source checks use the pinned Nix-bound Bazelisk through Just locally by default,
 with two action/test jobs on an admitted host. `just build`, `just test-unit`
-and `just bazel-check` select that lane. `just remote-build` and
-`just remote-test` require `DCX_REAPI_EXECUTOR` and an absolute external
-`DCX_REAPI_CONFIG` rc for operator authentication and executor properties.
+and `just bazel-check` select that lane and print `local, non-qualifying`:
+their results are not REAPI or flywheel evidence. Each Bazel server exits
+after 120 s idle (`startup --max_idle_secs=120` in `.bazelrc`).
+`just remote-build` and `just remote-test` require `DCX_REAPI_EXECUTOR` and an
+absolute external `DCX_REAPI_CONFIG` rc for operator authentication and
+executor properties.
 Unavailable remote actions fail without local fallback. Runtime rc content is
 not printed; ambient rc is excluded. GF enrollment is deferred. Hosted advisory
 provides formatting, shell/workflow/schema and lockfile feedback only.
