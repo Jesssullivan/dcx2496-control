@@ -36,6 +36,7 @@ if [[ -n "${DCX_BAZEL_OUTPUT_USER_ROOT:-}" ]]; then
   startup+=("--output_user_root=$DCX_BAZEL_OUTPUT_USER_ROOT")
 fi
 execution=()
+local_label=false
 if [[ "$lane" == reapi ]]; then
   case "$command" in
     build | test | coverage) ;;
@@ -71,6 +72,7 @@ if [[ "$lane" == reapi ]]; then
 else
   case "$command" in
     build | test | coverage | run)
+      local_label=true
       execution+=(--config=local --remote_executor= --remote_cache=
         --spawn_strategy=local '--strategy_regexp=.*=local'
         --strategy=TestRunner=local --jobs=2)
@@ -142,6 +144,12 @@ for argument in "$@"; do
     options+=("$argument")
   fi
 done
+
+# TIN-5770 R471: no flywheel lane is enrolled, so local results carry no REAPI
+# or flywheel evidence. The lane default itself is dec-local-first-reapi-20261004.
+if [[ "$local_label" == true ]]; then
+  printf 'lane=local: local, non-qualifying for REAPI or flywheel evidence\n' >&2
+fi
 
 # The selected external rc may hold authentication configuration. Do not print it.
 exec "$resolved" "${startup[@]}" "$command" \

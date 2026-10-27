@@ -1,3 +1,8 @@
+# TIN-5770 R470: bound every client server this workspace starts. The wrapper
+# passes --nosystem_rc --nohome_rc --noworkspace_rc and loads only this rc, so a
+# home ~/.bazelrc idle limit never applies here.
+startup --max_idle_secs=120
+
 common --enable_bzlmod
 # Refuse to silently rewrite MODULE.bazel.lock. Every module extension this
 # graph records is locked under the platform-independent `general` key, and the
@@ -10,6 +15,8 @@ common --announce_rc
 build --incompatible_strict_action_env
 test --test_output=errors
 test --test_summary=detailed
+# TIN-5770 R471: no lane falls back from a remote to local execution.
+build --remote_local_fallback=false
 
 # dec-local-first-reapi-20261004: bounded local development is independent of
 # provider enrollment. The dispatcher selects one explicit execution lane.
