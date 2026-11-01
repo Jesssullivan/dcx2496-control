@@ -67,3 +67,28 @@ the containing SwiftUI app source and plist with the selected Xcode SDK. It
 uses an owned temporary build directory. It produces no executable carrier,
 signature, app installation or device contact. `//apple:helper_ui_typecheck`
 indexes the same check for the Darwin Bazel lane.
+
+## Shared preparation
+
+`TinylandRoomPreparationProtocol` in the helper's signed `Info.plist` is
+`dcx.room-preparation/v1`. Lab must check this value, its pinned executable hash
+and the strict bundle signature before using foreground launch plus the fixed URL.
+Older helpers lack this contract.
+
+Both triggers share one in-flight verification when their complete helper
+configuration and exact expectation bytes match. A different binding is refused
+while that capture runs. Matching callers receive the same result or failure.
+A successful completed comparison can reuse its original capture while the tty
+exists and capture age is less than sixty seconds. Reuse preserves `verifiedAt`.
+The existing two-second heartbeat expiry and sixty-second lifetime still apply.
+A stale or disconnected result requires another explicit capture.
+
+Device operations, configuration or expectation changes and foreground exit
+invalidate reuse. They also prevent an in-flight capture from publishing after
+invalidation. A failed capture is never cached as readiness. A later explicit
+request can try again. No retry, parameter write or serial poll was added.
+
+The existing read-only `helper.status` reports `activeTransactionID` as
+`room-verification` during the owning capture. Status is observation, not approval
+or a fresh capture. Tests cover coordinator-level concurrent triggers, shared
+failure, mismatched bindings, invalidation and unchanged capture age.

@@ -102,6 +102,197 @@ final class RoomVerificationTests: XCTestCase {
         XCTAssertFalse(capture.values.last?.matches ?? true)
     }
 
+    func testCachedCoordinatorReceiptCannotBypassChangedRecoveryAuthority() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = DCXHelperStorageLocations(fixtureRoot: root)
+        let manifest = Data("SYNTHETIC recovery cache admission".utf8)
+        let snapshotURL = try XCTUnwrap(Bundle.module.url(forResource: "SYNTHETIC-blank-snapshot", withExtension: "json", subdirectory: "feedback"))
+        let snapshot = try Data(contentsOf: snapshotURL)
+        let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: snapshot)
+        let backend = RoomBackend(snapshot: snapshot, comparison: try JSONEncoder().encode(comparison(manifest, snapshot: carrier.snapshotDigest)))
+        let configuration = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
+        try configuration.save(to: locations.helperConfigurationURL)
+        let receipts = ReceiptCapture()
+        let coordinator = DCXHelperCoordinator(locations: locations, configuration: .success(configuration),
+            coreMIDI: .init(), runner: backend,
+            roomVerification: .init(startHeartbeats: false, submit: { receipts.append($0) }, ttyPresent: { _ in true }))
+        coordinator.setForeground(true)
+        let first = try coordinator.verifyRoom(expectation: manifest)
+        XCTAssertEqual(try coordinator.verifyRoom(expectation: manifest).verifiedAt, first.verifiedAt)
+        XCTAssertEqual(backend.arguments.count, 3)
+        let brokenLease = locations.planRootURL.appendingPathComponent("mutation-recovery.json")
+        try Data("SYNTHETIC malformed foreign recovery lease".utf8).write(to: brokenLease)
+        XCTAssertThrowsError(try coordinator.verifyRoom(expectation: manifest))
+        XCTAssertEqual(backend.arguments.count, 3)
+        XCTAssertEqual(receipts.values.last?.status, "invalidated")
+    }
+
+    func testCoordinatorConcurrentTriggersReachOneSerialCaptureBeforeProcessLock() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifest = Data("SYNTHETIC shared coordinator capture".utf8)
+        let snapshotURL = try XCTUnwrap(Bundle.module.url(forResource: "SYNTHETIC-blank-snapshot", withExtension: "json", subdirectory: "feedback"))
+        let snapshot = try Data(contentsOf: snapshotURL)
+        let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: snapshot)
+        let backend = RoomBackend(snapshot: snapshot, comparison: try JSONEncoder().encode(comparison(manifest, snapshot: carrier.snapshotDigest)))
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        backend.beforeSnapshot = {
+            started.signal()
+            guard release.wait(timeout: .now() + 3) == .success else { throw RoomVerificationError.unavailable }
+        }
+        let gate = RoomVerificationPreparation()
+        let configuration = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
+        let coordinator = DCXHelperCoordinator(locations: .init(fixtureRoot: root), configuration: .success(configuration),
+            coreMIDI: .init(), runner: backend, roomVerification: .init(startHeartbeats: false, submit: { _ in }), roomPreparation: gate)
+        coordinator.setForeground(true)
+        let done = expectation(description: "coordinator triggers returned")
+        done.expectedFulfillmentCount = 2
+        let results = PreparationResults()
+        DispatchQueue.global().async {
+            results.append(Result { try coordinator.verifyRoom(expectation: manifest) }); done.fulfill()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 3), .success)
+        DispatchQueue.global().async {
+            results.append(Result { try coordinator.verifyRoom(expectation: manifest) }); done.fulfill()
+        }
+        waitForJoin(gate)
+        release.signal()
+        wait(for: [done], timeout: 3)
+        XCTAssertEqual(results.values.count, 2)
+        for result in results.values { XCTAssertTrue(try result.get().matches) }
+        XCTAssertEqual(backend.arguments.count, 3)
+        XCTAssertEqual(backend.arguments.filter { $0.starts(with: ["control", "snapshot"]) }.count, 1)
+    }
+
+    func testConcurrentMatchingTriggersShareOneCaptureAndResult() throws {
+        let gate = RoomVerificationPreparation()
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let done = expectation(description: "both triggers completed")
+        done.expectedFulfillmentCount = 2
+        let receipt = try fixtureReceipt()
+        let results = PreparationResults()
+        DispatchQueue.global().async {
+            results.append(Result { try gate.run(key: Data([1]), reuse: { nil }) { _ in
+                started.signal()
+                guard release.wait(timeout: .now() + 3) == .success else { throw RoomVerificationError.unavailable }
+                return receipt
+            } })
+            done.fulfill()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 3), .success)
+        DispatchQueue.global().async {
+            results.append(Result { try gate.run(key: Data([1]), reuse: { nil }) { _ in
+                XCTFail("Matching trigger started a second capture")
+                throw RoomVerificationError.unavailable
+            } })
+            done.fulfill()
+        }
+        waitForJoin(gate)
+        release.signal()
+        wait(for: [done], timeout: 3)
+        XCTAssertEqual(results.values.count, 2)
+        for value in results.values { XCTAssertEqual(try value.get(), receipt) }
+    }
+
+    func testDifferentBindingRefusesAndInvalidationSuppressesInFlightPublication() throws {
+        let gate = RoomVerificationPreparation()
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let done = expectation(description: "invalidated trigger returned")
+        let receipt = try fixtureReceipt()
+        let results = PreparationResults()
+        DispatchQueue.global().async {
+            results.append(Result { try gate.run(key: Data([1]), reuse: { nil }) { attempt in
+                started.signal()
+                guard release.wait(timeout: .now() + 3) == .success else { throw RoomVerificationError.unavailable }
+                return try gate.publish(attempt) { XCTFail("Invalidated capture published"); return receipt }
+            } })
+            done.fulfill()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 3), .success)
+        XCTAssertThrowsError(try gate.run(key: Data([2]), reuse: { nil }) { _ in
+            XCTFail("Different binding started capture"); return receipt
+        })
+        gate.invalidate {}
+        release.signal()
+        wait(for: [done], timeout: 3)
+        XCTAssertThrowsError(try XCTUnwrap(results.values.first).get())
+    }
+
+    func testConcurrentFailureIsSharedAndDoesNotBecomeCachedSuccess() throws {
+        let gate = RoomVerificationPreparation()
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let done = expectation(description: "both failed triggers returned")
+        done.expectedFulfillmentCount = 2
+        let results = PreparationResults()
+        DispatchQueue.global().async {
+            results.append(Result { try gate.run(key: Data([1]), reuse: { nil }) { _ in
+                started.signal()
+                _ = release.wait(timeout: .now() + 3)
+                throw RoomVerificationError.invalidComparison
+            } })
+            done.fulfill()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 3), .success)
+        DispatchQueue.global().async {
+            results.append(Result { try gate.run(key: Data([1]), reuse: { nil }) { _ in
+                XCTFail("Concurrent failure retried capture"); throw RoomVerificationError.unavailable
+            } })
+            done.fulfill()
+        }
+        waitForJoin(gate)
+        release.signal()
+        wait(for: [done], timeout: 3)
+        XCTAssertEqual(results.values.count, 2)
+        for result in results.values {
+            XCTAssertThrowsError(try result.get()) { XCTAssertEqual($0 as? RoomVerificationError, .invalidComparison) }
+        }
+        let receipt = try fixtureReceipt()
+        XCTAssertEqual(try gate.run(key: Data([1]), reuse: { XCTFail("Failure was cached"); return receipt }) { _ in receipt }, receipt)
+    }
+
+    func testFreshCompletedResultReusesCaptureButStaleOrInvalidatedRequiresRead() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data().write(to: root)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in })
+        let manifest = Data("SYNTHETIC freshness".utf8)
+        let at = Date()
+        let receipt = try publisher.install(comparison(manifest), expectation: manifest, capturedAt: at, ttyPath: root.path)
+        let gate = RoomVerificationPreparation()
+        _ = try gate.run(key: manifest, reuse: { nil }) { _ in receipt }
+        let reused = try gate.run(key: manifest, reuse: { publisher.current(expectation: manifest, now: at.addingTimeInterval(59)) }) { _ in
+            XCTFail("Fresh completed capture reread serial"); return receipt
+        }
+        XCTAssertEqual(reused.verifiedAt, receipt.verifiedAt)
+        XCTAssertNil(publisher.current(expectation: manifest, now: at.addingTimeInterval(60)))
+        XCTAssertNil(publisher.current(expectation: Data("different".utf8), now: at))
+        var capturedAgain = false
+        _ = try gate.run(key: manifest, reuse: { publisher.current(expectation: manifest, now: at.addingTimeInterval(60)) }) { _ in
+            capturedAgain = true; return receipt
+        }
+        XCTAssertTrue(capturedAgain)
+        gate.invalidate { publisher.invalidate("device-operation") }
+        XCTAssertNil(publisher.current(expectation: manifest, now: at))
+        _ = try gate.run(key: manifest, reuse: { XCTFail("Invalidated result reused"); return receipt }) { _ in receipt }
+        try FileManager.default.removeItem(at: root)
+        XCTAssertNil(publisher.current(expectation: manifest, now: at))
+    }
+
+    private func waitForJoin(_ gate: RoomVerificationPreparation) {
+        let deadline = Date().addingTimeInterval(2)
+        while gate.waitingRequestCount == 0 && Date() < deadline { Thread.sleep(forTimeInterval: 0.001) }
+        XCTAssertEqual(gate.waitingRequestCount, 1)
+    }
+
+    private func fixtureReceipt() throws -> RoomVerificationReceipt {
+        let manifest = Data("SYNTHETIC concurrent expectation".utf8)
+        return try RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }).install(
+            comparison(manifest), expectation: manifest, capturedAt: Date(), ttyPath: "/SYNTHETIC")
+    }
+
     private func comparison(_ expectation: Data, snapshot: String = "sha256/" + String(repeating: "a", count: 64), expectedSnapshot: String? = nil) -> RoomComparison {
         .init(schemaVersion: "dcx.room-comparison/v1", sceneId: "practice-ready", sceneRevision: 1,
               compiledDigest: "sha256/" + String(repeating: "c", count: 64),
@@ -123,12 +314,21 @@ private final class RoomBackend: DCXCTLCommandExecuting, @unchecked Sendable {
     private let snapshot: Data
     private let comparison: Data
     var arguments: [[String]] = []
+    var beforeSnapshot: (@Sendable () throws -> Void)?
     init(snapshot: Data, comparison: Data) { self.snapshot = snapshot; self.comparison = comparison }
     func resolveExecutable(for configuration: HelperConfigurationV1) throws -> URL { URL(fileURLWithPath: "/SYNTHETIC/dcxctl") }
     func run(_ invocation: DCXCTLInvocation, timeoutSeconds: UInt8, mutationLock: MutationRecoveryProcessLock?) throws -> DCXCTLProcessResult {
         XCTAssertNotNil(mutationLock)
         arguments.append(invocation.arguments)
+        if invocation.arguments.starts(with: ["control", "snapshot"]) { try beforeSnapshot?() }
         let stdout = arguments.count == 1 ? Data("{}".utf8) : arguments.count == 2 ? snapshot : comparison
         return .init(terminationStatus: 0, stdout: stdout, stderr: Data(), durationMilliseconds: 1)
     }
+}
+
+private final class PreparationResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Result<RoomVerificationReceipt, Error>] = []
+    var values: [Result<RoomVerificationReceipt, Error>] { lock.lock(); defer { lock.unlock() }; return storage }
+    func append(_ value: Result<RoomVerificationReceipt, Error>) { lock.lock(); storage.append(value); lock.unlock() }
 }
