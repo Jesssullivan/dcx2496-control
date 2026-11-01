@@ -36,8 +36,13 @@ sdk="$(/usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" /usr/bin/xcr
   "$toolchain/swift" build --package-path "$package_path" --scratch-path "$owned_root/swift-build" --arch arm64 --jobs 1
 # SwiftBuild and the legacy SwiftPM backend emit modules in different layouts.
 # Resolve only exact package modules inside this invocation's owned build tree.
-helper_module="$(find "$owned_root/swift-build" -name DCXLogicHelperCore.swiftmodule -print)"
-bridge_module="$(find "$owned_root/swift-build" -name DCXLogicBridge.swiftmodule -print)"
+helper_module="$(find "$owned_root/swift-build" -path '*/Products/Debug/DCXLogicHelperCore.swiftmodule' -prune -print)"
+if [[ -n "$helper_module" && "$helper_module" != *$'\n'* ]]; then
+  bridge_module="${helper_module%/*}/DCXLogicBridge.swiftmodule"
+else
+  helper_module="$(find "$owned_root/swift-build" -path '*/Modules/DCXLogicHelperCore.swiftmodule' -prune -print)"
+  bridge_module="$(find "$owned_root/swift-build" -path '*/Modules/DCXLogicBridge.swiftmodule' -prune -print)"
+fi
 for module_path in "$helper_module" "$bridge_module"; do
   if [[ -z "$module_path" || "$module_path" == *$'\n'* || ! -e "$module_path" ]]; then
     printf 'expected one exact arm64 module inside the owned package build\n' >&2
