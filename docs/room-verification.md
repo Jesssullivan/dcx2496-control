@@ -139,3 +139,26 @@ The faster path is source-qualified only until the Darwin binary and one bounded
 named-device timing/readback run pass. Periodic delivery must remain disabled
 until that qualification is recorded. The conservative five-minute delay remains
 unchanged. No faster cadence or continuous-readiness claim follows from mocks.
+
+## Qualification record
+
+Source `141392d4067c1b723cc5dca40bdae5813b3a0557` passed the native package and
+helper UI checks on PZM. The run listed 114 tests: 106 passed, eight were
+explicitly skipped and none failed. All nineteen new cases passed. The actual
+SwiftUI source typecheck passed without compiler warnings. The owned process
+group was quiescent after 57.439 seconds. Root released exact source packet
+`a67201a61fa3805709f4c8b8786671ec48806d4bd60c5a73d79e93fefcb9fa01`.
+The receipt digest is
+`728fb6b643bfb94bdfe23096d9942eee6ec2fdf2c4c485bef91c93afad1c777c`.
+
+The combined Rust state also passed `nix develop --command just check` on
+Sting: 300 tests passed, none failed and none were ignored. Formatting, Clippy,
+fixtures and front-door checks passed. Independent source review found no
+remaining definite blocker after lifecycle, saved-binding and identity-policy
+fixes. These checks requested no application launch, device access or install.
+
+The standalone Darwin fast-refresh artifact and named-device timing remain
+unqualified. No periodic option was enabled on PZM. The five-minute cadence,
+failed-read latch and existing proof expiry remain unchanged.
+
+Lexical: XL-ACC-004
