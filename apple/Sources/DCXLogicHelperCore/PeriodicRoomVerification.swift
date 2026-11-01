@@ -17,7 +17,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         case busy
         case failed
     }
-    static let successDelay: TimeInterval = 300
+    static let successDelay: TimeInterval = 30
     private let lock = NSLock()
     private var running = false
     private var generation: UInt64 = 0

@@ -57,6 +57,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     private let startHeartbeats: Bool
     private let ttyPresent: @Sendable (String) -> Bool
     private var receipt: RoomVerificationReceipt?
+    private var captureBinding: Data?
     private var capturedAt: Date?
     private var ttyPath: String?
     private var timer: DispatchSourceTimer?
@@ -72,7 +73,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
 
     func install(_ comparison: RoomComparison, expectation: Data, capturedAt: Date, ttyPath: String,
                  bindingIsCurrent: @escaping @Sendable () -> Bool = { true },
-                 captureMetrics: RoomCaptureMetrics? = nil) throws -> RoomVerificationReceipt {
+                 captureMetrics: RoomCaptureMetrics? = nil, captureBinding: Data? = nil) throws -> RoomVerificationReceipt {
         guard bindingIsCurrent() else { throw RoomVerificationError.unavailable }
         let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
         guard comparison.schemaVersion == "dcx.room-comparison/v1",
@@ -105,6 +106,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         guard bindingIsCurrent() else { lock.unlock(); throw RoomVerificationError.unavailable }
         receipt = value
         self.bindingIsCurrent = bindingIsCurrent
+        self.captureBinding = captureBinding
         self.capturedAt = capturedAt
         self.ttyPath = ttyPath
         timer?.cancel()
@@ -130,6 +132,15 @@ final class RoomVerificationPublisher: @unchecked Sendable {
                                ttyPresent: ttyPresent(ttyPath))
     }
 
+    /// Only the admitted periodic read may retain a matching, unexpired proof.
+    /// The existing heartbeat retains its original capture timestamp and binding.
+    func canRetainDuringRead(binding: Data, now: Date = Date()) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard captureBinding == binding, bindingIsCurrent(), let receipt,
+              receipt.matches, let capturedAt, let ttyPath else { return false }
+        return receipt.renewed(at: now, capturedAt: capturedAt, ttyPresent: ttyPresent(ttyPath)) != nil
+    }
+
     func captureDate(expectation: Data) -> Date? {
         let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
         lock.lock(); defer { lock.unlock() }
@@ -143,6 +154,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         timer = nil
         let invalidated = receipt
         receipt = nil
+        captureBinding = nil
         capturedAt = nil
         ttyPath = nil
         bindingIsCurrent = { true }

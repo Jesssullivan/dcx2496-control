@@ -22,18 +22,18 @@ final class PeriodicRoomVerificationTests: XCTestCase {
             XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(seconds)).attempt)
         }
         schedule.complete(attempt, outcome: .success(capturedAt: at.addingTimeInterval(101)), now: at.addingTimeInterval(101))
-        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(400)).attempt)
-        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(401)).attempt)
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(130)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(131)).attempt)
     }
 
     func testRealManualCaptureDefersDeadlineButRepeatedHeartbeatCannotSlideIt() throws {
         let schedule = PeriodicRoomVerification(); schedule.start()
         let capture = at.addingTimeInterval(-10)
         XCTAssertNil(schedule.poll(binding: first, capturedAt: capture, now: at).attempt)
-        for seconds in [5.0, 60, 299] {
+        for seconds in [5.0, 29] {
             XCTAssertNil(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(seconds)).attempt)
         }
-        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(300)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(30)).attempt)
     }
 
     func testBusyBackoffIsBoundedAndDoesNotBecomeTransportRetry() throws {
@@ -53,7 +53,7 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         schedule.complete(attempt, outcome: .failed, now: at)
         XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(10000)).attempt)
         XCTAssertNil(schedule.poll(binding: first, capturedAt: at.addingTimeInterval(10001), now: at.addingTimeInterval(10001)).attempt)
-        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(10301)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(10031)).attempt)
     }
 
     func testOptOutOrChangedBindingCancelsOldCompletionAndRearm() throws {
@@ -97,7 +97,7 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         let fresh = startupFirst.poll(binding: first, capturedAt: at, now: at)
         XCTAssertFalse(fresh.invalidatesPriorBinding)
         XCTAssertNil(fresh.attempt, "a completed real startup capture defers periodic reading")
-        XCTAssertNotNil(startupFirst.poll(binding: first, capturedAt: at, now: at.addingTimeInterval(300)).attempt)
+        XCTAssertNotNil(startupFirst.poll(binding: first, capturedAt: at, now: at.addingTimeInterval(30)).attempt)
     }
 
 }

@@ -185,7 +185,8 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
                     throw RoomVerificationError.unavailable
                 }
                 let receipt = try self.coordinator.verifyBoundRoom(expectation: saved.approved.expectation,
-                    forceFresh: true, expectedConfiguration: saved.configuration, approvedTargetRefresh: true, bindingIsCurrent: { [weak self] in
+                    forceFresh: true, expectedConfiguration: saved.configuration, approvedTargetRefresh: true,
+                    retainFreshDuringRead: true, bindingIsCurrent: { [weak self] in
                         guard let self else { return false }
                         return self.periodic.isCurrent(attempt) && self.savedBindingMatches(attempt.binding)
                     })

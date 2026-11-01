@@ -83,6 +83,132 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    func testPeriodicReadRetainsOriginalFreshProofUntilAtomicReplacement() throws {
+        try exerciseRetention { coordinator, publisher, gate, backend, manifest, configuration, first in
+            backend.beforeRefresh = {
+                XCTAssertTrue(gate.isInFlight)
+                XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, first.verifiedAt)
+            }
+            let second = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true })
+            XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, second.verifiedAt)
+            XCTAssertTrue(second.matches)
+        }
+    }
+
+    func testPeriodicReadFailureImmediatelyInvalidatesRetainedProof() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, first in
+            backend.beforeRefresh = {
+                XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, first.verifiedAt)
+                throw RoomVerificationError.unavailable
+            }
+            XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true }))
+            XCTAssertNil(publisher.current(expectation: manifest))
+        }
+    }
+
+    func testPeriodicReadCannotRetainExpiredProofOrDifferentBinding() throws {
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
+        let manifest = Data("SYNTHETIC retention age".utf8)
+        let value = try decode(fixture(expectation: manifest))
+        let captured = Date()
+        let receipt = try publisher.install(value.comparison, expectation: manifest, capturedAt: captured,
+            ttyPath: "/SYNTHETIC", captureBinding: Data([1]))
+        XCTAssertTrue(publisher.canRetainDuringRead(binding: Data([1]), now: captured.addingTimeInterval(59)))
+        XCTAssertFalse(publisher.canRetainDuringRead(binding: Data([2]), now: captured))
+        XCTAssertFalse(publisher.canRetainDuringRead(binding: Data([1]), now: captured.addingTimeInterval(60)))
+        XCTAssertNil(publisher.current(expectation: manifest, now: captured.addingTimeInterval(60)))
+        XCTAssertEqual(publisher.current(expectation: manifest, now: captured)?.verifiedAt, receipt.verifiedAt)
+    }
+
+    func testExplicitFreshReadStillInvalidatesBeforeCapture() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            backend.beforeRefresh = { XCTAssertNil(publisher.current(expectation: manifest)) }
+            _ = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, bindingIsCurrent: { true })
+        }
+    }
+
+    func testForegroundCancellationDuringRetainedReadCannotRepublish() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            backend.beforeRefresh = {
+                coordinator.setForeground(false)
+                XCTAssertNil(publisher.current(expectation: manifest))
+            }
+            XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true }))
+            XCTAssertNil(publisher.current(expectation: manifest))
+        }
+    }
+
+    func testBindingChangeDuringRetainedReadPreventsPublicationAndHeartbeat() throws {
+        let allowed = RetentionFlag()
+        try exerciseRetention(initialBinding: { allowed.value }) { coordinator, publisher, _, backend, manifest, configuration, _ in
+            backend.beforeRefresh = {
+                allowed.disable()
+                XCTAssertNil(publisher.current(expectation: manifest))
+            }
+            XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { allowed.value }))
+            XCTAssertNil(publisher.current(expectation: manifest))
+        }
+    }
+
+    func testMutatingAuthorityInvalidationDuringReadCannotRestoreOldProof() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            backend.beforeRefresh = {
+                coordinator.invalidateApprovedRoomBinding()
+                XCTAssertNil(publisher.current(expectation: manifest))
+            }
+            XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true }))
+            XCTAssertNil(publisher.current(expectation: manifest))
+        }
+    }
+
+    func testDriftAtomicallyReplacesPriorMatchWithUnavailableReadiness() throws {
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
+        let manifest = Data("SYNTHETIC drift replacement".utf8)
+        var object = try fixture(expectation: manifest, capturedAt: Date())
+        let good = try decode(object)
+        _ = try publisher.install(good.comparison, expectation: manifest, capturedAt: Date(),
+            ttyPath: "/SYNTHETIC", captureBinding: Data([1]))
+        var comparison = try XCTUnwrap(object["comparison"] as? [String: Any])
+        comparison["matches"] = false
+        object["comparison"] = comparison
+        let drift = try decode(object)
+        let receipt = try publisher.install(drift.comparison, expectation: manifest, capturedAt: Date(),
+            ttyPath: "/SYNTHETIC", captureBinding: Data([1]))
+        XCTAssertEqual(receipt.status, "drift")
+        XCTAssertFalse(try XCTUnwrap(publisher.current(expectation: manifest)).matches)
+        XCTAssertFalse(publisher.canRetainDuringRead(binding: Data([1])))
+    }
+
+    private func exerciseRetention(initialBinding: @escaping @Sendable () -> Bool = { true },
+        _ body: (DCXHelperCoordinator, RoomVerificationPublisher, RoomVerificationPreparation, FastBackend,
+                 Data, HelperConfigurationV1, RoomVerificationReceipt) throws -> Void) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifest = Data("SYNTHETIC retained periodic approval".utf8)
+        let backend = FastBackend { try self.fixture(expectation: manifest, capturedAt: Date()) }
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
+        let gate = RoomVerificationPreparation()
+        let configuration = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
+        let coordinator = DCXHelperCoordinator(locations: .init(fixtureRoot: root), configuration: .success(configuration),
+            coreMIDI: .init(), runner: backend, roomVerification: publisher, roomPreparation: gate)
+        coordinator.setForeground(true)
+        let first = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+            expectedConfiguration: configuration, approvedTargetRefresh: true, bindingIsCurrent: initialBinding)
+        try body(coordinator, publisher, gate, backend, manifest, configuration, first)
+    }
+
     private func decode(_ object: [String: Any]) throws -> ApprovedRoomRefresh {
         try BridgeJSONCodec.decoder().decode(ApprovedRoomRefresh.self, from: JSONSerialization.data(withJSONObject: object))
     }
@@ -107,6 +233,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
 
 private final class FastBackend: DCXCTLCommandExecuting, @unchecked Sendable {
     var arguments: [[String]] = []
+    var beforeRefresh: (() throws -> Void)?
     let envelope: () throws -> [String: Any]
     init(_ envelope: @escaping () throws -> [String: Any]) { self.envelope = envelope }
     func resolveExecutable(for configuration: HelperConfigurationV1) throws -> URL { URL(fileURLWithPath: "/SYNTHETIC/dcxctl") }
@@ -114,10 +241,17 @@ private final class FastBackend: DCXCTLCommandExecuting, @unchecked Sendable {
         XCTAssertNotNil(mutationLock)
         arguments.append(invocation.arguments)
         let object: Any
-        if invocation.arguments.starts(with: ["profile", "room-refresh"]) { object = try envelope() }
+        if invocation.arguments.starts(with: ["profile", "room-refresh"]) { try beforeRefresh?(); object = try envelope() }
         else if invocation.arguments.starts(with: ["control", "snapshot"]) { object = try XCTUnwrap(envelope()["snapshot"]) }
         else if invocation.arguments.starts(with: ["profile", "room-verify"]) { object = try XCTUnwrap(envelope()["comparison"]) }
         else { object = [String: Any]() }
         return .init(terminationStatus: 0, stdout: try JSONSerialization.data(withJSONObject: object), stderr: Data(), durationMilliseconds: 1)
     }
+}
+
+private final class RetentionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enabled = true
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return enabled }
+    func disable() { lock.lock(); enabled = false; lock.unlock() }
 }

@@ -107,7 +107,8 @@ verification with startup, button and URL requests. A periodic attempt bypasses
 completed-cache reuse and requires an actual fresh snapshot. No MIDI input,
 heartbeat, daemon or competing serial owner starts a device operation.
 
-After a successful capture, the next periodic attempt waits five minutes. A real
+After a successful capture, the next periodic attempt becomes eligible after
+thirty seconds. The existing local timer checks eligibility every five seconds. A real
 explicit capture defers that deadline too. Known lock contention before child
 admission backs off from fifteen seconds to five minutes. Failed transport,
 invalid comparison and drift latch periodic reads off. An explicit successful
@@ -121,11 +122,17 @@ flight. Those checks also guard later heartbeats. An old worker cannot publish
 or rearm after leaving and reentering the foreground.
 
 Capture freshness stays sixty seconds and heartbeat expiry stays two seconds.
-Starting a new capture invalidates the previous attestation. The historical
-roughly one-hundred-second generic read therefore leaves admission gaps. This
-scheduler preserves audio routes and obtains new evidence. It does not provide
-continuous whole-room readiness. A faster approved-target policy needs separate
-source review and named-device timing qualification.
+Only a periodic read may retain a prior successful proof during capture. Its
+full configuration, callout, expectation and identity-policy key must match.
+Admission reloads recovery authority first. Heartbeats retain the original
+capture time, so expiration still blocks readiness during an unfinished read.
+The new result replaces the old proof atomically. Drift, failed capture,
+foreground exit or changed authority invalidate the prior proof. Mutating
+operations and explicit fresh reads still invalidate before capture.
+`helper.status.activeTransactionID` remains `room-verification` during a read.
+A fresh prior proof means the earlier capture remains valid, not that the
+in-flight capture has completed. Global Stop continues to block native room
+admission through the existing ASFW gate.
 
 Saved-approved verification uses the protected `profile room-refresh` path
 specified in [Approved room refresh](approved-room-refresh.md). Arbitrary staged
@@ -135,10 +142,9 @@ The helper checks complete frames, comparison binding, verified close and actual
 Search counters. It retains the CLI capture-completion time. Future, stale or
 pre-invocation times are refused. Receipts include measured capture metadata.
 
-The faster path is source-qualified only until the Darwin binary and one bounded
-named-device timing/readback run pass. Periodic delivery must remain disabled
-until that qualification is recorded. The conservative five-minute delay remains
-unchanged. No faster cadence or continuous-readiness claim follows from mocks.
+The standalone faster path passed the named-device qualification below.
+Periodic delivery remains disabled until the signed helper and its foreground
+workflow are qualified. Capture freshness and heartbeat expiry remain unchanged.
 
 ## Qualification record
 
@@ -158,7 +164,41 @@ remaining definite blocker after lifecycle, saved-binding and identity-policy
 fixes. These checks requested no application launch, device access or install.
 
 The standalone Darwin fast-refresh artifact and named-device timing remain
-unqualified. No periodic option was enabled on PZM. The five-minute cadence,
-failed-read latch and existing proof expiry remain unchanged.
+unqualified. No periodic option was enabled on PZM during that source run. That revision
+retained the earlier five-minute cadence, failed-read latch and existing expiry.
 
 Lexical: XL-ACC-004
+
+## Named fast capture
+
+On November 1, the source-141 protected reader completed one actual PZM capture.
+It took 6.142 seconds: two Search attempts, one empty timeout and one valid
+identity. Close verification passed. The complete 26-byte identity, 1,015-byte
+Dump0 and 911-byte Dump1 matched the approved snapshot. All 62 comparison fields,
+including the 55 O4 fields, matched. The controller exited zero after 6.572
+seconds. The owned group was quiescent, ports were clear and helper and Logic
+process custody was preserved.
+
+The canonical snapshot remained
+`sha256/20a5b485a4b4053b4b7026b9fb53517d210cbb3b456aa7f135b578c9b728b5e7`.
+The actual receipt digest is
+`e3facafc1bb1afb4eee67037403d2e897afa04ee353ee833221491aa2d22822a`.
+The capture capsule digest is
+`956c702a9f876fd1e51d5e65662131491fac59bd9a1002c1827835acdf68a76e`.
+Authority was the implementation direction and TIN-5379 live-output authority
+`e86eb6e8`. No muted-bench premise was asserted.
+
+This run used a retained Nix closure after a prior unrooted artifact failed
+before main with a missing runtime library. The final containing app must use
+Apple-system linkage or qualified private bundled libraries. Its dependency
+admission must reject every Nix load path before installation or default use.
+No helper was installed, periodic option enabled or MIDI attestation fabricated
+by the standalone capture.
+
+The success delay is now thirty seconds. The protected twenty-second capture
+budget plus that delay is fifty seconds, below the unchanged sixty-second
+capture-age ceiling. The local five-second eligibility timer can add scheduling
+latency. Failed reads still latch and old captures are never restamped. Only a
+still-fresh proof with unchanged binding may survive a periodic read. One fast
+capture does not qualify the installed periodic workflow or continuous Ready
+availability.

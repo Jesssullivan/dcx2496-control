@@ -179,6 +179,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     /// Periodic refresh bypasses completed-cache reuse, never an active flight.
     func verifyBoundRoom(expectation: Data, forceFresh: Bool,
                          expectedConfiguration: HelperConfigurationV1? = nil, approvedTargetRefresh: Bool = false,
+                         retainFreshDuringRead: Bool = false,
                          bindingIsCurrent: @escaping @Sendable () -> Bool) throws -> RoomVerificationReceipt {
         guard bindingIsCurrent(), !approvedTargetRefresh || expectedConfiguration != nil else {
             throw RoomVerificationError.unavailable
@@ -201,8 +202,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         return try roomPreparation.run(key: key, reuse: {
             forceFresh ? nil : self.reusableRoom(expectation: expectation, expectedConfiguration: configuration)
         }, bindingIsCurrent: bindingIsCurrent) { attempt in
-            try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt,
-                approvedTargetRefresh: approvedTargetRefresh)
+            do {
+                return try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt,
+                    approvedTargetRefresh: approvedTargetRefresh,
+                    retainFreshDuringRead: retainFreshDuringRead && forceFresh && approvedTargetRefresh)
+            } catch {
+                roomVerification.invalidate("room-verification-failed")
+                throw error
+            }
         }
     }
 
@@ -224,12 +231,13 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     }
 
     private func captureRoom(expectation: Data, expectedConfiguration: HelperConfigurationV1,
-                             attempt: RoomVerificationPreparation.Attempt, approvedTargetRefresh: Bool) throws -> RoomVerificationReceipt {
+                             attempt: RoomVerificationPreparation.Attempt, approvedTargetRefresh: Bool,
+                             retainFreshDuringRead: Bool) throws -> RoomVerificationReceipt {
         guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
             throw RoomVerificationError.invalidExpectation
         }
         guard attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
-        roomVerification.invalidate("room-verification-started")
+        if !retainFreshDuringRead { roomVerification.invalidate("room-verification-started") }
         let processLock: MutationRecoveryProcessLock
         do { processLock = try recoveryLeaseStore.acquireExclusiveLock() }
         catch MutationRecoveryLeaseError.lockBusy { throw RoomVerificationError.busy }
@@ -255,6 +263,11 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             stateLock.lock()
             activeTransactionID = nil
             stateLock.unlock()
+        }
+        // Admission has reloaded recovery authority and bound the actual target.
+        // A retained proof stays subject to its own heartbeat, TTL and binding.
+        if retainFreshDuringRead && !roomVerification.canRetainDuringRead(binding: attempt.key) {
+            roomVerification.invalidate("room-verification-prior-proof-unavailable")
         }
         let workspace = try TransactionWorkspace(root: locations.transactionRootURL)
         defer { workspace.remove() }
@@ -328,7 +341,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             return try roomVerification.install(
                 comparison, expectation: expectation, capturedAt: capturedAt,
                 ttyPath: configuration.ttyPath, bindingIsCurrent: { attempt.bindingChecks.isValid() },
-                captureMetrics: captureMetrics
+                captureMetrics: captureMetrics, captureBinding: attempt.key
             )
         }
     }
