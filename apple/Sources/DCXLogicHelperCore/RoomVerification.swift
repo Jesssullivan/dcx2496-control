@@ -23,6 +23,7 @@ public struct RoomVerificationReceipt: Codable, Equatable, Sendable {
     public let validationScope: String
     public let comparedFields: Int
     public var invalidationReason: String?
+    public var captureMetrics: RoomCaptureMetrics? = nil
 
     /// The heartbeat extends helper liveness, never the actual capture age.
     func renewed(at now: Date, capturedAt: Date, ttyPresent: Bool) -> Self? {
@@ -70,7 +71,8 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     }
 
     func install(_ comparison: RoomComparison, expectation: Data, capturedAt: Date, ttyPath: String,
-                 bindingIsCurrent: @escaping @Sendable () -> Bool = { true }) throws -> RoomVerificationReceipt {
+                 bindingIsCurrent: @escaping @Sendable () -> Bool = { true },
+                 captureMetrics: RoomCaptureMetrics? = nil) throws -> RoomVerificationReceipt {
         guard bindingIsCurrent() else { throw RoomVerificationError.unavailable }
         let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
         guard comparison.schemaVersion == "dcx.room-comparison/v1",
@@ -79,7 +81,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
               !comparison.matches || (comparison.readable && comparison.snapshotDigest == comparison.expectedSnapshotDigest) else {
             throw RoomVerificationError.invalidComparison
         }
-        let value = RoomVerificationReceipt(
+        var value = RoomVerificationReceipt(
             schemaVersion: "dcx.room-verification/v1",
             status: comparison.matches ? "match" : "drift",
             helperInstanceID: instanceID,
@@ -98,7 +100,9 @@ final class RoomVerificationPublisher: @unchecked Sendable {
             comparedFields: comparison.comparedFields,
             invalidationReason: nil
         )
+        value.captureMetrics = captureMetrics
         lock.lock()
+        guard bindingIsCurrent() else { lock.unlock(); throw RoomVerificationError.unavailable }
         receipt = value
         self.bindingIsCurrent = bindingIsCurrent
         self.capturedAt = capturedAt

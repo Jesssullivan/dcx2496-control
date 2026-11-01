@@ -1,3 +1,4 @@
+import CryptoKit
 import DCXLogicBridge
 import Foundation
 
@@ -177,9 +178,11 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
 
     /// Periodic refresh bypasses completed-cache reuse, never an active flight.
     func verifyBoundRoom(expectation: Data, forceFresh: Bool,
-                         expectedConfiguration: HelperConfigurationV1? = nil,
+                         expectedConfiguration: HelperConfigurationV1? = nil, approvedTargetRefresh: Bool = false,
                          bindingIsCurrent: @escaping @Sendable () -> Bool) throws -> RoomVerificationReceipt {
-        guard bindingIsCurrent() else { throw RoomVerificationError.unavailable }
+        guard bindingIsCurrent(), !approvedTargetRefresh || expectedConfiguration != nil else {
+            throw RoomVerificationError.unavailable
+        }
         guard !expectation.isEmpty, expectation.count <= 256 * 1024,
               let configuration = currentConfiguration(), isForeground else {
             throw RoomVerificationError.unavailable
@@ -187,14 +190,19 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         guard expectedConfiguration == nil || configuration == expectedConfiguration else {
             throw RoomVerificationError.unavailable
         }
-        struct Binding: Encodable { let configuration: HelperConfigurationV1; let expectation: Data }
+        struct Binding: Encodable {
+            let configuration: HelperConfigurationV1
+            let expectation: Data
+            let approvedTargetRefresh: Bool
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let key = try encoder.encode(Binding(configuration: configuration, expectation: expectation))
+        let key = try encoder.encode(Binding(configuration: configuration, expectation: expectation, approvedTargetRefresh: approvedTargetRefresh))
         return try roomPreparation.run(key: key, reuse: {
             forceFresh ? nil : self.reusableRoom(expectation: expectation, expectedConfiguration: configuration)
         }, bindingIsCurrent: bindingIsCurrent) { attempt in
-            try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt)
+            try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt,
+                approvedTargetRefresh: approvedTargetRefresh)
         }
     }
 
@@ -216,7 +224,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     }
 
     private func captureRoom(expectation: Data, expectedConfiguration: HelperConfigurationV1,
-                             attempt: RoomVerificationPreparation.Attempt) throws -> RoomVerificationReceipt {
+                             attempt: RoomVerificationPreparation.Attempt, approvedTargetRefresh: Bool) throws -> RoomVerificationReceipt {
         guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
             throw RoomVerificationError.invalidExpectation
         }
@@ -261,34 +269,57 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         )
         guard validation.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
         guard attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
-        let read = try runner.run(
-            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
-                "control", "snapshot", "--tty", configuration.ttyPath,
-                "--expected-device", String(configuration.expectedDeviceAddress),
-            ]),
-            timeoutSeconds: configuration.childTimeoutSeconds,
-            mutationLock: processLock
-        )
-        guard read.terminationStatus == 0 else { throw RoomVerificationError.unavailable }
-        let capturedAt = Date()
-        let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: read.stdout)
-        try carrier.validate(expectedDevice: configuration.expectedDeviceAddress)
-        let snapshot = try workspace.writeData(read.stdout, named: "room-snapshot.json")
-        let compared = try runner.run(
-            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
-                "profile", "room-verify", "--expectation", expectationURL.path,
-                "--snapshot", snapshot.path,
-            ]),
-            timeoutSeconds: 45,
-            mutationLock: processLock
-        )
-        guard compared.terminationStatus == 0 || compared.terminationStatus == 1 else {
-            throw RoomVerificationError.invalidComparison
-        }
-        let comparison = try JSONDecoder().decode(RoomComparison.self, from: compared.stdout)
-        guard comparison.snapshotDigest == carrier.snapshotDigest,
-              comparison.matches == (compared.terminationStatus == 0) else {
-            throw RoomVerificationError.invalidComparison
+        let capturedAt: Date
+        let comparison: RoomComparison
+        let captureMetrics: RoomCaptureMetrics?
+        if approvedTargetRefresh {
+            let startedAt = Date()
+            let refresh = try runner.run(
+                .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                    "profile", "room-refresh", "--expectation", expectationURL.path,
+                    "--expectation-digest", "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined(),
+                    "--tty", configuration.ttyPath,
+                    "--expected-device", String(configuration.expectedDeviceAddress),
+                ]), timeoutSeconds: configuration.childTimeoutSeconds, mutationLock: processLock)
+            guard refresh.terminationStatus == 0 || refresh.terminationStatus == 1 else {
+                throw RoomVerificationError.unavailable
+            }
+            let envelope = try BridgeJSONCodec.decoder().decode(ApprovedRoomRefresh.self, from: refresh.stdout)
+            capturedAt = try envelope.validate(expectedDevice: configuration.expectedDeviceAddress,
+                terminationStatus: refresh.terminationStatus, startedAt: startedAt, now: Date())
+            comparison = envelope.comparison
+            captureMetrics = envelope.metrics
+        } else {
+            let read = try runner.run(
+                .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                    "control", "snapshot", "--tty", configuration.ttyPath,
+                    "--expected-device", String(configuration.expectedDeviceAddress),
+                ]),
+                timeoutSeconds: configuration.childTimeoutSeconds,
+                mutationLock: processLock
+            )
+            guard read.terminationStatus == 0 else { throw RoomVerificationError.unavailable }
+            capturedAt = Date()
+            let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: read.stdout)
+            try carrier.validate(expectedDevice: configuration.expectedDeviceAddress)
+            let snapshot = try workspace.writeData(read.stdout, named: "room-snapshot.json")
+            let compared = try runner.run(
+                .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                    "profile", "room-verify", "--expectation", expectationURL.path,
+                    "--snapshot", snapshot.path,
+                ]),
+                timeoutSeconds: 45,
+                mutationLock: processLock
+            )
+            guard compared.terminationStatus == 0 || compared.terminationStatus == 1 else {
+                throw RoomVerificationError.invalidComparison
+            }
+            comparison = try JSONDecoder().decode(RoomComparison.self, from: compared.stdout)
+            guard comparison.snapshotDigest == carrier.snapshotDigest,
+                  comparison.matches == (compared.terminationStatus == 0) else {
+                throw RoomVerificationError.invalidComparison
+            }
+            captureMetrics = nil
         }
         return try roomPreparation.publish(attempt) {
             stateLock.lock()
@@ -296,7 +327,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             guard foreground else { throw RoomVerificationError.unavailable }
             return try roomVerification.install(
                 comparison, expectation: expectation, capturedAt: capturedAt,
-                ttyPath: configuration.ttyPath, bindingIsCurrent: { attempt.bindingChecks.isValid() }
+                ttyPath: configuration.ttyPath, bindingIsCurrent: { attempt.bindingChecks.isValid() },
+                captureMetrics: captureMetrics
             )
         }
     }

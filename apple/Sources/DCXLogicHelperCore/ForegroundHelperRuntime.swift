@@ -127,7 +127,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         }
         let binding = try checkedSavedBinding()
         guard binding.approved == approved else { throw RoomVerificationError.unavailable }
-        return try coordinator.verifyBoundRoom(expectation: approved.expectation, forceFresh: false, expectedConfiguration: binding.configuration,
+        return try coordinator.verifyBoundRoom(expectation: approved.expectation, forceFresh: false, expectedConfiguration: binding.configuration, approvedTargetRefresh: true,
             bindingIsCurrent: { [weak self] in self?.savedBindingMatches(binding.key) == true })
     }
 
@@ -185,7 +185,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
                     throw RoomVerificationError.unavailable
                 }
                 let receipt = try self.coordinator.verifyBoundRoom(expectation: saved.approved.expectation,
-                    forceFresh: true, expectedConfiguration: saved.configuration, bindingIsCurrent: { [weak self] in
+                    forceFresh: true, expectedConfiguration: saved.configuration, approvedTargetRefresh: true, bindingIsCurrent: { [weak self] in
                         guard let self else { return false }
                         return self.periodic.isCurrent(attempt) && self.savedBindingMatches(attempt.binding)
                     })

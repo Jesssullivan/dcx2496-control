@@ -76,7 +76,7 @@ and the strict bundle signature before using foreground launch plus the fixed UR
 Older helpers lack this contract.
 
 Both triggers share one in-flight verification when their complete helper
-configuration and exact expectation bytes match. A different binding is refused
+configuration, exact expectation bytes and identity policy match. A different binding is refused
 while that capture runs. Matching callers receive the same result or failure.
 A successful completed comparison can reuse its original capture while the tty
 exists and capture age is less than sixty seconds. Reuse preserves `verifiedAt`.
@@ -126,3 +126,16 @@ roughly one-hundred-second generic read therefore leaves admission gaps. This
 scheduler preserves audio routes and obtains new evidence. It does not provide
 continuous whole-room readiness. A faster approved-target policy needs separate
 source review and named-device timing qualification.
+
+Saved-approved verification uses the protected `profile room-refresh` path
+specified in [Approved room refresh](approved-room-refresh.md). Arbitrary staged
+expectations keep the generic ten-identity snapshot policy. The saved target and
+configuration must equal the actual capture configuration before any child.
+The helper checks complete frames, comparison binding, verified close and actual
+Search counters. It retains the CLI capture-completion time. Future, stale or
+pre-invocation times are refused. Receipts include measured capture metadata.
+
+The faster path is source-qualified only until the Darwin binary and one bounded
+named-device timing/readback run pass. Periodic delivery must remain disabled
+until that qualification is recorded. The conservative five-minute delay remains
+unchanged. No faster cadence or continuous-readiness claim follows from mocks.
