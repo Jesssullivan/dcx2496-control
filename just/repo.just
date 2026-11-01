@@ -159,6 +159,9 @@ native-logic-recall:
 native-response-binding:
     bash scripts/run_bazelisk.sh test //apple:response_binding
 
+native-room-verification:
+    bash scripts/run_bazelisk.sh test //apple:room_verification
+
 # Bridge v2 notch surface: v2 bindings, helper planning, AU staging, real dcxctl.
 native-feedback-notch:
     bash scripts/run_bazelisk.sh test //apple:feedback_notch

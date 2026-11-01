@@ -12,6 +12,7 @@ pub mod peq_bank;
 pub mod profile;
 pub mod protocol;
 pub mod rew;
+pub mod room_verification;
 pub mod routing;
 pub mod snapshot;
 pub mod typed_write;

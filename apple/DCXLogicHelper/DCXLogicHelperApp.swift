@@ -40,6 +40,8 @@ final class HelperAppModel: ObservableObject {
     @Published var bindingID = ""
     @Published var ttyPath = "/dev/cu.usbserial-"
     @Published var expectedDeviceAddress = 0
+    @Published var approvedRoomExpectation = ""
+    @Published private(set) var verifyingRoom = false
     @Published var childTimeoutSeconds = Int(HelperConfigurationV1.defaultChildTimeoutSeconds)
     @Published private(set) var enabledFeatures: Set<HelperFeature> = [
         .identitySearch,
@@ -177,6 +179,30 @@ final class HelperAppModel: ObservableObject {
         }
     }
 
+    func verifyPracticeRoom() {
+        guard let runtime, !verifyingRoom else { return }
+        let expectation = Data(approvedRoomExpectation.utf8)
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
+            status = "Paste the approved bounded room expectation first"
+            return
+        }
+        verifyingRoom = true
+        status = "Capturing one read-only snapshot and checking the approved image"
+        Task {
+            do {
+                let receipt = try await Task.detached {
+                    try runtime.verifyRoom(expectation: expectation)
+                }.value
+                status = receipt.matches
+                    ? "Room matches. Attestation expires sixty seconds after capture."
+                    : "Room differs. Output enable remains unavailable."
+            } catch {
+                status = "Room verification unavailable. No readiness was published."
+            }
+            verifyingRoom = false
+        }
+    }
+
     private func populate(from configuration: HelperConfigurationV1) {
         bindingID = configuration.bindingID
         ttyPath = configuration.ttyPath
@@ -266,6 +292,18 @@ private struct HelperContentView: View {
                 Button("Reload Saved Configuration") { model.reloadConfiguration() }
                 Spacer()
                 Button("Refresh Local Status") { model.refresh() }
+            }
+            Divider()
+            DisclosureGroup("Approved room verification") {
+                Text("Paste the independently approved dcx.room-expectation/v1 document. Capture never approves an image. No device write occurs.")
+                    .font(.caption)
+                TextEditor(text: $model.approvedRoomExpectation)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(height: 90)
+                Button(model.verifyingRoom ? "Verifying room" : "Snapshot and Verify Room") {
+                    model.verifyPracticeRoom()
+                }
+                .disabled(model.verifyingRoom || !model.configured)
             }
             Divider()
             Text("This app owns one bounded dcxctl transaction at a time. It does not run as a daemon, and incoming MIDI Commands have no device mapping in bridge v1.")

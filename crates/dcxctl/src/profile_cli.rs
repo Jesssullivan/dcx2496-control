@@ -88,6 +88,42 @@ pub fn verify(profile: &Path, snapshot: &Path) -> Result<bool, Box<dyn Error>> {
     Ok(verification.matches())
 }
 
+/// Compare a complete approved image and its reviewed profiles. Opens no device.
+pub fn verify_room(expectation: &Path, snapshot: &Path) -> Result<bool, Box<dyn Error>> {
+    let bytes = read_bounded(
+        expectation,
+        dcx_core::room_verification::MAX_ROOM_EXPECTATION_BYTES,
+        "room expectation",
+    )?;
+    let snapshot = SnapshotV1::from_json(&read_bounded(
+        snapshot,
+        MAX_SNAPSHOT_BYTES,
+        "control snapshot",
+    )?)?;
+    let verification = dcx_core::room_verification::verify_room(&snapshot, &bytes)?;
+    println!("{}", serde_json::to_string_pretty(&verification)?);
+    Ok(verification.matches)
+}
+
+/// Strict offline preflight before a helper initiates its first device read.
+pub fn validate_room(expectation: &Path) -> Result<(), Box<dyn Error>> {
+    let bytes = read_bounded(
+        expectation,
+        dcx_core::room_verification::MAX_ROOM_EXPECTATION_BYTES,
+        "room expectation",
+    )?;
+    dcx_core::room_verification::RoomExpectationV1::from_json(&bytes)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schemaVersion": "dcx.room-expectation-validation/v1",
+            "expectationDigest": profile_digest(&bytes),
+            "valid": true,
+        })
+    );
+    Ok(())
+}
+
 /// Steps `from` through `to` (1-based, inclusive) of a chain re-planned from
 /// the same profile, snapshot and policy, after an exact chain-id match.
 #[cfg(all(feature = "typed-write-live", target_os = "macos"))]

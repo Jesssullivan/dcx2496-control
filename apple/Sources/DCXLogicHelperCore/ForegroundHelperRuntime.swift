@@ -75,6 +75,11 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         return status
     }
 
+    /// Called only by the explicit foreground verification button, never MIDI.
+    public func verifyRoom(expectation: Data) throws -> RoomVerificationReceipt {
+        try coordinator.verifyRoom(expectation: expectation)
+    }
+
     /// Currently loaded checked configuration, if any.
     public func currentConfiguration() -> HelperConfigurationV1? {
         coordinator.currentConfiguration()
