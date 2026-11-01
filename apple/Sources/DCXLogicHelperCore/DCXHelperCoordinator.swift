@@ -280,7 +280,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                     "--expectation-digest", "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined(),
                     "--tty", configuration.ttyPath,
                     "--expected-device", String(configuration.expectedDeviceAddress),
-                ]), timeoutSeconds: configuration.childTimeoutSeconds, mutationLock: processLock)
+                ]), timeoutSeconds: min(configuration.childTimeoutSeconds, 30), mutationLock: processLock)
             guard refresh.terminationStatus == 0 || refresh.terminationStatus == 1 else {
                 throw RoomVerificationError.unavailable
             }
