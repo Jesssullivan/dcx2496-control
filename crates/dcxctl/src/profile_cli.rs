@@ -105,6 +105,57 @@ pub fn verify_room(expectation: &Path, snapshot: &Path) -> Result<bool, Box<dyn 
     Ok(verification.matches)
 }
 
+/// Read a complete approved-target image using the existing typed bulk frames.
+/// The exact document digest is checked before the live session is opened.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn refresh_room(
+    expectation: &Path,
+    expectation_digest: &str,
+    tty: std::path::PathBuf,
+    expected_device: u8,
+) -> Result<bool, Box<dyn Error>> {
+    use dcx_core::{
+        protocol::DeviceId,
+        room_verification::{ApprovedRoomRefreshAdmission, verify_room},
+    };
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    let bytes = read_bounded(
+        expectation,
+        dcx_core::room_verification::MAX_ROOM_EXPECTATION_BYTES,
+        "room expectation",
+    )?;
+    let admission = ApprovedRoomRefreshAdmission::from_json(
+        &bytes,
+        expectation_digest,
+        DeviceId::new(expected_device)?,
+    )?;
+    let captured = crate::live_control::capture_approved(tty, &admission)?;
+    // Timestamp the fresh complete capture before offline profile comparison.
+    let captured_at = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let comparison_started = Instant::now();
+    let comparison = verify_room(captured.capture().snapshot(), admission.expectation())?;
+    let comparison_elapsed = u64::try_from(comparison_started.elapsed().as_millis())?;
+    let matches = comparison.matches;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schemaVersion": "dcx.approved-room-refresh/v1",
+            "status": if matches { "match" } else { "drift" },
+            "snapshot": captured.capture().snapshot(),
+            "comparison": comparison,
+            "captureCompletedAtUnixMilliseconds": captured_at,
+            "comparisonElapsedMilliseconds": comparison_elapsed,
+            "captureElapsedMilliseconds": u64::try_from(captured.elapsed().as_millis())?,
+            "searchAttempts": captured.search_attempts(),
+            "searchEmptyTimeouts": captured.empty_search_timeouts(),
+            "validSearchCount": captured.capture().valid_search_count(),
+            "closeVerified": captured.capture().close_verified(),
+            "identityPolicy": "approved-exact-target-one-identity-three-attempts",
+        }))?
+    );
+    Ok(matches)
+}
+
 /// Strict offline preflight before a helper initiates its first device read.
 pub fn validate_room(expectation: &Path) -> Result<(), Box<dyn Error>> {
     let bytes = read_bounded(

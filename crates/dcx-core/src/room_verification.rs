@@ -13,6 +13,7 @@ use crate::{
     SnapshotV1,
     layout::{MUTE_PARAMETER, output_channel, reviewed_address},
     output_profile::{DcxOutputProfileV1, ProfileVerificationV1, profile_digest, verify_profile},
+    protocol::DeviceId,
 };
 
 /// Maximum expectation size, including embedded typed profiles.
@@ -99,6 +100,48 @@ fn valid_digest(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+/// Admission for the explicit approved-target bulk refresh. The caller owns
+/// the independent approval and exact tty binding. This type validates the
+/// pinned raw document before a transport session may be opened.
+#[derive(Debug)]
+pub struct ApprovedRoomRefreshAdmission {
+    expectation: Vec<u8>,
+    expected_device: DeviceId,
+}
+
+impl ApprovedRoomRefreshAdmission {
+    /// Validate the strict approval and its exact reviewed byte digest.
+    ///
+    /// # Errors
+    /// Rejects malformed or unapproved documents and any digest mismatch.
+    pub fn from_json(
+        bytes: &[u8],
+        expected_digest: &str,
+        expected_device: DeviceId,
+    ) -> Result<Self, RoomVerificationError> {
+        RoomExpectationV1::from_json(bytes)?;
+        if !valid_digest(expected_digest) || profile_digest(bytes) != expected_digest {
+            return Err(RoomVerificationError::Invalid(
+                "approved expectation digest differs",
+            ));
+        }
+        Ok(Self {
+            expectation: bytes.to_vec(),
+            expected_device,
+        })
+    }
+
+    /// Exact address supplied by the helper's separately checked target binding.
+    pub const fn expected_device(&self) -> DeviceId {
+        self.expected_device
+    }
+
+    /// The exact approved bytes. Capture never replaces or edits these bytes.
+    pub fn expectation(&self) -> &[u8] {
+        &self.expectation
+    }
 }
 
 /// Pure verification result. It has no timestamp or live-device claim.

@@ -84,6 +84,38 @@ pub fn capture(tty: PathBuf, expected_device: u8) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+/// Approved-target bulk refresh; the caller validates the saved approval first.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+pub fn capture_approved(
+    tty: PathBuf,
+    admission: &dcx_core::room_verification::ApprovedRoomRefreshAdmission,
+) -> Result<dcx_transport::snapshot::ApprovedTargetCapture, Box<dyn Error>> {
+    let binding = PrivateTtyBinding::new(tty)?;
+    let session = DarwinSearchSession::open_known_38400(binding)?;
+    let mut pacer = SystemPacer::new();
+    match dcx_transport::snapshot::execute_approved_target_snapshot(session, &mut pacer, admission)
+    {
+        Ok(captured) => Ok(captured),
+        Err(error) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schemaVersion": "dcx.approved-room-refresh/v1",
+                    "status": "failed",
+                    "snapshot": null,
+                    "comparison": null,
+                    "searchAttempts": error.search_attempts(),
+                    "searchEmptyTimeouts": error.empty_search_timeouts(),
+                    "captureElapsedMilliseconds": u64::try_from(error.elapsed().as_millis())?,
+                    "closeVerified": null,
+                    "error": error.to_string(),
+                })
+            );
+            Err(error.into())
+        }
+    }
+}
+
 pub fn diff(snapshot: &Path, profile: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = SnapshotV1::from_json(&read_bounded(
         snapshot,

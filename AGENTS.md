@@ -26,6 +26,13 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   each reply an exact 25-byte function-`0x04` frame, inside a 30 s budget,
   with no remote-mode or parameter write; its meter-byte layout is a lane
   hypothesis unverified on the named device.
+  The explicit `profile room-refresh` read path requires a strict independently
+  approved expectation and its exact byte digest before opening the helper-bound
+  tty/address. It accepts one valid Search identity in at most three attempts,
+  replaying only empty timeouts at the unchanged five-second cadence, then the
+  same complete Dump0/Dump1, remote-mode and verified-close checks. Generic
+  snapshot and mutation qualification remain ten identities. Named-device timing
+  and runtime qualification of this new path remain separate from source tests.
   It never enumerates ports or accepts caller-supplied frames, baud, retry,
   timeout, remote-mode bytes, or generic writes.
 - Mutation is snapshot -> strict reviewed-address semantic diff -> immutable
