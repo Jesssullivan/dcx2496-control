@@ -145,3 +145,39 @@ was performed.
 
 A retained archive is not a verified signed helper. Installation, launch,
 serial access, room approval and startup enablement remain outside this receipt.
+
+## Sign an existing archive
+
+`just apple-team-sign-existing-bundle INPUT.bundle OUTPUT.bundle INPUT_SHA256`
+signs a retained carrier without a build or archive dependency. Lab owns the
+frozen source, approved preimage, Aqua transport, watchdog, installed rollback
+and registration checks. The device frontdoor never enters Aqua automatically.
+
+| Boundary | Requirement |
+|---|---|
+| Caller | Ordinary Darwin user in actual Aqua |
+| Paths | Canonical caller-owned private parent, sibling `.bundle` paths and absent output |
+| Input | Exact byte/link manifest and helper/AU version 0.1.3, build 4 |
+| Product | Preparation capability v1, declared AU codes and arm64 executables |
+| Identity | Exact existing Developer ID identity and caller's login keychain |
+| Signing | CLI first, AU next and helper last |
+| Entitlements | Exact product dictionaries, without additional privileges |
+| Readback | Strict CMS leaf, team, identifier, architecture and complete manifest |
+
+The manifest matches Lab's existing algorithm. Sort entries by relative path.
+Each regular file contributes `path` and `sha256`. Each internal symlink
+contributes `path` and `link`. Omit directories, encode JSON with sorted keys and
+compact comma/colon separators, then hash its UTF-8 bytes with SHA256. Modes and
+ownership are separate custody checks, outside this digest.
+
+The CLI keeps the signing identifier read from the exact pinned input. Helper
+and AU signatures use their declared bundle identifiers. Signing occurs on a
+new copy. The output directory is reserved atomically, and its inode is checked
+before signing. Shared input/output file inodes are refused. The input manifest
+must remain unchanged. Failure retains the partial output for Lab's receipt.
+No automatic retry, keychain unlock/import, registration, application launch or
+device operation belongs to this frontdoor.
+
+`just apple-sign-existing-contract` runs injected filesystem and command fixtures.
+Its Bazel label is `//apple:sign_existing_bundle_contract`. These tests provide
+no native signing or installed-helper proof.
