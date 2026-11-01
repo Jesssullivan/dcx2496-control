@@ -43,6 +43,20 @@ operations, configuration changes, helper foreground exit and disappearance of
 the configured callout invalidate the attestation. A crashed helper cannot
 renew it. Expiry requires another explicit verification.
 
+The optional `approved-room-configuration.json` is owner-private inside the
+helper App Group. Saving it validates the manifest offline and binds the exact
+helper target, callout and expectation digest. Both switches default off.
+`verifyOnForegroundLaunch` captures once when the helper opens before Logic.
+An existing Logic process suppresses that automatic read. Launch the ASFW menu
+receiver before the helper, then wait for admission before opening Logic.
+
+`allowExplicitRefreshRequests` permits only the fixed
+`tinyland-dcx://verify-approved-room` URL. It reads the saved manifest and target.
+The URL accepts no path, query, port, profile or write parameter. Native controls
+can request this foreground refresh before acquiring an LS56 transaction.
+Receipt arrival itself never applies a scene. No startup configuration or
+approved device image ships by default.
+
 `just native-room-verification` runs the Darwin fixture suite. It exercises
 injected child processes and receipt lifetimes, without serial or audio. Rust
 room-admission tests run in the existing `profile_chain` family. Source checks

@@ -235,6 +235,25 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         )
     }
 
+    /// Offline preflight for persisting an independently approved expectation.
+    public func validateApprovedRoomExpectation(_ expectation: Data) throws {
+        roomVerification.invalidate("approved-expectation-replaced")
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024 else { throw RoomVerificationError.invalidExpectation }
+        let processLock = try recoveryLeaseStore.acquireExclusiveLock()
+        defer { processLock.release() }
+        guard let configuration = currentConfiguration() else { throw RoomVerificationError.unavailable }
+        let workspace = try TransactionWorkspace(root: locations.transactionRootURL)
+        defer { workspace.remove() }
+        let input = try workspace.writeData(expectation, named: "room-expectation.json")
+        let executable = try runner.resolveExecutable(for: configuration)
+        let result = try runner.run(
+            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                "profile", "room-validate", "--expectation", input.path,
+            ]), timeoutSeconds: 45, mutationLock: processLock
+        )
+        guard result.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
+    }
+
     public func handle(_ request: BridgeRequest) -> BridgeResponse {
         do {
             try request.body.validate()

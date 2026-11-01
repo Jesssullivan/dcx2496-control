@@ -5,6 +5,37 @@ import Foundation
 import XCTest
 
 final class RoomVerificationTests: XCTestCase {
+    func testSavedApprovalIsOptInAndPinsTargetCalloutAndExactBytes() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
+        let approved = try ApprovedRoomConfiguration(configuration: first, expectation: Data("SYNTHETIC approved manifest".utf8))
+        XCTAssertFalse(approved.verifyOnForegroundLaunch)
+        XCTAssertFalse(approved.allowExplicitRefreshRequests)
+        let file = root.appendingPathComponent("approved-room-configuration.json")
+        try approved.save(to: file)
+        let restored = try ApprovedRoomConfiguration.load(from: file)
+        XCTAssertEqual(restored, approved)
+        XCTAssertNoThrow(try restored.requireBinding(to: first))
+        let other = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-OTHER", enabledFeatures: [.snapshotCapture])
+        XCTAssertThrowsError(try restored.requireBinding(to: other))
+        var tampered = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        tampered["expectation"] = Data("different".utf8).base64EncodedString()
+        try JSONSerialization.data(withJSONObject: tampered).write(to: file)
+        XCTAssertThrowsError(try ApprovedRoomConfiguration.load(from: file))
+    }
+
+    func testRefreshURLAcceptsNoCallerSuppliedDeviceOrOperation() {
+        XCTAssertTrue(ApprovedRoomConfiguration.acceptsRefreshURL(URL(string: "tinyland-dcx://verify-approved-room")!))
+        for value in ["tinyland-dcx://verify-approved-room/", "tinyland-dcx://verify-approved-room?tty=other",
+                      "tinyland-dcx://verify-approved-room#apply", "tinyland-dcx://verify-approved-room:1",
+                      "tinyland-dcx://apply", "https://verify-approved-room"] {
+            XCTAssertFalse(ApprovedRoomConfiguration.acceptsRefreshURL(URL(string: value)!))
+        }
+    }
+
     func testHeartbeatNeverExtendsActualCaptureLifetime() throws {
         let capture = ReceiptCapture()
         let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: capture.append)

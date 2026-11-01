@@ -11,6 +11,7 @@ struct DCXLogicHelperApp: App {
             HelperContentView(model: model)
                 .frame(minWidth: 640, minHeight: 650)
                 .onAppear { model.enterForeground() }
+                .onOpenURL { model.handleRoomRefreshURL($0) }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -41,6 +42,8 @@ final class HelperAppModel: ObservableObject {
     @Published var ttyPath = "/dev/cu.usbserial-"
     @Published var expectedDeviceAddress = 0
     @Published var approvedRoomExpectation = ""
+    @Published var verifyRoomOnLaunch = false
+    @Published var allowRoomRefreshRequests = false
     @Published private(set) var verifyingRoom = false
     @Published var childTimeoutSeconds = Int(HelperConfigurationV1.defaultChildTimeoutSeconds)
     @Published private(set) var enabledFeatures: Set<HelperFeature> = [
@@ -56,6 +59,11 @@ final class HelperAppModel: ObservableObject {
             self.runtime = runtime
             if let configuration = runtime.currentConfiguration() {
                 populate(from: configuration)
+            }
+            if let approved = runtime.currentApprovedRoomConfiguration() {
+                approvedRoomExpectation = String(decoding: approved.expectation, as: UTF8.self)
+                verifyRoomOnLaunch = approved.verifyOnForegroundLaunch
+                allowRoomRefreshRequests = approved.allowExplicitRefreshRequests
             }
             status = "Ready to enter foreground"
         } catch {
@@ -203,6 +211,40 @@ final class HelperAppModel: ObservableObject {
         }
     }
 
+    func saveApprovedRoom() {
+        guard let runtime, !verifyingRoom else { return }
+        let expectation = Data(approvedRoomExpectation.utf8)
+        let startup = verifyRoomOnLaunch
+        let requests = allowRoomRefreshRequests
+        verifyingRoom = true
+        Task {
+            do {
+                try await Task.detached {
+                    try runtime.saveApprovedRoomExpectation(expectation, verifyOnForegroundLaunch: startup,
+                        allowExplicitRefreshRequests: requests)
+                }.value
+                status = "Approved expectation saved. No device read or write occurred."
+            } catch {
+                status = "Approved expectation was not saved. Verify the manifest and configured target."
+            }
+            verifyingRoom = false
+        }
+    }
+
+    func handleRoomRefreshURL(_ url: URL) {
+        guard let runtime, !verifyingRoom, ApprovedRoomConfiguration.acceptsRefreshURL(url) else { return }
+        verifyingRoom = true
+        Task {
+            do {
+                let receipt = try await Task.detached { try runtime.verifySavedApprovedRoom(requestURL: url) }.value
+                status = receipt.matches ? "Requested room snapshot matched the approved image." : "Requested room snapshot differs."
+            } catch {
+                status = "Saved room refresh is disabled, unavailable or did not verify."
+            }
+            verifyingRoom = false
+        }
+    }
+
     private func populate(from configuration: HelperConfigurationV1) {
         bindingID = configuration.bindingID
         ttyPath = configuration.ttyPath
@@ -300,6 +342,10 @@ private struct HelperContentView: View {
                 TextEditor(text: $model.approvedRoomExpectation)
                     .font(.system(.caption, design: .monospaced))
                     .frame(height: 90)
+                Toggle("Verify approved room when this helper opens before Logic", isOn: $model.verifyRoomOnLaunch)
+                Toggle("Allow explicit saved-room refresh from native controls", isOn: $model.allowRoomRefreshRequests)
+                Button("Save Approved Room Configuration") { model.saveApprovedRoom() }
+                    .disabled(model.verifyingRoom || !model.configured)
                 Button(model.verifyingRoom ? "Verifying room" : "Snapshot and Verify Room") {
                     model.verifyPracticeRoom()
                 }
