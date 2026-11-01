@@ -65,6 +65,13 @@ apple-adhoc-bundle: repo::apple-adhoc-bundle
 
 apple-team-signed-bundle: repo::apple-team-signed-bundle
 
+[positional-arguments]
+[script]
+apple-team-sign-existing-bundle input output manifest_sha256:
+    exec just --justfile just/repo.just apple-team-sign-existing-bundle "$1" "$2" "$3"
+
+apple-sign-existing-contract: repo::apple-sign-existing-contract
+
 product-check: repo::product-check
 
 [script]

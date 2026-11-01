@@ -494,6 +494,15 @@ apple-team-signed-bundle: apple-project-generate
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:manufacturer' "$info")" = TnLd
     printf 'team_signed_bundle=ready\n'
 
+# TIN-6964: Lab owns Aqua/staging/rollback. This signs a pinned copy only.
+[positional-arguments]
+[script]
+apple-team-sign-existing-bundle input output manifest_sha256:
+    exec python3 apple/Tools/sign_existing_bundle.py "$1" "$2" "$3"
+
+apple-sign-existing-contract:
+    bash apple/Tests/run_sign_existing_bundle_contract.sh apple/Tools/sign_existing_bundle.py apple/Tests/test_sign_existing_bundle.py
+
 # Full product-source compile without signing, install, GUI launch, or hardware I/O.
 product-check: schema-check apple-bundle-check
 

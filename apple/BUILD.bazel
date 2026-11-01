@@ -219,5 +219,29 @@ filegroup(
         "DCXLogicHelper/*.entitlements",
         "DCXLogicHelper/*.plist",
         "DCXLogicHelper/*.swift",
+        "Tools/*.py",
     ]),
+)
+
+# TIN-6964: pure filesystem and injected-command fixtures, no signing authority.
+sh_test(
+    name = "sign_existing_bundle_contract",
+    size = "small",
+    srcs = ["Tests/run_sign_existing_bundle_contract.sh"],
+    args = [
+        "$(location Tools/sign_existing_bundle.py)",
+        "$(location Tests/test_sign_existing_bundle.py)",
+    ],
+    data = [
+        "Tools/sign_existing_bundle.py",
+        "Tests/test_sign_existing_bundle.py",
+        "DCXLogicHelper/dcxctl.entitlements",
+        "DCXLogicHelper/DCXLogicHelper.entitlements",
+        "DCXControlAU/DCXControlAU.entitlements",
+    ],
+    tags = [
+        "no-remote",
+        "no-remote-cache",
+        "no-remote-exec",
+    ],
 )
