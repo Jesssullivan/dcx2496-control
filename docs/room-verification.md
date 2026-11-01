@@ -122,3 +122,26 @@ installation or foreign-process action occurred.
 Independent source review found and resolved cache admission and scope errors.
 The final source and native packet reviews found no remaining concrete blocker.
 This documentation follows the tested source without changing product code.
+
+## Artifact signing hold
+
+The subsequent artifact-only build of source `bbaf5f64` completed its Release
+archive. Its first signing command failed on the embedded `dcxctl` with
+`errSecInternalComponent`. Helper and AU signing were not reached. The caller's
+bootstrap manager was Background. The underlying key-use failure remains
+unverified. No signed candidate was exported and no retry or keychain workaround
+was performed.
+
+| Readback | Observed result |
+|---|---|
+| Recipe | Exit 1 after 132.404 seconds |
+| Owned process group | Quiescent |
+| Canonical build 3 | Manifest unchanged |
+| Configuration | Exact prior bytes preserved |
+| Scoped app and AU registrations | Unchanged |
+| Rollback | Build-3 bytes and configuration preserved |
+| Receipt SHA256 | `7147660a4fd75a13c98b71f21c58fd2df69dec8ce6896cfd9552634b103af0d5` |
+| Log SHA256 | `20ff213974bac8cd31b450cb30d700e5189d27ccdb4e6a93e154121ab04dd402` |
+
+A retained archive is not a verified signed helper. Installation, launch,
+serial access, room approval and startup enablement remain outside this receipt.
