@@ -59,6 +59,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     private var capturedAt: Date?
     private var ttyPath: String?
     private var timer: DispatchSourceTimer?
+    private var bindingIsCurrent: @Sendable () -> Bool = { true }
 
     init(startHeartbeats: Bool = true, submit: (@Sendable (RoomVerificationReceipt) -> Void)? = nil,
          ttyPresent: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) {
@@ -68,7 +69,9 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         self.ttyPresent = ttyPresent
     }
 
-    func install(_ comparison: RoomComparison, expectation: Data, capturedAt: Date, ttyPath: String) throws -> RoomVerificationReceipt {
+    func install(_ comparison: RoomComparison, expectation: Data, capturedAt: Date, ttyPath: String,
+                 bindingIsCurrent: @escaping @Sendable () -> Bool = { true }) throws -> RoomVerificationReceipt {
+        guard bindingIsCurrent() else { throw RoomVerificationError.unavailable }
         let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
         guard comparison.schemaVersion == "dcx.room-comparison/v1",
               comparison.expectationDigest == digest,
@@ -97,6 +100,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         )
         lock.lock()
         receipt = value
+        self.bindingIsCurrent = bindingIsCurrent
         self.capturedAt = capturedAt
         self.ttyPath = ttyPath
         timer?.cancel()
@@ -117,9 +121,16 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
         lock.lock()
         defer { lock.unlock() }
-        guard let receipt, receipt.expectationDigest == digest, let capturedAt, let ttyPath else { return nil }
+        guard bindingIsCurrent(), let receipt, receipt.expectationDigest == digest, let capturedAt, let ttyPath else { return nil }
         return receipt.renewed(at: now, capturedAt: capturedAt,
                                ttyPresent: ttyPresent(ttyPath))
+    }
+
+    func captureDate(expectation: Data) -> Date? {
+        let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
+        lock.lock(); defer { lock.unlock() }
+        guard bindingIsCurrent(), receipt?.matches == true, receipt?.expectationDigest == digest else { return nil }
+        return capturedAt
     }
 
     func invalidate(_ reason: String) {
@@ -130,6 +141,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         receipt = nil
         capturedAt = nil
         ttyPath = nil
+        bindingIsCurrent = { true }
         lock.unlock()
         guard var value = invalidated else { return }
         value.status = "invalidated"
@@ -143,7 +155,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         lock.lock()
         guard var value = receipt, let capturedAt, let ttyPath else { lock.unlock(); return }
         let now = Date()
-        guard let renewed = value.renewed(at: now, capturedAt: capturedAt,
+        guard bindingIsCurrent(), let renewed = value.renewed(at: now, capturedAt: capturedAt,
                                         ttyPresent: ttyPresent(ttyPath)) else {
             lock.unlock()
             invalidate("expired-or-disconnected")
@@ -167,7 +179,19 @@ final class RoomVerificationPublisher: @unchecked Sendable {
 /// TIN-6964: foreground startup and the fixed URL share one approved read.
 /// The lock protects admission and publication, never the serial capture itself.
 final class RoomVerificationPreparation: @unchecked Sendable {
-    final class Attempt {
+    final class BindingChecks: @unchecked Sendable {
+        private let lock = NSLock()
+        private var checks: [@Sendable () -> Bool] = []
+        func append(_ check: @escaping @Sendable () -> Bool) {
+            lock.lock(); checks.append(check); lock.unlock()
+        }
+        func isValid() -> Bool {
+            lock.lock(); let snapshot = checks; lock.unlock()
+            return snapshot.allSatisfy { $0() }
+        }
+    }
+    final class Attempt: @unchecked Sendable {
+        let bindingChecks = BindingChecks()
         let key: Data
         var invalidated = false
         var result: Result<RoomVerificationReceipt, Error>?
@@ -192,10 +216,12 @@ final class RoomVerificationPreparation: @unchecked Sendable {
     }
 
     func run(key: Data, reuse: () -> RoomVerificationReceipt?,
+             bindingIsCurrent: @escaping @Sendable () -> Bool = { true },
              capture: (Attempt) throws -> RoomVerificationReceipt) throws -> RoomVerificationReceipt {
         condition.lock()
         if let active {
             guard active.key == key else { condition.unlock(); throw RoomVerificationError.unavailable }
+            active.bindingChecks.append(bindingIsCurrent)
             waiters += 1
             while active.result == nil && !active.invalidated { condition.wait() }
             waiters -= 1
@@ -209,6 +235,7 @@ final class RoomVerificationPreparation: @unchecked Sendable {
             return receipt
         }
         let attempt = Attempt(key: key)
+        attempt.bindingChecks.append(bindingIsCurrent)
         active = attempt
         completedKey = nil
         condition.unlock()
@@ -237,7 +264,7 @@ final class RoomVerificationPreparation: @unchecked Sendable {
     func publish(_ attempt: Attempt, _ body: () throws -> RoomVerificationReceipt) throws -> RoomVerificationReceipt {
         condition.lock()
         defer { condition.unlock() }
-        guard active === attempt, !attempt.invalidated else { throw RoomVerificationError.unavailable }
+        guard active === attempt, !attempt.invalidated, attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
         return try body()
     }
 }
@@ -246,6 +273,7 @@ public enum RoomVerificationError: Error, Equatable {
     case invalidExpectation
     case invalidComparison
     case unavailable
+    case busy
 }
 
 /// Output-only IPC. Incoming MIDI never invokes a device command.

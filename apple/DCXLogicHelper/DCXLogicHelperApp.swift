@@ -44,6 +44,7 @@ final class HelperAppModel: ObservableObject {
     @Published var approvedRoomExpectation = ""
     @Published var verifyRoomOnLaunch = false
     @Published var allowRoomRefreshRequests = false
+    @Published var periodicRoomVerificationEnabled = false
     @Published private(set) var verifyingRoom = false
     @Published var childTimeoutSeconds = Int(HelperConfigurationV1.defaultChildTimeoutSeconds)
     @Published private(set) var enabledFeatures: Set<HelperFeature> = [
@@ -64,6 +65,7 @@ final class HelperAppModel: ObservableObject {
                 approvedRoomExpectation = String(decoding: approved.expectation, as: UTF8.self)
                 verifyRoomOnLaunch = approved.verifyOnForegroundLaunch
                 allowRoomRefreshRequests = approved.allowExplicitRefreshRequests
+                periodicRoomVerificationEnabled = approved.periodicVerificationEnabled
             }
             status = "Ready to enter foreground"
         } catch {
@@ -216,14 +218,16 @@ final class HelperAppModel: ObservableObject {
         let expectation = Data(approvedRoomExpectation.utf8)
         let startup = verifyRoomOnLaunch
         let requests = allowRoomRefreshRequests
+        let periodic = periodicRoomVerificationEnabled
         verifyingRoom = true
         Task {
             do {
                 try await Task.detached {
                     try runtime.saveApprovedRoomExpectation(expectation, verifyOnForegroundLaunch: startup,
-                        allowExplicitRefreshRequests: requests)
+                        allowExplicitRefreshRequests: requests, periodicVerificationEnabled: periodic)
                 }.value
-                status = "Approved expectation saved. No device read or write occurred."
+                status = periodic ? "Approved expectation saved. Periodic room reads are enabled."
+                    : "Approved expectation saved. Periodic room reads are disabled."
             } catch {
                 status = "Approved expectation was not saved. Verify the manifest and configured target."
             }
@@ -350,6 +354,9 @@ private struct HelperContentView: View {
                     .frame(height: 90)
                 Toggle("Verify approved room when this helper opens before Logic", isOn: $model.verifyRoomOnLaunch)
                 Toggle("Allow explicit saved-room refresh from native controls", isOn: $model.allowRoomRefreshRequests)
+                Toggle("Periodically read the approved room while this helper runs", isOn: $model.periodicRoomVerificationEnabled)
+                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. Failed reads stop periodic attempts until an explicit successful verification or configuration change.")
+                    .font(.caption)
                 Button("Save Approved Room Configuration") { model.saveApprovedRoom() }
                     .disabled(model.verifyingRoom || !model.configured)
                 Button(model.verifyingRoom ? "Verifying room" : "Snapshot and Verify Room") {

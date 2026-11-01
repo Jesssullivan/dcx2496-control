@@ -13,9 +13,11 @@ public struct ApprovedRoomConfiguration: Codable, Equatable, Sendable {
     public let expectationDigest: String
     public let verifyOnForegroundLaunch: Bool
     public let allowExplicitRefreshRequests: Bool
+    public let periodicVerificationEnabled: Bool
 
     public init(configuration: HelperConfigurationV1, expectation: Data,
-                verifyOnForegroundLaunch: Bool = false, allowExplicitRefreshRequests: Bool = false) throws {
+                verifyOnForegroundLaunch: Bool = false, allowExplicitRefreshRequests: Bool = false,
+                periodicVerificationEnabled: Bool = false) throws {
         guard !expectation.isEmpty, expectation.count <= 256 * 1024 else { throw RoomVerificationError.invalidExpectation }
         schemaVersion = "dcx.approved-room-configuration/v1"
         target = configuration.target
@@ -24,6 +26,25 @@ public struct ApprovedRoomConfiguration: Codable, Equatable, Sendable {
         expectationDigest = Self.digest(expectation)
         self.verifyOnForegroundLaunch = verifyOnForegroundLaunch
         self.allowExplicitRefreshRequests = allowExplicitRefreshRequests
+        self.periodicVerificationEnabled = periodicVerificationEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, target, ttyPath, expectation, expectationDigest
+        case verifyOnForegroundLaunch, allowExplicitRefreshRequests, periodicVerificationEnabled
+    }
+
+    /// Existing v1 documents keep periodic device access disabled.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(String.self, forKey: .schemaVersion)
+        target = try values.decode(DCXTargetReference.self, forKey: .target)
+        ttyPath = try values.decode(String.self, forKey: .ttyPath)
+        expectation = try values.decode(Data.self, forKey: .expectation)
+        expectationDigest = try values.decode(String.self, forKey: .expectationDigest)
+        verifyOnForegroundLaunch = try values.decode(Bool.self, forKey: .verifyOnForegroundLaunch)
+        allowExplicitRefreshRequests = try values.decode(Bool.self, forKey: .allowExplicitRefreshRequests)
+        periodicVerificationEnabled = try values.decodeIfPresent(Bool.self, forKey: .periodicVerificationEnabled) ?? false
     }
 
     public func requireBinding(to configuration: HelperConfigurationV1) throws {

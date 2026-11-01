@@ -164,15 +164,36 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     /// Matching foreground triggers share one read or a still-fresh capture.
     /// The independently approved expectation is never created from that read.
     public func verifyRoom(expectation: Data) throws -> RoomVerificationReceipt {
+        try verifyBoundRoom(expectation: expectation, forceFresh: false, bindingIsCurrent: { true })
+    }
+
+    func roomCaptureDate(expectation: Data) -> Date? {
+        roomVerification.captureDate(expectation: expectation)
+    }
+
+    func invalidateApprovedRoomBinding() {
+        invalidateRoomVerification("saved-approved-room-binding-changed")
+    }
+
+    /// Periodic refresh bypasses completed-cache reuse, never an active flight.
+    func verifyBoundRoom(expectation: Data, forceFresh: Bool,
+                         expectedConfiguration: HelperConfigurationV1? = nil,
+                         bindingIsCurrent: @escaping @Sendable () -> Bool) throws -> RoomVerificationReceipt {
+        guard bindingIsCurrent() else { throw RoomVerificationError.unavailable }
         guard !expectation.isEmpty, expectation.count <= 256 * 1024,
               let configuration = currentConfiguration(), isForeground else {
+            throw RoomVerificationError.unavailable
+        }
+        guard expectedConfiguration == nil || configuration == expectedConfiguration else {
             throw RoomVerificationError.unavailable
         }
         struct Binding: Encodable { let configuration: HelperConfigurationV1; let expectation: Data }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let key = try encoder.encode(Binding(configuration: configuration, expectation: expectation))
-        return try roomPreparation.run(key: key, reuse: { self.reusableRoom(expectation: expectation, expectedConfiguration: configuration) }) { attempt in
+        return try roomPreparation.run(key: key, reuse: {
+            forceFresh ? nil : self.reusableRoom(expectation: expectation, expectedConfiguration: configuration)
+        }, bindingIsCurrent: bindingIsCurrent) { attempt in
             try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt)
         }
     }
@@ -199,8 +220,11 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
             throw RoomVerificationError.invalidExpectation
         }
+        guard attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
         roomVerification.invalidate("room-verification-started")
-        let processLock = try recoveryLeaseStore.acquireExclusiveLock()
+        let processLock: MutationRecoveryProcessLock
+        do { processLock = try recoveryLeaseStore.acquireExclusiveLock() }
+        catch MutationRecoveryLeaseError.lockBusy { throw RoomVerificationError.busy }
         defer { processLock.release() }
         let configuration: HelperConfigurationV1
         stateLock.lock()
@@ -236,6 +260,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             mutationLock: processLock
         )
         guard validation.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
+        guard attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
         let read = try runner.run(
             .init(operation: .snapshotCapture, executableURL: executable, arguments: [
                 "control", "snapshot", "--tty", configuration.ttyPath,
@@ -271,7 +296,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             guard foreground else { throw RoomVerificationError.unavailable }
             return try roomVerification.install(
                 comparison, expectation: expectation, capturedAt: capturedAt,
-                ttyPath: configuration.ttyPath
+                ttyPath: configuration.ttyPath, bindingIsCurrent: { attempt.bindingChecks.isValid() }
             )
         }
     }

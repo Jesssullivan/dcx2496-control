@@ -41,11 +41,11 @@ Heartbeats run once per second without serial polling. Each expires within two
 seconds, never later than sixty seconds after the actual capture. Device
 operations, configuration changes, helper foreground exit and disappearance of
 the configured callout invalidate the attestation. A crashed helper cannot
-renew it. Expiry requires another explicit verification.
+renew it. Expiry requires another actual verification.
 
 The optional `approved-room-configuration.json` is owner-private inside the
 helper App Group. Saving it validates the manifest offline and binds the exact
-helper target, callout and expectation digest. Both switches default off.
+helper target, callout and expectation digest. All device-read switches default off.
 `verifyOnForegroundLaunch` captures once when the helper opens before Logic.
 An existing Logic process suppresses that automatic read. Launch the ASFW menu
 receiver before the helper, then wait for admission before opening Logic.
@@ -81,14 +81,48 @@ while that capture runs. Matching callers receive the same result or failure.
 A successful completed comparison can reuse its original capture while the tty
 exists and capture age is less than sixty seconds. Reuse preserves `verifiedAt`.
 The existing two-second heartbeat expiry and sixty-second lifetime still apply.
-A stale or disconnected result requires another explicit capture.
+A stale or disconnected result requires another actual capture.
 
 Device operations, configuration or expectation changes and foreground exit
 invalidate reuse. They also prevent an in-flight capture from publishing after
 invalidation. A failed capture is never cached as readiness. A later explicit
-request can try again. No retry, parameter write or serial poll was added.
+request can try again. Verification never writes device parameters.
 
 The existing read-only `helper.status` reports `activeTransactionID` as
 `room-verification` during the owning capture. Status is observation, not approval
 or a fresh capture. Tests cover coordinator-level concurrent triggers, shared
 failure, mismatched bindings, invalidation and unchanged capture age.
+
+## Periodic approved reads
+
+`periodicVerificationEnabled` is a separate optional boolean in the existing
+`dcx.approved-room-configuration/v1` document. Missing means false. Startup and
+fixed-URL permission do not grant this authority. The signed helper advertises
+`TinylandRoomPeriodicVerificationProtocol` as `dcx.room-periodic-verification/v1`.
+Lab must bind that capability to the exact signed artifact before opting in.
+
+The existing foreground app owns one timer. Local configuration checks run every
+five seconds. An enabled timer can read while Logic plays. It shares active
+verification with startup, button and URL requests. A periodic attempt bypasses
+completed-cache reuse and requires an actual fresh snapshot. No MIDI input,
+heartbeat, daemon or competing serial owner starts a device operation.
+
+After a successful capture, the next periodic attempt waits five minutes. A real
+explicit capture defers that deadline too. Known lock contention before child
+admission backs off from fifteen seconds to five minutes. Failed transport,
+invalid comparison and drift latch periodic reads off. An explicit successful
+verification or a changed approved configuration resets that latch. No timer
+performs parameter repair, rollback or unknown-child recovery.
+
+Saved helper configuration, target, callout and exact expectation bytes must
+match before capture and publication. Foreground exit or a changed binding
+invalidates pending work. Joined requests add their binding checks to the shared
+flight. Those checks also guard later heartbeats. An old worker cannot publish
+or rearm after leaving and reentering the foreground.
+
+Capture freshness stays sixty seconds and heartbeat expiry stays two seconds.
+Starting a new capture invalidates the previous attestation. The historical
+roughly one-hundred-second generic read therefore leaves admission gaps. This
+scheduler preserves audio routes and obtains new evidence. It does not provide
+continuous whole-room readiness. A faster approved-target policy needs separate
+source review and named-device timing qualification.

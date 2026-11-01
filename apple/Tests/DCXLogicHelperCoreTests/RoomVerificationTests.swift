@@ -281,6 +281,120 @@ final class RoomVerificationTests: XCTestCase {
         XCTAssertNil(publisher.current(expectation: manifest, now: at))
     }
 
+    func testOldApprovalSchemaDoesNotAuthorizePeriodicReads() throws {
+        let configuration = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
+        let value = try ApprovedRoomConfiguration(configuration: configuration, expectation: Data("SYNTHETIC".utf8),
+            periodicVerificationEnabled: true)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? [String: Any])
+        object.removeValue(forKey: "periodicVerificationEnabled")
+        let old = try JSONDecoder().decode(ApprovedRoomConfiguration.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertFalse(old.periodicVerificationEnabled)
+        XCTAssertTrue(try JSONDecoder().decode(ApprovedRoomConfiguration.self, from: JSONEncoder().encode(value)).periodicVerificationEnabled)
+        object["periodicVerificationEnabled"] = "true"
+        XCTAssertThrowsError(try JSONDecoder().decode(ApprovedRoomConfiguration.self, from: JSONSerialization.data(withJSONObject: object)))
+    }
+
+    func testPeriodicPathRequiresRealReadInsteadOfCompletedCache() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = DCXHelperStorageLocations(fixtureRoot: root)
+        let configuration = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
+        try configuration.save(to: locations.helperConfigurationURL)
+        let manifest = Data("SYNTHETIC periodic real capture".utf8)
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "SYNTHETIC-blank-snapshot", withExtension: "json", subdirectory: "feedback"))
+        let snapshot = try Data(contentsOf: url)
+        let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: snapshot)
+        let backend = RoomBackend(snapshot: snapshot, comparison: try JSONEncoder().encode(comparison(manifest, snapshot: carrier.snapshotDigest)))
+        let coordinator = DCXHelperCoordinator(locations: locations, configuration: .success(configuration), coreMIDI: .init(),
+            runner: backend, roomVerification: .init(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true }))
+        coordinator.setForeground(true)
+        _ = try coordinator.verifyRoom(expectation: manifest)
+        _ = try coordinator.verifyRoom(expectation: manifest)
+        XCTAssertEqual(backend.arguments.filter { $0.starts(with: ["control", "snapshot"]) }.count, 1)
+        _ = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true, bindingIsCurrent: { true })
+        XCTAssertEqual(backend.arguments.filter { $0.starts(with: ["control", "snapshot"]) }.count, 2)
+        XCTAssertFalse(backend.arguments.contains { $0.contains("apply") || $0.contains("rollback") })
+    }
+
+    func testChangedSavedBindingDuringComparisonCannotPublishInitialMatch() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
+        let manifest = Data("SYNTHETIC changed approval".utf8)
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "SYNTHETIC-blank-snapshot", withExtension: "json", subdirectory: "feedback"))
+        let snapshot = try Data(contentsOf: url)
+        let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: snapshot)
+        let backend = RoomBackend(snapshot: snapshot, comparison: try JSONEncoder().encode(comparison(manifest, snapshot: carrier.snapshotDigest)))
+        let allowed = BindingFlag()
+        backend.beforeComparison = { allowed.disable() }
+        let receipts = ReceiptCapture()
+        let coordinator = DCXHelperCoordinator(locations: .init(fixtureRoot: root), configuration: .success(configuration), coreMIDI: .init(),
+            runner: backend, roomVerification: .init(startHeartbeats: false, submit: { receipts.append($0) }))
+        coordinator.setForeground(true)
+        XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+            bindingIsCurrent: { allowed.value }))
+        XCTAssertFalse(receipts.values.contains { $0.matches })
+    }
+
+    func testCoalescedTriggerAddsBindingConstraintBeforePublication() throws {
+        let gate = RoomVerificationPreparation()
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let done = expectation(description: "coalesced saved binding returned")
+        done.expectedFulfillmentCount = 2
+        let results = PreparationResults(), allowed = BindingFlag()
+        let receipt = try fixtureReceipt()
+        DispatchQueue.global().async {
+            results.append(Result { try gate.run(key: Data([9]), reuse: { nil }) { attempt in
+                started.signal(); _ = release.wait(timeout: .now() + 3)
+                return try gate.publish(attempt) { receipt }
+            } }); done.fulfill()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 3), .success)
+        DispatchQueue.global().async {
+            results.append(Result { try gate.run(key: Data([9]), reuse: { nil }, bindingIsCurrent: { allowed.value }) { _ in
+                XCTFail("joined periodic trigger started another child"); return receipt
+            } }); done.fulfill()
+        }
+        waitForJoin(gate)
+        allowed.disable(); release.signal()
+        wait(for: [done], timeout: 3)
+        for result in results.values { XCTAssertThrowsError(try result.get()) }
+    }
+
+    func testSavedConfigurationCannotReadTheDifferentInMemoryTarget() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let memory = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC-A", enabledFeatures: [.snapshotCapture])
+        let saved = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
+            ttyPath: "/dev/cu.usbserial-SYNTHETIC-B", enabledFeatures: [.snapshotCapture])
+        let locations = DCXHelperStorageLocations(fixtureRoot: root)
+        try saved.save(to: locations.helperConfigurationURL)
+        let backend = RoomBackend(snapshot: Data(), comparison: Data())
+        let coordinator = DCXHelperCoordinator(locations: locations, configuration: .success(memory),
+            coreMIDI: .init(), runner: backend, roomVerification: .init(startHeartbeats: false, submit: { _ in }))
+        coordinator.setForeground(true)
+        XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: Data("SYNTHETIC".utf8), forceFresh: true,
+            expectedConfiguration: saved, bindingIsCurrent: { true }))
+        XCTAssertTrue(backend.arguments.isEmpty)
+    }
+
+    func testSavedBindingChangeStopsCachedHeartbeatWithoutRestamping() throws {
+        let allowed = BindingFlag()
+        let expectation = Data("SYNTHETIC heartbeat binding".utf8)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
+        let capturedAt = Date()
+        let receipt = try publisher.install(comparison(expectation), expectation: expectation, capturedAt: capturedAt,
+            ttyPath: "/SYNTHETIC", bindingIsCurrent: { allowed.value })
+        XCTAssertEqual(publisher.current(expectation: expectation)?.verifiedAt, receipt.verifiedAt)
+        allowed.disable()
+        XCTAssertNil(publisher.current(expectation: expectation))
+        XCTAssertNil(publisher.captureDate(expectation: expectation))
+    }
+
     private func waitForJoin(_ gate: RoomVerificationPreparation) {
         let deadline = Date().addingTimeInterval(2)
         while gate.waitingRequestCount == 0 && Date() < deadline { Thread.sleep(forTimeInterval: 0.001) }
@@ -315,13 +429,16 @@ private final class RoomBackend: DCXCTLCommandExecuting, @unchecked Sendable {
     private let comparison: Data
     var arguments: [[String]] = []
     var beforeSnapshot: (@Sendable () throws -> Void)?
+    var beforeComparison: (@Sendable () throws -> Void)?
     init(snapshot: Data, comparison: Data) { self.snapshot = snapshot; self.comparison = comparison }
     func resolveExecutable(for configuration: HelperConfigurationV1) throws -> URL { URL(fileURLWithPath: "/SYNTHETIC/dcxctl") }
     func run(_ invocation: DCXCTLInvocation, timeoutSeconds: UInt8, mutationLock: MutationRecoveryProcessLock?) throws -> DCXCTLProcessResult {
         XCTAssertNotNil(mutationLock)
         arguments.append(invocation.arguments)
         if invocation.arguments.starts(with: ["control", "snapshot"]) { try beforeSnapshot?() }
-        let stdout = arguments.count == 1 ? Data("{}".utf8) : arguments.count == 2 ? snapshot : comparison
+        if invocation.arguments.starts(with: ["profile", "room-verify"]) { try beforeComparison?() }
+        let stdout = invocation.arguments.starts(with: ["profile", "room-validate"]) ? Data("{}".utf8)
+            : invocation.arguments.starts(with: ["control", "snapshot"]) ? snapshot : comparison
         return .init(terminationStatus: 0, stdout: stdout, stderr: Data(), durationMilliseconds: 1)
     }
 }
@@ -331,4 +448,11 @@ private final class PreparationResults: @unchecked Sendable {
     private var storage: [Result<RoomVerificationReceipt, Error>] = []
     var values: [Result<RoomVerificationReceipt, Error>] { lock.lock(); defer { lock.unlock() }; return storage }
     func append(_ value: Result<RoomVerificationReceipt, Error>) { lock.lock(); storage.append(value); lock.unlock() }
+}
+
+private final class BindingFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var allowed = true
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return allowed }
+    func disable() { lock.lock(); allowed = false; lock.unlock() }
 }
