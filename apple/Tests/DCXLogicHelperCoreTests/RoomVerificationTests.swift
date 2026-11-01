@@ -38,7 +38,7 @@ final class RoomVerificationTests: XCTestCase {
 
     func testHeartbeatNeverExtendsActualCaptureLifetime() throws {
         let capture = ReceiptCapture()
-        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: capture.append)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { value in capture.append(value) })
         let expectation = Data("SYNTHETIC approved expectation".utf8)
         let at = Date()
         let receipt = try publisher.install(comparison(expectation), expectation: expectation, capturedAt: at, ttyPath: "/dev/cu.usbserial-SYNTHETIC")
@@ -65,7 +65,7 @@ final class RoomVerificationTests: XCTestCase {
     func testWrongExpectationOrSnapshotBindingCannotPublishMatch() throws {
         let expectation = Data("SYNTHETIC approved expectation".utf8)
         let capture = ReceiptCapture()
-        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: capture.append)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { value in capture.append(value) })
         XCTAssertThrowsError(try publisher.install(comparison(expectation), expectation: Data("different".utf8), capturedAt: Date(), ttyPath: "/dev/cu.usbserial-SYNTHETIC"))
         let wrong = comparison(expectation, expectedSnapshot: "sha256/" + String(repeating: "b", count: 64))
         XCTAssertThrowsError(try publisher.install(wrong, expectation: expectation, capturedAt: Date(), ttyPath: "/dev/cu.usbserial-SYNTHETIC"))
@@ -76,7 +76,7 @@ final class RoomVerificationTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let capture = ReceiptCapture()
-        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: capture.append)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { value in capture.append(value) })
         let expectation = Data("SYNTHETIC approved expectation".utf8)
         let snapshotURL = try XCTUnwrap(Bundle.module.url(forResource: "SYNTHETIC-blank-snapshot", withExtension: "json", subdirectory: "feedback"))
         let snapshot = try Data(contentsOf: snapshotURL)

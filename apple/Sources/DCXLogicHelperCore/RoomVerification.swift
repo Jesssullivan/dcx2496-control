@@ -191,10 +191,9 @@ private final class PracticeMIDISender: @unchecked Sendable {
         defer { memory.deallocate() }
         let list = memory.bindMemory(to: MIDIPacketList.self, capacity: 1)
         let packet = MIDIPacketListInit(list)
-        let added = frame.withUnsafeBufferPointer { buffer in
+        _ = frame.withUnsafeBufferPointer { buffer in
             MIDIPacketListAdd(list, capacity, packet, 0, frame.count, buffer.baseAddress!)
         }
-        guard added != nil else { return }
         _ = MIDISend(port, destinations[0], list)
     }
 
