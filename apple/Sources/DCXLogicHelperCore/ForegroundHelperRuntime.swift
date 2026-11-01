@@ -1,3 +1,4 @@
+import AppKit
 import DCXLogicBridge
 import Foundation
 
@@ -55,6 +56,12 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         lock.lock()
         running = true
         lock.unlock()
+        // Startup reads are explicitly opted in and run before Logic preload.
+        // Opening the helper during an existing Logic session never probes it.
+        if let approved = currentApprovedRoomConfiguration(), approved.verifyOnForegroundLaunch,
+           NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.logic10").isEmpty {
+            Task.detached { [weak self] in _ = try? self?.verifySavedApprovedRoom() }
+        }
     }
 
     public func leaveForeground() {
@@ -73,6 +80,44 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         let response = coordinator.handle(request)
         guard case let .helperStatus(status) = response.body else { return nil }
         return status
+    }
+
+    /// Called only by the explicit foreground verification button, never MIDI.
+    public func verifyRoom(expectation: Data) throws -> RoomVerificationReceipt {
+        try coordinator.verifyRoom(expectation: expectation)
+    }
+
+    private var approvedRoomURL: URL {
+        locations.helperConfigurationURL.deletingLastPathComponent().appendingPathComponent("approved-room-configuration.json")
+    }
+
+    public func currentApprovedRoomConfiguration() -> ApprovedRoomConfiguration? {
+        guard let configuration = currentConfiguration(),
+              let approved = try? ApprovedRoomConfiguration.load(from: approvedRoomURL),
+              (try? approved.requireBinding(to: configuration)) != nil else { return nil }
+        return approved
+    }
+
+    public func saveApprovedRoomExpectation(_ expectation: Data, verifyOnForegroundLaunch: Bool,
+                                            allowExplicitRefreshRequests: Bool) throws {
+        guard let configuration = currentConfiguration() else { throw RoomVerificationError.unavailable }
+        try coordinator.validateApprovedRoomExpectation(expectation)
+        let approved = try ApprovedRoomConfiguration(configuration: configuration, expectation: expectation,
+            verifyOnForegroundLaunch: verifyOnForegroundLaunch, allowExplicitRefreshRequests: allowExplicitRefreshRequests)
+        try approved.requireBinding(to: configuration)
+        try approved.save(to: approvedRoomURL)
+    }
+
+    /// A fixed URL may request a read of the configured target only. No URL
+    /// component supplies a port, frame, profile or write operation.
+    public func verifySavedApprovedRoom(requestURL: URL? = nil) throws -> RoomVerificationReceipt {
+        guard let approved = currentApprovedRoomConfiguration() else { throw RoomVerificationError.unavailable }
+        if let requestURL {
+            guard ApprovedRoomConfiguration.acceptsRefreshURL(requestURL), approved.allowExplicitRefreshRequests else {
+                throw RoomVerificationError.unavailable
+            }
+        }
+        return try coordinator.verifyRoom(expectation: approved.expectation)
     }
 
     /// Currently loaded checked configuration, if any.

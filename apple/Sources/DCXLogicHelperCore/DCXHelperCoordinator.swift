@@ -42,6 +42,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     private var recoveryLease: MutationRecoveryLeaseV1?
     private var recoveryCompletion: MutationRecoveryCompletionV1?
     private var recoveryLeaseError: Error?
+    private let roomVerification: RoomVerificationPublisher
 
     public convenience init(
         locations: AppGroupLocations,
@@ -60,10 +61,12 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         locations: DCXHelperStorageLocations,
         configuration: Result<HelperConfigurationV1, Error>,
         coreMIDI: CoreMIDIPresentation,
-        runner: any DCXCTLCommandExecuting
+        runner: any DCXCTLCommandExecuting,
+        roomVerification: RoomVerificationPublisher = .init()
     ) {
         self.locations = locations
         self.runner = runner
+        self.roomVerification = roomVerification
         snapshotStore = .init(root: locations.snapshotRootURL)
         planStore = .init(root: locations.planRootURL)
         notchPlanStore = .init(planRoot: locations.planRootURL)
@@ -96,12 +99,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         stateLock.lock()
         foreground = value
         stateLock.unlock()
+        if !value { roomVerification.invalidate("helper-left-foreground") }
     }
 
     @discardableResult
     func replaceConfiguration(
         load: () -> Result<HelperConfigurationV1, Error>
     ) throws -> HelperConfigurationV1 {
+        roomVerification.invalidate("configuration-reload")
         let processLock = try recoveryLeaseStore.acquireExclusiveLock()
         defer { processLock.release() }
         stateLock.lock()
@@ -127,6 +132,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         _ candidate: HelperConfigurationV1,
         persistAndReload: () throws -> HelperConfigurationV1
     ) throws -> HelperConfigurationV1 {
+        roomVerification.invalidate("configuration-replaced")
         let processLock = try recoveryLeaseStore.acquireExclusiveLock()
         defer { processLock.release() }
         stateLock.lock()
@@ -148,6 +154,106 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         return configuration
     }
 
+    /// Explicit foreground action: capture once, compare offline, publish only
+    /// a bounded live attestation. The expectation is supplied independently
+    /// after named-device approval; this method never creates one from a read.
+    public func verifyRoom(expectation: Data) throws -> RoomVerificationReceipt {
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
+            throw RoomVerificationError.invalidExpectation
+        }
+        roomVerification.invalidate("room-verification-started")
+        let processLock = try recoveryLeaseStore.acquireExclusiveLock()
+        defer { processLock.release() }
+        let configuration: HelperConfigurationV1
+        stateLock.lock()
+        do {
+            try reloadRecoveryStateFromStore()
+            guard foreground, recoveryLease == nil, recoveryLeaseError == nil,
+                  activeTransactionID == nil, let checked = self.configuration else {
+                throw RoomVerificationError.unavailable
+            }
+            try checked.require(.snapshotCapture, target: checked.target)
+            configuration = checked
+            activeTransactionID = "room-verification"
+            stateLock.unlock()
+        } catch {
+            stateLock.unlock()
+            throw error
+        }
+        defer {
+            stateLock.lock()
+            activeTransactionID = nil
+            stateLock.unlock()
+        }
+        let workspace = try TransactionWorkspace(root: locations.transactionRootURL)
+        defer { workspace.remove() }
+        let expectationURL = try workspace.writeData(expectation, named: "room-expectation.json")
+        let executable = try runner.resolveExecutable(for: configuration)
+        let validation = try runner.run(
+            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                "profile", "room-validate", "--expectation", expectationURL.path,
+            ]),
+            timeoutSeconds: 45,
+            mutationLock: processLock
+        )
+        guard validation.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
+        let read = try runner.run(
+            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                "control", "snapshot", "--tty", configuration.ttyPath,
+                "--expected-device", String(configuration.expectedDeviceAddress),
+            ]),
+            timeoutSeconds: configuration.childTimeoutSeconds,
+            mutationLock: processLock
+        )
+        guard read.terminationStatus == 0 else { throw RoomVerificationError.unavailable }
+        let capturedAt = Date()
+        let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: read.stdout)
+        try carrier.validate(expectedDevice: configuration.expectedDeviceAddress)
+        let snapshot = try workspace.writeData(read.stdout, named: "room-snapshot.json")
+        let compared = try runner.run(
+            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                "profile", "room-verify", "--expectation", expectationURL.path,
+                "--snapshot", snapshot.path,
+            ]),
+            timeoutSeconds: 45,
+            mutationLock: processLock
+        )
+        guard compared.terminationStatus == 0 || compared.terminationStatus == 1 else {
+            throw RoomVerificationError.invalidComparison
+        }
+        let comparison = try JSONDecoder().decode(RoomComparison.self, from: compared.stdout)
+        guard comparison.snapshotDigest == carrier.snapshotDigest,
+              comparison.matches == (compared.terminationStatus == 0) else {
+            throw RoomVerificationError.invalidComparison
+        }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard foreground else { throw RoomVerificationError.unavailable }
+        return try roomVerification.install(
+            comparison, expectation: expectation, capturedAt: capturedAt,
+            ttyPath: configuration.ttyPath
+        )
+    }
+
+    /// Offline preflight for persisting an independently approved expectation.
+    public func validateApprovedRoomExpectation(_ expectation: Data) throws {
+        roomVerification.invalidate("approved-expectation-replaced")
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024 else { throw RoomVerificationError.invalidExpectation }
+        let processLock = try recoveryLeaseStore.acquireExclusiveLock()
+        defer { processLock.release() }
+        guard let configuration = currentConfiguration() else { throw RoomVerificationError.unavailable }
+        let workspace = try TransactionWorkspace(root: locations.transactionRootURL)
+        defer { workspace.remove() }
+        let input = try workspace.writeData(expectation, named: "room-expectation.json")
+        let executable = try runner.resolveExecutable(for: configuration)
+        let result = try runner.run(
+            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                "profile", "room-validate", "--expectation", input.path,
+            ]), timeoutSeconds: 45, mutationLock: processLock
+        )
+        guard result.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
+    }
+
     public func handle(_ request: BridgeRequest) -> BridgeResponse {
         do {
             try request.body.validate()
@@ -162,6 +268,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         if case .helperStatus = request.body {
             return BridgeResponse(requestID: request.requestID, body: .helperStatus(status()))
         }
+        roomVerification.invalidate("device-operation")
         guard isForeground else {
             return preAdmissionFailure(
                 request,
