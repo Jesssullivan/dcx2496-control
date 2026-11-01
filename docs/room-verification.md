@@ -61,3 +61,9 @@ approved device image ships by default.
 injected child processes and receipt lifetimes, without serial or audio. Rust
 room-admission tests run in the existing `profile_chain` family. Source checks
 cannot establish an approved image, installed helper or working practice audio.
+
+`just native-helper-ui-typecheck` builds the Swift package modules and checks
+the containing SwiftUI app source and plist with the selected Xcode SDK. It
+uses an owned temporary build directory. It produces no executable carrier,
+signature, app installation or device contact. `//apple:helper_ui_typecheck`
+indexes the same check for the Darwin Bazel lane.

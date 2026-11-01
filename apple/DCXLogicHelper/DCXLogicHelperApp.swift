@@ -233,6 +233,12 @@ final class HelperAppModel: ObservableObject {
 
     func handleRoomRefreshURL(_ url: URL) {
         guard let runtime, !verifyingRoom, ApprovedRoomConfiguration.acceptsRefreshURL(url) else { return }
+        do {
+            try runtime.enterForeground()
+        } catch {
+            status = "The foreground bridge could not start for the requested refresh."
+            return
+        }
         verifyingRoom = true
         Task {
             do {

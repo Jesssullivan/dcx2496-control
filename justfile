@@ -51,6 +51,8 @@ native-response-binding: repo::native-response-binding
 
 native-room-verification: repo::native-room-verification
 
+native-helper-ui-typecheck: repo::native-helper-ui-typecheck
+
 native-feedback-notch: repo::native-feedback-notch
 
 schema-check: repo::schema-check
