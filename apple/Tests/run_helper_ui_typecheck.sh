@@ -33,9 +33,14 @@ test -x "$toolchain/swift"
 test -x "$toolchain/swiftc"
 sdk="$(/usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" /usr/bin/xcrun --sdk macosx --show-sdk-path)"
 /usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" \
-  "$toolchain/swift" build --package-path "$package_path" --scratch-path "$owned_root/swift-build" --jobs 1
+  "$toolchain/swift" build --package-path "$package_path" --scratch-path "$owned_root/swift-build" --arch arm64 --jobs 1
 bin_path="$(/usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" \
-  "$toolchain/swift" build --package-path "$package_path" --scratch-path "$owned_root/swift-build" --show-bin-path)"
+  "$toolchain/swift" build --package-path "$package_path" --scratch-path "$owned_root/swift-build" --arch arm64 --show-bin-path)"
+if [[ ! -e "$bin_path/Modules/DCXLogicHelperCore.swiftmodule" ]]; then
+  printf 'declared arm64 helper module is missing from the SwiftPM output path\n' >&2
+  find "$owned_root/swift-build" -type f -name DCXLogicHelperCore.swiftmodule -print >&2
+  exit 78
+fi
 /usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" \
   "$toolchain/swiftc" -parse-as-library -typecheck -target arm64-apple-macosx14.0 \
   -sdk "$sdk" -I "$bin_path/Modules" "$app_source"
