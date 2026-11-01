@@ -34,15 +34,19 @@ test -x "$toolchain/swiftc"
 sdk="$(/usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" /usr/bin/xcrun --sdk macosx --show-sdk-path)"
 /usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" \
   "$toolchain/swift" build --package-path "$package_path" --scratch-path "$owned_root/swift-build" --arch arm64 --jobs 1
-bin_path="$(/usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" \
-  "$toolchain/swift" build --package-path "$package_path" --scratch-path "$owned_root/swift-build" --arch arm64 --show-bin-path)"
-if [[ ! -e "$bin_path/Modules/DCXLogicHelperCore.swiftmodule" ]]; then
-  printf 'declared arm64 helper module is missing from the SwiftPM output path\n' >&2
-  find "$owned_root/swift-build" -type f -name DCXLogicHelperCore.swiftmodule -print >&2
-  exit 78
-fi
+# SwiftBuild and the legacy SwiftPM backend emit modules in different layouts.
+# Resolve only exact package modules inside this invocation's owned build tree.
+helper_module="$(find "$owned_root/swift-build" -name DCXLogicHelperCore.swiftmodule -print)"
+bridge_module="$(find "$owned_root/swift-build" -name DCXLogicBridge.swiftmodule -print)"
+for module_path in "$helper_module" "$bridge_module"; do
+  if [[ -z "$module_path" || "$module_path" == *$'\n'* || ! -e "$module_path" ]]; then
+    printf 'expected one exact arm64 module inside the owned package build\n' >&2
+    printf '%s\n' "$module_path" >&2
+    exit 78
+  fi
+done
 /usr/bin/env -u SDKROOT DEVELOPER_DIR="$xcode_developer_dir" \
   "$toolchain/swiftc" -parse-as-library -typecheck -target arm64-apple-macosx14.0 \
-  -sdk "$sdk" -I "$bin_path/Modules" "$app_source"
+  -sdk "$sdk" -I "${helper_module%/*}" -I "${bridge_module%/*}" "$app_source"
 /usr/bin/plutil -lint "$app_plist"
 printf 'DCX_HELPER_UI_TYPECHECK=pass NO-CARRIER NO-INSTALL NO-DEVICE\n'
