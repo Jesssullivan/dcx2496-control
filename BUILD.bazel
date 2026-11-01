@@ -67,6 +67,7 @@ test_suite(
     name = "check",
     tests = [
         ":apple_feedback_fixture_parity",
+        ":apple_linkage_tests",
         ":bazel_frontdoor_rejections",
         ":feedback_pipeline",
         ":fixture_contract",
@@ -272,5 +273,31 @@ sh_test(
     tags = [
         "no-remote",
         "no-remote-exec",
+    ],
+)
+
+# Source-only host-Python fixtures. No Apple binary or device is invoked.
+sh_test(
+    name = "apple_linkage_tests",
+    size = "small",
+    srcs = ["tests/apple_linkage_tests.sh"],
+    data = [
+        "scripts/build_apple_dcxctl.py",
+        "scripts/check_apple_bundle_links.py",
+        "tests/test_apple_bundle_links.py",
+        "tests/test_apple_cli_build.py",
+    ],
+    tags = [
+        "no-remote",
+        "no-remote-cache",
+        "no-remote-exec",
+    ],
+)
+
+filegroup(
+    name = "apple_packaging_tools",
+    srcs = [
+        "scripts/build_apple_dcxctl.py",
+        "scripts/check_apple_bundle_links.py",
     ],
 )

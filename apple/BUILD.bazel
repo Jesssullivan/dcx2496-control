@@ -212,6 +212,7 @@ filegroup(
     srcs = [
         "project.yml",
         ":swift_package_sources",
+        "//:apple_packaging_tools",
     ] + glob([
         "DCXControlAU/*.entitlements",
         "DCXControlAU/*.plist",

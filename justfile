@@ -71,3 +71,5 @@ product-check: repo::product-check
 [positional-arguments]
 dcxctl *args:
     exec cargo run --locked --jobs 2 --quiet --package dcxctl -- "$@"
+
+apple-linkage-tests: repo::apple-linkage-tests

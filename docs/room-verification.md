@@ -202,3 +202,30 @@ latency. Failed reads still latch and old captures are never restamped. Only a
 still-fresh proof with unchanged binding may survive a periodic read. One fast
 capture does not qualify the installed periodic workflow or continuous Ready
 availability.
+
+Source `db7a8eea111bd403eebe862f77f036cc0bdf6729` passed the next native
+source gate on November 1, 2026. It listed 122 unique tests: 114 passed,
+eight were explicitly skipped and none failed. All 27 required cases passed.
+The actual helper SwiftUI source typechecked without compiler warnings or
+errors. The owned group and subsequent global compiler inventory were quiet.
+Receipt SHA256 is `e35c02654863a4a2242188f9cd3fec84260a3321760c0ac1b15e15e40e84cdfe`.
+This receipt qualifies the source change, not an installed periodic workflow.
+Authority: user direction to implement the plan and Root's exact packet
+`1ac3dd1e` release. Lexical: XL-ACC-005.
+
+## Helper packaging
+
+Helper build five declares version `0.1.4`. Its embedded Cargo build uses the
+selected Xcode clang and macOS SDK in a closed environment. Ambient Rust, Nix,
+compiler and dynamic-loader flags are excluded. Hidden Cargo configuration is
+refused, dependencies must already be available and the lockfile stays fixed.
+The build records exact tool hashes, SDK and child environment in its scratch
+`apple-cli-link-inputs.json` file.
+
+Selecting Apple tools does not prove portable linkage. Final artifact admission
+checks every Mach-O image, load command and RPATH in the bundle. Every Nix or
+unknown external runtime path is refused. Only Apple system paths and resolved
+bundle-contained dependencies are admitted. The same check must pass on the
+archive and exported signed copy. It does not repair install names or sign
+binaries. Native build, signature verification and parent-owned child execution
+remain separate qualification steps.
