@@ -54,15 +54,18 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     private let instanceID = UUID().uuidString
     private let submit: @Sendable (RoomVerificationReceipt) -> Void
     private let startHeartbeats: Bool
+    private let ttyPresent: @Sendable (String) -> Bool
     private var receipt: RoomVerificationReceipt?
     private var capturedAt: Date?
     private var ttyPath: String?
     private var timer: DispatchSourceTimer?
 
-    init(startHeartbeats: Bool = true, submit: (@Sendable (RoomVerificationReceipt) -> Void)? = nil) {
+    init(startHeartbeats: Bool = true, submit: (@Sendable (RoomVerificationReceipt) -> Void)? = nil,
+         ttyPresent: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) {
         let sender = PracticeMIDISender()
         self.submit = submit ?? { value in sender.send(value) }
         self.startHeartbeats = startHeartbeats
+        self.ttyPresent = ttyPresent
     }
 
     func install(_ comparison: RoomComparison, expectation: Data, capturedAt: Date, ttyPath: String) throws -> RoomVerificationReceipt {
@@ -108,6 +111,17 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         return value
     }
 
+    /// Reuse liveness only while the original capture remains fresh. This never
+    /// changes verifiedAt or publishes a new capture timestamp.
+    func current(expectation: Data, now: Date = Date()) -> RoomVerificationReceipt? {
+        let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
+        lock.lock()
+        defer { lock.unlock() }
+        guard let receipt, receipt.expectationDigest == digest, let capturedAt, let ttyPath else { return nil }
+        return receipt.renewed(at: now, capturedAt: capturedAt,
+                               ttyPresent: ttyPresent(ttyPath))
+    }
+
     func invalidate(_ reason: String) {
         lock.lock()
         timer?.cancel()
@@ -130,7 +144,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         guard var value = receipt, let capturedAt, let ttyPath else { lock.unlock(); return }
         let now = Date()
         guard let renewed = value.renewed(at: now, capturedAt: capturedAt,
-                                        ttyPresent: FileManager.default.fileExists(atPath: ttyPath)) else {
+                                        ttyPresent: ttyPresent(ttyPath)) else {
             lock.unlock()
             invalidate("expired-or-disconnected")
             return
@@ -148,6 +162,84 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     }
 
     deinit { timer?.cancel() }
+}
+
+/// TIN-6964: foreground startup and the fixed URL share one approved read.
+/// The lock protects admission and publication, never the serial capture itself.
+final class RoomVerificationPreparation: @unchecked Sendable {
+    final class Attempt {
+        let key: Data
+        var invalidated = false
+        var result: Result<RoomVerificationReceipt, Error>?
+        init(key: Data) { self.key = key }
+    }
+
+    private let condition = NSCondition()
+    private var active: Attempt?
+    private var completedKey: Data?
+    private var waiters = 0
+
+    var isInFlight: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return active != nil
+    }
+
+    var waitingRequestCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return waiters
+    }
+
+    func run(key: Data, reuse: () -> RoomVerificationReceipt?,
+             capture: (Attempt) throws -> RoomVerificationReceipt) throws -> RoomVerificationReceipt {
+        condition.lock()
+        if let active {
+            guard active.key == key else { condition.unlock(); throw RoomVerificationError.unavailable }
+            waiters += 1
+            while active.result == nil && !active.invalidated { condition.wait() }
+            waiters -= 1
+            let result: Result<RoomVerificationReceipt, Error> = active.invalidated
+                ? .failure(RoomVerificationError.unavailable) : active.result!
+            condition.unlock()
+            return try result.get()
+        }
+        if completedKey == key, let receipt = reuse() {
+            condition.unlock()
+            return receipt
+        }
+        let attempt = Attempt(key: key)
+        active = attempt
+        completedKey = nil
+        condition.unlock()
+        let captured = Result { try capture(attempt) }
+        condition.lock()
+        let result: Result<RoomVerificationReceipt, Error> = attempt.invalidated
+            ? .failure(RoomVerificationError.unavailable) : captured
+        attempt.result = result
+        if case .success = result { completedKey = key }
+        active = nil
+        condition.broadcast()
+        condition.unlock()
+        return try result.get()
+    }
+
+    /// Invalidation also prevents an already-running capture from publishing.
+    func invalidate(_ body: () -> Void) {
+        condition.lock()
+        completedKey = nil
+        active?.invalidated = true
+        body()
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func publish(_ attempt: Attempt, _ body: () throws -> RoomVerificationReceipt) throws -> RoomVerificationReceipt {
+        condition.lock()
+        defer { condition.unlock() }
+        guard active === attempt, !attempt.invalidated else { throw RoomVerificationError.unavailable }
+        return try body()
+    }
 }
 
 public enum RoomVerificationError: Error, Equatable {

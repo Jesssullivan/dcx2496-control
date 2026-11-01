@@ -42,6 +42,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     private var recoveryLease: MutationRecoveryLeaseV1?
     private var recoveryCompletion: MutationRecoveryCompletionV1?
     private var recoveryLeaseError: Error?
+    private let roomPreparation: RoomVerificationPreparation
     private let roomVerification: RoomVerificationPublisher
 
     public convenience init(
@@ -62,11 +63,13 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         configuration: Result<HelperConfigurationV1, Error>,
         coreMIDI: CoreMIDIPresentation,
         runner: any DCXCTLCommandExecuting,
-        roomVerification: RoomVerificationPublisher = .init()
+        roomVerification: RoomVerificationPublisher = .init(),
+        roomPreparation: RoomVerificationPreparation = .init()
     ) {
         self.locations = locations
         self.runner = runner
         self.roomVerification = roomVerification
+        self.roomPreparation = roomPreparation
         snapshotStore = .init(root: locations.snapshotRootURL)
         planStore = .init(root: locations.planRootURL)
         notchPlanStore = .init(planRoot: locations.planRootURL)
@@ -99,14 +102,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         stateLock.lock()
         foreground = value
         stateLock.unlock()
-        if !value { roomVerification.invalidate("helper-left-foreground") }
+        if !value { invalidateRoomVerification("helper-left-foreground") }
     }
 
     @discardableResult
     func replaceConfiguration(
         load: () -> Result<HelperConfigurationV1, Error>
     ) throws -> HelperConfigurationV1 {
-        roomVerification.invalidate("configuration-reload")
+        invalidateRoomVerification("configuration-reload")
         let processLock = try recoveryLeaseStore.acquireExclusiveLock()
         defer { processLock.release() }
         stateLock.lock()
@@ -132,7 +135,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         _ candidate: HelperConfigurationV1,
         persistAndReload: () throws -> HelperConfigurationV1
     ) throws -> HelperConfigurationV1 {
-        roomVerification.invalidate("configuration-replaced")
+        invalidateRoomVerification("configuration-replaced")
         let processLock = try recoveryLeaseStore.acquireExclusiveLock()
         defer { processLock.release() }
         stateLock.lock()
@@ -154,10 +157,45 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         return configuration
     }
 
-    /// Explicit foreground action: capture once, compare offline, publish only
-    /// a bounded live attestation. The expectation is supplied independently
-    /// after named-device approval; this method never creates one from a read.
+    private func invalidateRoomVerification(_ reason: String) {
+        roomPreparation.invalidate { roomVerification.invalidate(reason) }
+    }
+
+    /// Matching foreground triggers share one read or a still-fresh capture.
+    /// The independently approved expectation is never created from that read.
     public func verifyRoom(expectation: Data) throws -> RoomVerificationReceipt {
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024,
+              let configuration = currentConfiguration(), isForeground else {
+            throw RoomVerificationError.unavailable
+        }
+        struct Binding: Encodable { let configuration: HelperConfigurationV1; let expectation: Data }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let key = try encoder.encode(Binding(configuration: configuration, expectation: expectation))
+        return try roomPreparation.run(key: key, reuse: { self.reusableRoom(expectation: expectation, expectedConfiguration: configuration) }) { attempt in
+            try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt)
+        }
+    }
+
+    /// A cached capture cannot bypass current recovery or configuration authority.
+    /// Called under the preparation lock. Lock order is preparation then state.
+    private func reusableRoom(expectation: Data, expectedConfiguration: HelperConfigurationV1) -> RoomVerificationReceipt? {
+        do {
+            let processLock = try recoveryLeaseStore.acquireExclusiveLock()
+            defer { processLock.release() }
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            try reloadRecoveryStateFromStore()
+            guard foreground, recoveryLease == nil, recoveryLeaseError == nil, activeTransactionID == nil else { return nil }
+            reloadCurrentConfigurationFromStore()
+            guard let configuration, configuration == expectedConfiguration else { return nil }
+            try configuration.require(.snapshotCapture, target: configuration.target)
+            return roomVerification.current(expectation: expectation)
+        } catch { return nil }
+    }
+
+    private func captureRoom(expectation: Data, expectedConfiguration: HelperConfigurationV1,
+                             attempt: RoomVerificationPreparation.Attempt) throws -> RoomVerificationReceipt {
         guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
             throw RoomVerificationError.invalidExpectation
         }
@@ -169,7 +207,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         do {
             try reloadRecoveryStateFromStore()
             guard foreground, recoveryLease == nil, recoveryLeaseError == nil,
-                  activeTransactionID == nil, let checked = self.configuration else {
+                  activeTransactionID == nil, let checked = self.configuration,
+                  checked == expectedConfiguration else {
                 throw RoomVerificationError.unavailable
             }
             try checked.require(.snapshotCapture, target: checked.target)
@@ -226,18 +265,20 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
               comparison.matches == (compared.terminationStatus == 0) else {
             throw RoomVerificationError.invalidComparison
         }
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard foreground else { throw RoomVerificationError.unavailable }
-        return try roomVerification.install(
-            comparison, expectation: expectation, capturedAt: capturedAt,
-            ttyPath: configuration.ttyPath
-        )
+        return try roomPreparation.publish(attempt) {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            guard foreground else { throw RoomVerificationError.unavailable }
+            return try roomVerification.install(
+                comparison, expectation: expectation, capturedAt: capturedAt,
+                ttyPath: configuration.ttyPath
+            )
+        }
     }
 
     /// Offline preflight for persisting an independently approved expectation.
     public func validateApprovedRoomExpectation(_ expectation: Data) throws {
-        roomVerification.invalidate("approved-expectation-replaced")
+        invalidateRoomVerification("approved-expectation-replaced")
         guard !expectation.isEmpty, expectation.count <= 256 * 1024 else { throw RoomVerificationError.invalidExpectation }
         let processLock = try recoveryLeaseStore.acquireExclusiveLock()
         defer { processLock.release() }
@@ -268,7 +309,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         if case .helperStatus = request.body {
             return BridgeResponse(requestID: request.requestID, body: .helperStatus(status()))
         }
-        roomVerification.invalidate("device-operation")
+        invalidateRoomVerification("device-operation")
         guard isForeground else {
             return preAdmissionFailure(
                 request,
@@ -770,6 +811,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
 
     private func status() -> HelperStatusResponse {
         var recoveryUnavailable = false
+        var foreignLockBusy = false
+        var configurationChanged = false
         do {
             let processLock = try recoveryLeaseStore.acquireExclusiveLock()
             defer { processLock.release() }
@@ -777,7 +820,9 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             do {
                 try reloadRecoveryStateFromStore()
                 if recoveryLease == nil {
+                    let previous = configuration
                     reloadCurrentConfigurationFromStore()
+                    configurationChanged = configuration != previous
                 }
                 stateLock.unlock()
             } catch {
@@ -786,6 +831,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             }
         } catch MutationRecoveryLeaseError.lockBusy {
             recoveryUnavailable = true
+            foreignLockBusy = true
         } catch {
             stateLock.lock()
             recoveryLease = nil
@@ -827,6 +873,12 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         _ = configurationError
         _ = recoveryLeaseError
         stateLock.unlock()
+        // A lock held by this helper's capture is expected during status reads.
+        // Foreign custody, durable recovery or changed config cancels readiness.
+        if configurationChanged || (recoveryBlocksOperations
+            && (!foreignLockBusy || (active == nil && !roomPreparation.isInFlight))) {
+            invalidateRoomVerification("status-authority-changed")
+        }
         return .init(
             foreground: foreground,
             configured: configuration != nil,
