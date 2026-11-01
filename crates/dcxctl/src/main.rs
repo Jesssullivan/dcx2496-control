@@ -464,6 +464,20 @@ impl ChainPolicyFlags {
 
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
+    /// Full bulk read for an independently approved exact target. No parameter writes.
+    #[cfg(all(feature = "live-control", target_os = "macos"))]
+    RoomRefresh {
+        #[arg(long)]
+        expectation: PathBuf,
+        /// SHA-256 binding of the exact independently approved expectation bytes.
+        #[arg(long)]
+        expectation_digest: String,
+        /// Exact configured callout; no port enumeration.
+        #[arg(long)]
+        tty: PathBuf,
+        #[arg(long)]
+        expected_device: u8,
+    },
     /// Strictly validate an approved room expectation without a device read.
     RoomValidate {
         #[arg(long)]
@@ -935,6 +949,18 @@ fn query(command: QueryCommand) -> Result<(), Box<dyn Error>> {
 
 fn profile(command: ProfileCommand) -> Result<(), Box<dyn Error>> {
     match command {
+        #[cfg(all(feature = "live-control", target_os = "macos"))]
+        ProfileCommand::RoomRefresh {
+            expectation,
+            expectation_digest,
+            tty,
+            expected_device,
+        } => {
+            if !profile_cli::refresh_room(&expectation, &expectation_digest, tty, expected_device)?
+            {
+                std::process::exit(1)
+            }
+        }
         ProfileCommand::RoomValidate { expectation } => profile_cli::validate_room(&expectation)?,
         ProfileCommand::RoomVerify {
             expectation,

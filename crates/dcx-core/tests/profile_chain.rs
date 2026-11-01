@@ -630,3 +630,52 @@ fn room_expectation_refuses_unsafe_or_ambiguous_bindings() {
     value["approveCurrentReadAutomatically"] = serde_json::json!(true);
     assert!(RoomExpectationV1::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
 }
+
+#[test]
+fn approved_refresh_requires_exact_independent_expectation_bytes() {
+    use dcx_core::{
+        output_profile::profile_digest, protocol::DeviceId,
+        room_verification::ApprovedRoomRefreshAdmission,
+    };
+    let states = replay();
+    let snapshot = &states.last().unwrap().1;
+    let expected = room_expectation(snapshot);
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    let digest = profile_digest(&bytes);
+    let device = DeviceId::new(0).unwrap();
+    let admission = ApprovedRoomRefreshAdmission::from_json(&bytes, &digest, device).unwrap();
+    assert_eq!(admission.expectation(), bytes);
+    assert_eq!(admission.expected_device(), device);
+    let mut whitespace = bytes.clone();
+    whitespace.push(b' ');
+    assert!(ApprovedRoomRefreshAdmission::from_json(&whitespace, &digest, device).is_err());
+    for index in 7..digest.len() {
+        let mut changed = digest.clone().into_bytes();
+        changed[index] = if changed[index] == b'0' { b'1' } else { b'0' };
+        assert!(
+            ApprovedRoomRefreshAdmission::from_json(
+                &bytes,
+                std::str::from_utf8(&changed).unwrap(),
+                device
+            )
+            .is_err()
+        );
+    }
+    for key in [
+        "approvedSnapshotDigest",
+        "profiles",
+        "outputMutes",
+        "sceneRevision",
+    ] {
+        let mut malformed = expected.clone();
+        malformed.as_object_mut().unwrap().remove(key);
+        let raw = serde_json::to_vec(&malformed).unwrap();
+        assert!(
+            ApprovedRoomRefreshAdmission::from_json(&raw, &profile_digest(&raw), device).is_err()
+        );
+    }
+    let mut unsafe_reserve = expected;
+    unsafe_reserve["outputMutes"][5] = serde_json::json!(false);
+    let raw = serde_json::to_vec(&unsafe_reserve).unwrap();
+    assert!(ApprovedRoomRefreshAdmission::from_json(&raw, &profile_digest(&raw), device).is_err());
+}
