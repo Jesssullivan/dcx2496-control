@@ -229,3 +229,28 @@ bundle-contained dependencies are admitted. The same check must pass on the
 archive and exported signed copy. It does not repair install names or sign
 binaries. Native build, signature verification and parent-owned child execution
 remain separate qualification steps.
+
+## Failure diagnostics
+
+A failed room capture invalidates readiness before any diagnostic storage work.
+The helper keeps the original failure and automatic-retry latch. Optional
+`helper.status` metadata identifies the attempt, phase, typed failure, completed
+child exit code and duration, output digests and whether close was verified.
+A timeout or absent child never implies verified serial close.
+
+Private records live under `DCXLogicBridge/RoomDiagnostics`. The store admits
+at most eight records, each bounded to 32 kibibytes. It retains at most 16
+kibibytes of child stderr per record. Directory permissions are `0700` and
+exclusive record permissions are `0600`. Redirected directory leaves, symlinks,
+hardlinks, collisions and unexpected files refuse persistence. Status exposes
+only typed metadata and a relative record pointer. Private stderr never enters
+MIDI or readiness receipts. Persistence failure reports unavailable diagnostics
+without turning a failed capture into a match.
+
+The installed build-five failure after the earlier bounded periodic trial
+cannot be reconstructed. That carrier discarded child errors and removed
+attempt workspaces. Build six adds diagnostic retention, not a speculative
+transport repair. It preserves the serial policy, proof lifetime and failure
+latch. Source tests, native compilation, installed behavior and a new actual
+failure remain separate evidence. Authority: user implementation direction,
+Root's diagnostic-loss source scope and TIN-6964. Lexical: XL-ACC-004.
