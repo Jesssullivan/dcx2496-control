@@ -74,6 +74,22 @@ pub const fn operation_label(operation: SnapshotOperationKind) -> &'static str {
     }
 }
 
+/// Typed primary carrier only for Search transport failures. No text classification.
+pub fn search_transport_carrier<E, P>(error: &SnapshotCaptureError<E, P>) -> Option<&E>
+where
+    E: Error + Send + Sync + 'static,
+    P: Error + Send + Sync + 'static,
+{
+    match error {
+        SnapshotCaptureError::Transport {
+            operation: SnapshotOperationKind::Search { .. },
+            source,
+            ..
+        } => Some(source),
+        _ => None,
+    }
+}
+
 /// Summarize a completed capture error without changing sequencing or retry rules.
 pub fn capture_failure_summary<E, P>(
     error: &SnapshotCaptureError<E, P>,
@@ -187,6 +203,81 @@ mod tests {
     use std::io;
 
     type Failure = SnapshotCaptureError<io::Error, io::Error>;
+
+    #[derive(Debug, thiserror::Error)]
+    enum TypedCarrier {
+        #[error("synthetic carrier failure")]
+        Overflow,
+        #[error("Overflow search transport")]
+        Other,
+    }
+
+    type TypedFailure = SnapshotCaptureError<TypedCarrier, io::Error>;
+
+    fn private_overflow_kind(error: &TypedFailure) -> Option<&'static str> {
+        search_transport_carrier(error)
+            .filter(|source| matches!(source, TypedCarrier::Overflow))
+            .map(|_| "overflow")
+    }
+
+    #[test]
+    fn search_overflow_subtype_is_typed_and_independent_of_verified_close() {
+        for finish_error in [None, Some(TypedCarrier::Other)] {
+            let error = TypedFailure::Transport {
+                operation: SnapshotOperationKind::Search { sequence: 1 },
+                source: TypedCarrier::Overflow,
+                finish_error,
+            };
+            assert_eq!(private_overflow_kind(&error), Some("overflow"));
+            assert_eq!(
+                capture_failure_summary(&error).session_closed_verified,
+                matches!(
+                    error,
+                    TypedFailure::Transport {
+                        finish_error: None,
+                        ..
+                    }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn carrier_subtype_rejects_other_operations_and_debug_like_text() {
+        for operation in [
+            SnapshotOperationKind::Search { sequence: 1 },
+            SnapshotOperationKind::Dump0,
+            SnapshotOperationKind::Dump1,
+            SnapshotOperationKind::Meter { sequence: 1 },
+        ] {
+            for source in [TypedCarrier::Overflow, TypedCarrier::Other] {
+                let exact = matches!(operation, SnapshotOperationKind::Search { .. })
+                    && matches!(source, TypedCarrier::Overflow);
+                let error = TypedFailure::Transport {
+                    operation,
+                    source,
+                    finish_error: None,
+                };
+                assert_eq!(private_overflow_kind(&error), exact.then_some("overflow"));
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_and_finish_errors_never_produce_search_overflow_subtype() {
+        for error in [
+            TypedFailure::Timeout {
+                operation: SnapshotOperationKind::Search { sequence: 1 },
+                received: 0,
+                finish_error: Some(TypedCarrier::Overflow),
+            },
+            TypedFailure::Finish {
+                source: TypedCarrier::Overflow,
+            },
+        ] {
+            assert!(private_overflow_kind(&error).is_none());
+        }
+    }
 
     #[test]
     fn dump_zero_timeout_preserves_actual_count_and_verified_finish() {

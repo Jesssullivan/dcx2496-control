@@ -131,6 +131,46 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
         XCTAssertEqual(value.captureFailure?.received, 0)
         XCTAssertTrue(try XCTUnwrap(value.captureFailure).sessionClosedVerified)
     }
+    func testOnlyTypedVerifiedCloseSearchOverflowCanRearmNewCapture() throws {
+        var original = searchContextEnvelope()
+        original.removeValue(forKey: "privateReadContext")
+        original["carrierFailureKind"] = "overflow"
+        func permitted(_ object: [String: Any], exit: Int32 = 1) throws -> Bool {
+            let envelope = try XCTUnwrap(ApprovedRoomFailureEnvelope.decodeIfFailed(
+                JSONSerialization.data(withJSONObject: object), terminationStatus: exit))
+            return ApprovedRoomCaptureFailed(failure: envelope.failure, carrierFailureKind: envelope.carrierFailureKind).permitsPeriodicRetry
+        }
+        XCTAssertTrue(try permitted(original))
+        let (metadata, root) = try exercise(.init(refresh: .success(result(exit: 1,
+            stdout: JSONSerialization.data(withJSONObject: original)))))
+        let privateData = try Data(contentsOf: root.appendingPathComponent(try XCTUnwrap(metadata.privateRecord)))
+        let stored = try XCTUnwrap(JSONSerialization.jsonObject(with: privateData) as? [String: Any])
+        XCTAssertEqual(stored["carrierFailureKind"] as? String, "overflow")
+        XCTAssertFalse(String(decoding: try BridgeJSONCodec.encoder().encode(metadata), as: UTF8.self).contains("carrierFailureKind"))
+        let subtypes: [Any] = [NSNull(), "system", "Overflow { received: 26, queued: 6 }"]
+        for subtype in subtypes {
+            var changed = original; changed["carrierFailureKind"] = subtype
+            XCTAssertFalse((try? permitted(changed)) ?? false)
+        }
+        let changes: [(String, Any)] = [("category", "validation"), ("category", "remote_mode"),
+            ("operation", "dump0"), ("operation", "dump1"), ("operation", "meter"),
+            ("received", 1),
+            ("sessionClosedVerified", false), ("closeFailure", "cleanup")]
+        for (key, invalid) in changes {
+            var changed = original
+            var failure = try XCTUnwrap(changed["failure"] as? [String: Any])
+            failure[key] = invalid; changed["failure"] = failure
+            if key == "sessionClosedVerified" {
+                changed["closeVerified"] = false
+                failure["closeFailure"] = "cleanup"; changed["failure"] = failure
+            }
+            XCTAssertFalse((try? permitted(changed)) ?? false, key)
+        }
+        for exit in [Int32(0), 2, -1] { XCTAssertFalse((try? permitted(original, exit: exit)) ?? false) }
+        var privateOnly = original; privateOnly.removeValue(forKey: "carrierFailureKind")
+        privateOnly["privateReadContext"] = searchContextEnvelope()["privateReadContext"]
+        XCTAssertFalse(try permitted(privateOnly), "Private forensic context cannot authorize a retry")
+    }
     func testTypedFailedCloseRemainsUnknownAndCannotBecomeFreshCapture() throws {
         let data = try JSONSerialization.data(withJSONObject: failedEnvelope(closed: false))
         let (value, _) = try exercise(.init(refresh: .success(result(exit: 1, stdout: data))))

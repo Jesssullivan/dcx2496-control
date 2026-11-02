@@ -313,9 +313,10 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             if let failed = try ApprovedRoomFailureEnvelope.decodeIfFailed(refresh.stdout, terminationStatus: refresh.terminationStatus) {
                 diagnostic.captureFailure = failed.failure
                 diagnostic.privateReadContext = failed.privateReadContext
+                diagnostic.carrierFailureKind = failed.carrierFailureKind
                 diagnostic.closeKnown = failed.failure.sessionClosedVerified ? .verified : .unknown
                 diagnostic.stage = .refreshChild
-                throw ApprovedRoomCaptureFailed(failure: failed.failure)
+                throw ApprovedRoomCaptureFailed(failure: failed.failure, carrierFailureKind: failed.carrierFailureKind)
             }
             let envelope = try BridgeJSONCodec.decoder().decode(ApprovedRoomRefresh.self, from: refresh.stdout)
             capturedAt = try envelope.validate(expectedDevice: configuration.expectedDeviceAddress,

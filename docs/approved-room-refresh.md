@@ -53,11 +53,13 @@ Authority: user implementation direction and Root's separate typed-failure sourc
 
 ## Periodic recovery
 
-The opt-in foreground scheduler may retry completed empty Dump0 or Dump1 timeouts with verified session close. The typed schema, approved binding and current lifecycle must still match. Success publishes only the new complete matching capture. A failed attempt cannot extend or restore an expired proof.
+The opt-in foreground scheduler may start a new full capture after completed empty Dump0 or Dump1 timeouts with verified session close. It also admits an exact typed Search transport overflow with verified close, under Root's recovery direction, TIN-6964. The failed CLI envelope must provide `carrierFailureKind: overflow`; error text and private diagnostic bytes grant no authority. The typed schema, approved binding and current lifecycle must still match. Success publishes only the new complete matching capture. A failed attempt cannot extend or restore an expired proof.
+
+The helper retains that validated subtype only in the existing private failure record. Public status and MIDI metadata remain unchanged. The retained field records the scheduler's typed evidence. It does not authorize a separate capture request.
 
 Consecutive qualified failures wait 15, 30, 60, 120, 240 and then 300 seconds. Later failures retain the 300-second limit. Busy admission has a separate counter and cannot reset transport backoff. A real successful capture resets the read-failure counter and resumes the existing 30-second success delay. One active attempt prevents queued reads.
 
-Malformed, unknown, nonempty, mismatched or unverified-close failures stay latched. Configuration, target or lifecycle changes invalidate the old attempt. Every new attempt repeats the existing approval, recovery, binding and exclusive-serial admission. This policy never retries a parameter write or publishes a synthetic match. Native and named-device recovery qualification remain separate.
+Every other malformed, unknown, nonempty, mismatched or unverified-close failure stays latched. The Search overflow exception never resumes a failed session or repeats its request within that session. It starts a new full capture after the same backoff and admission checks. Configuration, target or lifecycle changes invalidate the old attempt. Every new attempt repeats the existing approval, recovery, binding and exclusive-serial admission. This policy never retries a parameter write or publishes a synthetic match. Native and named-device recovery qualification remain separate.
 
 
 ## Late Search during Dump0

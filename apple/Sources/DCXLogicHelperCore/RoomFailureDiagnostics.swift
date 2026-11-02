@@ -12,6 +12,7 @@ struct RoomFailureAttempt {
     var child: DCXCTLProcessResult?
     var captureFailure: RoomCaptureFailureV1?
     var privateReadContext: PrivateSearchReadContext?
+    var carrierFailureKind: ApprovedRoomCarrierFailureKind?
     var closeKnown: RoomFailureDiagnosticV1.CloseKnown = .notApplicable
 
     func metadata(error: Error, pointer: String?, persistenceUnavailable: Bool) -> RoomFailureDiagnosticV1 {
@@ -64,12 +65,13 @@ final class RoomFailureDiagnosticStore: @unchecked Sendable {
             let metadata: RoomFailureDiagnosticV1
             let stderr: Data
             let privateReadContext: PrivateSearchReadContext?
+            let carrierFailureKind: ApprovedRoomCarrierFailureKind?
         }
         let originalError = error
         do {
             let data = try BridgeJSONCodec.encoder().encode(PrivateRecord(metadata: metadata,
                 stderr: Data((attempt.child?.stderr ?? Data()).prefix(Self.maximumStderrBytes)),
-                privateReadContext: attempt.privateReadContext))
+                privateReadContext: attempt.privateReadContext, carrierFailureKind: attempt.carrierFailureKind))
             guard data.count <= Self.maximumRecordBytes else { throw StoreError.bounds }
             try persist(data, leaf: leaf)
             return metadata

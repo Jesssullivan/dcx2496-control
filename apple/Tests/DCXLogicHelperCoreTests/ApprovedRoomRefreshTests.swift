@@ -125,15 +125,68 @@ final class ApprovedRoomRefreshTests: XCTestCase {
     }
 
     func testEmptyDump1TimeoutInvalidatesThenAllowsFreshMatchAfterBackoff() throws {
+        try exerciseReadFailureRecovery(operation: "dump1", category: "timeout")
+    }
+
+    func testTypedSearchOverflowInvalidatesThenRunsNewFullMatchingCaptureAfterBackoff() throws {
+        try exerciseReadFailureRecovery(operation: "search", category: "transport", carrier: "overflow")
+    }
+
+    func testTypedSearchOverflowFreshCapturesCrossOldTTLWithoutRestampingOrQueue() throws {
+        let manifest = Data("SYNTHETIC overflow recovery binding".utf8)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let origin = Date(timeIntervalSince1970: 2000)
+        let failed: [String: Any] = ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
+            "snapshot": NSNull(), "comparison": NSNull(), "closeVerified": true,
+            "searchAttempts": 1, "searchEmptyTimeouts": 0, "captureElapsedMilliseconds": 15,
+            "carrierFailureKind": "overflow",
+            "failure": ["schemaVersion": "dcx.approved-room-capture-failure/v1", "category": "transport",
+                        "operation": "search", "received": NSNull(), "sessionClosedVerified": true]]
+        let envelope = try XCTUnwrap(ApprovedRoomFailureEnvelope.decodeIfFailed(
+            JSONSerialization.data(withJSONObject: failed), terminationStatus: 1))
+        let error = ApprovedRoomCaptureFailed(failure: envelope.failure, carrierFailureKind: envelope.carrierFailureKind)
+        XCTAssertTrue(error.permitsPeriodicRetry)
+        let first = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: origin).attempt)
+        schedule.complete(first, outcome: error.permitsPeriodicRetry ? .retryableReadFailure : .failed, now: origin)
+        XCTAssertNil(schedule.poll(binding: manifest, capturedAt: nil, now: origin.addingTimeInterval(14.999)).attempt)
+        var lastCapture: Date?
+        var lastVerifiedAt: String?
+        for (start, finish) in [(15.0, 20.0), (50, 55), (85, 90)] {
+            let started = origin.addingTimeInterval(start)
+            let captured = origin.addingTimeInterval(finish)
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: lastCapture, now: started).attempt)
+            XCTAssertNil(schedule.poll(binding: manifest, capturedAt: lastCapture, now: started).attempt)
+            let full = try decode(fixture(expectation: manifest, capturedAt: captured))
+            let captureTime = try full.validate(expectedDevice: 0, terminationStatus: 0, startedAt: started, now: captured)
+            let proof = try publisher.install(full.comparison, expectation: manifest, capturedAt: captureTime,
+                ttyPath: "/SYNTHETIC", captureBinding: manifest)
+            XCTAssertNotEqual(proof.verifiedAt, lastVerifiedAt)
+            XCTAssertTrue(try XCTUnwrap(publisher.current(expectation: manifest, now: captured)).matches)
+            if let previous = lastCapture {
+                XCTAssertNotNil(publisher.current(expectation: manifest, now: previous.addingTimeInterval(59)))
+            }
+            lastCapture = captureTime; lastVerifiedAt = proof.verifiedAt
+            schedule.complete(attempt, outcome: .success(capturedAt: captureTime), now: captured)
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(lastCapture).timeIntervalSince(origin.addingTimeInterval(20)), 60)
+        XCTAssertNil(publisher.current(expectation: manifest, now: try XCTUnwrap(lastCapture).addingTimeInterval(60)))
+        schedule.stop()
+        XCTAssertNil(schedule.poll(binding: manifest, capturedAt: nil, now: origin.addingTimeInterval(1000)).attempt)
+    }
+
+    private func exerciseReadFailureRecovery(operation: String, category: String, carrier: String? = nil) throws {
         try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
             let schedule = PeriodicRoomVerification(); schedule.start()
             let now = Date()
             let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: now).attempt)
-            let failed: [String: Any] = ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
+            var failed: [String: Any] = ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
                 "snapshot": NSNull(), "comparison": NSNull(), "closeVerified": true,
                 "searchAttempts": 1, "searchEmptyTimeouts": 0, "captureElapsedMilliseconds": 8000,
-                "failure": ["schemaVersion": "dcx.approved-room-capture-failure/v1", "category": "timeout",
-                            "operation": "dump1", "received": 0, "sessionClosedVerified": true]]
+                "failure": ["schemaVersion": "dcx.approved-room-capture-failure/v1", "category": category,
+                            "operation": operation, "received": category == "timeout" ? 0 as Any : NSNull() as Any,
+                            "sessionClosedVerified": true]]
+            if let carrier { failed["carrierFailureKind"] = carrier }
             backend.refreshOverride = .init(terminationStatus: 1,
                 stdout: try JSONSerialization.data(withJSONObject: failed), stderr: Data(), durationMilliseconds: 8000)
             var captureError: ApprovedRoomCaptureFailed?
@@ -141,7 +194,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
                 expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
                 bindingIsCurrent: { true })) { captureError = $0 as? ApprovedRoomCaptureFailed }
             let failure = try XCTUnwrap(captureError)
-            XCTAssertEqual(failure.failure.operation, .dump1)
+            XCTAssertEqual(failure.failure.operation?.rawValue, operation)
             XCTAssertTrue(failure.permitsPeriodicRetry)
             XCTAssertNil(publisher.current(expectation: manifest))
             let outcome: PeriodicRoomVerification.Outcome = failure.permitsPeriodicRetry &&
@@ -158,6 +211,11 @@ final class ApprovedRoomRefreshTests: XCTestCase {
             XCTAssertTrue(receipt.matches)
             XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, receipt.verifiedAt)
             XCTAssertEqual(backend.arguments.filter { $0.starts(with: ["profile", "room-refresh"]) }.count, 3)
+            let validations = backend.arguments.filter { $0.starts(with: ["profile", "room-validate"]) }
+            XCTAssertEqual(validations.count, 3)
+            XCTAssertEqual(Set(validations.map { $0[3] }).count, 3, "Each complete attempt gets a new validated workspace")
+            XCTAssertEqual(backend.arguments.map { Array($0.prefix(2)) },
+                Array(repeating: [["profile", "room-validate"], ["profile", "room-refresh"]], count: 3).flatMap { $0 })
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let capturedAt = try XCTUnwrap(formatter.date(from: receipt.verifiedAt))

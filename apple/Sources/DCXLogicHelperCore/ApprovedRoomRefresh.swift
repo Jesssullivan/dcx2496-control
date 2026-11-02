@@ -64,12 +64,13 @@ struct ApprovedRoomRefresh: Decodable {
 struct ApprovedRoomFailureEnvelope: Decodable {
     let failure: RoomCaptureFailureV1
     let privateReadContext: PrivateSearchReadContext?
+    let carrierFailureKind: ApprovedRoomCarrierFailureKind?
     let searchAttempts: UInt32
     let searchEmptyTimeouts: UInt32
     let captureElapsedMilliseconds: UInt64
     private enum Keys: String, CodingKey {
         case schemaVersion, status, snapshot, comparison, failure, closeVerified
-        case searchAttempts, searchEmptyTimeouts, captureElapsedMilliseconds, privateReadContext
+        case searchAttempts, searchEmptyTimeouts, captureElapsedMilliseconds, privateReadContext, carrierFailureKind
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: Keys.self)
@@ -80,6 +81,7 @@ struct ApprovedRoomFailureEnvelope: Decodable {
         }
         failure = try values.decode(RoomCaptureFailureV1.self, forKey: .failure)
         privateReadContext = try values.decodeIfPresent(PrivateSearchReadContext.self, forKey: .privateReadContext)
+        carrierFailureKind = try values.decodeIfPresent(ApprovedRoomCarrierFailureKind.self, forKey: .carrierFailureKind)
         searchAttempts = try values.decode(UInt32.self, forKey: .searchAttempts)
         searchEmptyTimeouts = try values.decode(UInt32.self, forKey: .searchEmptyTimeouts)
         captureElapsedMilliseconds = try values.decode(UInt64.self, forKey: .captureElapsedMilliseconds)
@@ -94,7 +96,8 @@ struct ApprovedRoomFailureEnvelope: Decodable {
               failure.received.map({ $0 <= 2048 }) ?? true,
               failure.category != .timeout || (failure.operation != nil && failure.received != nil),
               failure.category != .finish || !closed,
-              privateReadContext == nil || (failure.category == .transport && failure.operation == .search) else {
+              privateReadContext == nil || (failure.category == .transport && failure.operation == .search),
+              carrierFailureKind == nil || (failure.category == .transport && failure.operation == .search && failure.received == nil) else {
             throw RoomVerificationError.invalidComparison
         }
     }
@@ -164,12 +167,22 @@ struct PrivateSearchReadContext: Codable {
     }
 }
 
+enum ApprovedRoomCarrierFailureKind: String, Codable { case overflow }
+
 struct ApprovedRoomCaptureFailed: Error {
     let failure: RoomCaptureFailureV1
-    /// TIN-6964: only a completed, verified-close empty Dump0 or Dump1 timeout may rearm.
+    let carrierFailureKind: ApprovedRoomCarrierFailureKind?
+    init(failure: RoomCaptureFailureV1, carrierFailureKind: ApprovedRoomCarrierFailureKind? = nil) {
+        self.failure = failure
+        self.carrierFailureKind = carrierFailureKind
+    }
+    /// TIN-6964: rearm only a new capture after a completed verified-close qualified failure.
     var permitsPeriodicRetry: Bool {
-        failure.schemaVersion == "dcx.approved-room-capture-failure/v1" &&
-        failure.category == .timeout && (failure.operation == .dump0 || failure.operation == .dump1) &&
-        failure.received == 0 && failure.sessionClosedVerified && failure.closeFailure == nil
+        guard failure.schemaVersion == "dcx.approved-room-capture-failure/v1",
+              failure.sessionClosedVerified, failure.closeFailure == nil else { return false }
+        if failure.category == .timeout && (failure.operation == .dump0 || failure.operation == .dump1) {
+            return failure.received == 0
+        }
+        return failure.category == .transport && failure.operation == .search && failure.received == nil && carrierFailureKind == .overflow
     }
 }

@@ -110,8 +110,11 @@ heartbeat, daemon or competing serial owner starts a device operation.
 After a successful capture, the next periodic attempt becomes eligible after
 thirty seconds. The existing local timer checks eligibility every five seconds. A real
 explicit capture defers that deadline too. Known lock contention before child
-admission backs off from fifteen seconds to five minutes. Failed transport,
-invalid comparison and drift latch periodic reads off. An explicit successful
+admission backs off from fifteen seconds to five minutes. Exact typed Search
+transport overflow with verified close may start a new full capture after the
+existing transport backoff. Completed empty Dump0 or Dump1 timeouts with verified
+close have the same exception. Every other failed transport, invalid comparison
+and drift latch periodic reads off. An explicit successful
 verification or a changed approved configuration resets that latch. No timer
 performs parameter repair, rollback or unknown-child recovery.
 
@@ -198,7 +201,8 @@ by the standalone capture.
 The success delay is now thirty seconds. The protected twenty-second capture
 budget plus that delay is fifty seconds, below the unchanged sixty-second
 capture-age ceiling. The local five-second eligibility timer can add scheduling
-latency. Failed reads still latch and old captures are never restamped. Only a
+latency. Failed reads latch except the typed verified-close cases above. Old
+captures are never restamped. Only a
 still-fresh proof with unchanged binding may survive a periodic read. One fast
 capture does not qualify the installed periodic workflow or continuous Ready
 availability.
@@ -233,7 +237,11 @@ remain separate qualification steps.
 ## Failure diagnostics
 
 A failed room capture invalidates readiness before any diagnostic storage work.
-The helper keeps the original failure and automatic-retry latch. Optional
+The helper keeps the original failure and its typed recovery decision. Private
+diagnostics cannot grant retry authority. The Search overflow exception requires
+the failed CLI envelope's typed subtype and verified close. It never resumes the
+failed session or repeats its request there. Historical packet identity and cause
+remain unverified. Authority: Root's recovery direction, TIN-6964. Optional
 `helper.status` metadata identifies the attempt, phase, typed failure, completed
 child exit code and duration, output digests and whether close was verified.
 A timeout or absent child never implies verified serial close.
