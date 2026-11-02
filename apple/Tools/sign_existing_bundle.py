@@ -15,7 +15,7 @@ import sys
 TEAM = "QP994XQKNH"
 IDENTITY = "61A8E77C4F3D678921FF0A7DC9D7E317F7754F50"
 GROUP = TEAM + ".io.tinyland.dcx2496"
-VERSION = ("0.1.3", "4")
+VERSION = ("0.1.7", "8")
 COMPONENTS = (
     (
         "dcxctl",

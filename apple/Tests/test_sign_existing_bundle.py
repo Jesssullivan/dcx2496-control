@@ -131,8 +131,8 @@ class SigningContractTests(unittest.TestCase):
             if name != "dcxctl":
                 info = {
                     "CFBundleIdentifier": identifier,
-                    "CFBundleShortVersionString": "0.1.3",
-                    "CFBundleVersion": "4",
+                    "CFBundleShortVersionString": "0.1.7",
+                    "CFBundleVersion": "8",
                 }
                 if name == "helper":
                     info["TinylandRoomPreparationProtocol"] = "dcx.room-preparation/v1"
