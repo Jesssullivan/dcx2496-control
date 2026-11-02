@@ -10,6 +10,7 @@ struct RoomFailureAttempt {
     let observedAt = Date()
     var stage: RoomFailureDiagnosticV1.Stage = .admission
     var child: DCXCTLProcessResult?
+    var captureFailure: RoomCaptureFailureV1?
     var closeKnown: RoomFailureDiagnosticV1.CloseKnown = .notApplicable
 
     func metadata(error: Error, pointer: String?, persistenceUnavailable: Bool) -> RoomFailureDiagnosticV1 {
@@ -34,7 +35,7 @@ struct RoomFailureAttempt {
             stdoutDigest: child.map { digest($0.stdout) }, stdoutByteCount: child?.stdout.count,
             stderrDigest: child.map { digest($0.stderr) }, stderrByteCount: child?.stderr.count,
             stderrRetainedByteCount: persistenceUnavailable ? 0 : min(child?.stderr.count ?? 0, RoomFailureDiagnosticStore.maximumStderrBytes),
-            closeKnown: closeKnown, privateRecord: pointer, persistenceUnavailable: persistenceUnavailable)
+            closeKnown: closeKnown, privateRecord: pointer, persistenceUnavailable: persistenceUnavailable, captureFailure: captureFailure)
     }
 }
 

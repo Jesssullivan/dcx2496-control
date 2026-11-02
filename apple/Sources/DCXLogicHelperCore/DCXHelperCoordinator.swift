@@ -310,6 +310,12 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 throw RoomVerificationError.unavailable
             }
             diagnostic.stage = .refreshDecode
+            if let failed = try ApprovedRoomFailureEnvelope.decodeIfFailed(refresh.stdout, terminationStatus: refresh.terminationStatus) {
+                diagnostic.captureFailure = failed.failure
+                diagnostic.closeKnown = failed.failure.sessionClosedVerified ? .verified : .unknown
+                diagnostic.stage = .refreshChild
+                throw ApprovedRoomCaptureFailed(failure: failed.failure)
+            }
             let envelope = try BridgeJSONCodec.decoder().decode(ApprovedRoomRefresh.self, from: refresh.stdout)
             capturedAt = try envelope.validate(expectedDevice: configuration.expectedDeviceAddress,
                 terminationStatus: refresh.terminationStatus, startedAt: startedAt, now: Date())

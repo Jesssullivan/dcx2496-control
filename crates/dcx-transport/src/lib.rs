@@ -16,6 +16,7 @@ use dcx_core::{
 };
 use thiserror::Error;
 
+pub mod capture_failure;
 pub mod meter;
 pub mod snapshot;
 

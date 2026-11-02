@@ -2430,6 +2430,67 @@
         },
         "persistenceUnavailable": {
           "type": "boolean"
+        },
+        "captureFailure": {
+          "$ref": "#/$defs/roomCaptureFailure"
+        }
+      },
+      "additionalProperties": false
+    },
+    "roomCaptureFailure": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "category",
+        "sessionClosedVerified"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.approved-room-capture-failure/v1"
+        },
+        "category": {
+          "enum": [
+            "pacing",
+            "budget_exceeded",
+            "search_qualification_incomplete",
+            "transport",
+            "remote_mode",
+            "timeout",
+            "response_limit",
+            "validation",
+            "finish"
+          ]
+        },
+        "operation": {
+          "enum": [
+            "search",
+            "dump0",
+            "dump1",
+            "meter"
+          ]
+        },
+        "received": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2048
+        },
+        "sessionClosedVerified": {
+          "type": "boolean"
+        },
+        "closeFailure": {
+          "enum": [
+            "unexpected_trailing_frame",
+            "input_recovery_required",
+            "deadline",
+            "overflow",
+            "end_of_file",
+            "preexisting_input",
+            "short_write",
+            "system",
+            "cleanup",
+            "binding",
+            "other"
+          ]
         }
       },
       "additionalProperties": false

@@ -1,4 +1,5 @@
 import Foundation
+import DCXLogicBridge
 
 public struct RoomCaptureMetrics: Codable, Equatable, Sendable {
     public let identityPolicy: String
@@ -52,3 +53,63 @@ struct ApprovedRoomRefresh: Decodable {
             comparisonElapsedMilliseconds: comparisonElapsedMilliseconds, closeVerified: closeVerified)
     }
 }
+
+
+/// A completed failed child remains failure data, even when its close succeeded.
+/// Legacy failed envelopes have no typed authority and retain unknown close.
+struct ApprovedRoomFailureEnvelope: Decodable {
+    let failure: RoomCaptureFailureV1
+    let searchAttempts: UInt32
+    let searchEmptyTimeouts: UInt32
+    let captureElapsedMilliseconds: UInt64
+    private enum Keys: String, CodingKey {
+        case schemaVersion, status, snapshot, comparison, failure, closeVerified
+        case searchAttempts, searchEmptyTimeouts, captureElapsedMilliseconds
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: Keys.self)
+        guard try values.decode(String.self, forKey: .schemaVersion) == "dcx.approved-room-refresh/v1",
+              try values.decode(String.self, forKey: .status) == "failed",
+              try values.decodeNil(forKey: .snapshot), try values.decodeNil(forKey: .comparison) else {
+            throw RoomVerificationError.invalidComparison
+        }
+        failure = try values.decode(RoomCaptureFailureV1.self, forKey: .failure)
+        searchAttempts = try values.decode(UInt32.self, forKey: .searchAttempts)
+        searchEmptyTimeouts = try values.decode(UInt32.self, forKey: .searchEmptyTimeouts)
+        captureElapsedMilliseconds = try values.decode(UInt64.self, forKey: .captureElapsedMilliseconds)
+        let closed = try values.decode(Bool.self, forKey: .closeVerified)
+        let carrierKinds: Set<String> = ["unexpected_trailing_frame", "input_recovery_required", "deadline", "overflow", "end_of_file", "preexisting_input", "short_write", "system", "cleanup", "binding", "other"]
+        guard failure.schemaVersion == "dcx.approved-room-capture-failure/v1",
+              searchAttempts <= 3, searchEmptyTimeouts <= searchAttempts,
+              captureElapsedMilliseconds <= 30_000,
+              closed == failure.sessionClosedVerified,
+              (closed && failure.closeFailure == nil) || (!closed && failure.closeFailure != nil),
+              failure.closeFailure.map({ carrierKinds.contains($0) }) ?? true,
+              failure.received.map({ $0 <= 2048 }) ?? true,
+              failure.category != .timeout || (failure.operation != nil && failure.received != nil),
+              failure.category != .finish || !closed else {
+            throw RoomVerificationError.invalidComparison
+        }
+    }
+    static func decodeIfFailed(_ data: Data, terminationStatus: Int32) throws -> Self? {
+        struct Header: Decodable {
+            let status: String
+            let hasFailure: Bool
+            private enum Keys: String, CodingKey { case status, failure }
+            init(from decoder: Decoder) throws {
+                let values = try decoder.container(keyedBy: Keys.self)
+                status = try values.decode(String.self, forKey: .status)
+                hasFailure = values.contains(.failure)
+            }
+        }
+        let header = try BridgeJSONCodec.decoder().decode(Header.self, from: data)
+        guard header.status == "failed" else {
+            guard !header.hasFailure else { throw RoomVerificationError.invalidComparison }
+            return nil
+        }
+        guard terminationStatus == 1 else { throw RoomVerificationError.invalidComparison }
+        return try BridgeJSONCodec.decoder().decode(Self.self, from: data)
+    }
+}
+
+struct ApprovedRoomCaptureFailed: Error { let failure: RoomCaptureFailureV1 }

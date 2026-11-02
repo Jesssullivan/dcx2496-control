@@ -51,6 +51,67 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: record) as? [String: Any])
         XCTAssertEqual(Data(base64Encoded: try XCTUnwrap(object["stderr"] as? String)), Data("SYNTHETIC private stderr".utf8))
     }
+    private func failedEnvelope(closed: Bool = true) -> [String: Any] {
+        ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
+         "snapshot": NSNull(), "comparison": NSNull(), "closeVerified": closed,
+         "searchAttempts": 2, "searchEmptyTimeouts": 1, "captureElapsedMilliseconds": 7800,
+         "failure": ["schemaVersion": "dcx.approved-room-capture-failure/v1", "category": "timeout",
+                     "operation": "dump0", "received": 0, "sessionClosedVerified": closed,
+                     "closeFailure": closed ? NSNull() as Any : "cleanup" as Any]]
+    }
+    func testTypedEmptyDumpTimeoutRetainsActualCloseAndNeverPublishesReadiness() throws {
+        let data = try JSONSerialization.data(withJSONObject: failedEnvelope())
+        let (value, _) = try exercise(.init(refresh: .success(result(exit: 1, stdout: data))))
+        XCTAssertEqual(value.stage, .refreshChild); XCTAssertEqual(value.failure, .childExit)
+        XCTAssertEqual(value.childExitCode, 1); XCTAssertEqual(value.closeKnown, .verified)
+        XCTAssertEqual(value.captureFailure?.category, .timeout)
+        XCTAssertEqual(value.captureFailure?.operation, .dump0)
+        XCTAssertEqual(value.captureFailure?.received, 0)
+        XCTAssertTrue(try XCTUnwrap(value.captureFailure).sessionClosedVerified)
+    }
+    func testTypedFailedCloseRemainsUnknownAndCannotBecomeFreshCapture() throws {
+        let data = try JSONSerialization.data(withJSONObject: failedEnvelope(closed: false))
+        let (value, _) = try exercise(.init(refresh: .success(result(exit: 1, stdout: data))))
+        XCTAssertEqual(value.closeKnown, .unknown)
+        XCTAssertEqual(value.captureFailure?.closeFailure, "cleanup")
+        XCTAssertFalse(try XCTUnwrap(value.captureFailure).sessionClosedVerified)
+    }
+    func testLegacyFailedEnvelopeRetainsUnknownClose() throws {
+        var object = failedEnvelope(); object.removeValue(forKey: "failure"); object["closeVerified"] = NSNull()
+        let (value, _) = try exercise(.init(refresh: .success(result(exit: 1, stdout: try JSONSerialization.data(withJSONObject: object)))))
+        XCTAssertEqual(value.closeKnown, .unknown); XCTAssertNil(value.captureFailure)
+    }
+    func testConflictingUnknownAndMalformedFailureEvidenceCannotClaimClose() throws {
+        let changes: [(inout [String: Any]) -> Void] = [
+            { $0["closeVerified"] = false },
+            { $0["snapshot"] = ["synthetic": true] },
+            { $0["comparison"] = ["matches": true] },
+            { $0["searchAttempts"] = 4 },
+            { $0["captureElapsedMilliseconds"] = 30_001 },
+            { var f = $0["failure"] as! [String: Any]; f["operation"] = "unknown"; $0["failure"] = f },
+            { var f = $0["failure"] as! [String: Any]; f["received"] = -1; $0["failure"] = f },
+            { var f = $0["failure"] as! [String: Any]; f["received"] = 2049; $0["failure"] = f },
+            { var f = $0["failure"] as! [String: Any]; f["received"] = NSNull(); $0["failure"] = f },
+            { var f = $0["failure"] as! [String: Any]; f["schemaVersion"] = "unknown"; $0["failure"] = f },
+            { var f = $0["failure"] as! [String: Any]; f["category"] = "unknown"; $0["failure"] = f },
+            { var f = $0["failure"] as! [String: Any]; f["sessionClosedVerified"] = NSNull(); $0["failure"] = f },
+            { var f = $0["failure"] as! [String: Any]; f["closeFailure"] = "cleanup"; $0["failure"] = f },
+        ]
+        for change in changes {
+            var object = failedEnvelope(); change(&object)
+            let (value, _) = try exercise(.init(refresh: .success(result(exit: 1, stdout: try JSONSerialization.data(withJSONObject: object)))))
+            XCTAssertEqual(value.closeKnown, .unknown); XCTAssertNil(value.captureFailure)
+        }
+    }
+    func testFailedEnvelopeWithSuccessfulChildExitCannotClaimClose() throws {
+        let data = try JSONSerialization.data(withJSONObject: failedEnvelope())
+        let (value, _) = try exercise(.init(refresh: .success(result(exit: 0, stdout: data))))
+        XCTAssertEqual(value.closeKnown, .unknown); XCTAssertNil(value.captureFailure)
+    }
+    func testSuccessfulStatusCannotSmuggleTypedFailureAuthority() throws {
+        var object = failedEnvelope(); object["status"] = "match"
+        XCTAssertThrowsError(try ApprovedRoomFailureEnvelope.decodeIfFailed(JSONSerialization.data(withJSONObject: object), terminationStatus: 0))
+    }
     func testMalformedSuccessfulRefreshIsDecodeFailureAndCloseUnknown() throws {
         let (value, _) = try exercise(.init(refresh: .success(result(exit: 0))))
         XCTAssertEqual(value.stage, .refreshDecode); XCTAssertEqual(value.failure, .decoding)

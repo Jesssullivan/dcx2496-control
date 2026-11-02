@@ -1899,6 +1899,32 @@ mod tests {
     }
 
     #[test]
+    fn approved_dump0_timeout_summary_uses_actual_consuming_finish_result() {
+        use crate::capture_failure::{capture_failure_summary, operation_label};
+        for fail_finish in [false, true] {
+            let mut steps = snapshot_steps(&snapshot(0, 1, 2), 1);
+            steps[1] = Step::Read(SnapshotRead::timed_out(&[]).unwrap());
+            let (mut session, log) = FakeSession::new(steps);
+            session.fail_finish = fail_finish;
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            let value = capture_failure_summary(error.failure());
+            assert_eq!(value.category.as_str(), "timeout");
+            assert_eq!(value.operation.map(operation_label), Some("dump0"));
+            assert_eq!(value.received, Some(0));
+            assert_eq!(value.session_closed_verified, !fail_finish);
+            assert_eq!(value.close_failure.is_some(), fail_finish);
+            assert_eq!(error.search_attempts(), 1);
+            assert_eq!(log.borrow().finishes, 1);
+            assert_eq!(log.borrow().operations.len(), 2);
+        }
+    }
+
+    #[test]
     fn approved_refresh_invalid_bulk_and_unverified_close_are_never_success() {
         for part in 0..2 {
             let mut steps = snapshot_steps(&snapshot(0, 1, 2), 1);

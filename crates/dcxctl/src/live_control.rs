@@ -97,6 +97,7 @@ pub fn capture_approved(
     {
         Ok(captured) => Ok(captured),
         Err(error) => {
+            let failure = approved_capture_failure_receipt(error.failure());
             println!(
                 "{}",
                 serde_json::json!({
@@ -107,7 +108,8 @@ pub fn capture_approved(
                     "searchAttempts": error.search_attempts(),
                     "searchEmptyTimeouts": error.empty_search_timeouts(),
                     "captureElapsedMilliseconds": u64::try_from(error.elapsed().as_millis())?,
-                    "closeVerified": null,
+                    "closeVerified": failure["sessionClosedVerified"],
+                    "failure": failure,
                     "error": error.to_string(),
                 })
             );
@@ -333,81 +335,29 @@ fn carrier_failure_kind(error: &DarwinCarrierError) -> &'static str {
 fn capture_failure_receipt(
     error: &SnapshotCaptureError<DarwinCarrierError, Infallible>,
 ) -> serde_json::Value {
-    let (kind, operation, carrier, finish_error) = match error {
-        SnapshotCaptureError::Pacing { finish_error, .. } => {
-            ("pacing", None, None, finish_error.as_ref())
-        }
-        SnapshotCaptureError::BudgetExceeded {
-            operation,
-            finish_error,
-        } => (
-            "budget_exceeded",
-            Some(*operation),
-            None,
-            finish_error.as_ref(),
-        ),
-        SnapshotCaptureError::SearchQualificationIncomplete { finish_error, .. } => (
-            "search_qualification_incomplete",
-            None,
-            None,
-            finish_error.as_ref(),
-        ),
-        SnapshotCaptureError::Transport {
-            operation,
-            source,
-            finish_error,
-        } => (
-            "transport",
-            Some(*operation),
-            Some(carrier_failure_kind(source)),
-            finish_error.as_ref(),
-        ),
-        SnapshotCaptureError::RemoteMode {
-            source,
-            finish_error,
-            ..
-        } => (
-            "remote_mode",
-            None,
-            Some(carrier_failure_kind(source)),
-            finish_error.as_ref(),
-        ),
-        SnapshotCaptureError::Timeout {
-            operation,
-            finish_error,
-            ..
-        } => ("timeout", Some(*operation), None, finish_error.as_ref()),
-        SnapshotCaptureError::ResponseLimit {
-            operation,
-            finish_error,
-            ..
-        } => (
-            "response_limit",
-            Some(*operation),
-            None,
-            finish_error.as_ref(),
-        ),
-        SnapshotCaptureError::Validation {
-            operation,
-            finish_error,
-            ..
-        } => ("validation", Some(*operation), None, finish_error.as_ref()),
-        SnapshotCaptureError::Finish { source } => {
-            return serde_json::json!({
-                "kind": "finish",
-                "operation": null,
-                "carrier": carrier_failure_kind(source),
-                "session_closed_verified": false,
-                "close_failure": carrier_failure_kind(source),
-            });
-        }
-    };
+    let value = dcx_transport::capture_failure::capture_failure_summary(error);
     serde_json::json!({
-        "kind": kind,
-        "operation": operation.map(|operation| format!("{operation:?}")),
-        "carrier": carrier,
-        "session_closed_verified": finish_error.is_none(),
-        "close_failure": finish_error.map(carrier_failure_kind),
+        "kind": value.category.as_str(),
+        "operation": value.operation.map(|operation| format!("{operation:?}")),
+        "carrier": value.carrier.map(carrier_failure_kind),
+        "session_closed_verified": value.session_closed_verified,
+        "close_failure": value.close_failure.map(carrier_failure_kind),
+    })
+}
+
+/// Versioned approved-room failure metadata. No Debug text is wire authority.
+#[cfg(all(feature = "live-control", target_os = "macos"))]
+fn approved_capture_failure_receipt(
+    error: &SnapshotCaptureError<DarwinCarrierError, Infallible>,
+) -> serde_json::Value {
+    let value = dcx_transport::capture_failure::capture_failure_summary(error);
+    serde_json::json!({
+        "schemaVersion": "dcx.approved-room-capture-failure/v1",
+        "category": value.category.as_str(),
+        "operation": value.operation.map(dcx_transport::capture_failure::operation_label),
+        "received": value.received,
+        "sessionClosedVerified": value.session_closed_verified,
+        "closeFailure": value.close_failure.map(carrier_failure_kind),
     })
 }
 
