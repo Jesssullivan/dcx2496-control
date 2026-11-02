@@ -112,21 +112,24 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
         var object = failedEnvelope(); object["status"] = "match"
         XCTAssertThrowsError(try ApprovedRoomFailureEnvelope.decodeIfFailed(JSONSerialization.data(withJSONObject: object), terminationStatus: 0))
     }
-    func testOnlyVerifiedClosedEmptyDump0TimeoutPermitsPeriodicRetry() throws {
+    func testOnlyVerifiedClosedEmptyDump0OrDump1TimeoutPermitsPeriodicRetry() throws {
         func eligible(_ object: [String: Any]) throws -> Bool {
             let failure = try BridgeJSONCodec.decoder().decode(RoomCaptureFailureV1.self,
                 from: JSONSerialization.data(withJSONObject: object))
             return ApprovedRoomCaptureFailed(failure: failure).permitsPeriodicRetry
         }
-        let original = try XCTUnwrap(failedEnvelope()["failure"] as? [String: Any])
-        XCTAssertTrue(try eligible(original))
-        for (key, value) in [("category", "transport" as Any), ("category", "validation" as Any),
-                             ("operation", "search" as Any), ("operation", "dump1" as Any),
-                             ("received", 1 as Any), ("received", NSNull() as Any),
-                             ("sessionClosedVerified", false as Any), ("closeFailure", "cleanup" as Any),
-                             ("schemaVersion", "unknown" as Any)] {
-            var changed = original; changed[key] = value
-            XCTAssertFalse(try eligible(changed))
+        for operation in ["dump0", "dump1"] {
+            var original = try XCTUnwrap(failedEnvelope()["failure"] as? [String: Any])
+            original["operation"] = operation
+            XCTAssertTrue(try eligible(original))
+            for (key, value) in [("category", "transport" as Any), ("category", "validation" as Any),
+                                 ("operation", "search" as Any), ("operation", "meter" as Any),
+                                 ("received", 1 as Any), ("received", 903 as Any), ("received", NSNull() as Any),
+                                 ("sessionClosedVerified", false as Any), ("closeFailure", "cleanup" as Any),
+                                 ("schemaVersion", "unknown" as Any)] {
+                var changed = original; changed[key] = value
+                XCTAssertFalse(try eligible(changed))
+            }
         }
     }
     func testCompletedFailurePropagatesRetryEvidenceWhileReadinessStaysInvalid() throws {

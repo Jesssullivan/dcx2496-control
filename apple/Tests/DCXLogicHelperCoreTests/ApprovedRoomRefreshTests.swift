@@ -97,6 +97,49 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    func testEmptyDump1TimeoutInvalidatesThenAllowsFreshMatchAfterBackoff() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let now = Date()
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: now).attempt)
+            let failed: [String: Any] = ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
+                "snapshot": NSNull(), "comparison": NSNull(), "closeVerified": true,
+                "searchAttempts": 1, "searchEmptyTimeouts": 0, "captureElapsedMilliseconds": 8000,
+                "failure": ["schemaVersion": "dcx.approved-room-capture-failure/v1", "category": "timeout",
+                            "operation": "dump1", "received": 0, "sessionClosedVerified": true]]
+            backend.refreshOverride = .init(terminationStatus: 1,
+                stdout: try JSONSerialization.data(withJSONObject: failed), stderr: Data(), durationMilliseconds: 8000)
+            var captureError: ApprovedRoomCaptureFailed?
+            XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true })) { captureError = $0 as? ApprovedRoomCaptureFailed }
+            let failure = try XCTUnwrap(captureError)
+            XCTAssertEqual(failure.failure.operation, .dump1)
+            XCTAssertTrue(failure.permitsPeriodicRetry)
+            XCTAssertNil(publisher.current(expectation: manifest))
+            let outcome: PeriodicRoomVerification.Outcome = failure.permitsPeriodicRetry &&
+                schedule.isCurrent(attempt) && attempt.binding == manifest ? .retryableReadFailure : .failed
+            schedule.complete(attempt, outcome: outcome, now: now)
+            XCTAssertNil(schedule.poll(binding: manifest, capturedAt: nil, now: now.addingTimeInterval(14.999)).attempt)
+            let retryAt = now.addingTimeInterval(15)
+            let retry = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: retryAt).attempt)
+            XCTAssertNil(schedule.poll(binding: manifest, capturedAt: nil, now: retryAt).attempt)
+            backend.refreshOverride = nil
+            let receipt = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true })
+            XCTAssertTrue(receipt.matches)
+            XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, receipt.verifiedAt)
+            XCTAssertEqual(backend.arguments.filter { $0.starts(with: ["profile", "room-refresh"]) }.count, 3)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let capturedAt = try XCTUnwrap(formatter.date(from: receipt.verifiedAt))
+            schedule.complete(retry, outcome: .success(capturedAt: capturedAt), now: retryAt)
+            XCTAssertNil(schedule.poll(binding: manifest, capturedAt: capturedAt, now: now.addingTimeInterval(44.999)).attempt)
+            XCTAssertNotNil(schedule.poll(binding: manifest, capturedAt: capturedAt, now: now.addingTimeInterval(45)).attempt)
+        }
+    }
+
     func testPeriodicReadFailureImmediatelyInvalidatesRetainedProof() throws {
         try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, first in
             backend.beforeRefresh = {
@@ -253,6 +296,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
 private final class FastBackend: DCXCTLCommandExecuting, @unchecked Sendable {
     var arguments: [[String]] = []
     var beforeRefresh: (() throws -> Void)?
+    var refreshOverride: DCXCTLProcessResult?
     let envelope: () throws -> [String: Any]
     init(_ envelope: @escaping () throws -> [String: Any]) { self.envelope = envelope }
     func resolveExecutable(for configuration: HelperConfigurationV1) throws -> URL { URL(fileURLWithPath: "/SYNTHETIC/dcxctl") }
@@ -260,7 +304,11 @@ private final class FastBackend: DCXCTLCommandExecuting, @unchecked Sendable {
         XCTAssertNotNil(mutationLock)
         arguments.append(invocation.arguments)
         let object: Any
-        if invocation.arguments.starts(with: ["profile", "room-refresh"]) { try beforeRefresh?(); object = try envelope() }
+        if invocation.arguments.starts(with: ["profile", "room-refresh"]) {
+            try beforeRefresh?()
+            if let refreshOverride { return refreshOverride }
+            object = try envelope()
+        }
         else if invocation.arguments.starts(with: ["control", "snapshot"]) { object = try XCTUnwrap(envelope()["snapshot"]) }
         else if invocation.arguments.starts(with: ["profile", "room-verify"]) { object = try XCTUnwrap(envelope()["comparison"]) }
         else { object = [String: Any]() }

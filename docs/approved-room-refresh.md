@@ -52,7 +52,7 @@ Authority: user implementation direction and Root's separate typed-failure sourc
 
 ## Periodic recovery
 
-The opt-in foreground scheduler may retry one qualified failure: a completed child reports an empty Dump0 timeout and verified session close. The typed schema, approved binding and current lifecycle must still match. Success publishes only the new complete matching capture. A failed attempt cannot extend or restore an expired proof.
+The opt-in foreground scheduler may retry completed empty Dump0 or Dump1 timeouts with verified session close. The typed schema, approved binding and current lifecycle must still match. Success publishes only the new complete matching capture. A failed attempt cannot extend or restore an expired proof.
 
 Consecutive qualified failures wait 15, 30, 60, 120, 240 and then 300 seconds. Later failures retain the 300-second limit. Busy admission has a separate counter and cannot reset transport backoff. A real successful capture resets the read-failure counter and resumes the existing 30-second success delay. One active attempt prevents queued reads.
 
