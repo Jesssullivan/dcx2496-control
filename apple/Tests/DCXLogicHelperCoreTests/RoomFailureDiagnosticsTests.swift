@@ -136,8 +136,10 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
         original.removeValue(forKey: "privateReadContext")
         original["carrierFailureKind"] = "overflow"
         func permitted(_ object: [String: Any], exit: Int32 = 1) throws -> Bool {
-            let envelope = try XCTUnwrap(ApprovedRoomFailureEnvelope.decodeIfFailed(
-                JSONSerialization.data(withJSONObject: object), terminationStatus: exit))
+            guard let envelope = try ApprovedRoomFailureEnvelope.decodeIfFailed(
+                JSONSerialization.data(withJSONObject: object), terminationStatus: exit) else {
+                throw RoomVerificationError.invalidComparison
+            }
             return ApprovedRoomCaptureFailed(failure: envelope.failure, carrierFailureKind: envelope.carrierFailureKind).permitsPeriodicRetry
         }
         XCTAssertTrue(try permitted(original))
