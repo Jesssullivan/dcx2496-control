@@ -7,6 +7,33 @@ import XCTest
 final class ApprovedRoomRefreshTests: XCTestCase {
     private let at = Date(timeIntervalSince1970: 1_000)
 
+    func testIgnoredDump0SearchReplayMetricIsOptionalAndBounded() throws {
+        XCTAssertNil(try decode(fixture()).metrics.ignoredDump0SearchReplays)
+        for count in [0, 1] {
+            var object = try fixture()
+            object["ignoredDump0SearchReplays"] = count
+            let value = try decode(object)
+            _ = try value.validate(expectedDevice: 0, terminationStatus: 0,
+                startedAt: at.addingTimeInterval(-10), now: at.addingTimeInterval(2))
+            XCTAssertEqual(value.metrics.ignoredDump0SearchReplays, UInt32(count))
+        }
+        var drift = try fixture()
+        drift["ignoredDump0SearchReplays"] = 1
+        drift["status"] = "drift"
+        var comparison = try XCTUnwrap(drift["comparison"] as? [String: Any])
+        comparison["matches"] = false
+        drift["comparison"] = comparison
+        _ = try decode(drift).validate(expectedDevice: 0, terminationStatus: 1,
+            startedAt: at.addingTimeInterval(-10), now: at.addingTimeInterval(2))
+        let invalidValues: [Any] = [2, -1, "1", UInt64(UInt32.max) + 1]
+        for invalid in invalidValues {
+            var object = try fixture()
+            object["ignoredDump0SearchReplays"] = invalid
+            XCTAssertThrowsError(try decode(object).validate(expectedDevice: 0, terminationStatus: 0,
+                startedAt: at.addingTimeInterval(-10), now: at.addingTimeInterval(2)))
+        }
+    }
+
     func testFullBulkEnvelopeRetainsActualCaptureTimeAndMeasuredAttempts() throws {
         let value = try decode(fixture())
         let date = try value.validate(expectedDevice: 0, terminationStatus: 0, startedAt: at.addingTimeInterval(-10), now: at.addingTimeInterval(2))

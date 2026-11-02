@@ -21,7 +21,7 @@ use dcx_core::protocol::{DeviceId, ProtocolError, RemoteMode};
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 use dcx_core::{
     discovery::FALLBACK_BAUD,
-    protocol::{DirectParameterCommand, MAX_FRAME_LEN, RemoteModeCommand},
+    protocol::{DirectParameterCommand, MAX_FRAME_LEN, RemoteModeCommand, SearchResponse26},
 };
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 use dcx_transport::{
@@ -694,6 +694,7 @@ struct PersistentCarrier<B: SerialBackend> {
     control_lines_snapshot: i32,
     input_discard_required: bool,
     last_search_response: Option<[u8; SEARCH_RESPONSE_LIMIT]>,
+    ignored_dump0_search_replay: bool,
     receive_direct_cleanup_device: Option<DeviceId>,
 }
 
@@ -795,6 +796,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             control_lines_snapshot,
             input_discard_required: false,
             last_search_response: None,
+            ignored_dump0_search_replay: false,
             receive_direct_cleanup_device: None,
         })
     }
@@ -1020,13 +1022,22 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. }) {
             self.attempt_count += 1;
         }
-        let bounded = read_snapshot_bounded(
+        let replay_context = matches!(operation.kind(), SnapshotOperationKind::Dump0)
+            .then_some(self.last_search_response.as_ref())
+            .flatten()
+            .map(|frame| (operation.expected_device(), frame.as_slice()));
+        let mut ignored_replay = false;
+        let bounded = read_snapshot_bounded_with_replay(
             &mut self.backend,
             deadline,
             operation.response_limit(),
             request.as_bytes(),
             matches!(operation.kind(), SnapshotOperationKind::Search { .. }),
-        )?;
+            replay_context,
+            &mut ignored_replay,
+        );
+        self.ignored_dump0_search_replay |= ignored_replay;
+        let bounded = bounded?;
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. })
             && let Some(response) = bounded.response
         {
@@ -1155,6 +1166,10 @@ impl<B: SerialBackend> PersistentSnapshotSession for PersistentCarrier<B> {
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
         self.write_remote_mode_command(*command)
+    }
+
+    fn ignored_dump0_search_replay(&self) -> bool {
+        self.ignored_dump0_search_replay
     }
 
     fn finish(self) -> Result<(), Self::Error> {
@@ -1847,7 +1862,7 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
     }
 }
 
-#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+#[cfg(test)]
 fn read_snapshot_bounded<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1855,27 +1870,62 @@ fn read_snapshot_bounded<B: SerialBackend>(
     request: &[u8],
     consume_all_queued_search_replays: bool,
 ) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
+    read_snapshot_bounded_with_replay(
+        backend,
+        deadline,
+        limit,
+        request,
+        consume_all_queued_search_replays,
+        None,
+        &mut false,
+    )
+}
+
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+fn read_snapshot_bounded_with_replay<B: SerialBackend>(
+    backend: &mut B,
+    deadline: Duration,
+    limit: usize,
+    request: &[u8],
+    consume_all_queued_search_replays: bool,
+    dump0_search: Option<(DeviceId, &[u8])>,
+    ignored_replay: &mut bool,
+) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
     let mut observer = ();
-    let first = read_one_frame(backend, deadline, limit, &mut observer)?;
-    let response = match first {
-        FramedRead::TimedOut(partial) => {
-            return Ok(BoundedRead {
-                read: SnapshotRead::timed_out(&partial)?,
-                response: None,
-            });
-        }
-        FramedRead::Complete(frame) if frame.as_slice() == request => {
-            match read_one_frame(backend, deadline, limit, &mut observer)? {
-                FramedRead::Complete(response) => response,
-                FramedRead::TimedOut(partial) => {
-                    return Ok(BoundedRead {
-                        read: SnapshotRead::timed_out(&partial)?,
-                        response: None,
+    let mut echo_consumed = false;
+    let response = loop {
+        match read_one_frame(backend, deadline, limit, &mut observer)? {
+            FramedRead::TimedOut(partial) => {
+                // TIN-6964: a consumed replay is evidence of input, never an empty timeout.
+                if *ignored_replay {
+                    return Err(DarwinCarrierError::UnexpectedTrailingFrame {
+                        received: partial.len(),
                     });
                 }
+                return Ok(BoundedRead {
+                    read: SnapshotRead::timed_out(&partial)?,
+                    response: None,
+                });
+            }
+            FramedRead::Complete(frame)
+                if !echo_consumed && !*ignored_replay && frame == request =>
+            {
+                echo_consumed = true;
+            }
+            FramedRead::Complete(frame) => {
+                if !*ignored_replay
+                    && dump0_search.is_some_and(|(device, accepted)| {
+                        frame == accepted
+                            && SearchResponse26::parse(&frame)
+                                .is_ok_and(|response| response.device() == device)
+                    })
+                {
+                    *ignored_replay = true;
+                    continue;
+                }
+                break frame;
             }
         }
-        FramedRead::Complete(response) => response,
     };
     let read = SnapshotRead::complete(&response)?;
     if consume_all_queued_search_replays {
@@ -2021,6 +2071,10 @@ impl PersistentSnapshotSession for DarwinSearchSession {
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
         self.inner.write_remote_mode_command(*command)
+    }
+
+    fn ignored_dump0_search_replay(&self) -> bool {
+        self.inner.ignored_dump0_search_replay
     }
 
     fn finish(self) -> Result<(), Self::Error> {

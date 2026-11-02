@@ -52,6 +52,7 @@ struct FakeBackend {
     written: bool,
     read_since_write: usize,
     read_goal: usize,
+    dump0_prefix_len: usize,
     eof_after: Option<usize>,
     would_block_once_at: Option<usize>,
     writes: Vec<Vec<u8>>,
@@ -80,6 +81,7 @@ impl FakeBackend {
             written: false,
             read_since_write: 0,
             read_goal: 0,
+            dump0_prefix_len: 0,
             eof_after: None,
             would_block_once_at: None,
             writes: Vec::new(),
@@ -178,7 +180,7 @@ impl SerialBackend for FakeBackend {
                 SEARCH_REQUEST_LEN + SEARCH_RESPONSE_LIMIT
             }
             Some(0x40) => SEARCH_RESPONSE_LIMIT,
-            Some(0x50) if bytes.get(9) == Some(&0) => DUMP0_RESPONSE_LEN,
+            Some(0x50) if bytes.get(9) == Some(&0) => DUMP0_RESPONSE_LEN + self.dump0_prefix_len,
             Some(0x50) if bytes.get(9) == Some(&1) => DUMP1_RESPONSE_LEN,
             Some(0x44) => METER_RESPONSE_LEN,
             Some(0x20 | 0x3f) => 0,
@@ -2247,4 +2249,172 @@ fn exhausted_positive_count_refreshes_before_reading_more() {
     assert!(matches!(result, FramedRead::Complete(actual) if actual == synthetic_response(0)));
     assert_eq!(queue_query_count(&backend), 3);
     assert_eq!(backend.read_since_write, SEARCH_RESPONSE_LIMIT);
+}
+
+fn read_dump0_with_search(
+    backend: &mut FakeBackend,
+    accepted: &[u8],
+    ignored: &mut bool,
+) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
+    read_snapshot_bounded_with_replay(
+        backend,
+        Duration::from_secs(2),
+        DUMP0_RESPONSE_LEN,
+        &[0xf0, 0, 0x20, 0x32, 0, 0x0e, 0x50, 0, 0, 0, 0xf7],
+        false,
+        Some((DeviceId::new(0).unwrap(), accepted)),
+        ignored,
+    )
+}
+
+#[test]
+fn dump0_consumes_one_strict_identical_search_without_a_second_write_or_overread() {
+    let search = synthetic_response(0);
+    let dump = synthetic_dump(0, 0);
+    let mut backend = queued_frame_backend(search.into_iter().chain(dump.clone()));
+    let mut ignored = false;
+    let result = read_dump0_with_search(&mut backend, &search, &mut ignored).unwrap();
+    assert!(ignored);
+    assert_eq!(result.read, SnapshotRead::complete(&dump).unwrap());
+    assert!(backend.inbound.is_empty());
+    assert!(
+        backend
+            .calls
+            .iter()
+            .all(|call| !matches!(call, Call::Write(_) | Call::DiscardInput))
+    );
+    assert_eq!(backend.read_since_write, search.len() + dump.len());
+}
+
+#[test]
+fn dump0_never_skips_arbitrary_or_changed_twenty_six_byte_candidates() {
+    let accepted = synthetic_response(0);
+    for index in [0, 1, 4, 5, 6, 7] {
+        let mut changed = accepted;
+        changed[index] ^= 1;
+        let mut backend = queued_frame_backend(changed);
+        let mut ignored = false;
+        let result = read_dump0_with_search(&mut backend, &accepted, &mut ignored).unwrap();
+        assert!(!ignored, "changed byte {index}");
+        assert_eq!(result.read, SnapshotRead::complete(&changed).unwrap());
+    }
+    // Even equality is insufficient when the cached frame is malformed or wrong-address.
+    let mut wrong_model = accepted;
+    wrong_model[5] = 0x0f;
+    for invalid in [synthetic_response(1), wrong_model] {
+        let mut backend = queued_frame_backend(invalid);
+        let mut ignored = false;
+        read_dump0_with_search(&mut backend, &invalid, &mut ignored).unwrap();
+        assert!(!ignored);
+    }
+}
+
+#[test]
+fn dump0_second_search_is_terminal_candidate_not_skipped() {
+    let search = synthetic_response(0);
+    let mut backend = queued_frame_backend(search.into_iter().chain(search));
+    let mut ignored = false;
+    let result = read_dump0_with_search(&mut backend, &search, &mut ignored).unwrap();
+    assert!(ignored);
+    assert_eq!(result.read, SnapshotRead::complete(&search).unwrap());
+    // The unchanged transport validator rejects this 26-byte Dump0 candidate.
+}
+
+#[test]
+fn dump0_replay_without_dump_or_with_partial_dump_is_not_empty_timeout() {
+    let search = synthetic_response(0);
+    for partial in [Vec::new(), synthetic_dump(0, 0)[..17].to_vec()] {
+        let mut backend = queued_frame_backend(search.into_iter().chain(partial.clone()));
+        backend.now = Duration::from_millis(1_700);
+        let mut ignored = false;
+        let result = read_dump0_with_search(&mut backend, &search, &mut ignored);
+        assert!(ignored);
+        assert!(
+            matches!(result, Err(DarwinCarrierError::UnexpectedTrailingFrame { received }) if received == partial.len())
+        );
+        assert_eq!(backend.now, Duration::from_secs(2));
+        assert!(!backend.calls.contains(&Call::DiscardInput));
+    }
+}
+
+#[test]
+fn partial_search_is_never_skipped_and_retains_same_deadline() {
+    let search = synthetic_response(0);
+    let mut backend = queued_frame_backend(search[..20].iter().copied());
+    let mut ignored = false;
+    let result = read_dump0_with_search(&mut backend, &search, &mut ignored).unwrap();
+    assert!(!ignored);
+    assert_eq!(result.read, SnapshotRead::timed_out(&search[..20]).unwrap());
+    assert_eq!(backend.now, Duration::from_secs(2));
+}
+
+#[test]
+fn capture_preserves_dump0_validation_and_verified_close_after_search_replay() {
+    for (replay_count, dump_present) in [(0, true), (1, true), (2, true), (1, false)] {
+        let identity = synthetic_response(0);
+        let mut inbound = identity.repeat(10);
+        for _ in 0..replay_count {
+            inbound.extend_from_slice(&identity);
+        }
+        if dump_present {
+            inbound.extend_from_slice(&synthetic_dump(0, 0));
+            inbound.extend_from_slice(&synthetic_dump(0, 1));
+        }
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = FakeBackend::with_inbound(inbound)
+            .with_shared_calls(Rc::clone(&calls))
+            .with_shared_writes(Rc::clone(&writes));
+        backend.dump0_prefix_len = replay_count * identity.len();
+        let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+        let result = execute_persistent_snapshot(
+            carrier,
+            &mut FastPacer::default(),
+            DeviceId::new(0).unwrap(),
+        );
+        if replay_count < 2 && dump_present {
+            let capture = result.unwrap();
+            assert!(capture.close_verified());
+            assert_eq!(
+                capture.snapshot().frame(SnapshotSection::Dump0),
+                synthetic_dump(0, 0)
+            );
+            assert_eq!(writes.borrow().len(), 14);
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(calls.borrow().last(), Some(&Call::Close));
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == Call::Close)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn delayed_search_and_dump_share_original_deadline() {
+    let search = synthetic_response(0);
+    let dump = synthetic_dump(0, 0);
+    for dump_delay in [Duration::from_millis(100), Duration::from_millis(400)] {
+        let mut backend = queued_frame_backend(search.into_iter().chain(dump.clone()));
+        backend.available_script = [0, search.len(), 0, dump.len()].into_iter().collect();
+        backend.wait_script = [(true, Duration::from_millis(1_700)), (true, dump_delay)]
+            .into_iter()
+            .collect();
+        let mut ignored = false;
+        let result = read_dump0_with_search(&mut backend, &search, &mut ignored);
+        assert!(ignored);
+        if dump_delay == Duration::from_millis(100) {
+            assert_eq!(result.unwrap().read, SnapshotRead::complete(&dump).unwrap());
+            assert_eq!(backend.now, Duration::from_millis(1_800));
+        } else {
+            assert!(result.is_err());
+            assert_eq!(backend.now, Duration::from_secs(2));
+            assert_eq!(backend.inbound.iter().copied().collect::<Vec<_>>(), dump);
+        }
+    }
 }

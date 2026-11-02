@@ -9,6 +9,7 @@ public struct RoomCaptureMetrics: Codable, Equatable, Sendable {
     public let captureElapsedMilliseconds: UInt64
     public let comparisonElapsedMilliseconds: UInt64
     public let closeVerified: Bool
+    public var ignoredDump0SearchReplays: UInt32? = nil
 }
 
 /// Produced only by the protected approved-target CLI. A failed/null carrier
@@ -26,6 +27,7 @@ struct ApprovedRoomRefresh: Decodable {
     let validSearchCount: UInt32
     let closeVerified: Bool
     let identityPolicy: String
+    let ignoredDump0SearchReplays: UInt32?
 
     func validate(expectedDevice: UInt8, terminationStatus: Int32, startedAt: Date, now: Date) throws -> Date {
         try snapshot.validate(expectedDevice: expectedDevice)
@@ -34,6 +36,7 @@ struct ApprovedRoomRefresh: Decodable {
               identityPolicy == "approved-exact-target-one-identity-three-attempts",
               closeVerified, validSearchCount == 1, (1...3).contains(searchAttempts),
               searchEmptyTimeouts <= 2, searchEmptyTimeouts + 1 == searchAttempts,
+              (ignoredDump0SearchReplays ?? 0) <= 1,
               captureElapsedMilliseconds <= 20_000,
               comparisonElapsedMilliseconds <= 45_000,
               capturedAt >= startedAt.addingTimeInterval(-0.001), capturedAt <= now,
@@ -50,7 +53,8 @@ struct ApprovedRoomRefresh: Decodable {
         .init(identityPolicy: identityPolicy, searchAttempts: searchAttempts,
             searchEmptyTimeouts: searchEmptyTimeouts, validSearchCount: validSearchCount,
             captureElapsedMilliseconds: captureElapsedMilliseconds,
-            comparisonElapsedMilliseconds: comparisonElapsedMilliseconds, closeVerified: closeVerified)
+            comparisonElapsedMilliseconds: comparisonElapsedMilliseconds, closeVerified: closeVerified,
+            ignoredDump0SearchReplays: ignoredDump0SearchReplays)
     }
 }
 

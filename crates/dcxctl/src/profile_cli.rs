@@ -146,6 +146,7 @@ pub fn refresh_room(
             "captureCompletedAtUnixMilliseconds": captured_at,
             "comparisonElapsedMilliseconds": comparison_elapsed,
             "captureElapsedMilliseconds": u64::try_from(captured.elapsed().as_millis())?,
+            "ignoredDump0SearchReplays": u8::from(captured.ignored_dump0_search_replay()),
             "searchAttempts": captured.search_attempts(),
             "searchEmptyTimeouts": captured.empty_search_timeouts(),
             "validSearchCount": captured.capture().valid_search_count(),

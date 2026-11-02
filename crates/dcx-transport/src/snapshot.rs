@@ -66,6 +66,7 @@ pub const APPROVED_TARGET_SNAPSHOT_BUDGET: Duration = Duration::from_secs(20);
 /// Complete bulk image plus counters measured from this session's operations.
 #[derive(Debug)]
 pub struct ApprovedTargetCapture {
+    ignored_dump0_search_replay: bool,
     capture: CapturedSnapshotV1,
     search_attempts: usize,
     empty_search_timeouts: usize,
@@ -73,6 +74,10 @@ pub struct ApprovedTargetCapture {
 }
 
 impl ApprovedTargetCapture {
+    /// Complete byte-identical accepted Search replay ignored while awaiting Dump0.
+    pub const fn ignored_dump0_search_replay(&self) -> bool {
+        self.ignored_dump0_search_replay
+    }
     /// Full validated image, with the same frame and close checks as snapshots.
     pub const fn capture(&self) -> &CapturedSnapshotV1 {
         &self.capture
@@ -152,6 +157,9 @@ impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshot
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
         self.session.write_remote_mode(command)
     }
+    fn ignored_dump0_search_replay(&self) -> bool {
+        self.session.ignored_dump0_search_replay()
+    }
     fn finish(self) -> Result<(), Self::Error> {
         self.session.finish()
     }
@@ -194,6 +202,7 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
         started,
         APPROVED_TARGET_SNAPSHOT_BUDGET,
     );
+    let ignored_dump0_search_replay = counted.ignored_dump0_search_replay();
     let finish = counted.finish();
     let elapsed = pacer.elapsed().saturating_sub(started);
     let capture = finish_capture(body, finish, APPROVED_TARGET_SEARCH_COUNT)
@@ -214,6 +223,7 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
             elapsed,
         })?;
     Ok(ApprovedTargetCapture {
+        ignored_dump0_search_replay,
         capture,
         search_attempts: attempts,
         empty_search_timeouts: empty_timeouts,
@@ -467,6 +477,11 @@ pub trait PersistentSnapshotSession: Sized {
     ///
     /// Returns a platform error and issues no internal retry.
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error>;
+
+    /// Whether one strict accepted Search replay was consumed while awaiting Dump0.
+    fn ignored_dump0_search_replay(&self) -> bool {
+        false
+    }
 
     /// Restore, verify, and close the single session.
     ///
@@ -1687,6 +1702,7 @@ mod tests {
         log: Rc<RefCell<SessionLog>>,
         fail_write: bool,
         fail_finish: bool,
+        ignored_replay: bool,
         /// Zero-based remote-mode write that fails.
         fail_mode_index: Option<usize>,
     }
@@ -1700,6 +1716,7 @@ mod tests {
                     log: Rc::clone(&log),
                     fail_write: false,
                     fail_finish: false,
+                    ignored_replay: false,
                     fail_mode_index: None,
                 },
                 log,
@@ -1726,6 +1743,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn ignored_dump0_search_replay(&self) -> bool {
+            self.ignored_replay
         }
 
         fn finish(self) -> Result<(), Self::Error> {
@@ -1819,10 +1840,12 @@ mod tests {
                 steps.push(Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
             }
             steps.extend(snapshot_steps(&snapshot(0, 1, 2), 1));
-            let (session, log) = FakeSession::new(steps);
+            let (mut session, log) = FakeSession::new(steps);
+            session.ignored_replay = empty == 1;
             let mut pacer = FakePacer::default();
             let captured =
                 approved_target_snapshot(session, &mut pacer, DeviceId::new(0).unwrap()).unwrap();
+            assert_eq!(captured.ignored_dump0_search_replay(), empty == 1);
             assert_eq!(captured.search_attempts(), empty + 1);
             assert_eq!(captured.empty_search_timeouts(), empty);
             assert_eq!(captured.capture().valid_search_count(), 1);

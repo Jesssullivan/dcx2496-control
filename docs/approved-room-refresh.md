@@ -25,6 +25,7 @@ Successful JSON has schema `dcx.approved-room-refresh/v1`:
 | `searchAttempts` | Actual Search exchanges submitted |
 | `searchEmptyTimeouts` | Actual empty Search deadline results |
 | `validSearchCount` | One validated same-address identity |
+| `ignoredDump0SearchReplays` | Zero or one strict accepted Search replay consumed while awaiting Dump0 |
 | `closeVerified` | `true` only after successful complete capture and verified close |
 | `identityPolicy` | `approved-exact-target-one-identity-three-attempts` |
 
@@ -57,3 +58,14 @@ The opt-in foreground scheduler may retry completed empty Dump0 or Dump1 timeout
 Consecutive qualified failures wait 15, 30, 60, 120, 240 and then 300 seconds. Later failures retain the 300-second limit. Busy admission has a separate counter and cannot reset transport backoff. A real successful capture resets the read-failure counter and resumes the existing 30-second success delay. One active attempt prevents queued reads.
 
 Malformed, unknown, nonempty, mismatched or unverified-close failures stay latched. Configuration, target or lifecycle changes invalidate the old attempt. Every new attempt repeats the existing approval, recovery, binding and exclusive-serial admission. This policy never retries a parameter write or publishes a synthetic match. Native and named-device recovery qualification remain separate.
+
+
+## Late Search during Dump0
+
+While awaiting Dump0, the Darwin carrier may consume one complete strict Search response matching this session's accepted identity byte for byte. The address must also match the pending Dump0. It then continues under the original absolute operation deadline, without another query, write or flush. A second replay, changed frame or partial response remains terminal. Dump1 and meter reads gain no replay allowance.
+
+If no Dump0 follows that consumed replay, the result is a terminal carrier failure. It cannot become an empty Dump timeout eligible for periodic recovery. Complete dump validation, image comparison and consuming verified close remain required. Successful captures report `ignoredDump0SearchReplays` as zero or one. The helper accepts an absent legacy metric and rejects values above one.
+
+This source rule addresses a possible late-response boundary. A retained Dump0 length failure alone does not identify the rejected frame or establish its cause. Synthetic tests do not qualify the rule on hardware.
+
+Authority: Root's bounded implementation direction, TIN-6964. Lexical: XL-ACC-004
