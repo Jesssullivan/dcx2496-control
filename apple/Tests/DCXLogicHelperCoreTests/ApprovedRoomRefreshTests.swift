@@ -110,6 +110,23 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    func testPeriodicReadFailureInvalidatesBeforeDiagnosticWrite() throws {
+        let write = expectation(description: "diagnostic write hook reached")
+        try exerciseRetention(beforeDiagnosticWrite: { publisher, manifest in
+            XCTAssertNil(publisher.current(expectation: manifest))
+            write.fulfill()
+        }) { coordinator, publisher, _, backend, manifest, configuration, first in
+            backend.beforeRefresh = {
+                XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, first.verifiedAt)
+                throw DCXCTLRunnerError.timedOut
+            }
+            XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true }))
+        }
+        wait(for: [write], timeout: 0.1)
+    }
+
     func testPeriodicReadCannotRetainExpiredProofOrDifferentBinding() throws {
         let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
         let manifest = Data("SYNTHETIC retention age".utf8)
@@ -191,6 +208,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
     }
 
     private func exerciseRetention(initialBinding: @escaping @Sendable () -> Bool = { true },
+        beforeDiagnosticWrite: @escaping @Sendable (RoomVerificationPublisher, Data) -> Void = { _, _ in },
         _ body: (DCXHelperCoordinator, RoomVerificationPublisher, RoomVerificationPreparation, FastBackend,
                  Data, HelperConfigurationV1, RoomVerificationReceipt) throws -> Void) throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -202,7 +220,8 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         let configuration = try HelperConfigurationV1(bindingID: "synthetic-room", expectedDeviceAddress: 0,
             ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
         let coordinator = DCXHelperCoordinator(locations: .init(fixtureRoot: root), configuration: .success(configuration),
-            coreMIDI: .init(), runner: backend, roomVerification: publisher, roomPreparation: gate)
+            coreMIDI: .init(), runner: backend, roomVerification: publisher, roomPreparation: gate,
+            roomFailureDiagnostics: .init(parent: root, beforePersist: { beforeDiagnosticWrite(publisher, manifest) }))
         coordinator.setForeground(true)
         let first = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
             expectedConfiguration: configuration, approvedTargetRefresh: true, bindingIsCurrent: initialBinding)

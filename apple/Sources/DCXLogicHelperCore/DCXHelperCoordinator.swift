@@ -44,6 +44,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     private var recoveryCompletion: MutationRecoveryCompletionV1?
     private var recoveryLeaseError: Error?
     private let roomPreparation: RoomVerificationPreparation
+    private let roomFailureDiagnostics: RoomFailureDiagnosticStore
+    private var lastRoomFailure: RoomFailureDiagnosticV1?
     private let roomVerification: RoomVerificationPublisher
 
     public convenience init(
@@ -65,12 +67,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         coreMIDI: CoreMIDIPresentation,
         runner: any DCXCTLCommandExecuting,
         roomVerification: RoomVerificationPublisher = .init(),
-        roomPreparation: RoomVerificationPreparation = .init()
+        roomPreparation: RoomVerificationPreparation = .init(),
+        roomFailureDiagnostics: RoomFailureDiagnosticStore? = nil
     ) {
         self.locations = locations
         self.runner = runner
         self.roomVerification = roomVerification
         self.roomPreparation = roomPreparation
+        self.roomFailureDiagnostics = roomFailureDiagnostics ?? .init(parent: locations.helperConfigurationURL.deletingLastPathComponent())
         snapshotStore = .init(root: locations.snapshotRootURL)
         planStore = .init(root: locations.planRootURL)
         notchPlanStore = .init(planRoot: locations.planRootURL)
@@ -233,6 +237,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     private func captureRoom(expectation: Data, expectedConfiguration: HelperConfigurationV1,
                              attempt: RoomVerificationPreparation.Attempt, approvedTargetRefresh: Bool,
                              retainFreshDuringRead: Bool) throws -> RoomVerificationReceipt {
+        var diagnostic = RoomFailureAttempt()
+        do {
         guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
             throw RoomVerificationError.invalidExpectation
         }
@@ -273,6 +279,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         defer { workspace.remove() }
         let expectationURL = try workspace.writeData(expectation, named: "room-expectation.json")
         let executable = try runner.resolveExecutable(for: configuration)
+        diagnostic.stage = .validationChild
         let validation = try runner.run(
             .init(operation: .snapshotCapture, executableURL: executable, arguments: [
                 "profile", "room-validate", "--expectation", expectationURL.path,
@@ -280,6 +287,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             timeoutSeconds: 45,
             mutationLock: processLock
         )
+        diagnostic.child = validation
         guard validation.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
         guard attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
         let capturedAt: Date
@@ -287,6 +295,9 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         let captureMetrics: RoomCaptureMetrics?
         if approvedTargetRefresh {
             let startedAt = Date()
+            diagnostic.stage = .refreshChild
+            diagnostic.child = nil
+            diagnostic.closeKnown = .unknown
             let refresh = try runner.run(
                 .init(operation: .snapshotCapture, executableURL: executable, arguments: [
                     "profile", "room-refresh", "--expectation", expectationURL.path,
@@ -294,15 +305,21 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                     "--tty", configuration.ttyPath,
                     "--expected-device", String(configuration.expectedDeviceAddress),
                 ]), timeoutSeconds: min(configuration.childTimeoutSeconds, 30), mutationLock: processLock)
+            diagnostic.child = refresh
             guard refresh.terminationStatus == 0 || refresh.terminationStatus == 1 else {
                 throw RoomVerificationError.unavailable
             }
+            diagnostic.stage = .refreshDecode
             let envelope = try BridgeJSONCodec.decoder().decode(ApprovedRoomRefresh.self, from: refresh.stdout)
             capturedAt = try envelope.validate(expectedDevice: configuration.expectedDeviceAddress,
                 terminationStatus: refresh.terminationStatus, startedAt: startedAt, now: Date())
+            diagnostic.closeKnown = .verified
             comparison = envelope.comparison
             captureMetrics = envelope.metrics
         } else {
+            diagnostic.stage = .snapshotChild
+            diagnostic.child = nil
+            diagnostic.closeKnown = .unknown
             let read = try runner.run(
                 .init(operation: .snapshotCapture, executableURL: executable, arguments: [
                     "control", "snapshot", "--tty", configuration.ttyPath,
@@ -311,11 +328,15 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 timeoutSeconds: configuration.childTimeoutSeconds,
                 mutationLock: processLock
             )
+            diagnostic.child = read
             guard read.terminationStatus == 0 else { throw RoomVerificationError.unavailable }
             capturedAt = Date()
+            diagnostic.stage = .snapshotDecode
             let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: read.stdout)
             try carrier.validate(expectedDevice: configuration.expectedDeviceAddress)
             let snapshot = try workspace.writeData(read.stdout, named: "room-snapshot.json")
+            diagnostic.stage = .comparisonChild
+            diagnostic.child = nil
             let compared = try runner.run(
                 .init(operation: .snapshotCapture, executableURL: executable, arguments: [
                     "profile", "room-verify", "--expectation", expectationURL.path,
@@ -324,9 +345,11 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 timeoutSeconds: 45,
                 mutationLock: processLock
             )
+            diagnostic.child = compared
             guard compared.terminationStatus == 0 || compared.terminationStatus == 1 else {
                 throw RoomVerificationError.invalidComparison
             }
+            diagnostic.stage = .comparisonDecode
             comparison = try JSONDecoder().decode(RoomComparison.self, from: compared.stdout)
             guard comparison.snapshotDigest == carrier.snapshotDigest,
                   comparison.matches == (compared.terminationStatus == 0) else {
@@ -334,6 +357,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             }
             captureMetrics = nil
         }
+        diagnostic.stage = .publication
         return try roomPreparation.publish(attempt) {
             stateLock.lock()
             defer { stateLock.unlock() }
@@ -343,6 +367,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 ttyPath: configuration.ttyPath, bindingIsCurrent: { attempt.bindingChecks.isValid() },
                 captureMetrics: captureMetrics, captureBinding: attempt.key
             )
+        }
+        } catch {
+            roomVerification.invalidate("room-verification-failed")
+            let metadata = roomFailureDiagnostics.record(diagnostic, error: error)
+            stateLock.lock()
+            lastRoomFailure = metadata
+            stateLock.unlock()
+            throw error
         }
     }
 
@@ -913,6 +945,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
 
         stateLock.lock()
         let foreground = foreground
+        let lastRoomFailure = lastRoomFailure
         let active = activeTransactionID
         let configuration = configuration
         let unavailable = recoveryUnavailable || recoveryLeaseError != nil
@@ -958,7 +991,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             activeTransactionID: active,
             recovery: recovery,
             completion: completion,
-            recoveryUnavailable: unavailable
+            recoveryUnavailable: unavailable,
+            roomFailureDiagnostic: lastRoomFailure
         )
     }
 
