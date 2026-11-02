@@ -100,4 +100,59 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         XCTAssertNotNil(startupFirst.poll(binding: first, capturedAt: at, now: at.addingTimeInterval(30)).attempt)
     }
 
+    func testVerifiedReadFailureBackoffCapsWithoutQueueOrEarlyRetry() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        for delay in [15.0, 30, 60, 120, 240, 300, 300] {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(1000)).attempt)
+            schedule.complete(attempt, outcome: .retryableReadFailure, now: now)
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(delay - 0.001)).attempt)
+            now = now.addingTimeInterval(delay)
+        }
+    }
+    func testFreshSuccessResetsReadBackoffAndResumesRefreshAcrossProofLifetime() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let failed = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+        schedule.complete(failed, outcome: .retryableReadFailure, now: at)
+        let recovery = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(15)).attempt)
+        schedule.complete(recovery, outcome: .success(capturedAt: at.addingTimeInterval(20)), now: at.addingTimeInterval(20))
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: at.addingTimeInterval(20), now: at.addingTimeInterval(49)).attempt)
+        let next = try XCTUnwrap(schedule.poll(binding: first, capturedAt: at.addingTimeInterval(20), now: at.addingTimeInterval(50)).attempt)
+        schedule.complete(next, outcome: .success(capturedAt: at.addingTimeInterval(55)), now: at.addingTimeInterval(55))
+        let later = try XCTUnwrap(schedule.poll(binding: first, capturedAt: at.addingTimeInterval(55), now: at.addingTimeInterval(85)).attempt)
+        schedule.complete(later, outcome: .retryableReadFailure, now: at.addingTimeInterval(85))
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(99)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(100)).attempt)
+    }
+    func testUnknownFailureStillLatchesAfterVerifiedReadFailure() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let firstAttempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+        schedule.complete(firstAttempt, outcome: .retryableReadFailure, now: at)
+        let retry = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(15)).attempt)
+        schedule.complete(retry, outcome: .failed, now: at.addingTimeInterval(15))
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(10000)).attempt)
+    }
+    func testChangedBindingAndStopDiscardOldRetryCompletion() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let old = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+        let changed = Data("SYNTHETIC replacement approved binding".utf8)
+        XCTAssertTrue(schedule.poll(binding: changed, capturedAt: nil, now: at).invalidatesPriorBinding)
+        schedule.complete(old, outcome: .retryableReadFailure, now: at)
+        let current = try XCTUnwrap(schedule.poll(binding: changed, capturedAt: nil, now: at).attempt)
+        schedule.stop(); schedule.complete(current, outcome: .retryableReadFailure, now: at)
+        XCTAssertNil(schedule.poll(binding: changed, capturedAt: nil, now: at.addingTimeInterval(10000)).attempt)
+    }
+    func testBusyDoesNotResetReadFailureBackoff() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let firstAttempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+        schedule.complete(firstAttempt, outcome: .retryableReadFailure, now: at)
+        let busy = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(15)).attempt)
+        schedule.complete(busy, outcome: .busy, now: at.addingTimeInterval(15))
+        let again = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(30)).attempt)
+        schedule.complete(again, outcome: .retryableReadFailure, now: at.addingTimeInterval(30))
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(59)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(60)).attempt)
+    }
+
 }

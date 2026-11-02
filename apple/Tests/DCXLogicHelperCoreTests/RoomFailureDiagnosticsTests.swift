@@ -15,7 +15,7 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
     private func result(exit: Int32 = 2, stdout: Data = Data("SYNTHETIC stdout".utf8), stderr: Data = Data("SYNTHETIC private stderr".utf8)) -> DCXCTLProcessResult {
         .init(terminationStatus: exit, stdout: stdout, stderr: stderr, durationMilliseconds: 321)
     }
-    private func exercise(_ backend: DiagnosticBackend, obstructStorage: Bool = false) throws -> (RoomFailureDiagnosticV1, URL) {
+    private func exercise(_ backend: DiagnosticBackend, obstructStorage: Bool = false, observeError: (Error) -> Void = { _ in }) throws -> (RoomFailureDiagnosticV1, URL) {
         let root = try directory()
         let configuration = try HelperConfigurationV1(bindingID: "synthetic-diagnostic", expectedDeviceAddress: 0,
             ttyPath: "/dev/cu.usbserial-SYNTHETIC", enabledFeatures: [.snapshotCapture])
@@ -26,7 +26,7 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
         coordinator.setForeground(true)
         if obstructStorage { try Data("SYNTHETIC obstruction".utf8).write(to: root.appendingPathComponent("RoomDiagnostics")) }
         XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: Data("SYNTHETIC approval".utf8), forceFresh: true,
-            expectedConfiguration: configuration, approvedTargetRefresh: true, bindingIsCurrent: { true }))
+            expectedConfiguration: configuration, approvedTargetRefresh: true, bindingIsCurrent: { true })) { observeError($0) }
         XCTAssertNil(publisher.current(expectation: Data("SYNTHETIC approval".utf8)))
         let response = coordinator.handle(try .init(body: .helperStatus(.init())))
         guard case let .helperStatus(status)? = response.body else { throw FixtureError.status }
@@ -111,6 +111,31 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
     func testSuccessfulStatusCannotSmuggleTypedFailureAuthority() throws {
         var object = failedEnvelope(); object["status"] = "match"
         XCTAssertThrowsError(try ApprovedRoomFailureEnvelope.decodeIfFailed(JSONSerialization.data(withJSONObject: object), terminationStatus: 0))
+    }
+    func testOnlyVerifiedClosedEmptyDump0TimeoutPermitsPeriodicRetry() throws {
+        func eligible(_ object: [String: Any]) throws -> Bool {
+            let failure = try BridgeJSONCodec.decoder().decode(RoomCaptureFailureV1.self,
+                from: JSONSerialization.data(withJSONObject: object))
+            return ApprovedRoomCaptureFailed(failure: failure).permitsPeriodicRetry
+        }
+        let original = try XCTUnwrap(failedEnvelope()["failure"] as? [String: Any])
+        XCTAssertTrue(try eligible(original))
+        for (key, value) in [("category", "transport" as Any), ("category", "validation" as Any),
+                             ("operation", "search" as Any), ("operation", "dump1" as Any),
+                             ("received", 1 as Any), ("received", NSNull() as Any),
+                             ("sessionClosedVerified", false as Any), ("closeFailure", "cleanup" as Any),
+                             ("schemaVersion", "unknown" as Any)] {
+            var changed = original; changed[key] = value
+            XCTAssertFalse(try eligible(changed))
+        }
+    }
+    func testCompletedFailurePropagatesRetryEvidenceWhileReadinessStaysInvalid() throws {
+        let data = try JSONSerialization.data(withJSONObject: failedEnvelope())
+        var error: Error?
+        let (value, _) = try exercise(.init(refresh: .success(result(exit: 1, stdout: data))), observeError: { error = $0 })
+        XCTAssertTrue(try XCTUnwrap(error as? ApprovedRoomCaptureFailed).permitsPeriodicRetry)
+        XCTAssertEqual(value.closeKnown, .verified)
+        XCTAssertEqual(value.failure, .childExit)
     }
     func testMalformedSuccessfulRefreshIsDecodeFailureAndCloseUnknown() throws {
         let (value, _) = try exercise(.init(refresh: .success(result(exit: 0))))

@@ -45,6 +45,15 @@ The macOS-only CLI branch has not been compiled on Darwin or run against hardwar
 
 The helper accepts typed failure metadata only from a completed child with exit one. It requires the exact schema, bounded metrics and consistent close fields. Failure data cannot pass successful snapshot validation or publish readiness. A legacy, malformed or conflicting failure retains unknown close. Status exposes an optional `captureFailure` within `roomFailureDiagnostic`, without private stderr.
 
-An empty timeout count measures the response accumulator. The carrier may have consumed an exact request echo before that empty response. The count cannot establish that the device sent no bytes. Verified finish requires ReceiveDirect quiescence and checked serial cleanup. An empty response still invalidates readiness and leaves periodic failure latched. This change adds no retry or device command.
+An empty timeout count measures the response accumulator. The carrier may have consumed an exact request echo before that empty response. The count cannot establish that the device sent no bytes. Verified finish requires ReceiveDirect quiescence and checked serial cleanup. An empty response still invalidates readiness. The typed-envelope change alone adds no retry or device command.
 
 Authority: user implementation direction and Root's separate typed-failure source scope, TIN-6964. Lexical: XL-ACC-004
+
+
+## Periodic recovery
+
+The opt-in foreground scheduler may retry one qualified failure: a completed child reports an empty Dump0 timeout and verified session close. The typed schema, approved binding and current lifecycle must still match. Success publishes only the new complete matching capture. A failed attempt cannot extend or restore an expired proof.
+
+Consecutive qualified failures wait 15, 30, 60, 120, 240 and then 300 seconds. Later failures retain the 300-second limit. Busy admission has a separate counter and cannot reset transport backoff. A real successful capture resets the read-failure counter and resumes the existing 30-second success delay. One active attempt prevents queued reads.
+
+Malformed, unknown, nonempty, mismatched or unverified-close failures stay latched. Configuration, target or lifecycle changes invalidate the old attempt. Every new attempt repeats the existing approval, recovery, binding and exclusive-serial admission. This policy never retries a parameter write or publishes a synthetic match. Native and named-device recovery qualification remain separate.

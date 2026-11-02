@@ -198,6 +198,9 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
                 outcome = .success(capturedAt: date)
             } catch RoomVerificationError.busy {
                 outcome = .busy
+            } catch let failure as ApprovedRoomCaptureFailed {
+                outcome = failure.permitsPeriodicRetry && self.periodic.isCurrent(attempt) &&
+                    self.savedBindingMatches(attempt.binding) ? .retryableReadFailure : .failed
             } catch {
                 outcome = .failed
             }

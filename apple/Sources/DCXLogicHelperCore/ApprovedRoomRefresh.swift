@@ -112,4 +112,12 @@ struct ApprovedRoomFailureEnvelope: Decodable {
     }
 }
 
-struct ApprovedRoomCaptureFailed: Error { let failure: RoomCaptureFailureV1 }
+struct ApprovedRoomCaptureFailed: Error {
+    let failure: RoomCaptureFailureV1
+    /// TIN-6964: only a completed, verified-close empty Dump0 timeout may rearm.
+    var permitsPeriodicRetry: Bool {
+        failure.schemaVersion == "dcx.approved-room-capture-failure/v1" &&
+        failure.category == .timeout && failure.operation == .dump0 &&
+        failure.received == 0 && failure.sessionClosedVerified && failure.closeFailure == nil
+    }
+}

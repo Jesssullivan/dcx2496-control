@@ -16,6 +16,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         case success(capturedAt: Date)
         case busy
         case failed
+        case retryableReadFailure
     }
     static let successDelay: TimeInterval = 30
     private let lock = NSLock()
@@ -25,6 +26,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
     private var active: Attempt?
     private var due: Date?
     private var observedCapture: Date?
+    private var readFailureCount = 0
     private var busyCount = 0
     private var blocked = false
 
@@ -53,6 +55,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             binding = checkedBinding
             due = now
             busyCount = 0
+            readFailureCount = 0
             blocked = false
             observedCapture = nil
         }
@@ -63,6 +66,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             due = now.addingTimeInterval(Self.successDelay)
             blocked = false
             busyCount = 0
+            readFailureCount = 0
         }
         guard let binding, active == nil, !blocked, due == nil || now >= due! else {
             return Step(invalidatesPriorBinding: invalidates, attempt: nil)
@@ -87,9 +91,14 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             observedCapture = capturedAt
             due = now.addingTimeInterval(Self.successDelay)
             busyCount = 0
+            readFailureCount = 0
         case .busy:
             busyCount = min(busyCount + 1, 6)
             due = now.addingTimeInterval(min(300, 15 * pow(2, Double(busyCount - 1))))
+        case .retryableReadFailure:
+            // A fresh read still passes every binding, recovery and serial guard.
+            readFailureCount = min(readFailureCount + 1, 6)
+            due = now.addingTimeInterval(min(300, 15 * pow(2, Double(readFailureCount - 1))))
         case .failed:
             // Unknown or failed transport retirement is never retried by a timer.
             blocked = true
