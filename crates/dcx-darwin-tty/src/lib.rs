@@ -6,7 +6,9 @@
 //! byte-write method, retry loop, or durable raw capture. While one descriptor
 //! remains open, the carrier may retain exactly one fixed-size accepted Search
 //! response solely to reject or consume a byte-identical late replay. That
-//! ephemeral value is never logged, serialized, or included in receipts. Tests
+//! ephemeral accepted value is never logged or included in public receipts. Failed
+//! Search overflow may explicitly export at most 26 already-consumed bytes into
+//! a private diagnostic envelope; ordinary error Debug and Display redact them. Tests
 //! exercise the same state machine through injected fake syscalls without
 //! opening a device.
 
@@ -214,6 +216,50 @@ pub enum CarrierFailureKind {
     ReadInvariant,
 }
 
+/// Private, bounded context for a failed Search frame. Debug never exposes bytes.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateSearchReadContext {
+    /// Version of the private record, not a public readiness schema.
+    pub schema_version: &'static str,
+    /// Post-write response or queued replay.
+    pub subphase: &'static str,
+    /// Zero-based frame index within this post-write read.
+    pub frame_index: usize,
+    /// Only bytes already consumed, never queued bytes.
+    pub prefix: Vec<u8>,
+    /// Actual consumed count.
+    pub received: usize,
+    /// Actual pending count, without reading it.
+    pub queued: usize,
+    /// Whether the consumed prefix contains a terminator.
+    pub delimiter: &'static str,
+    /// Header shape only, never an identity acceptance.
+    pub header: &'static str,
+    /// Monotonic observation time.
+    pub observed_monotonic_microseconds: u64,
+    /// Unchanged operation deadline.
+    pub deadline_monotonic_microseconds: u64,
+}
+
+impl fmt::Debug for PrivateSearchReadContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PrivateSearchReadContext { bytes: REDACTED }")
+    }
+}
+
+impl DarwinCarrierError {
+    /// Explicit private export only. Ordinary error text contains no wire bytes.
+    pub fn private_search_read_context(&self) -> Option<&PrivateSearchReadContext> {
+        match self {
+            Self::Overflow {
+                private_context, ..
+            } => private_context.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// Error from one bounded Darwin tty operation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DarwinCarrierError {
@@ -282,6 +328,8 @@ pub enum DarwinCarrierError {
         received: usize,
         /// Bytes observed pending without consuming them.
         queued: usize,
+        /// Private diagnostic data, excluded from ordinary error text.
+        private_context: Option<Box<PrivateSearchReadContext>>,
     },
     /// The tty returned EOF before an exact response or timeout.
     #[error("tty reached EOF after {received} response bytes")]
@@ -607,7 +655,11 @@ impl ReceiptBuilder {
     fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError {
         self.overflow_received_bytes = received;
         self.overflow_queued_bytes = queued;
-        DarwinCarrierError::Overflow { received, queued }
+        DarwinCarrierError::Overflow {
+            received,
+            queued,
+            private_context: None,
+        }
     }
 
     fn finish(
@@ -1708,7 +1760,11 @@ impl WireObserver for () {
     }
 
     fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError {
-        DarwinCarrierError::Overflow { received, queued }
+        DarwinCarrierError::Overflow {
+            received,
+            queued,
+            private_context: None,
+        }
     }
 }
 
@@ -1781,6 +1837,7 @@ fn finish_queued_snapshot_search_replays<B: SerialBackend, O: WireObserver>(
     frame_limit: usize,
     response: &[u8],
     observer: &mut O,
+    mut frame_index: usize,
 ) -> Result<(), DarwinCarrierError> {
     loop {
         ensure_before_deadline(backend, deadline, CarrierStage::BytesAvailable)?;
@@ -1790,8 +1847,13 @@ fn finish_queued_snapshot_search_replays<B: SerialBackend, O: WireObserver>(
         if queued == 0 {
             return Ok(());
         }
-        match read_one_frame(backend, deadline, frame_limit, observer)? {
-            FramedRead::Complete(duplicate) if duplicate == response => observer.duplicate(),
+        match read_one_frame(backend, deadline, frame_limit, observer)
+            .map_err(|error| label_search_context(error, "queued_replay", frame_index))?
+        {
+            FramedRead::Complete(duplicate) if duplicate == response => {
+                observer.duplicate();
+                frame_index += 1;
+            }
             FramedRead::Complete(other) | FramedRead::TimedOut(other) => {
                 return Err(observer.unexpected(other.len()));
             }
@@ -1834,7 +1896,45 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
             continue;
         }
         if frame.len() == frame_limit.min(MAX_FRAME_LEN) {
-            return Err(observer.overflow(frame.len(), queued_budget));
+            let mut error = observer.overflow(frame.len(), queued_budget);
+            if frame_limit == SEARCH_RESPONSE_LIMIT
+                && let DarwinCarrierError::Overflow {
+                    private_context, ..
+                } = &mut error
+            {
+                let header = if frame.len() < 7 {
+                    "incomplete"
+                } else if frame[..4] == [0xf0, 0, 0x20, 0x32] && frame[5] == 0x0e {
+                    match frame[6] {
+                        0 => "search_response",
+                        0x40 => "search_request",
+                        _ => "other",
+                    }
+                } else {
+                    "other"
+                };
+                *private_context = Some(Box::new(PrivateSearchReadContext {
+                    schema_version: "dcx.search-read-context/v1",
+                    subphase: "unclassified",
+                    frame_index: 0,
+                    prefix: frame.clone(),
+                    received: frame.len(),
+                    queued: queued_budget,
+                    delimiter: if frame.contains(&0xf7) {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    header,
+                    observed_monotonic_microseconds: u64::try_from(
+                        backend.monotonic_now().as_micros(),
+                    )
+                    .unwrap_or(u64::MAX),
+                    deadline_monotonic_microseconds: u64::try_from(deadline.as_micros())
+                        .unwrap_or(u64::MAX),
+                }));
+            }
+            return Err(error);
         }
         let mut byte = [0_u8; 1];
         match backend
@@ -1860,6 +1960,23 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
             return Ok(FramedRead::Complete(frame));
         }
     }
+}
+
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+fn label_search_context(
+    mut error: DarwinCarrierError,
+    subphase: &'static str,
+    frame_index: usize,
+) -> DarwinCarrierError {
+    if let DarwinCarrierError::Overflow {
+        private_context: Some(context),
+        ..
+    } = &mut error
+    {
+        context.subphase = subphase;
+        context.frame_index = frame_index;
+    }
+    error
 }
 
 #[cfg(test)]
@@ -1893,8 +2010,11 @@ fn read_snapshot_bounded_with_replay<B: SerialBackend>(
 ) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
     let mut observer = ();
     let mut echo_consumed = false;
+    let mut frame_index = 0;
     let response = loop {
-        match read_one_frame(backend, deadline, limit, &mut observer)? {
+        match read_one_frame(backend, deadline, limit, &mut observer)
+            .map_err(|error| label_search_context(error, "response", frame_index))?
+        {
             FramedRead::TimedOut(partial) => {
                 // TIN-6964: a consumed replay is evidence of input, never an empty timeout.
                 if *ignored_replay {
@@ -1911,6 +2031,7 @@ fn read_snapshot_bounded_with_replay<B: SerialBackend>(
                 if !echo_consumed && !*ignored_replay && frame == request =>
             {
                 echo_consumed = true;
+                frame_index += 1;
             }
             FramedRead::Complete(frame) => {
                 if !*ignored_replay
@@ -1929,7 +2050,14 @@ fn read_snapshot_bounded_with_replay<B: SerialBackend>(
     };
     let read = SnapshotRead::complete(&response)?;
     if consume_all_queued_search_replays {
-        finish_queued_snapshot_search_replays(backend, deadline, limit, &response, &mut observer)?;
+        finish_queued_snapshot_search_replays(
+            backend,
+            deadline,
+            limit,
+            &response,
+            &mut observer,
+            frame_index + 1,
+        )?;
     } else {
         finish_bounded_response(backend, deadline, limit, &response, &mut observer, false)?;
     }

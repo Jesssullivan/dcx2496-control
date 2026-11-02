@@ -312,6 +312,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             diagnostic.stage = .refreshDecode
             if let failed = try ApprovedRoomFailureEnvelope.decodeIfFailed(refresh.stdout, terminationStatus: refresh.terminationStatus) {
                 diagnostic.captureFailure = failed.failure
+                diagnostic.privateReadContext = failed.privateReadContext
                 diagnostic.closeKnown = failed.failure.sessionClosedVerified ? .verified : .unknown
                 diagnostic.stage = .refreshChild
                 throw ApprovedRoomCaptureFailed(failure: failed.failure)

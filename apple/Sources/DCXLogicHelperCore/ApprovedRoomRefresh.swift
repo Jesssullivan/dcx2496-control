@@ -63,12 +63,13 @@ struct ApprovedRoomRefresh: Decodable {
 /// Legacy failed envelopes have no typed authority and retain unknown close.
 struct ApprovedRoomFailureEnvelope: Decodable {
     let failure: RoomCaptureFailureV1
+    let privateReadContext: PrivateSearchReadContext?
     let searchAttempts: UInt32
     let searchEmptyTimeouts: UInt32
     let captureElapsedMilliseconds: UInt64
     private enum Keys: String, CodingKey {
         case schemaVersion, status, snapshot, comparison, failure, closeVerified
-        case searchAttempts, searchEmptyTimeouts, captureElapsedMilliseconds
+        case searchAttempts, searchEmptyTimeouts, captureElapsedMilliseconds, privateReadContext
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: Keys.self)
@@ -78,6 +79,7 @@ struct ApprovedRoomFailureEnvelope: Decodable {
             throw RoomVerificationError.invalidComparison
         }
         failure = try values.decode(RoomCaptureFailureV1.self, forKey: .failure)
+        privateReadContext = try values.decodeIfPresent(PrivateSearchReadContext.self, forKey: .privateReadContext)
         searchAttempts = try values.decode(UInt32.self, forKey: .searchAttempts)
         searchEmptyTimeouts = try values.decode(UInt32.self, forKey: .searchEmptyTimeouts)
         captureElapsedMilliseconds = try values.decode(UInt64.self, forKey: .captureElapsedMilliseconds)
@@ -91,7 +93,8 @@ struct ApprovedRoomFailureEnvelope: Decodable {
               failure.closeFailure.map({ carrierKinds.contains($0) }) ?? true,
               failure.received.map({ $0 <= 2048 }) ?? true,
               failure.category != .timeout || (failure.operation != nil && failure.received != nil),
-              failure.category != .finish || !closed else {
+              failure.category != .finish || !closed,
+              privateReadContext == nil || (failure.category == .transport && failure.operation == .search) else {
             throw RoomVerificationError.invalidComparison
         }
     }
@@ -113,6 +116,51 @@ struct ApprovedRoomFailureEnvelope: Decodable {
         }
         guard terminationStatus == 1 else { throw RoomVerificationError.invalidComparison }
         return try BridgeJSONCodec.decoder().decode(Self.self, from: data)
+    }
+}
+
+/// TIN-6964: consumed Search bytes belong only in the bounded private failure record.
+/// This diagnostic never grants close, identity, readiness or retry authority.
+struct PrivateSearchReadContext: Codable {
+    let schemaVersion: String
+    let subphase: String
+    let frameIndex: UInt32
+    let prefix: [UInt8]
+    let received: UInt32
+    let queued: UInt32
+    let delimiter: String
+    let header: String
+    let observedMonotonicMicroseconds: UInt64
+    let deadlineMonotonicMicroseconds: UInt64
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, subphase, frameIndex, prefix, received, queued, delimiter, header
+        case observedMonotonicMicroseconds, deadlineMonotonicMicroseconds
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(String.self, forKey: .schemaVersion)
+        subphase = try values.decode(String.self, forKey: .subphase)
+        frameIndex = try values.decode(UInt32.self, forKey: .frameIndex)
+        prefix = try values.decode([UInt8].self, forKey: .prefix)
+        received = try values.decode(UInt32.self, forKey: .received)
+        queued = try values.decode(UInt32.self, forKey: .queued)
+        delimiter = try values.decode(String.self, forKey: .delimiter)
+        header = try values.decode(String.self, forKey: .header)
+        observedMonotonicMicroseconds = try values.decode(UInt64.self, forKey: .observedMonotonicMicroseconds)
+        deadlineMonotonicMicroseconds = try values.decode(UInt64.self, forKey: .deadlineMonotonicMicroseconds)
+        guard schemaVersion == "dcx.search-read-context/v1", ["response", "queued_replay"].contains(subphase),
+              prefix.count == 26, received == 26, queued > 0, queued <= UInt32(Int32.max),
+              delimiter == "absent", !prefix.contains(0xf7),
+              ["search_response", "search_request", "other", "incomplete"].contains(header) else {
+            throw RoomVerificationError.invalidComparison
+        }
+        let classified: String
+        if prefix.starts(with: [0xf0, 0, 0x20, 0x32]) && prefix[5] == 0x0e {
+            classified = prefix[6] == 0 ? "search_response" : (prefix[6] == 0x40 ? "search_request" : "other")
+        } else {
+            classified = "other"
+        }
+        guard header == classified else { throw RoomVerificationError.invalidComparison }
     }
 }
 

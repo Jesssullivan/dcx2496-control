@@ -69,3 +69,21 @@ If no Dump0 follows that consumed replay, the result is a terminal carrier failu
 This source rule addresses a possible late-response boundary. A retained Dump0 length failure alone does not identify the rejected frame or establish its cause. Synthetic tests do not qualify the rule on hardware.
 
 Authority: Root's bounded implementation direction, TIN-6964. Lexical: XL-ACC-004
+
+## Private Search diagnostics
+
+A failed approved refresh may include top-level `privateReadContext`, separate from the public `failure` object. It records a post-write Search overflow only. Success envelopes, helper status and MIDI readiness never include the raw prefix. Ordinary carrier error Display and Debug redact it. The helper stores accepted context only in its bounded private failure record.
+
+| Fields | Meaning |
+| --- | --- |
+| `schemaVersion` | Exact `dcx.search-read-context/v1` |
+| `subphase`, `frameIndex` | `response` or `queued_replay`, with a zero-based frame index across the post-write read, including an echo |
+| `prefix`, `received`, `queued` | At most 26 already-consumed bytes, consumed count and actual pending count. No pending byte is read for diagnostics |
+| `delimiter`, `header` | Terminator presence and header shape. A header classification does not validate an identity |
+| `observedMonotonicMicroseconds`, `deadlineMonotonicMicroseconds` | Actual observation time and the unchanged operation deadline. Neither grants freshness or retry authority |
+
+Pre-write reconciliation context is not exported. Missing or malformed context does not change the original failure or its latch. Capture proof invalidates before private storage. Diagnostic storage failure cannot restore readiness.
+
+Search limits apply to each frame, not the total queued input. A complete frame ends immediately at its terminator. A retained overflow count of 26 consumed bytes and six queued bytes establishes no packet identity. The historical bytes were not retained, so their type and the failure's cause remain unverified. This diagnostic change adds no read, request, replay, deadline extension or acceptance rule. Partial, changed and malformed input remains terminal under the existing verified-close policy.
+
+Authority: Root's diagnostics-only implementation direction, TIN-6964. Lexical: XL-ACC-004

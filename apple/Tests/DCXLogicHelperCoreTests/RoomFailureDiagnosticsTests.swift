@@ -59,6 +59,68 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
                      "operation": "dump0", "received": 0, "sessionClosedVerified": closed,
                      "closeFailure": closed ? NSNull() as Any : "cleanup" as Any]]
     }
+    private func searchContextEnvelope() -> [String: Any] {
+        var envelope = failedEnvelope()
+        envelope["failure"] = ["schemaVersion": "dcx.approved-room-capture-failure/v1",
+            "category": "transport", "operation": "search", "received": NSNull(),
+            "sessionClosedVerified": true, "closeFailure": NSNull()]
+        envelope["privateReadContext"] = ["schemaVersion": "dcx.search-read-context/v1",
+            "subphase": "response", "frameIndex": 0, "prefix": [240] + Array(repeating: 42, count: 25),
+            "received": 26, "queued": 6, "delimiter": "absent", "header": "other",
+            "observedMonotonicMicroseconds": 100, "deadlineMonotonicMicroseconds": 200]
+        return envelope
+    }
+    func testSearchReadContextIsRetainedOnlyInPrivateRecordAndCannotPermitRetry() throws {
+        let envelope = searchContextEnvelope()
+        let data = try JSONSerialization.data(withJSONObject: envelope)
+        let (value, root) = try exercise(.init(refresh: .success(result(exit: 1, stdout: data))))
+        XCTAssertEqual(value.closeKnown, .verified)
+        XCTAssertFalse(ApprovedRoomCaptureFailed(failure: try XCTUnwrap(value.captureFailure)).permitsPeriodicRetry)
+        let publicData = try BridgeJSONCodec.encoder().encode(value)
+        let publicObject = try XCTUnwrap(JSONSerialization.jsonObject(with: publicData) as? [String: Any])
+        XCTAssertNil(publicObject["privateReadContext"])
+        XCTAssertFalse(String(decoding: publicData, as: UTF8.self).contains("prefix"))
+        let record = try Data(contentsOf: root.appendingPathComponent(try XCTUnwrap(value.privateRecord)))
+        let stored = try XCTUnwrap(JSONSerialization.jsonObject(with: record) as? [String: Any])
+        let context = try XCTUnwrap(stored["privateReadContext"] as? [String: Any])
+        XCTAssertEqual(context["prefix"] as? [Int], [240] + Array(repeating: 42, count: 25))
+        XCTAssertNil((stored["metadata"] as? [String: Any])?["privateReadContext"])
+    }
+    func testMalformedSearchPrivateContextCannotSupplyCloseOrRetryAuthority() throws {
+        let changes: [(String, Any)] = [("prefix", Array(repeating: 0, count: 27)),
+            ("prefix", Array(repeating: 256, count: 26)), ("prefix", Array(repeating: 247, count: 26)),
+            ("received", 25), ("queued", 0), ("queued", UInt64(UInt32.max)),
+            ("subphase", "prewrite"), ("header", "unknown"), ("header", "search_response"), ("delimiter", "present"),
+            ("observedMonotonicMicroseconds", -1), ("schemaVersion", "unknown")]
+        for (key, invalid) in changes {
+            var object = searchContextEnvelope()
+            var context = try XCTUnwrap(object["privateReadContext"] as? [String: Any])
+            context[key] = invalid; object["privateReadContext"] = context
+            XCTAssertThrowsError(try ApprovedRoomFailureEnvelope.decodeIfFailed(
+                JSONSerialization.data(withJSONObject: object), terminationStatus: 1), key)
+        }
+        var wrongOperation = searchContextEnvelope()
+        wrongOperation["failure"] = failedEnvelope()["failure"]
+        XCTAssertThrowsError(try ApprovedRoomFailureEnvelope.decodeIfFailed(
+            JSONSerialization.data(withJSONObject: wrongOperation), terminationStatus: 1))
+        XCTAssertNil(try ApprovedRoomFailureEnvelope.decodeIfFailed(
+            JSONSerialization.data(withJSONObject: failedEnvelope()), terminationStatus: 1)?.privateReadContext)
+        var lateObservation = searchContextEnvelope()
+        var context = try XCTUnwrap(lateObservation["privateReadContext"] as? [String: Any])
+        context["observedMonotonicMicroseconds"] = 201
+        lateObservation["privateReadContext"] = context
+        XCTAssertEqual(try ApprovedRoomFailureEnvelope.decodeIfFailed(
+            JSONSerialization.data(withJSONObject: lateObservation), terminationStatus: 1)?.privateReadContext?.observedMonotonicMicroseconds, 201)
+        for (function, label) in [(0, "search_response"), (0x40, "search_request")] {
+            var classified = searchContextEnvelope()
+            var context = try XCTUnwrap(classified["privateReadContext"] as? [String: Any])
+            context["prefix"] = [240, 0, 32, 50, 0, 14, function] + Array(repeating: 0, count: 19)
+            context["header"] = label
+            classified["privateReadContext"] = context
+            XCTAssertEqual(try ApprovedRoomFailureEnvelope.decodeIfFailed(
+                JSONSerialization.data(withJSONObject: classified), terminationStatus: 1)?.privateReadContext?.header, label)
+        }
+    }
     func testTypedEmptyDumpTimeoutRetainsActualCloseAndNeverPublishesReadiness() throws {
         let data = try JSONSerialization.data(withJSONObject: failedEnvelope())
         let (value, _) = try exercise(.init(refresh: .success(result(exit: 1, stdout: data))))

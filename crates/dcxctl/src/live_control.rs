@@ -110,6 +110,7 @@ pub fn capture_approved(
                     "captureElapsedMilliseconds": u64::try_from(error.elapsed().as_millis())?,
                     "closeVerified": failure["sessionClosedVerified"],
                     "failure": failure,
+                    "privateReadContext": dcx_transport::capture_failure::capture_failure_summary(error.failure()).carrier.and_then(DarwinCarrierError::private_search_read_context).filter(|context| matches!(context.subphase, "response" | "queued_replay")),
                     "error": error.to_string(),
                 })
             );

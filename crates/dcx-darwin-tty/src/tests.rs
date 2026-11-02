@@ -2232,7 +2232,8 @@ fn frame_limit_refreshes_actual_queue_count_before_overflow() {
         result,
         Err(DarwinCarrierError::Overflow {
             received: 3,
-            queued: 7
+            queued: 7,
+            ..
         })
     ));
     assert_eq!(queue_query_count(&backend), 2);
@@ -2417,4 +2418,151 @@ fn delayed_search_and_dump_share_original_deadline() {
             assert_eq!(backend.inbound.iter().copied().collect::<Vec<_>>(), dump);
         }
     }
+}
+
+#[test]
+fn search_valid_frame_plus_six_byte_prefix_never_aggregate_overflows_at_any_split() {
+    let response = synthetic_response(0);
+    let prefix = &response[..6];
+    for split in 1..=32 {
+        let mut backend = queued_frame_backend(response.into_iter().chain(prefix.iter().copied()));
+        backend.available_script = [split, 32 - split, 6, 0]
+            .into_iter()
+            .filter(|n| *n != 0)
+            .collect();
+        // Supply exact available counts for each frame; the first terminator always ends it.
+        let first = read_one_frame(
+            &mut backend,
+            SNAPSHOT_OPERATION_TIMEOUT,
+            SEARCH_RESPONSE_LIMIT,
+            &mut (),
+        )
+        .unwrap();
+        assert!(matches!(first, FramedRead::Complete(frame) if frame == response));
+        assert_eq!(backend.inbound.iter().copied().collect::<Vec<_>>(), prefix);
+    }
+}
+
+#[test]
+fn search_nonterminated_prefix_context_preserves_queue_without_reading_it() {
+    let bytes = [0x11; 32];
+    for split in 1..=26 {
+        let mut backend = queued_frame_backend(bytes);
+        backend.available_script = [split, 32 - split, 6].into_iter().collect();
+        let error = read_snapshot_bounded(
+            &mut backend,
+            SNAPSHOT_OPERATION_TIMEOUT,
+            SEARCH_RESPONSE_LIMIT,
+            &synthetic_search_request(),
+            true,
+        )
+        .err()
+        .expect("synthetic terminal input");
+        let context = error.private_search_read_context().unwrap();
+        assert_eq!(context.prefix, [0x11; 26]);
+        assert_eq!((context.received, context.queued), (26, 6));
+        assert_eq!((context.subphase, context.frame_index), ("response", 0));
+        assert_eq!((context.header, context.delimiter), ("other", "absent"));
+        assert_eq!(
+            context.deadline_monotonic_microseconds,
+            u64::try_from(SNAPSHOT_OPERATION_TIMEOUT.as_micros()).unwrap()
+        );
+        assert_eq!(backend.inbound.len(), 6);
+        assert_eq!(backend.read_since_write, 26);
+        assert!(requires_input_discard(&error));
+        assert!(!format!("{error:?}").contains("17, 17"));
+        assert!(!format!("{error}").contains("17, 17"));
+    }
+}
+
+#[test]
+fn search_echo_then_overflow_records_response_frame_index_without_echo_bytes() {
+    let request = synthetic_search_request();
+    let mut backend = queued_frame_backend(request.into_iter().chain([0x11; 32]));
+    let error = read_snapshot_bounded(
+        &mut backend,
+        SNAPSHOT_OPERATION_TIMEOUT,
+        SEARCH_RESPONSE_LIMIT,
+        &request,
+        true,
+    )
+    .err()
+    .expect("synthetic terminal input");
+    let context = error.private_search_read_context().unwrap();
+    assert_eq!((context.subphase, context.frame_index), ("response", 1));
+    assert_eq!(context.prefix, [0x11; 26]);
+    assert_eq!(backend.inbound.len(), 6);
+}
+
+#[test]
+fn search_replay_overflow_records_queued_phase_and_preserves_pending_bytes() {
+    let response = synthetic_response(0);
+    let mut backend = queued_frame_backend(response.into_iter().chain(response).chain([0x11; 32]));
+    let error = read_snapshot_bounded(
+        &mut backend,
+        SNAPSHOT_OPERATION_TIMEOUT,
+        SEARCH_RESPONSE_LIMIT,
+        &synthetic_search_request(),
+        true,
+    )
+    .err()
+    .expect("synthetic terminal input");
+    let context = error.private_search_read_context().unwrap();
+    assert_eq!(
+        (context.subphase, context.frame_index),
+        ("queued_replay", 2)
+    );
+    assert_eq!(context.prefix.len(), 26);
+    assert_eq!(backend.inbound.len(), 6);
+    let request = synthetic_search_request();
+    let mut echoed = queued_frame_backend(request.into_iter().chain(response).chain([0x11; 32]));
+    let error = read_snapshot_bounded(
+        &mut echoed,
+        SNAPSHOT_OPERATION_TIMEOUT,
+        SEARCH_RESPONSE_LIMIT,
+        &request,
+        true,
+    )
+    .err()
+    .expect("synthetic terminal input");
+    let context = error.private_search_read_context().unwrap();
+    assert_eq!(
+        (context.subphase, context.frame_index),
+        ("queued_replay", 2)
+    );
+    assert_eq!(echoed.inbound.len(), 6);
+}
+
+#[test]
+fn search_other_target_and_partial_replay_remain_terminal_without_raw_context() {
+    for trailing in [
+        synthetic_response(1).to_vec(),
+        synthetic_response(0)[..6].to_vec(),
+    ] {
+        let mut backend = queued_frame_backend(synthetic_response(0).into_iter().chain(trailing));
+        let error = read_snapshot_bounded(
+            &mut backend,
+            SNAPSHOT_OPERATION_TIMEOUT,
+            SEARCH_RESPONSE_LIMIT,
+            &synthetic_search_request(),
+            true,
+        )
+        .err()
+        .expect("synthetic terminal input");
+        assert!(matches!(
+            error,
+            DarwinCarrierError::UnexpectedTrailingFrame { .. }
+        ));
+        assert!(error.private_search_read_context().is_none());
+    }
+}
+
+#[test]
+fn non_search_overflow_never_retains_private_prefix() {
+    let mut backend = queued_frame_backend([0x11; 32]);
+    let error = read_one_frame(&mut backend, SNAPSHOT_OPERATION_TIMEOUT, 27, &mut ())
+        .err()
+        .expect("synthetic terminal input");
+    assert!(error.private_search_read_context().is_none());
+    assert_eq!(backend.inbound.len(), 5);
 }
