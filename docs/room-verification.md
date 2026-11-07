@@ -93,6 +93,59 @@ The existing read-only `helper.status` reports `activeTransactionID` as
 or a fresh capture. Tests cover coordinator-level concurrent triggers, shared
 failure, mismatched bindings, invalidation and unchanged capture age.
 
+## Native source validation
+
+Authority: the operator's implementation direction, TIN-6964 and R-N13.
+Source `bbaf5f64bbbcb0d41250f2932bee5d2d359c5340` passed the Lab-owned native
+source lane on PZM. This receipt covers source compilation and injected tests.
+It does not qualify an installed helper or approve a room baseline.
+
+| Check | Observed result |
+|---|---|
+| Recipes | `just apple-package-check native-helper-ui-typecheck` |
+| XCTest | 95 listed, 87 passed, 8 explicitly skipped and 0 failed |
+| Room verification | 11 passed, including all six new cases |
+| Helper UI | Actual SwiftUI source typecheck passed |
+| Diagnostics | No compiler warnings or errors |
+| Bounds | Swift jobs 1, maximum jobs 2, nice increment 10 |
+| Completion | 56.381 seconds, exit 0 and owned process group quiescent |
+| Archive SHA256 | `531d581f6f294731f268923111215101782da30a06b20e85ed7e01dbb7403b2e` |
+| Receipt SHA256 | `b955b568c9c5d5301192670bfccfdf98bf7f715a1cc98e1c17daf3a77aa268ad` |
+| Full log SHA256 | `5e3f982c9080842f0c6bf8091fe6688edad5a4e45de0844f4f8ccf87069c22b6` |
+
+The seven real-child tests and one real Rust CLI test were skipped because their
+explicit executable inputs were absent. Those skips provide no child or hardware
+proof. The runner removed those executable inputs and retained its complete log.
+No helper IPC or CoreMIDI endpoint was started. No application, device, serial,
+installation or foreign-process action occurred.
+
+Independent source review found and resolved cache admission and scope errors.
+The final source and native packet reviews found no remaining concrete blocker.
+This documentation follows the tested source without changing product code.
+
+## Artifact signing hold
+
+The subsequent artifact-only build of source `bbaf5f64` completed its Release
+archive. Its first signing command failed on the embedded `dcxctl` with
+`errSecInternalComponent`. Helper and AU signing were not reached. The caller's
+bootstrap manager was Background. The underlying key-use failure remains
+unverified. No signed candidate was exported and no retry or keychain workaround
+was performed.
+
+| Readback | Observed result |
+|---|---|
+| Recipe | Exit 1 after 132.404 seconds |
+| Owned process group | Quiescent |
+| Canonical build 3 | Manifest unchanged |
+| Configuration | Exact prior bytes preserved |
+| Scoped app and AU registrations | Unchanged |
+| Rollback | Build-3 bytes and configuration preserved |
+| Receipt SHA256 | `7147660a4fd75a13c98b71f21c58fd2df69dec8ce6896cfd9552634b103af0d5` |
+| Log SHA256 | `20ff213974bac8cd31b450cb30d700e5189d27ccdb4e6a93e154121ab04dd402` |
+
+A retained archive is not a verified signed helper. Installation, launch,
+serial access, room approval and startup enablement remain outside this receipt.
+
 ## Periodic approved reads
 
 `periodicVerificationEnabled` is a separate optional boolean in the existing
