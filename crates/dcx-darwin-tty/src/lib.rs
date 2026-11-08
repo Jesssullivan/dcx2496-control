@@ -1792,15 +1792,22 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
     observer: &mut O,
 ) -> Result<FramedRead, DarwinCarrierError> {
     let mut frame = Vec::with_capacity(SEARCH_RESPONSE_LIMIT);
+    let mut queued_budget = 0;
     loop {
         let time_left = remaining(backend, deadline);
         if time_left.is_zero() {
             return Ok(FramedRead::TimedOut(frame));
         }
-        let queued = backend
-            .bytes_available()
-            .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
-        if queued == 0 {
+        if queued_budget == 0 || frame.len() == frame_limit.min(MAX_FRAME_LEN) {
+            queued_budget = backend
+                .bytes_available()
+                .map_err(|fault| system_error(CarrierStage::BytesAvailable, fault))?;
+            // A queue query can consume the remaining deadline too.
+            if remaining(backend, deadline).is_zero() {
+                return Ok(FramedRead::TimedOut(frame));
+            }
+        }
+        if queued_budget == 0 {
             let time_left = remaining(backend, deadline);
             if time_left.is_zero()
                 || !backend
@@ -1812,7 +1819,7 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
             continue;
         }
         if frame.len() == frame_limit.min(MAX_FRAME_LEN) {
-            return Err(observer.overflow(frame.len(), queued));
+            return Err(observer.overflow(frame.len(), queued_budget));
         }
         let mut byte = [0_u8; 1];
         match backend
@@ -1820,6 +1827,7 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
             .map_err(|fault| system_error(CarrierStage::Read, fault))?
         {
             ReadProgress::Bytes(1) => {
+                queued_budget -= 1;
                 frame.push(byte[0]);
                 observer.consumed(1);
             }
@@ -1828,7 +1836,10 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
                     received: frame.len(),
                 });
             }
-            ReadProgress::WouldBlock => continue,
+            ReadProgress::WouldBlock => {
+                queued_budget = 0;
+                continue;
+            }
         }
         if byte[0] == 0xf7 {
             return Ok(FramedRead::Complete(frame));

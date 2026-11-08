@@ -540,3 +540,142 @@ fn an_unmuted_profile_never_unmutes_a_muted_output() {
     }
     assert_eq!(code(chain.final_snapshot(&baseline), MUTE_PARAMETER), 1);
 }
+
+fn room_expectation(snapshot: &SnapshotV1) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": "dcx.room-expectation/v1",
+        "sceneId": "practice-ready",
+        "sceneRevision": 1,
+        "compiledDigest": format!("sha256/{}", "a".repeat(64)),
+        "presetDigest": format!("sha256/{}", "b".repeat(64)),
+        "approvedSnapshotDigest": snapshot.digest(),
+        "outputMutes": [true, true, true, false, true, true],
+        "profiles": [profile()],
+    })
+}
+
+#[test]
+fn room_match_requires_approved_image_and_reviewed_profiles() {
+    use dcx_core::room_verification::verify_room;
+    let states = replay();
+    let snapshot = &states.last().unwrap().1;
+    let expected = room_expectation(snapshot);
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    let comparison = verify_room(snapshot, &bytes).unwrap();
+    assert!(comparison.matches);
+    assert!(comparison.readable);
+    assert_eq!(comparison.expectation_digest, profile_digest(&bytes));
+    assert!(comparison.compared_fields > 7);
+
+    // A self-consistent but different image never inherits the approved baseline.
+    assert!(!verify_room(&states[0].1, &bytes).unwrap().matches);
+    // A contradictory typed profile cannot approve even the exact same bytes.
+    let mut contradicted = expected;
+    contradicted["profiles"][0]["state"]["gainDbTenths"] = serde_json::json!(-10);
+    assert!(
+        !verify_room(snapshot, &serde_json::to_vec(&contradicted).unwrap())
+            .unwrap()
+            .matches
+    );
+}
+
+#[test]
+fn every_unreviewed_jbl_source_change_fails_exact_image_admission() {
+    use dcx_core::{SnapshotSection, layout::output_location, room_verification::verify_room};
+    let states = replay();
+    let baseline = &states.last().unwrap().1;
+    let bytes = serde_json::to_vec(&room_expectation(baseline)).unwrap();
+    for output in 1..=2 {
+        assert!(reviewed_address(output_channel(output), SOURCE_PARAMETER).is_none());
+        let location = output_location(output, SOURCE_PARAMETER).unwrap();
+        for source in 0..=3 {
+            let mut dump0 = baseline.frame(SnapshotSection::Dump0).to_vec();
+            let mut dump1 = baseline.frame(SnapshotSection::Dump1).to_vec();
+            let frame = if location.part() == DumpPart::Part0 {
+                &mut dump0
+            } else {
+                &mut dump1
+            };
+            let before = location.read(frame);
+            location.write(frame, source).unwrap();
+            let changed =
+                SnapshotV1::from_frames(baseline.frame(SnapshotSection::Identity), &dump0, &dump1)
+                    .unwrap();
+            let comparison = verify_room(&changed, &bytes).unwrap();
+            assert_eq!(
+                comparison.matches,
+                source == before,
+                "output {output}, source {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn room_expectation_refuses_unsafe_or_ambiguous_bindings() {
+    use dcx_core::room_verification::RoomExpectationV1;
+    let states = replay();
+    let baseline = &states.last().unwrap().1;
+    for field in ["compiledDigest", "presetDigest", "approvedSnapshotDigest"] {
+        let mut value = room_expectation(baseline);
+        value[field] = serde_json::json!("sha256/not-a-digest");
+        assert!(RoomExpectationV1::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    for output in 4..=5 {
+        let mut value = room_expectation(baseline);
+        value["outputMutes"][output] = serde_json::json!(false);
+        assert!(RoomExpectationV1::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    let mut value = room_expectation(baseline);
+    value["approveCurrentReadAutomatically"] = serde_json::json!(true);
+    assert!(RoomExpectationV1::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
+fn approved_refresh_requires_exact_independent_expectation_bytes() {
+    use dcx_core::{
+        output_profile::profile_digest, protocol::DeviceId,
+        room_verification::ApprovedRoomRefreshAdmission,
+    };
+    let states = replay();
+    let snapshot = &states.last().unwrap().1;
+    let expected = room_expectation(snapshot);
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    let digest = profile_digest(&bytes);
+    let device = DeviceId::new(0).unwrap();
+    let admission = ApprovedRoomRefreshAdmission::from_json(&bytes, &digest, device).unwrap();
+    assert_eq!(admission.expectation(), bytes);
+    assert_eq!(admission.expected_device(), device);
+    let mut whitespace = bytes.clone();
+    whitespace.push(b' ');
+    assert!(ApprovedRoomRefreshAdmission::from_json(&whitespace, &digest, device).is_err());
+    for index in 7..digest.len() {
+        let mut changed = digest.clone().into_bytes();
+        changed[index] = if changed[index] == b'0' { b'1' } else { b'0' };
+        assert!(
+            ApprovedRoomRefreshAdmission::from_json(
+                &bytes,
+                std::str::from_utf8(&changed).unwrap(),
+                device
+            )
+            .is_err()
+        );
+    }
+    for key in [
+        "approvedSnapshotDigest",
+        "profiles",
+        "outputMutes",
+        "sceneRevision",
+    ] {
+        let mut malformed = expected.clone();
+        malformed.as_object_mut().unwrap().remove(key);
+        let raw = serde_json::to_vec(&malformed).unwrap();
+        assert!(
+            ApprovedRoomRefreshAdmission::from_json(&raw, &profile_digest(&raw), device).is_err()
+        );
+    }
+    let mut unsafe_reserve = expected;
+    unsafe_reserve["outputMutes"][5] = serde_json::json!(false);
+    let raw = serde_json::to_vec(&unsafe_reserve).unwrap();
+    assert!(ApprovedRoomRefreshAdmission::from_json(&raw, &profile_digest(&raw), device).is_err());
+}

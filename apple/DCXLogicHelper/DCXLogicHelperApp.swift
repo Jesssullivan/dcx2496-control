@@ -11,6 +11,7 @@ struct DCXLogicHelperApp: App {
             HelperContentView(model: model)
                 .frame(minWidth: 640, minHeight: 650)
                 .onAppear { model.enterForeground() }
+                .onOpenURL { model.handleRoomRefreshURL($0) }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -40,6 +41,11 @@ final class HelperAppModel: ObservableObject {
     @Published var bindingID = ""
     @Published var ttyPath = "/dev/cu.usbserial-"
     @Published var expectedDeviceAddress = 0
+    @Published var approvedRoomExpectation = ""
+    @Published var verifyRoomOnLaunch = false
+    @Published var allowRoomRefreshRequests = false
+    @Published var periodicRoomVerificationEnabled = false
+    @Published private(set) var verifyingRoom = false
     @Published var childTimeoutSeconds = Int(HelperConfigurationV1.defaultChildTimeoutSeconds)
     @Published private(set) var enabledFeatures: Set<HelperFeature> = [
         .identitySearch,
@@ -54,6 +60,12 @@ final class HelperAppModel: ObservableObject {
             self.runtime = runtime
             if let configuration = runtime.currentConfiguration() {
                 populate(from: configuration)
+            }
+            if let approved = runtime.currentApprovedRoomConfiguration() {
+                approvedRoomExpectation = String(decoding: approved.expectation, as: UTF8.self)
+                verifyRoomOnLaunch = approved.verifyOnForegroundLaunch
+                allowRoomRefreshRequests = approved.allowExplicitRefreshRequests
+                periodicRoomVerificationEnabled = approved.periodicVerificationEnabled
             }
             status = "Ready to enter foreground"
         } catch {
@@ -177,6 +189,72 @@ final class HelperAppModel: ObservableObject {
         }
     }
 
+    func verifyPracticeRoom() {
+        guard let runtime, !verifyingRoom else { return }
+        let expectation = Data(approvedRoomExpectation.utf8)
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
+            status = "Paste the approved bounded room expectation first"
+            return
+        }
+        verifyingRoom = true
+        status = "Capturing one read-only snapshot and checking the approved image"
+        Task {
+            do {
+                let receipt = try await Task.detached {
+                    try runtime.verifyRoom(expectation: expectation)
+                }.value
+                status = receipt.matches
+                    ? "Room matches. Attestation expires sixty seconds after capture."
+                    : "Room differs. Output enable remains unavailable."
+            } catch {
+                status = "Room verification unavailable. No readiness was published."
+            }
+            verifyingRoom = false
+        }
+    }
+
+    func saveApprovedRoom() {
+        guard let runtime, !verifyingRoom else { return }
+        let expectation = Data(approvedRoomExpectation.utf8)
+        let startup = verifyRoomOnLaunch
+        let requests = allowRoomRefreshRequests
+        let periodic = periodicRoomVerificationEnabled
+        verifyingRoom = true
+        Task {
+            do {
+                try await Task.detached {
+                    try runtime.saveApprovedRoomExpectation(expectation, verifyOnForegroundLaunch: startup,
+                        allowExplicitRefreshRequests: requests, periodicVerificationEnabled: periodic)
+                }.value
+                status = periodic ? "Approved expectation saved. Periodic room reads are enabled."
+                    : "Approved expectation saved. Periodic room reads are disabled."
+            } catch {
+                status = "Approved expectation was not saved. Verify the manifest and configured target."
+            }
+            verifyingRoom = false
+        }
+    }
+
+    func handleRoomRefreshURL(_ url: URL) {
+        guard let runtime, !verifyingRoom, ApprovedRoomConfiguration.acceptsRefreshURL(url) else { return }
+        do {
+            try runtime.enterForeground()
+        } catch {
+            status = "The foreground bridge could not start for the requested refresh."
+            return
+        }
+        verifyingRoom = true
+        Task {
+            do {
+                let receipt = try await Task.detached { try runtime.verifySavedApprovedRoom(requestURL: url) }.value
+                status = receipt.matches ? "Requested room snapshot matched the approved image." : "Requested room snapshot differs."
+            } catch {
+                status = "Saved room refresh is disabled, unavailable or did not verify."
+            }
+            verifyingRoom = false
+        }
+    }
+
     private func populate(from configuration: HelperConfigurationV1) {
         bindingID = configuration.bindingID
         ttyPath = configuration.ttyPath
@@ -266,6 +344,25 @@ private struct HelperContentView: View {
                 Button("Reload Saved Configuration") { model.reloadConfiguration() }
                 Spacer()
                 Button("Refresh Local Status") { model.refresh() }
+            }
+            Divider()
+            DisclosureGroup("Approved room verification") {
+                Text("Paste the independently approved dcx.room-expectation/v1 document. Capture never approves an image. No device write occurs.")
+                    .font(.caption)
+                TextEditor(text: $model.approvedRoomExpectation)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(height: 90)
+                Toggle("Verify approved room when this helper opens before Logic", isOn: $model.verifyRoomOnLaunch)
+                Toggle("Allow explicit saved-room refresh from native controls", isOn: $model.allowRoomRefreshRequests)
+                Toggle("Periodically read the approved room while this helper runs", isOn: $model.periodicRoomVerificationEnabled)
+                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. Failed reads stop periodic attempts until an explicit successful verification or configuration change.")
+                    .font(.caption)
+                Button("Save Approved Room Configuration") { model.saveApprovedRoom() }
+                    .disabled(model.verifyingRoom || !model.configured)
+                Button(model.verifyingRoom ? "Verifying room" : "Snapshot and Verify Room") {
+                    model.verifyPracticeRoom()
+                }
+                .disabled(model.verifyingRoom || !model.configured)
             }
             Divider()
             Text("This app owns one bounded dcxctl transaction at a time. It does not run as a daemon, and incoming MIDI Commands have no device mapping in bridge v1.")

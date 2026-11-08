@@ -266,6 +266,7 @@ public struct HelperStatusResponse: Codable, Equatable, Sendable {
     public let recovery: HelperRecoveryStatusV1?
     public let completion: HelperRecoveryCompletionStatusV1?
     public let recoveryUnavailable: Bool
+    public let roomFailureDiagnostic: RoomFailureDiagnosticV1?
 
     public init(
         foreground: Bool,
@@ -276,7 +277,8 @@ public struct HelperStatusResponse: Codable, Equatable, Sendable {
         activeTransactionID: String?,
         recovery: HelperRecoveryStatusV1? = nil,
         completion: HelperRecoveryCompletionStatusV1? = nil,
-        recoveryUnavailable: Bool = false
+        recoveryUnavailable: Bool = false,
+        roomFailureDiagnostic: RoomFailureDiagnosticV1? = nil
     ) {
         self.foreground = foreground
         self.configured = configured
@@ -287,6 +289,7 @@ public struct HelperStatusResponse: Codable, Equatable, Sendable {
         self.recovery = recovery
         self.completion = completion
         self.recoveryUnavailable = recoveryUnavailable
+        self.roomFailureDiagnostic = roomFailureDiagnostic
     }
 }
 

@@ -740,6 +740,9 @@
         },
         "recoveryUnavailable": {
           "type": "boolean"
+        },
+        "roomFailureDiagnostic": {
+          "$ref": "#/$defs/roomFailureDiagnostic"
         }
       },
       "allOf": [
@@ -2327,6 +2330,167 @@
         },
         "profileReceipt": {
           "$ref": "#/$defs/receipt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "roomFailureDiagnostic": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "attemptID",
+        "observedAt",
+        "stage",
+        "failure",
+        "stderrRetainedByteCount",
+        "closeKnown",
+        "persistenceUnavailable"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.room-failure-diagnostic/v1"
+        },
+        "attemptID": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "stage": {
+          "enum": [
+            "admission",
+            "validationChild",
+            "refreshChild",
+            "refreshDecode",
+            "snapshotChild",
+            "snapshotDecode",
+            "comparisonChild",
+            "comparisonDecode",
+            "publication"
+          ]
+        },
+        "failure": {
+          "enum": [
+            "childExit",
+            "launchFailed",
+            "timedOut",
+            "outputReadFailed",
+            "outputTooLarge",
+            "terminationUnconfirmed",
+            "invalidExpectation",
+            "invalidComparison",
+            "unavailable",
+            "busy",
+            "decoding",
+            "other"
+          ]
+        },
+        "childExitCode": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "childDurationMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stdoutDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "stdoutByteCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576
+        },
+        "stderrDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "stderrByteCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576
+        },
+        "stderrRetainedByteCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16384
+        },
+        "closeKnown": {
+          "enum": [
+            "notApplicable",
+            "unknown",
+            "verified"
+          ]
+        },
+        "privateRecord": {
+          "type": "string",
+          "pattern": "^RoomDiagnostics/failure-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.json$"
+        },
+        "persistenceUnavailable": {
+          "type": "boolean"
+        },
+        "captureFailure": {
+          "$ref": "#/$defs/roomCaptureFailure"
+        }
+      },
+      "additionalProperties": false
+    },
+    "roomCaptureFailure": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "category",
+        "sessionClosedVerified"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "dcx.approved-room-capture-failure/v1"
+        },
+        "category": {
+          "enum": [
+            "pacing",
+            "budget_exceeded",
+            "search_qualification_incomplete",
+            "transport",
+            "remote_mode",
+            "timeout",
+            "response_limit",
+            "validation",
+            "finish"
+          ]
+        },
+        "operation": {
+          "enum": [
+            "search",
+            "dump0",
+            "dump1",
+            "meter"
+          ]
+        },
+        "received": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2048
+        },
+        "sessionClosedVerified": {
+          "type": "boolean"
+        },
+        "closeFailure": {
+          "enum": [
+            "unexpected_trailing_frame",
+            "input_recovery_required",
+            "deadline",
+            "overflow",
+            "end_of_file",
+            "preexisting_input",
+            "short_write",
+            "system",
+            "cleanup",
+            "binding",
+            "other"
+          ]
         }
       },
       "additionalProperties": false

@@ -114,6 +114,48 @@ filegroup(
     ]),
 )
 
+sh_test(
+    name = "room_verification",
+    size = "medium",
+    srcs = ["Tests/run_room_verification.sh"],
+    args = ["$(location Package.swift)"],
+    data = [
+        "Package.swift",
+        ":swift_package_sources",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+)
+
+sh_test(
+    name = "helper_ui_typecheck",
+    size = "medium",
+    srcs = ["Tests/run_helper_ui_typecheck.sh"],
+    args = [
+        "$(location Package.swift)",
+        "$(location DCXLogicHelper/DCXLogicHelperApp.swift)",
+        "$(location DCXLogicHelper/Info.plist)",
+    ],
+    data = [
+        "DCXLogicHelper/DCXLogicHelperApp.swift",
+        "DCXLogicHelper/Info.plist",
+        "Package.swift",
+        ":swift_package_sources",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+)
+
 # dec-native-studio-20261004 / dec-local-first-reapi-20261004 / R-N13:
 # Darwin fixture-only recovery proof; no serial, audio, or child process work.
 sh_test(
@@ -170,6 +212,7 @@ filegroup(
     srcs = [
         "project.yml",
         ":swift_package_sources",
+        "//:apple_packaging_tools",
     ] + glob([
         "DCXControlAU/*.entitlements",
         "DCXControlAU/*.plist",

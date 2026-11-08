@@ -113,7 +113,7 @@ lockfiles-static:
 lockfiles: lockfiles-static
     cargo metadata --locked --offline --no-deps --format-version 1 >/dev/null
 
-check: fmt-check lint test fixtures lockfiles frontdoor-check
+check: fmt-check lint test fixtures lockfiles frontdoor-check apple-linkage-tests
 
 bazel-check:
     #!/usr/bin/env bash
@@ -159,6 +159,12 @@ native-logic-recall:
 native-response-binding:
     bash scripts/run_bazelisk.sh test //apple:response_binding
 
+native-room-verification:
+    bash scripts/run_bazelisk.sh test //apple:room_verification
+
+native-helper-ui-typecheck:
+    bash apple/Tests/run_helper_ui_typecheck.sh apple/Package.swift apple/DCXLogicHelper/DCXLogicHelperApp.swift apple/DCXLogicHelper/Info.plist
+
 # Bridge v2 notch surface: v2 bindings, helper planning, AU staging, real dcxctl.
 native-feedback-notch:
     bash scripts/run_bazelisk.sh test //apple:feedback_notch
@@ -181,6 +187,7 @@ apple-bundle-check: apple-project-generate
       dcx_cargo_bin="$(command -v cargo)"; \
       dcx_rustc_bin="$(command -v rustc)"; \
       DEVELOPER_DIR="$xcode_developer_dir" "$xcode_developer_dir/usr/bin/xcodebuild" -project apple/DCXLogic.xcodeproj -scheme DCXLogicHelper -configuration Debug -derivedDataPath apple/.derived -jobs 1 ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CC="$xcode_toolchain/clang" CPLUSPLUS="$xcode_toolchain/clang++" LD="$xcode_toolchain/clang" LDPLUSPLUS="$xcode_toolchain/clang++" DCX_CARGO_BIN="$dcx_cargo_bin" DCX_RUSTC_BIN="$dcx_rustc_bin" build
+    /usr/bin/python3 -I -B scripts/check_apple_bundle_links.py apple/.derived/Build/Products/Debug/DCXLogicHelper.app
 
 # Build and verify one arm64 ad-hoc test carrier for helper-absent AU discovery/auval.
 # Its qualification-only entitlements deliberately omit the team-bound App Group
@@ -277,6 +284,7 @@ apple-adhoc-bundle: apple-project-generate
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:type' "$info")" = aumi
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:subtype' "$info")" = DcxC
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:manufacturer' "$info")" = TnLd
+    /usr/bin/python3 -I -B scripts/check_apple_bundle_links.py "$app"
     printf 'adhoc_bundle=ready\n'
 
 # Build the containing app unsigned, then sign the app, AUv3, and dcxctl with
@@ -403,7 +411,6 @@ apple-team-signed-bundle: apple-project-generate
       DCX_CARGO_BIN="$dcx_cargo_bin" \
       DCX_RUSTC_BIN="$dcx_rustc_bin" \
       archive
-    unlock_selected_keychain
     app="$archive_path/Products/Applications/DCXLogicHelper.app"
     au="$app/Contents/PlugIns/DCXControlAU.appex"
     child="$app/Contents/Helpers/dcxctl"
@@ -413,6 +420,8 @@ apple-team-signed-bundle: apple-project-generate
     test -d "$au"
     test ! -e "$app/Contents/embedded.provisionprofile"
     test ! -e "$au/Contents/embedded.provisionprofile"
+    /usr/bin/python3 -I -B scripts/check_apple_bundle_links.py "$app"
+    unlock_selected_keychain
     /usr/bin/codesign \
       --force --sign "$signer" "${codesign_keychain_args[@]}" \
       --options runtime --timestamp=none \
@@ -486,6 +495,7 @@ apple-team-signed-bundle: apple-project-generate
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:type' "$info")" = aumi
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:subtype' "$info")" = DcxC
     test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:AudioComponents:0:manufacturer' "$info")" = TnLd
+    /usr/bin/python3 -I -B scripts/check_apple_bundle_links.py "$app"
     printf 'team_signed_bundle=ready\n'
 
 # Full product-source compile without signing, install, GUI launch, or hardware I/O.
@@ -495,3 +505,7 @@ security:
     cargo deny check
     gitleaks dir . --no-banner
     gitleaks git . --no-banner
+
+# Synthetic linker-environment and bundle-dependency refusals, no Apple tools.
+apple-linkage-tests:
+    python3 -B -m unittest discover -s tests -p 'test_apple_*.py'

@@ -18,6 +18,7 @@ use dcx_core::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DecodedMessage, DeviceId, DumpPart, MAX_FRAME_LEN,
         ProtocolError, Query, SEARCH_RESPONSE_LEN, SearchResponse26, decode, parse_frame,
     },
+    room_verification::ApprovedRoomRefreshAdmission,
 };
 use thiserror::Error;
 
@@ -55,6 +56,171 @@ pub const SNAPSHOT_OPERATION_TIMEOUT: Duration = Duration::from_millis(500);
 pub const SNAPSHOT_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Whole ten-valid-identity plus Dump0/Dump1 snapshot budget.
 pub const PERSISTENT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(120);
+/// Valid identity count for an independently approved exact-target refresh.
+pub const APPROVED_TARGET_SEARCH_COUNT: usize = 1;
+/// Only empty Search timeouts may replay, at the unchanged five-second gap.
+pub const APPROVED_TARGET_SEARCH_ATTEMPT_LIMIT: usize = 3;
+/// Fixed full-bulk refresh budget, including modes and verified close admission.
+pub const APPROVED_TARGET_SNAPSHOT_BUDGET: Duration = Duration::from_secs(20);
+
+/// Complete bulk image plus counters measured from this session's operations.
+#[derive(Debug)]
+pub struct ApprovedTargetCapture {
+    capture: CapturedSnapshotV1,
+    search_attempts: usize,
+    empty_search_timeouts: usize,
+    elapsed: Duration,
+}
+
+impl ApprovedTargetCapture {
+    /// Full validated image, with the same frame and close checks as snapshots.
+    pub const fn capture(&self) -> &CapturedSnapshotV1 {
+        &self.capture
+    }
+    /// Number of Search exchanges actually submitted, including empty timeouts.
+    pub const fn search_attempts(&self) -> usize {
+        self.search_attempts
+    }
+    /// Empty Search deadline results actually received before the valid identity.
+    pub const fn empty_search_timeouts(&self) -> usize {
+        self.empty_search_timeouts
+    }
+    /// Monotonic executor elapsed time, from before identity to after close.
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+}
+
+/// A failed attempt with actual counters and elapsed time, never a ready receipt.
+#[derive(Debug, Error)]
+#[error("approved-target bulk capture failed: {failure}")]
+pub struct ApprovedTargetCaptureError<
+    E: StdError + Send + Sync + 'static,
+    P: StdError + Send + Sync + 'static,
+> {
+    #[source]
+    failure: SnapshotCaptureError<E, P>,
+    search_attempts: usize,
+    empty_search_timeouts: usize,
+    elapsed: Duration,
+}
+
+impl<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>
+    ApprovedTargetCaptureError<E, P>
+{
+    /// Actual submitted Search count, including a terminal failed exchange.
+    pub const fn search_attempts(&self) -> usize {
+        self.search_attempts
+    }
+    /// Actual empty Search timeout count, never nonempty or malformed reads.
+    pub const fn empty_search_timeouts(&self) -> usize {
+        self.empty_search_timeouts
+    }
+    /// Executor elapsed through its attempted verified close.
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+    /// Terminal transport/validation/finish failure.
+    pub const fn failure(&self) -> &SnapshotCaptureError<E, P> {
+        &self.failure
+    }
+}
+
+struct CountedSnapshotSession<'a, S> {
+    session: S,
+    attempts: &'a mut usize,
+    empty_timeouts: &'a mut usize,
+}
+
+impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshotSession<'_, S> {
+    type Error = S::Error;
+    fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
+        let search = matches!(operation.kind(), SnapshotOperationKind::Search { .. });
+        if search {
+            *self.attempts += 1;
+        }
+        let result = self.session.exchange(operation);
+        if search
+            && result.as_ref().is_ok_and(|read| {
+                read.end() == SnapshotReadEnd::TimedOut && read.received_len() == 0
+            })
+        {
+            *self.empty_timeouts += 1;
+        }
+        result
+    }
+    fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
+        self.session.write_remote_mode(command)
+    }
+    fn finish(self) -> Result<(), Self::Error> {
+        self.session.finish()
+    }
+}
+
+/// Read one complete image for an independently approved exact target.
+/// Generic snapshot qualification remains ten identities. This explicit path
+/// grants no parameter writes and uses the same typed bulk frames and close.
+///
+/// # Errors
+/// Only empty Search timeouts replay, at most three attempts. Every malformed,
+/// partial, wrong-address, transport, budget or close failure is terminal.
+pub fn execute_approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
+    session: S,
+    pacer: &mut P,
+    admission: &ApprovedRoomRefreshAdmission,
+) -> Result<ApprovedTargetCapture, ApprovedTargetCaptureError<S::Error, P::Error>> {
+    approved_target_snapshot(session, pacer, admission.expected_device())
+}
+
+fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
+    session: S,
+    pacer: &mut P,
+    expected_device: DeviceId,
+) -> Result<ApprovedTargetCapture, ApprovedTargetCaptureError<S::Error, P::Error>> {
+    let started = pacer.elapsed();
+    let mut attempts = 0;
+    let mut empty_timeouts = 0;
+    let mut counted = CountedSnapshotSession {
+        session,
+        attempts: &mut attempts,
+        empty_timeouts: &mut empty_timeouts,
+    };
+    let body = capture_body(
+        &mut counted,
+        pacer,
+        expected_device,
+        APPROVED_TARGET_SEARCH_COUNT,
+        APPROVED_TARGET_SEARCH_ATTEMPT_LIMIT,
+        started,
+        APPROVED_TARGET_SNAPSHOT_BUDGET,
+    );
+    let finish = counted.finish();
+    let elapsed = pacer.elapsed().saturating_sub(started);
+    let capture = finish_capture(body, finish, APPROVED_TARGET_SEARCH_COUNT)
+        .and_then(|capture| {
+            if elapsed > APPROVED_TARGET_SNAPSHOT_BUDGET {
+                Err(SnapshotCaptureError::BudgetExceeded {
+                    operation: SnapshotOperationKind::Dump1,
+                    finish_error: None,
+                })
+            } else {
+                Ok(capture)
+            }
+        })
+        .map_err(|failure| ApprovedTargetCaptureError {
+            failure,
+            search_attempts: attempts,
+            empty_search_timeouts: empty_timeouts,
+            elapsed,
+        })?;
+    Ok(ApprovedTargetCapture {
+        capture,
+        search_attempts: attempts,
+        empty_search_timeouts: empty_timeouts,
+        elapsed,
+    })
+}
+
 /// Whole stale-baseline-check plus typed-apply/readback budget.
 ///
 /// This includes the maximum twenty paced baseline Search attempts, complete
@@ -1643,6 +1809,172 @@ mod tests {
             &dump(device, 1, marker1),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn approved_refresh_counts_each_empty_attempt_and_keeps_full_bulk_frames() {
+        for empty in 0..APPROVED_TARGET_SEARCH_ATTEMPT_LIMIT {
+            let mut steps = Vec::new();
+            for _ in 0..empty {
+                steps.push(Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
+            }
+            steps.extend(snapshot_steps(&snapshot(0, 1, 2), 1));
+            let (session, log) = FakeSession::new(steps);
+            let mut pacer = FakePacer::default();
+            let captured =
+                approved_target_snapshot(session, &mut pacer, DeviceId::new(0).unwrap()).unwrap();
+            assert_eq!(captured.search_attempts(), empty + 1);
+            assert_eq!(captured.empty_search_timeouts(), empty);
+            assert_eq!(captured.capture().valid_search_count(), 1);
+            assert_eq!(captured.capture().snapshot(), &snapshot(0, 1, 2));
+            assert!(captured.capture().close_verified());
+            assert_eq!(pacer.waits, vec![REPEAT_SEARCH_GAP; empty]);
+            assert_eq!(
+                captured.elapsed(),
+                REPEAT_SEARCH_GAP * u32::try_from(empty).unwrap()
+            );
+            let log = log.borrow();
+            assert_eq!(log.operations.len(), empty + 3);
+            assert_eq!(
+                log.operations[empty + 1].response_limit(),
+                DUMP0_RESPONSE_LEN
+            );
+            assert_eq!(
+                log.operations[empty + 2].response_limit(),
+                DUMP1_RESPONSE_LEN
+            );
+            assert_eq!(
+                log.modes.iter().map(|mode| mode.mode()).collect::<Vec<_>>(),
+                [RemoteMode::Transmit, RemoteMode::ReceiveDirect]
+            );
+            assert!(log.writes.is_empty());
+            assert_eq!(log.finishes, 1);
+        }
+    }
+
+    #[test]
+    fn approved_refresh_stops_at_three_empty_searches_without_modes_or_dumps() {
+        let steps = (0..3).map(|_| Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
+        let (session, log) = FakeSession::new(steps);
+        let mut pacer = FakePacer::default();
+        let error =
+            approved_target_snapshot(session, &mut pacer, DeviceId::new(0).unwrap()).unwrap_err();
+        assert_eq!(error.search_attempts(), 3);
+        assert_eq!(error.empty_search_timeouts(), 3);
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::SearchQualificationIncomplete {
+                valid: 0,
+                required: 1,
+                attempts: 3,
+                ..
+            }
+        ));
+        assert_eq!(log.borrow().operations.len(), 3);
+        assert!(log.borrow().modes.is_empty());
+        assert_eq!(log.borrow().finishes, 1);
+        assert_eq!(pacer.waits, [REPEAT_SEARCH_GAP; 2]);
+    }
+
+    #[test]
+    fn approved_refresh_never_replays_wrong_identity_partial_or_transport_error() {
+        for step in [
+            Step::Read(SnapshotRead::complete(&identity(1)).unwrap()),
+            Step::Read(SnapshotRead::timed_out(&[0xf0]).unwrap()),
+            Step::Fail,
+        ] {
+            let (session, log) = FakeSession::new([step]);
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(error.search_attempts(), 1);
+            assert_eq!(error.empty_search_timeouts(), 0);
+            assert_eq!(log.borrow().operations.len(), 1);
+            assert!(log.borrow().modes.is_empty());
+            assert_eq!(log.borrow().finishes, 1);
+        }
+    }
+
+    #[test]
+    fn approved_dump0_timeout_summary_uses_actual_consuming_finish_result() {
+        use crate::capture_failure::{capture_failure_summary, operation_label};
+        for fail_finish in [false, true] {
+            let mut steps = snapshot_steps(&snapshot(0, 1, 2), 1);
+            steps[1] = Step::Read(SnapshotRead::timed_out(&[]).unwrap());
+            let (mut session, log) = FakeSession::new(steps);
+            session.fail_finish = fail_finish;
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            let value = capture_failure_summary(error.failure());
+            assert_eq!(value.category.as_str(), "timeout");
+            assert_eq!(value.operation.map(operation_label), Some("dump0"));
+            assert_eq!(value.received, Some(0));
+            assert_eq!(value.session_closed_verified, !fail_finish);
+            assert_eq!(value.close_failure.is_some(), fail_finish);
+            assert_eq!(error.search_attempts(), 1);
+            assert_eq!(log.borrow().finishes, 1);
+            assert_eq!(log.borrow().operations.len(), 2);
+        }
+    }
+
+    #[test]
+    fn approved_refresh_invalid_bulk_and_unverified_close_are_never_success() {
+        for part in 0..2 {
+            let mut steps = snapshot_steps(&snapshot(0, 1, 2), 1);
+            steps[part + 1] = Step::Read(
+                SnapshotRead::complete(&dump(1, u8::try_from(part).unwrap(), 1)).unwrap(),
+            );
+            let (session, log) = FakeSession::new(steps);
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(error.search_attempts(), 1);
+            assert_eq!(log.borrow().operations.len(), part + 2);
+            assert_eq!(log.borrow().finishes, 1);
+        }
+        let (mut session, log) = FakeSession::new(snapshot_steps(&snapshot(0, 1, 2), 1));
+        session.fail_finish = true;
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::Finish { .. }
+        ));
+        assert_eq!(error.search_attempts(), 1);
+        assert_eq!(log.borrow().finishes, 1);
+    }
+
+    #[test]
+    fn approved_refresh_budget_refuses_later_query_and_still_finishes() {
+        let (session, log) = FakeSession::new([Step::Read(SnapshotRead::timed_out(&[]).unwrap())]);
+        let mut pacer = FakePacer {
+            stretch: Duration::from_secs(20),
+            ..FakePacer::default()
+        };
+        let error =
+            approved_target_snapshot(session, &mut pacer, DeviceId::new(0).unwrap()).unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::BudgetExceeded { .. }
+        ));
+        assert_eq!(error.search_attempts(), 1);
+        assert_eq!(error.empty_search_timeouts(), 1);
+        assert!(log.borrow().modes.is_empty());
+        assert_eq!(log.borrow().finishes, 1);
     }
 
     #[test]

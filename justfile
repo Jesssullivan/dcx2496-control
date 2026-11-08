@@ -49,6 +49,10 @@ native-logic-recall: repo::native-logic-recall
 
 native-response-binding: repo::native-response-binding
 
+native-room-verification: repo::native-room-verification
+
+native-helper-ui-typecheck: repo::native-helper-ui-typecheck
+
 native-feedback-notch: repo::native-feedback-notch
 
 schema-check: repo::schema-check
@@ -67,3 +71,5 @@ product-check: repo::product-check
 [positional-arguments]
 dcxctl *args:
     exec cargo run --locked --jobs 2 --quiet --package dcxctl -- "$@"
+
+apple-linkage-tests: repo::apple-linkage-tests

@@ -53,6 +53,7 @@ struct FakeBackend {
     read_since_write: usize,
     read_goal: usize,
     eof_after: Option<usize>,
+    would_block_once_at: Option<usize>,
     writes: Vec<Vec<u8>>,
     preexisting_input: usize,
     post_response_input: usize,
@@ -80,6 +81,7 @@ impl FakeBackend {
             read_since_write: 0,
             read_goal: 0,
             eof_after: None,
+            would_block_once_at: None,
             writes: Vec::new(),
             preexisting_input: 0,
             post_response_input: 0,
@@ -224,6 +226,10 @@ impl SerialBackend for FakeBackend {
 
     fn read_once(&mut self, bytes: &mut [u8]) -> Result<ReadProgress, SystemFault> {
         self.step(CarrierStage::Read, Call::Read(bytes.len()))?;
+        if self.would_block_once_at == Some(self.read_since_write) {
+            self.would_block_once_at = None;
+            return Ok(ReadProgress::WouldBlock);
+        }
         if self.eof_after == Some(self.read_since_write) {
             return Ok(ReadProgress::EndOfFile);
         }
@@ -2102,4 +2108,143 @@ fn native_backend_is_excluded() {
         "bazel_test_no_native is set but the native macOS backend is still compiled in"
     );
     assert!(!NATIVE_BACKEND_COMPILED);
+}
+
+fn queued_frame_backend(bytes: impl IntoIterator<Item = u8>) -> FakeBackend {
+    let mut backend = FakeBackend::with_inbound(bytes);
+    backend.written = true;
+    backend.read_goal = backend.inbound.len();
+    backend
+}
+
+fn queue_query_count(backend: &FakeBackend) -> usize {
+    backend
+        .calls
+        .iter()
+        .filter(|call| **call == Call::BytesAvailable)
+        .count()
+}
+
+#[test]
+fn queued_full_dump_uses_one_count_despite_per_ioctl_cost() {
+    let frame = synthetic_dump(0, 0);
+    let mut backend = queued_frame_backend(frame.clone());
+    backend.advance_at = Some((CarrierStage::BytesAvailable, Duration::from_millis(3)));
+    let result =
+        read_one_frame(&mut backend, Duration::from_secs(2), MAX_FRAME_LEN, &mut ()).unwrap();
+    assert!(matches!(result, FramedRead::Complete(actual) if actual == frame));
+    assert_eq!(queue_query_count(&backend), 1);
+    assert_eq!(backend.now, Duration::from_millis(3));
+    assert_eq!(
+        backend
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Read(1)))
+            .count(),
+        DUMP0_RESPONSE_LEN
+    );
+    assert!(backend.inbound.is_empty());
+}
+
+#[test]
+fn queued_dump_still_expires_when_byte_reads_consume_deadline() {
+    let mut backend = queued_frame_backend(synthetic_dump(0, 0));
+    backend.advance_at = Some((CarrierStage::Read, Duration::from_millis(3)));
+    let result =
+        read_one_frame(&mut backend, Duration::from_secs(2), MAX_FRAME_LEN, &mut ()).unwrap();
+    let FramedRead::TimedOut(partial) = result else {
+        panic!("read cost must retain the deadline");
+    };
+    assert_eq!(partial.len(), 667);
+    assert_eq!(backend.inbound.len(), DUMP0_RESPONSE_LEN - partial.len());
+    assert_eq!(backend.now, Duration::from_millis(2001));
+    assert_eq!(queue_query_count(&backend), 1);
+}
+
+#[test]
+fn positive_queue_query_exhausting_deadline_never_reads() {
+    let mut backend = queued_frame_backend(synthetic_response(0));
+    backend.advance_at = Some((CarrierStage::BytesAvailable, Duration::from_secs(2)));
+    let result =
+        read_one_frame(&mut backend, Duration::from_secs(2), MAX_FRAME_LEN, &mut ()).unwrap();
+    assert!(matches!(result, FramedRead::TimedOut(partial) if partial.is_empty()));
+    assert_eq!(backend.inbound.len(), SEARCH_RESPONSE_LIMIT);
+    assert!(
+        !backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Read(_)))
+    );
+}
+
+#[test]
+fn queued_count_including_two_frames_never_reads_past_first_terminator() {
+    let first = synthetic_response(0);
+    let second = synthetic_response(1);
+    let mut backend = queued_frame_backend(first.into_iter().chain(second));
+    let result =
+        read_one_frame(&mut backend, Duration::from_secs(2), MAX_FRAME_LEN, &mut ()).unwrap();
+    assert!(matches!(result, FramedRead::Complete(actual) if actual == synthetic_response(0)));
+    assert_eq!(
+        backend.inbound.iter().copied().collect::<Vec<_>>(),
+        synthetic_response(1)
+    );
+    assert_eq!(backend.read_since_write, SEARCH_RESPONSE_LIMIT);
+    let result =
+        read_one_frame(&mut backend, Duration::from_secs(2), MAX_FRAME_LEN, &mut ()).unwrap();
+    assert!(matches!(result, FramedRead::Complete(actual) if actual == synthetic_response(1)));
+    assert_eq!(queue_query_count(&backend), 2);
+    assert!(
+        backend
+            .calls
+            .iter()
+            .all(|call| !matches!(call, Call::Read(count) if *count != 1))
+    );
+}
+
+#[test]
+fn would_block_discards_positive_count_and_queries_again() {
+    let frame = synthetic_response(0);
+    let mut backend = queued_frame_backend(frame);
+    backend.would_block_once_at = Some(1);
+    let result =
+        read_one_frame(&mut backend, Duration::from_secs(2), MAX_FRAME_LEN, &mut ()).unwrap();
+    assert!(matches!(result, FramedRead::Complete(actual) if actual == synthetic_response(0)));
+    assert_eq!(queue_query_count(&backend), 2);
+    assert_eq!(
+        backend
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Read(1)))
+            .count(),
+        SEARCH_RESPONSE_LIMIT + 1
+    );
+}
+
+#[test]
+fn frame_limit_refreshes_actual_queue_count_before_overflow() {
+    let mut backend = queued_frame_backend([0xf0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    backend.available_script = VecDeque::from([10, 7]);
+    let result = read_one_frame(&mut backend, Duration::from_secs(2), 3, &mut ());
+    assert!(matches!(
+        result,
+        Err(DarwinCarrierError::Overflow {
+            received: 3,
+            queued: 7
+        })
+    ));
+    assert_eq!(queue_query_count(&backend), 2);
+    assert_eq!(backend.inbound.len(), 7);
+    assert_eq!(backend.read_since_write, 3);
+}
+
+#[test]
+fn exhausted_positive_count_refreshes_before_reading_more() {
+    let mut backend = queued_frame_backend(synthetic_response(0));
+    backend.available_script = VecDeque::from([1, 2, SEARCH_RESPONSE_LIMIT - 3]);
+    let result =
+        read_one_frame(&mut backend, Duration::from_secs(2), MAX_FRAME_LEN, &mut ()).unwrap();
+    assert!(matches!(result, FramedRead::Complete(actual) if actual == synthetic_response(0)));
+    assert_eq!(queue_query_count(&backend), 3);
+    assert_eq!(backend.read_since_write, SEARCH_RESPONSE_LIMIT);
 }

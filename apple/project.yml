@@ -11,8 +11,8 @@ packages:
 
 settings:
   base:
-    CURRENT_PROJECT_VERSION: 3
-    MARKETING_VERSION: 0.1.2
+    CURRENT_PROJECT_VERSION: 9
+    MARKETING_VERSION: 0.1.8
     SWIFT_VERSION: 5.0
     DEVELOPMENT_TEAM: QP994XQKNH
     CODE_SIGN_STYLE: Automatic
@@ -60,13 +60,11 @@ targets:
             echo "pinned cargo and rustc must be executable" >&2
             exit 1
           fi
-          export RUSTC="${rustc_bin}"
-          "${cargo_bin}" build \
-            --manifest-path "${SRCROOT}/../Cargo.toml" \
-            --locked \
-            --release \
-            --package dcxctl \
-            --features live-control
+          /usr/bin/python3 -I -B "${SRCROOT}/../scripts/build_apple_dcxctl.py" \
+            --source "${SRCROOT}/.." --target "$dcx_target_dir" \
+            --cargo "$cargo_bin" --rustc "$rustc_bin" \
+            --developer "${DEVELOPER_DIR:?selected Xcode developer directory required}" \
+            --jobs "$CARGO_BUILD_JOBS"
           helper_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
           /bin/mkdir -p "${helper_dir}"
           /usr/bin/ditto "$dcx_target_dir/release/dcxctl" "${helper_dir}/dcxctl"

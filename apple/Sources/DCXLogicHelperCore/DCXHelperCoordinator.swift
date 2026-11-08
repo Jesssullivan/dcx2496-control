@@ -1,3 +1,4 @@
+import CryptoKit
 import DCXLogicBridge
 import Foundation
 
@@ -42,6 +43,10 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     private var recoveryLease: MutationRecoveryLeaseV1?
     private var recoveryCompletion: MutationRecoveryCompletionV1?
     private var recoveryLeaseError: Error?
+    private let roomPreparation: RoomVerificationPreparation
+    private let roomFailureDiagnostics: RoomFailureDiagnosticStore
+    private var lastRoomFailure: RoomFailureDiagnosticV1?
+    private let roomVerification: RoomVerificationPublisher
 
     public convenience init(
         locations: AppGroupLocations,
@@ -60,10 +65,16 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         locations: DCXHelperStorageLocations,
         configuration: Result<HelperConfigurationV1, Error>,
         coreMIDI: CoreMIDIPresentation,
-        runner: any DCXCTLCommandExecuting
+        runner: any DCXCTLCommandExecuting,
+        roomVerification: RoomVerificationPublisher = .init(),
+        roomPreparation: RoomVerificationPreparation = .init(),
+        roomFailureDiagnostics: RoomFailureDiagnosticStore? = nil
     ) {
         self.locations = locations
         self.runner = runner
+        self.roomVerification = roomVerification
+        self.roomPreparation = roomPreparation
+        self.roomFailureDiagnostics = roomFailureDiagnostics ?? .init(parent: locations.helperConfigurationURL.deletingLastPathComponent())
         snapshotStore = .init(root: locations.snapshotRootURL)
         planStore = .init(root: locations.planRootURL)
         notchPlanStore = .init(planRoot: locations.planRootURL)
@@ -96,12 +107,14 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         stateLock.lock()
         foreground = value
         stateLock.unlock()
+        if !value { invalidateRoomVerification("helper-left-foreground") }
     }
 
     @discardableResult
     func replaceConfiguration(
         load: () -> Result<HelperConfigurationV1, Error>
     ) throws -> HelperConfigurationV1 {
+        invalidateRoomVerification("configuration-reload")
         let processLock = try recoveryLeaseStore.acquireExclusiveLock()
         defer { processLock.release() }
         stateLock.lock()
@@ -127,6 +140,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         _ candidate: HelperConfigurationV1,
         persistAndReload: () throws -> HelperConfigurationV1
     ) throws -> HelperConfigurationV1 {
+        invalidateRoomVerification("configuration-replaced")
         let processLock = try recoveryLeaseStore.acquireExclusiveLock()
         defer { processLock.release() }
         stateLock.lock()
@@ -148,6 +162,247 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         return configuration
     }
 
+    private func invalidateRoomVerification(_ reason: String) {
+        roomPreparation.invalidate { roomVerification.invalidate(reason) }
+    }
+
+    /// Matching foreground triggers share one read or a still-fresh capture.
+    /// The independently approved expectation is never created from that read.
+    public func verifyRoom(expectation: Data) throws -> RoomVerificationReceipt {
+        try verifyBoundRoom(expectation: expectation, forceFresh: false, bindingIsCurrent: { true })
+    }
+
+    func roomCaptureDate(expectation: Data) -> Date? {
+        roomVerification.captureDate(expectation: expectation)
+    }
+
+    func invalidateApprovedRoomBinding() {
+        invalidateRoomVerification("saved-approved-room-binding-changed")
+    }
+
+    /// Periodic refresh bypasses completed-cache reuse, never an active flight.
+    func verifyBoundRoom(expectation: Data, forceFresh: Bool,
+                         expectedConfiguration: HelperConfigurationV1? = nil, approvedTargetRefresh: Bool = false,
+                         retainFreshDuringRead: Bool = false,
+                         bindingIsCurrent: @escaping @Sendable () -> Bool) throws -> RoomVerificationReceipt {
+        guard bindingIsCurrent(), !approvedTargetRefresh || expectedConfiguration != nil else {
+            throw RoomVerificationError.unavailable
+        }
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024,
+              let configuration = currentConfiguration(), isForeground else {
+            throw RoomVerificationError.unavailable
+        }
+        guard expectedConfiguration == nil || configuration == expectedConfiguration else {
+            throw RoomVerificationError.unavailable
+        }
+        struct Binding: Encodable {
+            let configuration: HelperConfigurationV1
+            let expectation: Data
+            let approvedTargetRefresh: Bool
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let key = try encoder.encode(Binding(configuration: configuration, expectation: expectation, approvedTargetRefresh: approvedTargetRefresh))
+        return try roomPreparation.run(key: key, reuse: {
+            forceFresh ? nil : self.reusableRoom(expectation: expectation, expectedConfiguration: configuration)
+        }, bindingIsCurrent: bindingIsCurrent) { attempt in
+            do {
+                return try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt,
+                    approvedTargetRefresh: approvedTargetRefresh,
+                    retainFreshDuringRead: retainFreshDuringRead && forceFresh && approvedTargetRefresh)
+            } catch {
+                roomVerification.invalidate("room-verification-failed")
+                throw error
+            }
+        }
+    }
+
+    /// A cached capture cannot bypass current recovery or configuration authority.
+    /// Called under the preparation lock. Lock order is preparation then state.
+    private func reusableRoom(expectation: Data, expectedConfiguration: HelperConfigurationV1) -> RoomVerificationReceipt? {
+        do {
+            let processLock = try recoveryLeaseStore.acquireExclusiveLock()
+            defer { processLock.release() }
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            try reloadRecoveryStateFromStore()
+            guard foreground, recoveryLease == nil, recoveryLeaseError == nil, activeTransactionID == nil else { return nil }
+            reloadCurrentConfigurationFromStore()
+            guard let configuration, configuration == expectedConfiguration else { return nil }
+            try configuration.require(.snapshotCapture, target: configuration.target)
+            return roomVerification.current(expectation: expectation)
+        } catch { return nil }
+    }
+
+    private func captureRoom(expectation: Data, expectedConfiguration: HelperConfigurationV1,
+                             attempt: RoomVerificationPreparation.Attempt, approvedTargetRefresh: Bool,
+                             retainFreshDuringRead: Bool) throws -> RoomVerificationReceipt {
+        var diagnostic = RoomFailureAttempt()
+        do {
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024 else {
+            throw RoomVerificationError.invalidExpectation
+        }
+        guard attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
+        if !retainFreshDuringRead { roomVerification.invalidate("room-verification-started") }
+        let processLock: MutationRecoveryProcessLock
+        do { processLock = try recoveryLeaseStore.acquireExclusiveLock() }
+        catch MutationRecoveryLeaseError.lockBusy { throw RoomVerificationError.busy }
+        defer { processLock.release() }
+        let configuration: HelperConfigurationV1
+        stateLock.lock()
+        do {
+            try reloadRecoveryStateFromStore()
+            guard foreground, recoveryLease == nil, recoveryLeaseError == nil,
+                  activeTransactionID == nil, let checked = self.configuration,
+                  checked == expectedConfiguration else {
+                throw RoomVerificationError.unavailable
+            }
+            try checked.require(.snapshotCapture, target: checked.target)
+            configuration = checked
+            activeTransactionID = "room-verification"
+            stateLock.unlock()
+        } catch {
+            stateLock.unlock()
+            throw error
+        }
+        defer {
+            stateLock.lock()
+            activeTransactionID = nil
+            stateLock.unlock()
+        }
+        // Admission has reloaded recovery authority and bound the actual target.
+        // A retained proof stays subject to its own heartbeat, TTL and binding.
+        if retainFreshDuringRead && !roomVerification.canRetainDuringRead(binding: attempt.key) {
+            roomVerification.invalidate("room-verification-prior-proof-unavailable")
+        }
+        let workspace = try TransactionWorkspace(root: locations.transactionRootURL)
+        defer { workspace.remove() }
+        let expectationURL = try workspace.writeData(expectation, named: "room-expectation.json")
+        let executable = try runner.resolveExecutable(for: configuration)
+        diagnostic.stage = .validationChild
+        let validation = try runner.run(
+            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                "profile", "room-validate", "--expectation", expectationURL.path,
+            ]),
+            timeoutSeconds: 45,
+            mutationLock: processLock
+        )
+        diagnostic.child = validation
+        guard validation.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
+        guard attempt.bindingChecks.isValid() else { throw RoomVerificationError.unavailable }
+        let capturedAt: Date
+        let comparison: RoomComparison
+        let captureMetrics: RoomCaptureMetrics?
+        if approvedTargetRefresh {
+            let startedAt = Date()
+            diagnostic.stage = .refreshChild
+            diagnostic.child = nil
+            diagnostic.closeKnown = .unknown
+            let refresh = try runner.run(
+                .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                    "profile", "room-refresh", "--expectation", expectationURL.path,
+                    "--expectation-digest", "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined(),
+                    "--tty", configuration.ttyPath,
+                    "--expected-device", String(configuration.expectedDeviceAddress),
+                ]), timeoutSeconds: min(configuration.childTimeoutSeconds, 30), mutationLock: processLock)
+            diagnostic.child = refresh
+            guard refresh.terminationStatus == 0 || refresh.terminationStatus == 1 else {
+                throw RoomVerificationError.unavailable
+            }
+            diagnostic.stage = .refreshDecode
+            if let failed = try ApprovedRoomFailureEnvelope.decodeIfFailed(refresh.stdout, terminationStatus: refresh.terminationStatus) {
+                diagnostic.captureFailure = failed.failure
+                diagnostic.closeKnown = failed.failure.sessionClosedVerified ? .verified : .unknown
+                diagnostic.stage = .refreshChild
+                throw ApprovedRoomCaptureFailed(failure: failed.failure)
+            }
+            let envelope = try BridgeJSONCodec.decoder().decode(ApprovedRoomRefresh.self, from: refresh.stdout)
+            capturedAt = try envelope.validate(expectedDevice: configuration.expectedDeviceAddress,
+                terminationStatus: refresh.terminationStatus, startedAt: startedAt, now: Date())
+            diagnostic.closeKnown = .verified
+            comparison = envelope.comparison
+            captureMetrics = envelope.metrics
+        } else {
+            diagnostic.stage = .snapshotChild
+            diagnostic.child = nil
+            diagnostic.closeKnown = .unknown
+            let read = try runner.run(
+                .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                    "control", "snapshot", "--tty", configuration.ttyPath,
+                    "--expected-device", String(configuration.expectedDeviceAddress),
+                ]),
+                timeoutSeconds: configuration.childTimeoutSeconds,
+                mutationLock: processLock
+            )
+            diagnostic.child = read
+            guard read.terminationStatus == 0 else { throw RoomVerificationError.unavailable }
+            capturedAt = Date()
+            diagnostic.stage = .snapshotDecode
+            let carrier = try BridgeJSONCodec.decoder().decode(CoreSnapshotCarrierV1.self, from: read.stdout)
+            try carrier.validate(expectedDevice: configuration.expectedDeviceAddress)
+            let snapshot = try workspace.writeData(read.stdout, named: "room-snapshot.json")
+            diagnostic.stage = .comparisonChild
+            diagnostic.child = nil
+            let compared = try runner.run(
+                .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                    "profile", "room-verify", "--expectation", expectationURL.path,
+                    "--snapshot", snapshot.path,
+                ]),
+                timeoutSeconds: 45,
+                mutationLock: processLock
+            )
+            diagnostic.child = compared
+            guard compared.terminationStatus == 0 || compared.terminationStatus == 1 else {
+                throw RoomVerificationError.invalidComparison
+            }
+            diagnostic.stage = .comparisonDecode
+            comparison = try JSONDecoder().decode(RoomComparison.self, from: compared.stdout)
+            guard comparison.snapshotDigest == carrier.snapshotDigest,
+                  comparison.matches == (compared.terminationStatus == 0) else {
+                throw RoomVerificationError.invalidComparison
+            }
+            captureMetrics = nil
+        }
+        diagnostic.stage = .publication
+        return try roomPreparation.publish(attempt) {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            guard foreground else { throw RoomVerificationError.unavailable }
+            return try roomVerification.install(
+                comparison, expectation: expectation, capturedAt: capturedAt,
+                ttyPath: configuration.ttyPath, bindingIsCurrent: { attempt.bindingChecks.isValid() },
+                captureMetrics: captureMetrics, captureBinding: attempt.key
+            )
+        }
+        } catch {
+            roomVerification.invalidate("room-verification-failed")
+            let metadata = roomFailureDiagnostics.record(diagnostic, error: error)
+            stateLock.lock()
+            lastRoomFailure = metadata
+            stateLock.unlock()
+            throw error
+        }
+    }
+
+    /// Offline preflight for persisting an independently approved expectation.
+    public func validateApprovedRoomExpectation(_ expectation: Data) throws {
+        invalidateRoomVerification("approved-expectation-replaced")
+        guard !expectation.isEmpty, expectation.count <= 256 * 1024 else { throw RoomVerificationError.invalidExpectation }
+        let processLock = try recoveryLeaseStore.acquireExclusiveLock()
+        defer { processLock.release() }
+        guard let configuration = currentConfiguration() else { throw RoomVerificationError.unavailable }
+        let workspace = try TransactionWorkspace(root: locations.transactionRootURL)
+        defer { workspace.remove() }
+        let input = try workspace.writeData(expectation, named: "room-expectation.json")
+        let executable = try runner.resolveExecutable(for: configuration)
+        let result = try runner.run(
+            .init(operation: .snapshotCapture, executableURL: executable, arguments: [
+                "profile", "room-validate", "--expectation", input.path,
+            ]), timeoutSeconds: 45, mutationLock: processLock
+        )
+        guard result.terminationStatus == 0 else { throw RoomVerificationError.invalidExpectation }
+    }
+
     public func handle(_ request: BridgeRequest) -> BridgeResponse {
         do {
             try request.body.validate()
@@ -162,6 +417,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         if case .helperStatus = request.body {
             return BridgeResponse(requestID: request.requestID, body: .helperStatus(status()))
         }
+        invalidateRoomVerification("device-operation")
         guard isForeground else {
             return preAdmissionFailure(
                 request,
@@ -663,6 +919,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
 
     private func status() -> HelperStatusResponse {
         var recoveryUnavailable = false
+        var foreignLockBusy = false
+        var configurationChanged = false
         do {
             let processLock = try recoveryLeaseStore.acquireExclusiveLock()
             defer { processLock.release() }
@@ -670,7 +928,9 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             do {
                 try reloadRecoveryStateFromStore()
                 if recoveryLease == nil {
+                    let previous = configuration
                     reloadCurrentConfigurationFromStore()
+                    configurationChanged = configuration != previous
                 }
                 stateLock.unlock()
             } catch {
@@ -679,6 +939,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             }
         } catch MutationRecoveryLeaseError.lockBusy {
             recoveryUnavailable = true
+            foreignLockBusy = true
         } catch {
             stateLock.lock()
             recoveryLease = nil
@@ -690,6 +951,7 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
 
         stateLock.lock()
         let foreground = foreground
+        let lastRoomFailure = lastRoomFailure
         let active = activeTransactionID
         let configuration = configuration
         let unavailable = recoveryUnavailable || recoveryLeaseError != nil
@@ -720,6 +982,12 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         _ = configurationError
         _ = recoveryLeaseError
         stateLock.unlock()
+        // A lock held by this helper's capture is expected during status reads.
+        // Foreign custody, durable recovery or changed config cancels readiness.
+        if configurationChanged || (recoveryBlocksOperations
+            && (!foreignLockBusy || (active == nil && !roomPreparation.isInFlight))) {
+            invalidateRoomVerification("status-authority-changed")
+        }
         return .init(
             foreground: foreground,
             configured: configuration != nil,
@@ -729,7 +997,8 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             activeTransactionID: active,
             recovery: recovery,
             completion: completion,
-            recoveryUnavailable: unavailable
+            recoveryUnavailable: unavailable,
+            roomFailureDiagnostic: lastRoomFailure
         )
     }
 
