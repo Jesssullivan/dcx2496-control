@@ -155,4 +155,29 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(60)).attempt)
     }
 
+    func testOnlyOnePeriodicReaderOwnerPerProcessClaim() {
+        let claim = PeriodicRoomReaderClaim()
+        let firstOwner = NSObject(), secondOwner = NSObject()
+        XCTAssertTrue(claim.acquire(firstOwner))
+        XCTAssertTrue(claim.acquire(firstOwner))
+        for _ in 0..<6 { XCTAssertFalse(claim.acquire(secondOwner)) }
+        claim.release(secondOwner)
+        XCTAssertFalse(claim.acquire(secondOwner))
+        claim.release(firstOwner)
+        XCTAssertTrue(claim.acquire(secondOwner))
+        XCTAssertFalse(claim.acquire(firstOwner))
+    }
+
+    func testConcurrentClaimsAdmitExactlyOneReader() {
+        let claim = PeriodicRoomReaderClaim()
+        let owners = (0..<32).map { _ in NSObject() }
+        let admitted = NSLock()
+        var count = 0
+        DispatchQueue.concurrentPerform(iterations: owners.count) { index in
+            if claim.acquire(owners[index]) {
+                admitted.lock(); count += 1; admitted.unlock()
+            }
+        }
+        XCTAssertEqual(count, 1)
+    }
 }

@@ -1,5 +1,28 @@
 import Foundation
 
+/// Process-wide owner of the one periodic room reader. A second runtime in the
+/// same process cannot start a second timer while the first owner holds it.
+final class PeriodicRoomReaderClaim: @unchecked Sendable {
+    static let process = PeriodicRoomReaderClaim()
+    private let lock = NSLock()
+    private var owner: ObjectIdentifier?
+
+    /// True when `candidate` now owns the reader. Repeating the owner's claim is idempotent.
+    func acquire(_ candidate: AnyObject) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let id = ObjectIdentifier(candidate)
+        guard owner == nil || owner == id else { return false }
+        owner = id
+        return true
+    }
+
+    /// Only the current owner can release. Other callers change nothing.
+    func release(_ candidate: AnyObject) {
+        lock.lock(); defer { lock.unlock() }
+        if owner == ObjectIdentifier(candidate) { owner = nil }
+    }
+}
+
 /// Scheduling state only. The foreground runtime owns the one timer and all
 /// captures still pass through the coordinator's existing serial ownership.
 final class PeriodicRoomVerification: @unchecked Sendable {

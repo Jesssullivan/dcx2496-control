@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep the DCX Logic Helper to one window (TIN-6964). Each
+  `tinyland-dcx://verify-approved-room` open now acts on the existing window
+  and its one model. On November 11, 2026, five opens left six windows in one
+  process. A process-wide claim lets only one periodic room reader run,
+  however many windows or runtimes exist.
 - Add output profile chains: `dcxctl profile plan|verify` (offline) and
   `profile apply` (`typed-write-live` only) move one output to a Legalab
   `DcxOutputProfileV1` (fixture `fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json`)

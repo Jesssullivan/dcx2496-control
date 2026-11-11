@@ -54,6 +54,8 @@ receiver before the helper, then wait for admission before opening Logic.
 `tinyland-dcx://verify-approved-room` URL. It reads the saved manifest and target.
 The URL accepts no path, query, port, profile or write parameter. Native controls
 can request this foreground refresh before acquiring an LS56 transaction.
+The helper has one window. A URL open acts on that window and never opens
+another. Only one periodic room reader can run in the helper process.
 Receipt arrival itself never applies a scene. No startup configuration or
 approved device image ships by default.
 

@@ -11,8 +11,10 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
     private let coordinator: DCXHelperCoordinator
     private let lock = NSLock()
     private var running = false
+    private var starting = false
     private let periodic = PeriodicRoomVerification()
     private var periodicTimer: DispatchSourceTimer?
+    private var periodicClockGeneration: UInt64 = 0
 
     public init() throws {
         let locations = try AppGroupLocations()
@@ -32,11 +34,19 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
 
     public func enterForeground() throws {
         lock.lock()
-        guard !running else {
+        // Every window, scene phase and URL calls this. Only the first caller
+        // starts the socket, CoreMIDI and the periodic clock.
+        guard !running, !starting else {
             lock.unlock()
             return
         }
+        starting = true
         lock.unlock()
+        defer {
+            lock.lock()
+            starting = false
+            lock.unlock()
+        }
 
         try locations.prepareBridgeDirectory()
         // Pick up an App Group configuration replaced while the app was
@@ -77,6 +87,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         guard wasRunning else { return }
         periodic.stop()
         stoppedTimer?.cancel()
+        if stoppedTimer != nil { PeriodicRoomReaderClaim.process.release(self) }
         coordinator.setForeground(false)
         socketServer.stop()
         coreMIDI.stop()
@@ -152,20 +163,31 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
 
     private func startPeriodicClock() {
         lock.lock()
-        guard running, periodicTimer == nil else { lock.unlock(); return }
+        // One reader per process, however many windows or runtimes exist.
+        guard running, periodicTimer == nil, PeriodicRoomReaderClaim.process.acquire(self) else { lock.unlock(); return }
         periodic.start()
+        periodicClockGeneration &+= 1
+        let generation = periodicClockGeneration
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "io.tinyland.dcx.periodic-room"))
         timer.schedule(deadline: .now())
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let self, self.ownsPeriodicClock(generation) else { return }
+            // A cancelled timer's late event never reads or rearms a newer clock.
             self.periodicTick()
             self.lock.lock()
-            if self.running { self.periodicTimer?.schedule(deadline: .now() + .seconds(5)) }
+            if self.running, self.periodicClockGeneration == generation {
+                self.periodicTimer?.schedule(deadline: .now() + .seconds(5))
+            }
             self.lock.unlock()
         }
         periodicTimer = timer
         timer.resume()
         lock.unlock()
+    }
+
+    private func ownsPeriodicClock(_ generation: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return running && periodicTimer != nil && periodicClockGeneration == generation
     }
 
     private func periodicTick() {

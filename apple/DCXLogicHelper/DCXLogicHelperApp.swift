@@ -1,13 +1,17 @@
+import AppKit
 import DCXLogicHelperCore
 import SwiftUI
 
 @main
 struct DCXLogicHelperApp: App {
+    @NSApplicationDelegateAdaptor(HelperAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = HelperAppModel()
 
     var body: some Scene {
-        WindowGroup("DCX Logic Helper") {
+        // A Window scene is unique. Each tinyland-dcx URL is delivered to this
+        // one window and its one model, and never creates another window.
+        Window("DCX Logic Helper", id: "dcx-logic-helper") {
             HelperContentView(model: model)
                 .frame(minWidth: 640, minHeight: 650)
                 .onAppear { model.enterForeground() }
@@ -27,6 +31,14 @@ struct DCXLogicHelperApp: App {
                 model.leaveForeground()
             }
         }
+    }
+}
+
+/// A sole Window scene would quit the app when it closes. The helper keeps
+/// its bridge running with no window, as it did under a window group.
+final class HelperAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 }
 
