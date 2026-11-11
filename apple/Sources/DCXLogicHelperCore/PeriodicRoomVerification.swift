@@ -1,25 +1,59 @@
 import Foundation
 
-/// Process-wide owner of the one periodic room reader. A second runtime in the
-/// same process cannot start a second timer while the first owner holds it.
+/// Process-wide owner of the periodic room reader. This is a defensive guard.
+/// The app has one runtime, and a runtime already allows one periodic timer.
 final class PeriodicRoomReaderClaim: @unchecked Sendable {
     static let process = PeriodicRoomReaderClaim()
     private let lock = NSLock()
-    private var owner: ObjectIdentifier?
+    // Weak, so an owner freed without a release does not hold the claim.
+    private weak var owner: AnyObject?
 
     /// True when `candidate` now owns the reader. Repeating the owner's claim is idempotent.
     func acquire(_ candidate: AnyObject) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        let id = ObjectIdentifier(candidate)
-        guard owner == nil || owner == id else { return false }
-        owner = id
+        guard owner == nil || owner === candidate else { return false }
+        owner = candidate
         return true
     }
 
     /// Only the current owner can release. Other callers change nothing.
     func release(_ candidate: AnyObject) {
         lock.lock(); defer { lock.unlock() }
-        if owner == ObjectIdentifier(candidate) { owner = nil }
+        if owner === candidate { owner = nil }
+    }
+}
+
+/// The runtime's periodic clock state. `begin` takes the claim and names a new
+/// generation. A timer event acts only while its generation is current.
+final class PeriodicRoomClockOwnership: @unchecked Sendable {
+    private let claim: PeriodicRoomReaderClaim
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+    private var current: UInt64?
+
+    init(claim: PeriodicRoomReaderClaim = .process) {
+        self.claim = claim
+    }
+
+    /// The new generation, or nil when another owner holds the claim.
+    func begin(owner: AnyObject) -> UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        guard claim.acquire(owner) else { return nil }
+        generation &+= 1
+        current = generation
+        return generation
+    }
+
+    func isCurrent(_ candidate: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return current == candidate
+    }
+
+    /// Retires the current generation and releases the claim.
+    func end(owner: AnyObject) {
+        lock.lock(); defer { lock.unlock() }
+        current = nil
+        claim.release(owner)
     }
 }
 

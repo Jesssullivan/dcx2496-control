@@ -6,16 +6,16 @@ import SwiftUI
 struct DCXLogicHelperApp: App {
     @NSApplicationDelegateAdaptor(HelperAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var model = HelperAppModel()
+
+    private var model: HelperAppModel { appDelegate.model }
 
     var body: some Scene {
-        // A Window scene is unique. Each tinyland-dcx URL is delivered to this
-        // one window and its one model, and never creates another window.
+        // A Window scene is unique, so a URL open cannot add a second window.
+        // URLs reach the model through HelperAppDelegate, not through a view.
         Window("DCX Logic Helper", id: "dcx-logic-helper") {
             HelperContentView(model: model)
                 .frame(minWidth: 640, minHeight: 650)
                 .onAppear { model.enterForeground() }
-                .onOpenURL { model.handleRoomRefreshURL($0) }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -34,9 +34,19 @@ struct DCXLogicHelperApp: App {
     }
 }
 
-/// A sole Window scene would quit the app when it closes. The helper keeps
-/// its bridge running with no window, as it did under a window group.
+/// Owns the one model, so a URL needs no live window or view to arrive.
+@MainActor
 final class HelperAppDelegate: NSObject, NSApplicationDelegate {
+    let model = HelperAppModel()
+
+    /// AppKit calls this for each tinyland-dcx URL, at launch or later, with or
+    /// without an open window. The model starts the bridge before it verifies.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { model.handleRoomRefreshURL(url) }
+    }
+
+    /// A sole Window scene would quit the app when it closes. The process stays
+    /// alive. The bridge still starts and stops with the scene phase.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }

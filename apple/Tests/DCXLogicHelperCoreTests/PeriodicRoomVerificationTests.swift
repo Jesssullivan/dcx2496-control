@@ -180,4 +180,38 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         }
         XCTAssertEqual(count, 1)
     }
+
+    func testFreedOwnerDoesNotHoldTheClaim() {
+        let claim = PeriodicRoomReaderClaim()
+        autoreleasepool {
+            let gone = NSObject()
+            XCTAssertTrue(claim.acquire(gone))
+        }
+        XCTAssertTrue(claim.acquire(NSObject()))
+    }
+
+    func testClockStartStopRestartAndStaleGeneration() {
+        let claim = PeriodicRoomReaderClaim()
+        let clock = PeriodicRoomClockOwnership(claim: claim)
+        let runtime = NSObject(), other = NSObject()
+        guard let first = clock.begin(owner: runtime) else { return XCTFail("start must take the claim") }
+        XCTAssertTrue(clock.isCurrent(first))
+        XCTAssertFalse(claim.acquire(other), "a started clock holds the claim")
+        clock.end(owner: runtime)
+        XCTAssertFalse(clock.isCurrent(first), "a stopped clock's late event must not tick")
+        XCTAssertTrue(claim.acquire(other), "stop releases the claim")
+        claim.release(other)
+        guard let second = clock.begin(owner: runtime) else { return XCTFail("restart must take the claim again") }
+        XCTAssertNotEqual(first, second)
+        XCTAssertFalse(clock.isCurrent(first), "an old generation stays stale after restart")
+        XCTAssertTrue(clock.isCurrent(second))
+    }
+
+    func testClockRefusedWhileAnotherOwnerHoldsTheClaim() {
+        let claim = PeriodicRoomReaderClaim()
+        let holder = NSObject()
+        XCTAssertTrue(claim.acquire(holder))
+        let clock = PeriodicRoomClockOwnership(claim: claim)
+        XCTAssertNil(clock.begin(owner: NSObject()))
+    }
 }

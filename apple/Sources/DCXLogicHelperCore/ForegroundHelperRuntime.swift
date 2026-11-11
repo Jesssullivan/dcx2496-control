@@ -14,7 +14,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
     private var starting = false
     private let periodic = PeriodicRoomVerification()
     private var periodicTimer: DispatchSourceTimer?
-    private var periodicClockGeneration: UInt64 = 0
+    private let periodicClock = PeriodicRoomClockOwnership()
 
     public init() throws {
         let locations = try AppGroupLocations()
@@ -34,8 +34,8 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
 
     public func enterForeground() throws {
         lock.lock()
-        // Every window, scene phase and URL calls this. Only the first caller
-        // starts the socket, CoreMIDI and the periodic clock.
+        // Scene phase, the window and URL refreshes all call this on the main
+        // actor. `starting` is a defensive guard against a reentrant start.
         guard !running, !starting else {
             lock.unlock()
             return
@@ -87,7 +87,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         guard wasRunning else { return }
         periodic.stop()
         stoppedTimer?.cancel()
-        if stoppedTimer != nil { PeriodicRoomReaderClaim.process.release(self) }
+        if stoppedTimer != nil { periodicClock.end(owner: self) }
         coordinator.setForeground(false)
         socketServer.stop()
         coreMIDI.stop()
@@ -163,11 +163,10 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
 
     private func startPeriodicClock() {
         lock.lock()
-        // One reader per process, however many windows or runtimes exist.
-        guard running, periodicTimer == nil, PeriodicRoomReaderClaim.process.acquire(self) else { lock.unlock(); return }
+        // The claim is defensive. The app has one runtime and this guard
+        // already allowed one timer per runtime.
+        guard running, periodicTimer == nil, let generation = periodicClock.begin(owner: self) else { lock.unlock(); return }
         periodic.start()
-        periodicClockGeneration &+= 1
-        let generation = periodicClockGeneration
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "io.tinyland.dcx.periodic-room"))
         timer.schedule(deadline: .now())
         timer.setEventHandler { [weak self] in
@@ -175,7 +174,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             // A cancelled timer's late event never reads or rearms a newer clock.
             self.periodicTick()
             self.lock.lock()
-            if self.running, self.periodicClockGeneration == generation {
+            if self.running, self.periodicClock.isCurrent(generation) {
                 self.periodicTimer?.schedule(deadline: .now() + .seconds(5))
             }
             self.lock.unlock()
@@ -187,7 +186,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
 
     private func ownsPeriodicClock(_ generation: UInt64) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return running && periodicTimer != nil && periodicClockGeneration == generation
+        return running && periodicTimer != nil && periodicClock.isCurrent(generation)
     }
 
     private func periodicTick() {
