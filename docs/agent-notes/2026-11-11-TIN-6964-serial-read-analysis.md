@@ -1,7 +1,7 @@
 # DCX serial reads on November 11, 2026: source analysis
 
-Linear: TIN-6964. Evidence: TIN-5385 comment `64c91d0e`, TIN-6964 comment
-`4f0dc0fc`. Source: `origin/main` at `7b2af6c`, which carries the Helper 9
+Linear: TIN-6964. Evidence: TIN-5385 comment `64c91d0e`, TIN-6964 comments
+`4f0dc0fc`, `89e6b7d7`, `d029daee` and `6d42560c`. Source: `origin/main` at `7b2af6c`, which carries the Helper 9
 lineage `43086d4`. Every line number below is on that commit.
 
 This note answers four questions from the source alone. No hardware was read.
@@ -12,7 +12,7 @@ open cause needs one bench run on the real DCX.
 
 | Question | Answer from source | Confidence |
 |---|---|---|
-| Why does every good read show searchAttempts 2 and searchEmptyTimeouts 1? | The device gave no Search response to the first request of each session. Attempt 2 follows the fixed 5 second gap. The cause is not in host code. | High on the mechanism, unknown on the cause |
+| Why does every good read show searchAttempts 2 and searchEmptyTimeouts 1? | The device gave no Search response to the first request of each session. Attempt 2 follows the fixed 5 second gap. Probably device state. One post-power-cycle read is the only evidence against a host cause. | High on the mechanism, unknown on the cause |
 | Why can Dump0 or Dump1 time out with 0 or 491 bytes? | The DCX sent no dump frame, or stopped mid-frame, inside a 1.975 second deadline. The 491 figure is not in any record I found. | Medium |
 | What does the retry policy do after a zero-byte or partial dump? | Zero bytes with a verified close rearm at 15 seconds, doubling to 300. Any partial count latches the periodic reader until the app leaves the foreground or a binding changes. | High |
 | Can six helper windows truncate each other's reads? | No. The windows share one runtime and one timer. Three separate guards serialize every serial open. | High |
@@ -47,8 +47,9 @@ first write (`lib.rs:714-741`, `lib.rs:2155-2176`). It has no delay after the
 baud change and no `tcdrain`.
 
 The DCX answered attempt 1 at 22:09:03Z, right after a power cycle. The host
-path did not change, so that read argues against a host baud race. It points
-at device state left by the previous session. Every capture ends with a
+path did not change, so that read argues against a host baud race. That same
+read then failed at Dump1. It is one sample, so it cannot rule out a host
+cause. It points at device state left by the previous session. Every capture ends with a
 ReceiveDirect write (`snapshot.rs:803-807`). The carrier sends it through
 `quiesce_receive_direct_command` (`lib.rs:1058-1098`). A power cycle clears
 that state.
@@ -68,9 +69,16 @@ the wire. Transmit mode is written and Dump0 follows with no gap
 (`snapshot.rs:766-781`).
 
 - **0 bytes.** No dump frame began inside 1.975 seconds. An echo may have
-  come back and been stripped. Both recorded cases, 21:58:53Z on Dump0 and
-  22:09:03Z on Dump1, came within minutes of a host reboot or a DCX power
-  cycle.
+  come back and been stripped. I found four zero-byte dump records. Two
+  came within minutes of a host reboot or a DCX power cycle: 21:58:53Z on
+  Dump0 and 22:09:03Z on Dump1 on November 11 (TIN-6964 `4f0dc0fc`). Two came
+  in steady state, with no reboot or power cycle recorded before them. Helper 6
+  recorded a Dump0 timeout with received 0, Search attempts 2 and one empty
+  Search (TIN-6964 `89e6b7d7`, November 2). Helper 7 recorded a natural empty
+  Dump0 timeout with a verified close during a running session (TIN-6964
+  `d029daee`, November 2). So a settle wait after power-up does not explain
+  all of them. The Helper 6 record has the empty first Search and the empty
+  Dump0 in the same read. That bears on the device-state lead in section 1.
 - **491 bytes.** That count does not appear in TIN-5385 `64c91d0e`, in
   TIN-6964, or in the estate-push notes. If it was seen, the DCX began a frame
   and then went silent for at least 1.7 seconds. 491 bytes is less than half
@@ -162,19 +170,23 @@ On November 2, Helper 10 failed at open with `PreexistingInput { queued: 11 }`
 envelope plus 3 data bytes (`protocol.rs:201-204`). A Search request is 8
 bytes (`crates/dcx-transport/src/lib.rs:24`). So the queued bytes may be a
 late echo of the previous session's Dump request. That fits a link that echoes
-requests. It is a lead, not a finding.
+requests. The lead holds only if the bytes arrived after the previous close,
+or if that session's finish failed or never ran. Otherwise finish's discard and
+quiet drain would have removed them (`lib.rs:1190-1221`, `lib.rs:1230-1277`).
+It is a lead, not a finding.
 
 ## Bench runs that would close the causes
 
-Each is one read-only session on the muted bench under
+Each runs as read-only sessions on the muted bench under
 `legalab-hardware-gate`. Watch `searchAttempts`, `searchEmptyTimeouts` and the
-dump byte counts.
+dump byte counts. None of the three can run against the installed build. Each
+needs a source change first.
 
-| Run | Change | Prediction if device state is the cause |
-|---|---|---|
-| A | Skip the closing ReceiveDirect for one read, then read again | The next read answers attempt 1 |
-| B | Add 250 milliseconds after `configure` | No change in the empty count |
-| C | Log raw byte counts before echo stripping | Shows whether the empty attempt carried an echo |
+| Run | Change | Prediction if device state is the cause | Needs a build |
+|---|---|---|---|
+| A | Skip the closing ReceiveDirect for one read, then read again | The next read answers attempt 1 | Yes. A code or flag change and an operator ruling |
+| B | Add 250 milliseconds after `configure` | No change in the empty count | Yes. A new signed dcxctl or helper build |
+| C | Log raw byte counts before echo stripping | Shows whether the empty attempt carried an echo | Yes. A new signed dcxctl or helper build |
 
 Run A needs an operator ruling. The closing ReceiveDirect is part of the
 reviewed close contract. A shorter first-replay gap departs from the
