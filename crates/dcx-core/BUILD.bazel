@@ -43,7 +43,8 @@ rust_test(
 )
 
 # The Bazel form of `just schema-check`: both bridge schemas parse as JSON
-# objects. Cargo runs the same file as a dcx-core integration test.
+# objects. It also asserts a `$schema` key, which `jq -e .` does not check.
+# Cargo runs the same file as a dcx-core integration test.
 rust_test(
     name = "bridge_schema_parse",
     size = "small",

@@ -1,8 +1,10 @@
-//! Assert that both checked-in Logic bridge schemas parse as JSON objects.
+//! Assert that both checked-in Logic bridge schemas parse as JSON objects
+//! that declare a `$schema` dialect.
 //!
 //! This is the Bazel and Cargo form of `just schema-check`, which runs
-//! `jq -e .` over the same two files. Both files are read at compile time, so
-//! Bazel declares them through `compile_data`.
+//! `jq -e .` over the same two files. The `$schema` assertion is stricter than
+//! jq. Both files are read at compile time, so Bazel declares them through
+//! `compile_data`.
 
 const BRIDGE_V1: &str = include_str!("../../../schemas/v1/dcx_logic_bridge.schema.json");
 const BRIDGE_V2: &str = include_str!("../../../schemas/v2/dcx_logic_bridge.schema.json");
