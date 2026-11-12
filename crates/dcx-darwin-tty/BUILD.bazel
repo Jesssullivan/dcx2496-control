@@ -35,6 +35,32 @@ rust_test(
     ]),
 )
 
+# The same unit tests with the native macOS backend compiled in, as
+# `just darwin-carrier-check` runs them through Cargo on a Darwin host. The
+# injected syscall boundary is exercised; no tty is opened. The Darwin sysroot
+# still comes from the host Xcode probe (TIN-4050), so this stays local.
+rust_test(
+    name = "native_unit_tests",
+    size = "small",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "dcx_darwin_tty_native_test",
+    edition = "2024",
+    tags = [
+        "local",
+        "manual",
+        "no-remote",
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["@platforms//os:osx"],
+    deps = [
+        "//crates/dcx-core:dcx_core",
+        "//crates/dcx-transport:dcx_transport",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 test_suite(
     name = "all_tests",
     tests = [":unit_tests"],

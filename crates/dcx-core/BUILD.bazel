@@ -42,9 +42,24 @@ rust_test(
     deps = [":dcx_core"] + all_crate_deps(normal = True),
 )
 
+# The Bazel form of `just schema-check`: both bridge schemas parse as JSON
+# objects. Cargo runs the same file as a dcx-core integration test.
+rust_test(
+    name = "bridge_schema_parse",
+    size = "small",
+    srcs = ["tests/bridge_schema_parse.rs"],
+    compile_data = [
+        "//schemas/v1:dcx_logic_bridge_schema",
+        "//schemas/v2:dcx_logic_bridge_schema",
+    ],
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
 test_suite(
     name = "all_tests",
     tests = [
+        ":bridge_schema_parse",
         ":profile_chain",
         ":robustness",
         ":unit_tests",
