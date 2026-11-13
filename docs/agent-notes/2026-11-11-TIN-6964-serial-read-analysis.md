@@ -201,4 +201,9 @@ under `$TMPDIR`:
 - `cargo test -p dcx-transport`: 66 and 6 passed, 0 failed.
 - `cargo test -p dcx-darwin-tty`: 59 passed, 0 failed.
 
-Not run: `just check`, the Swift tests and any hardware read.
+On November 13, 2026, `just check` passed on sting inside `nix develop` on
+`8cd479b`. Cargo ran 315 tests in 7 suites with 0 failures. The fixture
+pipelines, lockfile checks, Bazel front-door refusals and 24 Apple linkage
+tests passed. The refusal test starts no Bazel build.
+
+Not run: the Swift tests and any hardware read.
