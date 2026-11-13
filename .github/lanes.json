@@ -1,0 +1,13 @@
+{
+  "schema_version": 3,
+  "actions": {
+    "validate": {
+      "command": "test",
+      "targets": ["//:linux_suite"],
+      "capability": "rbe-linux-x86_64",
+      "result": {
+        "mode": "status-only"
+      }
+    }
+  }
+}

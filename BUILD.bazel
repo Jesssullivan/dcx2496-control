@@ -103,12 +103,45 @@ test_suite(
     name = "remote_eligible",
     tests = [
         ":toolchain_pin_parity",
+        "//crates/dcx-core:bridge_schema_parse",
         "//crates/dcx-core:profile_chain",
         "//crates/dcx-core:robustness",
         "//crates/dcx-core:unit_tests",
         "//crates/dcx-darwin-tty:unit_tests",
         "//crates/dcx-transport:robustness",
         "//crates/dcx-transport:unit_tests",
+    ],
+)
+
+# TIN-5447, operator ruling 5 on TIN-5385 comment 4974cf0d: the Linux suite a
+# GF validate action runs. It is exactly the hermetic set above, so it carries
+# no host-PATH shell test. The eight sh_tests in `//:check` read the host PATH
+# and stay out. They still need `--config=host-gates`. `.github/lanes.json`
+# names it.
+test_suite(
+    name = "linux_suite",
+    tests = [":remote_eligible"],
+)
+
+# The native macOS suite: seven Swift package tests, the helper UI typecheck and
+# the Darwin tty carrier with its native backend. Every member is local-only and
+# compatible with macOS alone. It is for Darwin lanes only. On Linux every
+# member is skipped, Bazel finds no test and exits 4, so never name it in a
+# Linux action. Tagged manual so a `//...` pattern keeps leaving these native
+# tests out, as it does today.
+test_suite(
+    name = "macos_suite",
+    tags = ["manual"],
+    tests = [
+        "//apple:child_failure_diagnostics",
+        "//apple:feedback_notch",
+        "//apple:helper_ui_typecheck",
+        "//apple:logic_recall",
+        "//apple:mutation_recovery",
+        "//apple:process_runner",
+        "//apple:response_binding",
+        "//apple:room_verification",
+        "//crates/dcx-darwin-tty:native_unit_tests",
     ],
 )
 
