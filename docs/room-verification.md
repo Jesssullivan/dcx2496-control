@@ -175,7 +175,9 @@ capture between them latch periodic reads off. The reason names the cap and the
 last byte count. The helper window shows it under Periodic room reads, and the
 unified log records it under `io.tinyland.dcx2496.logic`. Dump0 and Dump1 are
 reads, so a retry replays no write. A partial dump with an unknown close or
-byte count still latches at once. No timer
+byte count still latches at once. Leaving the foreground or stopping the
+reader clears the partial count and the latch, so the cap counts within one
+foreground session. No timer
 performs parameter repair, rollback or unknown-child recovery.
 
 Saved helper configuration, target, callout and exact expectation bytes must

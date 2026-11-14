@@ -88,7 +88,7 @@ replaced build 9, and its rollback restored build 9.
 |---|---|---|---|
 | 1 | Review approves PR 67. The lead merges it or pins its approved head. Name the source revision `REV` | | |
 | 2 | Swift unit tests on PZM at `REV`, unit only, under the shared build lock. Repeat only if `REV` differs from `0cdcc71c` in Swift source | | **receipt**: Mac unit gate above |
-| 3 | `just pzm-dcx-team-signed-build CHECKOUT REV SCRATCH` from lab, with a clean checkout of `REV` under the scratch root | **SIGN**, **PRIV** | **receipt** for Helper 9 on November 2. Not run for `REV` |
+| 3 | `just pzm-dcx-team-signed-build CHECKOUT REV SCRATCH` from lab, with a clean checkout of `REV` under the scratch root | **SIGN**, **PRIV**, **PROMPT** | **receipt** for Helper 9 on November 2. Not run for `REV`. The lab script checks only that the login keychain exists. It does not check that it is unlocked. A locked keychain or a changed key access list can raise a codesign dialog in the Aqua session. The operator unlocks or answers it |
 | 4 | Candidate readback before any placement. Run the commands under Readbacks on the signed bundle in scratch. Record the bundle manifest and three executable digests | | **source** |
 | 5 | Write a lab Helper 11 placement adapter. Copy the Helper 9 adapter. Set `OLD` to the Helper 9 manifest above and the old binaries to the Helper 9 new binaries. Set `NEW` and the new binaries from step 4. Bind the owned-App custody to the running App 61 actor, not App 57 | | **UNPROVEN**: no Helper 11 adapter exists. The unmerged Helper 10 adapter on lab `feat/TIN-6964-helper10-placement-20261102` is the closest template |
 | 6 | Run that adapter in `plan` mode | **PRIV** | **source** once step 5 lands |
@@ -105,6 +105,10 @@ Run these on PZM as the logged-in user. All are read only except the URL open
 in row 5. That open asks the helper for one saved-room read, a device read
 the approved configuration already allows.
 
+Precondition for rows 5 and 6: the ASFW menu app is running. It is the only
+writer of the room receipt. It writes the file from helper heartbeats over
+CoreMIDI. Without it, row 6 fails even when the helper is good.
+
 | # | Proves | Command | Pass |
 |---|---|---|---|
 | 1 | Version | `plutil -p /Applications/DCXLogicHelper.app/Contents/Info.plist` | `CFBundleVersion` 11, short version 0.1.10 |
@@ -112,7 +116,7 @@ the approved configuration already allows.
 | 3 | Same bytes as the candidate | `shasum -a 256` on `Contents/MacOS/DCXLogicHelper`, the AU executable and `Contents/Helpers/dcxctl` | Equal to step 4 |
 | 4 | AU registration | `pluginkit -m -v -i io.tinyland.dcx2496.logic.midi` | One row, version 0.1.10, path inside `/Applications/DCXLogicHelper.app` |
 | 5 | One window after a verify request | `open tinyland-dcx://verify-approved-room`, then the window count below | Exactly one helper window and one helper process |
-| 6 | Room receipt | `cat "$HOME/Library/Application Support/ASFW/LS56/dcx-room-verification.json"` | `status` `match`, `matches` true, `sceneID` `practice-ready`, `sceneRevision` 1, `compiledDigest` starting `60566ba2`, `expectedSnapshotDigest` and `snapshotDigest` starting `20a5b485`, `captureMetrics.closeVerified` true, a `helperInstanceID` new since step 9 |
+| 6 | Room receipt | `cat "$HOME/Library/Application Support/ASFW/LS56/dcx-room-verification.json"` | `status` `match`, `matches` true, `sceneID` `practice-ready`, `sceneRevision` 1, `compiledDigest` starting `sha256/60566ba2`, `expectedSnapshotDigest` and `snapshotDigest` starting `sha256/20a5b485`, `captureMetrics.closeVerified` true, a `helperInstanceID` new since step 9 |
 | 7 | Reader state | Click Refresh Local Status in the helper window. Or read `log show --last 30m --predicate 'subsystem == "io.tinyland.dcx2496.logic"'` | The Periodic room reads row shows `Not stopped`. The log has no `periodic room reads stopped` line |
 
 Window count for row 5. It reads the window list only and needs no
@@ -128,6 +132,27 @@ pgrep -x DCXLogicHelper | wc -l
 Row 6 holds only while the DCX is still at snapshot `20a5b485`. After any
 JBL protection apply from `docs/plans/jbl-protection-20a5b485`, the approved
 expectation must change first, or row 6 reads drift.
+
+## The November 14 invalidation
+
+The room receipt read on November 14 shows status `invalidated`, reason
+`room-verification-failed` and `verifiedAt` 15:02:30Z. That time is the last
+successful capture. The receipt does not name the failure. The helper's
+private failure record does. It sits in the App Group under
+`DCXLogicBridge/RoomDiagnostics`, and its child started at 15:03:04Z.
+
+| Field | Value |
+|---|---|
+| `captureFailure.category` | `timeout` |
+| `captureFailure.operation` | `dump1` |
+| `captureFailure.received` | 264 |
+| `captureFailure.sessionClosedVerified` | true |
+| `closeKnown` | `verified` |
+
+That is the class the PR 67 rearm admits: a verified-close Dump1 timeout with a
+known nonzero byte count. Build 9 latched on it. Build 11 would retry it on the
+next thirty-second period. The unified log for that window holds only `dcxctl`
+sandbox lines, so the record above is the only source.
 
 ## Rollback
 
