@@ -60,6 +60,7 @@ final class HelperAppModel: ObservableObject {
     @Published private(set) var target = "Not configured"
     @Published private(set) var capabilities = "helper.status"
     @Published private(set) var recovery = "None"
+    @Published private(set) var periodicReads = "Not stopped"
     @Published var bindingID = ""
     @Published var ttyPath = "/dev/cu.usbserial-"
     @Published var expectedDeviceAddress = 0
@@ -125,6 +126,7 @@ final class HelperAppModel: ObservableObject {
             "\($0.bindingID), device \($0.expectedDeviceAddress)"
         } ?? "Not configured"
         capabilities = status.capabilities.map(\.rawValue).joined(separator: ", ")
+        periodicReads = runtime?.periodicReaderBlockReason().map { "Stopped: \($0)" } ?? "Not stopped"
         if status.recoveryUnavailable {
             recovery = "Unavailable (durable state is fail-closed)"
         } else if let active = status.recovery {
@@ -301,6 +303,7 @@ private struct HelperContentView: View {
                 GridRow { Text("CoreMIDI"); Text(model.midiOnline ? "Commands + Status online" : "Offline") }
                 GridRow { Text("Operations"); Text(model.capabilities).textSelection(.enabled) }
                 GridRow { Text("Mutation recovery"); Text(model.recovery).textSelection(.enabled) }
+                GridRow { Text("Periodic room reads"); Text(model.periodicReads).textSelection(.enabled) }
             }
             Divider()
             Text("Exact DCX binding")
@@ -377,7 +380,7 @@ private struct HelperContentView: View {
                 Toggle("Verify approved room when this helper opens before Logic", isOn: $model.verifyRoomOnLaunch)
                 Toggle("Allow explicit saved-room refresh from native controls", isOn: $model.allowRoomRefreshRequests)
                 Toggle("Periodically read the approved room while this helper runs", isOn: $model.periodicRoomVerificationEnabled)
-                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. Failed reads stop periodic attempts until an explicit successful verification or configuration change.")
+                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. A failed read stops periodic attempts until an explicit successful verification or configuration change. Three partial reads in a row also stop them.")
                     .font(.caption)
                 Button("Save Approved Room Configuration") { model.saveApprovedRoom() }
                     .disabled(model.verifyingRoom || !model.configured)

@@ -1,6 +1,7 @@
 import AppKit
 import DCXLogicBridge
 import Foundation
+import os
 
 /// Lifecycle-owned runtime for the containing app. There is deliberately no
 /// daemon entry point: the app calls `enterForeground()` and `leaveForeground()`.
@@ -224,13 +225,29 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             } catch RoomVerificationError.busy {
                 outcome = .busy
             } catch let failure as ApprovedRoomCaptureFailed {
-                outcome = failure.permitsPeriodicRetry && self.periodic.isCurrent(attempt) &&
-                    self.savedBindingMatches(attempt.binding) ? .retryableReadFailure : .failed
+                let current = self.periodic.isCurrent(attempt) && self.savedBindingMatches(attempt.binding)
+                if current, failure.permitsPeriodicRetry {
+                    outcome = .retryableReadFailure
+                } else if current, failure.permitsBoundedPartialRetry, let received = failure.failure.received {
+                    outcome = .partialReadFailure(received: received)
+                } else {
+                    outcome = .failed
+                }
             } catch {
                 outcome = .failed
             }
             self.periodic.complete(attempt, outcome: outcome, now: Date())
+            if let reason = self.periodic.blockReason {
+                Self.log.error("periodic room reads stopped: \(reason, privacy: .public)")
+            }
         }
+    }
+
+    private static let log = Logger(subsystem: "io.tinyland.dcx2496.logic", category: "periodic-room")
+
+    /// Why periodic room reads stopped, or nil while they may run.
+    public func periodicReaderBlockReason() -> String? {
+        periodic.blockReason
     }
 
     /// Currently loaded checked configuration, if any.

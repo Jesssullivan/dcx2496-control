@@ -76,8 +76,17 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         case busy
         case failed
         case retryableReadFailure
+        /// A verified-close Dump0 or Dump1 timeout after `received` bytes.
+        case partialReadFailure(received: UInt32)
     }
     static let successDelay: TimeInterval = 30
+    /// Partial dumps in a row, with no successful capture between them, that
+    /// stop the periodic reader. The first two retry on the next period.
+    static let partialReadCap = 3
+    static let failedReason = "periodic-read-failed"
+    static func partialCapReason(received: UInt32) -> String {
+        "periodic-partial-read-cap-reached: \(partialReadCap) partial dumps in a row, last received \(received) bytes"
+    }
     private let lock = NSLock()
     private var running = false
     private var generation: UInt64 = 0
@@ -87,7 +96,15 @@ final class PeriodicRoomVerification: @unchecked Sendable {
     private var observedCapture: Date?
     private var readFailureCount = 0
     private var busyCount = 0
+    private var partialReadCount = 0
     private var blocked = false
+    private var blockedReason: String?
+
+    /// Why periodic reads stopped, or nil while they may run.
+    var blockReason: String? {
+        lock.lock(); defer { lock.unlock() }
+        return blocked ? blockedReason : nil
+    }
 
     func start() {
         lock.lock(); defer { lock.unlock() }
@@ -101,7 +118,9 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         binding = nil
         due = nil
         observedCapture = nil
+        partialReadCount = 0
         blocked = false
+        blockedReason = nil
     }
 
     func poll(binding checkedBinding: Data?, capturedAt: Date?, now: Date) -> Step {
@@ -115,7 +134,9 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             due = now
             busyCount = 0
             readFailureCount = 0
+            partialReadCount = 0
             blocked = false
+            blockedReason = nil
             observedCapture = nil
         }
         // A real explicit/URL/startup capture defers the periodic deadline too.
@@ -124,8 +145,10 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             observedCapture = capturedAt
             due = now.addingTimeInterval(Self.successDelay)
             blocked = false
+            blockedReason = nil
             busyCount = 0
             readFailureCount = 0
+            partialReadCount = 0
         }
         guard let binding, active == nil, !blocked, due == nil || now >= due! else {
             return Step(invalidatesPriorBinding: invalidates, attempt: nil)
@@ -151,6 +174,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             due = now.addingTimeInterval(Self.successDelay)
             busyCount = 0
             readFailureCount = 0
+            partialReadCount = 0
         case .busy:
             busyCount = min(busyCount + 1, 6)
             due = now.addingTimeInterval(min(300, 15 * pow(2, Double(busyCount - 1))))
@@ -158,9 +182,21 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             // A fresh read still passes every binding, recovery and serial guard.
             readFailureCount = min(readFailureCount + 1, 6)
             due = now.addingTimeInterval(min(300, 15 * pow(2, Double(readFailureCount - 1))))
+        case let .partialReadFailure(received):
+            // Busy and empty timeouts do not reset this count. Only a
+            // successful capture or a changed binding does.
+            partialReadCount += 1
+            if partialReadCount >= Self.partialReadCap {
+                blocked = true
+                blockedReason = Self.partialCapReason(received: received)
+                due = nil
+            } else {
+                due = now.addingTimeInterval(Self.successDelay)
+            }
         case .failed:
             // Unknown or failed transport retirement is never retried by a timer.
             blocked = true
+            blockedReason = Self.failedReason
             due = nil
         }
     }
