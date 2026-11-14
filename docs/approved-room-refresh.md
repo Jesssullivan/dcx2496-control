@@ -52,8 +52,8 @@ Authority: user implementation direction and Root's separate typed-failure sourc
 
 ## Periodic recovery
 
-The opt-in foreground scheduler may retry completed empty Dump0 or Dump1 timeouts with verified session close. The typed schema, approved binding and current lifecycle must still match. Success publishes only the new complete matching capture. A failed attempt cannot extend or restore an expired proof.
+The opt-in foreground scheduler may retry completed empty Dump0 or Dump1 timeouts with verified session close. It may also retry a completed Dump0 or Dump1 timeout after some bytes with verified session close, at most twice in a row, as [Room verification](room-verification.md) describes. The typed schema, approved binding and current lifecycle must still match. Success publishes only the new complete matching capture. A failed attempt cannot extend or restore an expired proof.
 
-Consecutive qualified failures wait 15, 30, 60, 120, 240 and then 300 seconds. Later failures retain the 300-second limit. Busy admission has a separate counter and cannot reset transport backoff. A real successful capture resets the read-failure counter and resumes the existing 30-second success delay. One active attempt prevents queued reads.
+Consecutive empty timeouts wait 15, 30, 60, 120, 240 and then 300 seconds. Later empty timeouts retain the 300-second limit. This backoff applies to empty timeouts only. A partial dump retries at the 30-second success delay and has its own counter. Busy admission has a separate counter and cannot reset transport backoff. A real successful capture resets the read-failure counter and resumes the existing 30-second success delay. One active attempt prevents queued reads.
 
 Malformed, unknown, nonempty, mismatched or unverified-close failures stay latched. Configuration, target or lifecycle changes invalidate the old attempt. Every new attempt repeats the existing approval, recovery, binding and exclusive-serial admission. This policy never retries a parameter write or publishes a synthetic match. Native and named-device recovery qualification remain separate.
