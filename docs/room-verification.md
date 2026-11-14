@@ -54,6 +54,8 @@ receiver before the helper, then wait for admission before opening Logic.
 `tinyland-dcx://verify-approved-room` URL. It reads the saved manifest and target.
 The URL accepts no path, query, port, profile or write parameter. Native controls
 can request this foreground refresh before acquiring an LS56 transaction.
+The helper has one window and never opens another for a URL. The app delegate
+receives the URL, so a refresh runs when that window is closed.
 Receipt arrival itself never applies a scene. No startup configuration or
 approved device image ships by default.
 
@@ -165,7 +167,15 @@ thirty seconds. The existing local timer checks eligibility every five seconds. 
 explicit capture defers that deadline too. Known lock contention before child
 admission backs off from fifteen seconds to five minutes. Failed transport,
 invalid comparison and drift latch periodic reads off. An explicit successful
-verification or a changed approved configuration resets that latch. No timer
+verification or a changed approved configuration resets that latch.
+
+A Dump0 or Dump1 timeout after some bytes, with a verified close, retries on
+the next thirty-second period. Three such partial dumps with no successful
+capture between them latch periodic reads off. The reason names the cap and the
+last byte count. The helper window shows it under Periodic room reads, and the
+unified log records it under `io.tinyland.dcx2496.logic`. Dump0 and Dump1 are
+reads, so a retry replays no write. A partial dump with an unknown close or
+byte count still latches at once. No timer
 performs parameter repair, rollback or unknown-child recovery.
 
 Saved helper configuration, target, callout and exact expectation bytes must

@@ -140,6 +140,45 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    func testPartialDump1TimeoutInvalidatesThenRearmsOnNextPeriod() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let now = Date()
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: now).attempt)
+            let failed: [String: Any] = ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
+                "snapshot": NSNull(), "comparison": NSNull(), "closeVerified": true,
+                "searchAttempts": 1, "searchEmptyTimeouts": 0, "captureElapsedMilliseconds": 8000,
+                "failure": ["schemaVersion": "dcx.approved-room-capture-failure/v1", "category": "timeout",
+                            "operation": "dump1", "received": 491, "sessionClosedVerified": true]]
+            backend.refreshOverride = .init(terminationStatus: 1,
+                stdout: try JSONSerialization.data(withJSONObject: failed), stderr: Data(), durationMilliseconds: 8000)
+            var captureError: ApprovedRoomCaptureFailed?
+            XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true })) { captureError = $0 as? ApprovedRoomCaptureFailed }
+            let failure = try XCTUnwrap(captureError)
+            XCTAssertEqual(failure.failure.received, 491)
+            XCTAssertFalse(failure.permitsPeriodicRetry)
+            XCTAssertTrue(failure.permitsBoundedPartialRetry)
+            XCTAssertNil(publisher.current(expectation: manifest))
+            schedule.complete(attempt, outcome: .partialReadFailure(received: 491), now: now)
+            XCTAssertNil(schedule.blockReason)
+            XCTAssertNil(schedule.poll(binding: manifest, capturedAt: nil, now: now.addingTimeInterval(29.999)).attempt)
+            let retryAt = now.addingTimeInterval(30)
+            let retry = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: retryAt).attempt)
+            backend.refreshOverride = nil
+            let receipt = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true })
+            XCTAssertTrue(receipt.matches)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            schedule.complete(retry, outcome: .success(capturedAt: try XCTUnwrap(formatter.date(from: receipt.verifiedAt))),
+                now: retryAt)
+            XCTAssertNil(schedule.blockReason)
+        }
+    }
+
     func testPeriodicReadFailureImmediatelyInvalidatesRetainedProof() throws {
         try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, first in
             backend.beforeRefresh = {

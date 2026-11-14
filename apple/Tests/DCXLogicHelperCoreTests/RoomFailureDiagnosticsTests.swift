@@ -132,6 +132,41 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
             }
         }
     }
+    func testOnlyVerifiedClosedPartialDump0OrDump1TimeoutPermitsBoundedRetry() throws {
+        func failed(_ object: [String: Any]) throws -> ApprovedRoomCaptureFailed {
+            ApprovedRoomCaptureFailed(failure: try BridgeJSONCodec.decoder().decode(RoomCaptureFailureV1.self,
+                from: JSONSerialization.data(withJSONObject: object)))
+        }
+        for operation in ["dump0", "dump1"] {
+            var original = try XCTUnwrap(failedEnvelope()["failure"] as? [String: Any])
+            original["operation"] = operation
+            for received in [1, 491, 2048] {
+                var partial = original; partial["received"] = received
+                XCTAssertTrue(try failed(partial).permitsBoundedPartialRetry)
+                XCTAssertFalse(try failed(partial).permitsPeriodicRetry)
+            }
+            XCTAssertFalse(try failed(original).permitsBoundedPartialRetry)
+            var partial = original; partial["received"] = 491
+            for (key, value) in [("category", "transport" as Any), ("category", "validation" as Any),
+                                 ("operation", "search" as Any), ("operation", "meter" as Any),
+                                 ("received", NSNull() as Any),
+                                 ("sessionClosedVerified", false as Any), ("closeFailure", "cleanup" as Any),
+                                 ("schemaVersion", "unknown" as Any)] {
+                var changed = partial; changed[key] = value
+                XCTAssertFalse(try failed(changed).permitsBoundedPartialRetry)
+            }
+        }
+    }
+    func testPartialDumpWithUnverifiedCloseDecodesWithoutRetryAuthority() throws {
+        var object = failedEnvelope(closed: false)
+        var failure = try XCTUnwrap(object["failure"] as? [String: Any])
+        failure["operation"] = "dump1"; failure["received"] = 491; object["failure"] = failure
+        let envelope = try XCTUnwrap(ApprovedRoomFailureEnvelope.decodeIfFailed(
+            JSONSerialization.data(withJSONObject: object), terminationStatus: 1))
+        let failed = ApprovedRoomCaptureFailed(failure: envelope.failure)
+        XCTAssertFalse(failed.permitsBoundedPartialRetry)
+        XCTAssertFalse(failed.permitsPeriodicRetry)
+    }
     func testCompletedFailurePropagatesRetryEvidenceWhileReadinessStaysInvalid() throws {
         let data = try JSONSerialization.data(withJSONObject: failedEnvelope())
         var error: Error?

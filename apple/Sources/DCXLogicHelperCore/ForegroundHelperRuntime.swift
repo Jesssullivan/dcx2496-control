@@ -1,6 +1,7 @@
 import AppKit
 import DCXLogicBridge
 import Foundation
+import os
 
 /// Lifecycle-owned runtime for the containing app. There is deliberately no
 /// daemon entry point: the app calls `enterForeground()` and `leaveForeground()`.
@@ -11,8 +12,11 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
     private let coordinator: DCXHelperCoordinator
     private let lock = NSLock()
     private var running = false
+    private var starting = false
     private let periodic = PeriodicRoomVerification()
     private var periodicTimer: DispatchSourceTimer?
+    private var periodicGeneration: UInt64?
+    private let periodicClock = PeriodicRoomClockOwnership()
 
     public init() throws {
         let locations = try AppGroupLocations()
@@ -32,11 +36,19 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
 
     public func enterForeground() throws {
         lock.lock()
-        guard !running else {
+        // Scene phase, the window and URL refreshes all call this on the main
+        // actor. `starting` is a defensive guard against a reentrant start.
+        guard !running, !starting else {
             lock.unlock()
             return
         }
+        starting = true
         lock.unlock()
+        defer {
+            lock.lock()
+            starting = false
+            lock.unlock()
+        }
 
         try locations.prepareBridgeDirectory()
         // Pick up an App Group configuration replaced while the app was
@@ -72,11 +84,14 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         let wasRunning = running
         running = false
         let stoppedTimer = periodicTimer
+        let stoppedGeneration = periodicGeneration
         periodicTimer = nil
+        periodicGeneration = nil
         lock.unlock()
         guard wasRunning else { return }
         periodic.stop()
         stoppedTimer?.cancel()
+        if let stoppedGeneration { periodicClock.end(owner: self, generation: stoppedGeneration) }
         coordinator.setForeground(false)
         socketServer.stop()
         coreMIDI.stop()
@@ -152,20 +167,31 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
 
     private func startPeriodicClock() {
         lock.lock()
-        guard running, periodicTimer == nil else { lock.unlock(); return }
+        // The claim is defensive. The app has one runtime and this guard
+        // already allowed one timer per runtime.
+        guard running, periodicTimer == nil, let generation = periodicClock.begin(owner: self) else { lock.unlock(); return }
         periodic.start()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "io.tinyland.dcx.periodic-room"))
         timer.schedule(deadline: .now())
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let self, self.ownsPeriodicClock(generation) else { return }
+            // A cancelled timer's late event never reads or rearms a newer clock.
             self.periodicTick()
             self.lock.lock()
-            if self.running { self.periodicTimer?.schedule(deadline: .now() + .seconds(5)) }
+            if self.running, self.periodicClock.isCurrent(generation) {
+                self.periodicTimer?.schedule(deadline: .now() + .seconds(5))
+            }
             self.lock.unlock()
         }
         periodicTimer = timer
+        periodicGeneration = generation
         timer.resume()
         lock.unlock()
+    }
+
+    private func ownsPeriodicClock(_ generation: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return running && periodicTimer != nil && periodicClock.isCurrent(generation)
     }
 
     private func periodicTick() {
@@ -199,13 +225,29 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             } catch RoomVerificationError.busy {
                 outcome = .busy
             } catch let failure as ApprovedRoomCaptureFailed {
-                outcome = failure.permitsPeriodicRetry && self.periodic.isCurrent(attempt) &&
-                    self.savedBindingMatches(attempt.binding) ? .retryableReadFailure : .failed
+                let current = self.periodic.isCurrent(attempt) && self.savedBindingMatches(attempt.binding)
+                if current, failure.permitsPeriodicRetry {
+                    outcome = .retryableReadFailure
+                } else if current, failure.permitsBoundedPartialRetry, let received = failure.failure.received {
+                    outcome = .partialReadFailure(received: received)
+                } else {
+                    outcome = .failed
+                }
             } catch {
                 outcome = .failed
             }
             self.periodic.complete(attempt, outcome: outcome, now: Date())
+            if let reason = self.periodic.blockReason {
+                Self.log.error("periodic room reads stopped: \(reason, privacy: .public)")
+            }
         }
+    }
+
+    private static let log = Logger(subsystem: "io.tinyland.dcx2496.logic", category: "periodic-room")
+
+    /// Why periodic room reads stopped, or nil while they may run.
+    public func periodicReaderBlockReason() -> String? {
+        periodic.blockReason
     }
 
     /// Currently loaded checked configuration, if any.
