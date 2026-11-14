@@ -347,7 +347,7 @@ private struct HelperContentView: View {
             }
             Divider()
             DisclosureGroup("Approved room verification") {
-                Text("Paste the independently approved dcx.room-expectation/v1 document. Capture never approves an image. No device write occurs.")
+                Text("Paste the independently approved dcx.room-expectation/v1 or v2 document. Only an approved v2 file validates. Capture never approves an image. No device write occurs.")
                     .font(.caption)
                 TextEditor(text: $model.approvedRoomExpectation)
                     .font(.system(.caption, design: .monospaced))

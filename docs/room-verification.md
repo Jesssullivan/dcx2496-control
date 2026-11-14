@@ -320,13 +320,18 @@ DCX preset instead. It names no scene.
 
 | Field | Meaning |
 |---|---|
-| `presetId` | Legalab preset name in `profiles/dcx-scene-map.json` |
+| `presetId` | Legalab preset name in `profiles/dcx-scene-map.json`. Lowercase letters, digits and hyphens |
 | `presetDigest` | The catalog `dcxPresetDigest` of every scene that uses the preset |
 | `dcxBlockDigest` | Legalab canonical digest of the catalog scene's `dcx` object |
 | `snapshotDigest` | Exact whole-device image this preset is on the named device |
 | `approved` | True only after a named-device readback equals `snapshotDigest` |
 | `basis` | The readback receipt, or why approval is pending |
 | `outputMutes`, `profiles` | As in v1 |
+
+v2 covers only named presets. The Legalab catalog gives the jbl-2.0 and
+jbl-2.1 scenes the `dcx.origin` value `explicit outputs`, which is not a
+valid `presetId`. Those scenes get no v2 receipt until Legalab names their
+preset.
 
 An approved file must carry both Legalab digests. An unapproved file may leave
 them null. `profile room-verify` compares an unapproved file offline. A match
@@ -370,9 +375,15 @@ the old receipt, so the next explicit verification publishes the new form.
    publishing v1 receipts. A new helper build with the same file also does.
 2. Install the ASFW app that reads both receipt forms. It admits v1 receipts by
    the same rule as App 61.
-3. Install a helper built from this change. Then rebind the helper and the
+3. Install a helper built from this change, under a decision still to be
+   made. Then rebind the helper and the
    agent pin to the approved practice-room v2 file, with Logic closed, and
    request one verification. App 61 refuses v2 receipts, so step 3 must
    follow step 2.
 4. After the JBL protection applies, Legalab declares and approves the new
    image. Lab rebinds both files to it.
+
+Ruling 55, TIN-5385 comment 8b6baa67, lets the #67 helper fix install once
+its review approves. It does not name this change. Step 3 needs its own
+decision, or a helper build that carries #67 and this change under ruling 55.
+This change and #67 conflict only in `CHANGELOG.md`, per `git merge-tree`.
