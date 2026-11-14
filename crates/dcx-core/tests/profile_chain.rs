@@ -556,26 +556,28 @@ fn room_expectation(snapshot: &SnapshotV1) -> serde_json::Value {
 
 #[test]
 fn room_match_requires_approved_image_and_reviewed_profiles() {
-    use dcx_core::room_verification::verify_room;
+    use dcx_core::room_verification::{RoomVerification, verify_room};
     let states = replay();
     let snapshot = &states.last().unwrap().1;
     let expected = room_expectation(snapshot);
     let bytes = serde_json::to_vec(&expected).unwrap();
-    let comparison = verify_room(snapshot, &bytes).unwrap();
+    let RoomVerification::V1(comparison) = verify_room(snapshot, &bytes).unwrap() else {
+        panic!("a v1 expectation yields a v1 comparison");
+    };
     assert!(comparison.matches);
     assert!(comparison.readable);
     assert_eq!(comparison.expectation_digest, profile_digest(&bytes));
     assert!(comparison.compared_fields > 7);
 
     // A self-consistent but different image never inherits the approved baseline.
-    assert!(!verify_room(&states[0].1, &bytes).unwrap().matches);
+    assert!(!verify_room(&states[0].1, &bytes).unwrap().matches());
     // A contradictory typed profile cannot approve even the exact same bytes.
     let mut contradicted = expected;
     contradicted["profiles"][0]["state"]["gainDbTenths"] = serde_json::json!(-10);
     assert!(
         !verify_room(snapshot, &serde_json::to_vec(&contradicted).unwrap())
             .unwrap()
-            .matches
+            .matches()
     );
 }
 
@@ -603,7 +605,7 @@ fn every_unreviewed_jbl_source_change_fails_exact_image_admission() {
                     .unwrap();
             let comparison = verify_room(&changed, &bytes).unwrap();
             assert_eq!(
-                comparison.matches,
+                comparison.matches(),
                 source == before,
                 "output {output}, source {source}"
             );
@@ -678,4 +680,237 @@ fn approved_refresh_requires_exact_independent_expectation_bytes() {
     unsafe_reserve["outputMutes"][5] = serde_json::json!(false);
     let raw = serde_json::to_vec(&unsafe_reserve).unwrap();
     assert!(ApprovedRoomRefreshAdmission::from_json(&raw, &profile_digest(&raw), device).is_err());
+}
+
+// TIN-5385 step 6: a preset-bound expectation binds the DCX preset and the
+// scene's `dcx` block, never a scene revision.
+fn preset_expectation(snapshot: &SnapshotV1) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": "dcx.room-expectation/v2",
+        "presetId": "practice-room",
+        "presetDigest": format!("sha256/{}", "b".repeat(64)),
+        "dcxBlockDigest": format!("sha256/{}", "c".repeat(64)),
+        "snapshotDigest": snapshot.digest(),
+        "approved": true,
+        "basis": "SYNTHETIC approval for tests",
+        "outputMutes": [true, true, true, false, true, true],
+        "profiles": [profile()],
+    })
+}
+
+fn object_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn preset_expectation_compares_like_v1_and_names_no_scene() {
+    use dcx_core::room_verification::{RoomVerification, verify_room};
+    let states = replay();
+    let snapshot = &states.last().unwrap().1;
+    let v1 = serde_json::to_vec(&room_expectation(snapshot)).unwrap();
+    let v2 = serde_json::to_vec(&preset_expectation(snapshot)).unwrap();
+    let old = verify_room(snapshot, &v1).unwrap();
+    let new = verify_room(snapshot, &v2).unwrap();
+    assert!(old.matches() && new.matches());
+    let RoomVerification::V2(comparison) = &new else {
+        panic!("a v2 expectation yields a v2 comparison");
+    };
+    assert!(comparison.approved);
+    assert_eq!(comparison.expectation_digest, profile_digest(&v2));
+    assert_eq!(comparison.preset_id, "practice-room");
+    // Same image checks: identity, six mutes and every profile field.
+    let RoomVerification::V1(reference) = &old else {
+        panic!("v1 stays v1")
+    };
+    assert_eq!(comparison.compared_fields, reference.compared_fields);
+    assert!(!verify_room(&states[0].1, &v2).unwrap().matches());
+
+    // Wire forms: v1 output keeps its exact key set for installed helpers.
+    let old_json = serde_json::to_value(&old).unwrap();
+    assert_eq!(old_json["schemaVersion"], "dcx.room-comparison/v1");
+    assert_eq!(
+        object_keys(&old_json),
+        [
+            "comparedFields",
+            "compiledDigest",
+            "expectationDigest",
+            "expectedSnapshotDigest",
+            "matches",
+            "presetDigest",
+            "profiles",
+            "readable",
+            "sceneId",
+            "sceneRevision",
+            "snapshotDigest",
+            "schemaVersion",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+    );
+    let new_json = serde_json::to_value(&new).unwrap();
+    assert_eq!(new_json["schemaVersion"], "dcx.room-comparison/v2");
+    for key in ["sceneId", "sceneRevision", "compiledDigest"] {
+        assert!(new_json.get(key).is_none(), "{key}");
+    }
+    assert_eq!(new_json["presetId"], "practice-room");
+    assert_eq!(
+        new_json["dcxBlockDigest"],
+        format!("sha256/{}", "c".repeat(64))
+    );
+    assert_eq!(new_json["approved"], true);
+}
+
+#[test]
+fn preset_expectation_refuses_malformed_or_partial_approval() {
+    use dcx_core::room_verification::{RoomExpectation, RoomExpectationV2};
+    let states = replay();
+    let baseline = &states.last().unwrap().1;
+    let decode = |value: &serde_json::Value| {
+        RoomExpectationV2::from_json(&serde_json::to_vec(value).unwrap())
+    };
+    assert!(decode(&preset_expectation(baseline)).unwrap().approved);
+    // An approved file must carry both Legalab digests.
+    for key in ["presetDigest", "dcxBlockDigest"] {
+        let mut value = preset_expectation(baseline);
+        value[key] = serde_json::Value::Null;
+        assert!(decode(&value).is_err(), "{key} null");
+        value.as_object_mut().unwrap().remove(key);
+        assert!(decode(&value).is_err(), "{key} absent");
+        // The same gap is admitted while unapproved.
+        value["approved"] = serde_json::json!(false);
+        assert!(decode(&value).is_ok(), "{key} unapproved");
+    }
+    for (key, bad) in [
+        ("presetDigest", serde_json::json!("sha256/not-a-digest")),
+        ("dcxBlockDigest", serde_json::json!("sha256/ABC")),
+        ("snapshotDigest", serde_json::json!("sha256/")),
+        ("presetId", serde_json::json!("Practice Room")),
+        ("presetId", serde_json::json!("")),
+        ("basis", serde_json::json!("")),
+        ("basis", serde_json::json!("line\nbreak")),
+        (
+            "schemaVersion",
+            serde_json::json!("dcx.room-expectation/v3"),
+        ),
+    ] {
+        let mut value = preset_expectation(baseline);
+        value[key] = bad;
+        assert!(decode(&value).is_err(), "{key}");
+    }
+    for key in [
+        "sceneId",
+        "sceneRevision",
+        "compiledDigest",
+        "approvedSnapshotDigest",
+    ] {
+        let mut value = preset_expectation(baseline);
+        value[key] = serde_json::json!("x");
+        assert!(decode(&value).is_err(), "scene key {key} is unknown in v2");
+    }
+    let mut value = preset_expectation(baseline);
+    value["outputMutes"][5] = serde_json::json!(false);
+    assert!(decode(&value).is_err());
+    // The dispatcher refuses an unknown schema rather than guessing a form.
+    let mut value = preset_expectation(baseline);
+    value["schemaVersion"] = serde_json::json!("dcx.room-expectation/v9");
+    assert!(RoomExpectation::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
+fn unapproved_preset_compares_offline_but_never_admits_a_refresh() {
+    use dcx_core::{
+        protocol::DeviceId,
+        room_verification::{ApprovedRoomRefreshAdmission, RoomVerification, verify_room},
+    };
+    let states = replay();
+    let snapshot = &states.last().unwrap().1;
+    let device = DeviceId::new(0).unwrap();
+    let approved = serde_json::to_vec(&preset_expectation(snapshot)).unwrap();
+    assert!(
+        ApprovedRoomRefreshAdmission::from_json(&approved, &profile_digest(&approved), device)
+            .is_ok()
+    );
+    let mut pending = preset_expectation(snapshot);
+    pending["approved"] = serde_json::json!(false);
+    pending["presetDigest"] = serde_json::Value::Null;
+    let raw = serde_json::to_vec(&pending).unwrap();
+    // A matching readback is the evidence for approval, not approval itself.
+    let RoomVerification::V2(comparison) = verify_room(snapshot, &raw).unwrap() else {
+        panic!("v2")
+    };
+    assert!(comparison.matches && !comparison.approved);
+    assert!(ApprovedRoomRefreshAdmission::from_json(&raw, &profile_digest(&raw), device).is_err());
+}
+
+const PRACTICE_ROOM: &[u8] =
+    include_bytes!("../../../fixtures/room-expectations/LEGALAB-practice-room.json");
+const JBL_PROTECTED: &[u8] =
+    include_bytes!("../../../fixtures/room-expectations/LEGALAB-jbl-protected.json");
+const JBL_PLAN: &[u8] = include_bytes!("../../../docs/plans/jbl-protection-20a5b485/expected.json");
+
+#[test]
+fn declared_preset_files_bind_the_approved_and_planned_images() {
+    use dcx_core::{
+        protocol::DeviceId,
+        room_verification::{ApprovedRoomRefreshAdmission, RoomExpectationV2},
+    };
+    let device = DeviceId::new(0).unwrap();
+    let room = RoomExpectationV2::from_json(PRACTICE_ROOM).unwrap();
+    assert_eq!(room.preset_id, "practice-room");
+    assert!(room.approved);
+    assert_eq!(
+        room.snapshot_digest,
+        "sha256/20a5b485a4b4053b4b7026b9fb53517d210cbb3b456aa7f135b578c9b728b5e7"
+    );
+    // The shared preset digest the LS56 agent pins today, and the canonical
+    // digest of the practice-room `dcx` block in the scene catalog.
+    assert_eq!(
+        room.preset_digest.as_deref(),
+        Some("sha256/a361aecd15c91f173bc475361f455cc6e0772acf92a84efc18092ba0a35a6038")
+    );
+    assert_eq!(
+        room.dcx_block_digest.as_deref(),
+        Some("sha256/ce403b60c9ae9cf40bc2d36358de9aba82deaf49ac0234caf9c2c63e1a9fae88")
+    );
+    assert!(
+        ApprovedRoomRefreshAdmission::from_json(
+            PRACTICE_ROOM,
+            &profile_digest(PRACTICE_ROOM),
+            device
+        )
+        .is_ok()
+    );
+
+    let jbl = RoomExpectationV2::from_json(JBL_PROTECTED).unwrap();
+    assert_eq!(jbl.preset_id, "jbl-protected");
+    assert!(!jbl.approved);
+    let plan: serde_json::Value = serde_json::from_slice(JBL_PLAN).unwrap();
+    let applies = plan["applies"].as_array().unwrap();
+    assert_eq!(
+        plan["baseline_snapshot_digest"].as_str(),
+        Some(room.snapshot_digest.as_str())
+    );
+    assert_eq!(
+        applies.last().unwrap()["desired_snapshot_digest"].as_str(),
+        Some(jbl.snapshot_digest.as_str())
+    );
+    assert_eq!(
+        jbl.snapshot_digest,
+        "sha256/0b1f125af34b24cb9224d8e83565902d72cbb2b06d0124c77353b4d8076bfe35"
+    );
+    // The plan writes no mute, so the planned image keeps the baseline mutes.
+    assert_eq!(jbl.output_mutes, room.output_mutes);
+    assert!(
+        ApprovedRoomRefreshAdmission::from_json(
+            JBL_PROTECTED,
+            &profile_digest(JBL_PROTECTED),
+            device
+        )
+        .is_err()
+    );
 }

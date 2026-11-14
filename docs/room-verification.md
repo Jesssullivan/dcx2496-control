@@ -319,3 +319,83 @@ transport repair. It preserves the serial policy, proof lifetime and failure
 latch. Source tests, native compilation, installed behavior and a new actual
 failure remain separate evidence. Authority: user implementation direction,
 Root's diagnostic-loss source scope and TIN-6964. Lexical: XL-ACC-004.
+
+## Preset-bound expectations
+
+Linear: TIN-6964 and TIN-5385, design build order step 6. Rulings 39 and 43,
+TIN-5385 comments fa2b83c6 and f8153925. R-N13. Nothing here ran on a device.
+
+A `dcx.room-expectation/v1` file binds one scene id, revision and compiled
+digest. A new LS56-only scene revision therefore voids the room receipt,
+although the DCX image is the same. A `dcx.room-expectation/v2` file binds a
+DCX preset instead. It names no scene.
+
+| Field | Meaning |
+|---|---|
+| `presetId` | Legalab preset name in `profiles/dcx-scene-map.json`. Lowercase letters, digits and hyphens |
+| `presetDigest` | The catalog `dcxPresetDigest` of every scene that uses the preset |
+| `dcxBlockDigest` | Legalab canonical digest of the catalog scene's `dcx` object |
+| `snapshotDigest` | Exact whole-device image this preset is on the named device |
+| `approved` | True only after a named-device readback equals `snapshotDigest` |
+| `basis` | The readback receipt, or why approval is pending |
+| `outputMutes`, `profiles` | As in v1 |
+
+v2 covers only named presets. The Legalab catalog gives the jbl-2.0 and
+jbl-2.1 scenes the `dcx.origin` value `explicit outputs`, which is not a
+valid `presetId`. Those scenes get no v2 receipt until Legalab names their
+preset.
+
+An approved file must carry both Legalab digests. An unapproved file may leave
+them null. `profile room-verify` compares an unapproved file offline. A match
+there is the readback evidence for approval, not approval itself.
+`profile room-validate` and `profile room-refresh` refuse an unapproved file,
+so a helper cannot bind one.
+
+The comparison form follows the expectation form. A v1 file gives
+`dcx.room-comparison/v1` with the same keys as before. A v2 file gives
+`dcx.room-comparison/v2` with `presetId`, `presetDigest`, `dcxBlockDigest`
+and `approved`, and no scene key. The helper publishes
+`dcx.room-verification/v1` from a v1 comparison and `dcx.room-verification/v2`
+from an approved v2 comparison. A v2 receipt carries `presetID`,
+`presetDigest`, `dcxBlockDigest` and the snapshot digests. A comparison that
+mixes the two forms, or names an unapproved preset, publishes nothing.
+
+### Declared files
+
+| File | Preset | Snapshot | Approved |
+|---|---|---|---|
+| `fixtures/room-expectations/LEGALAB-practice-room.json` | practice-room | `20a5b485` | Yes, by expectation `c49d97c0` and receipt `e3facafc` |
+| `fixtures/room-expectations/LEGALAB-jbl-protected.json` | jbl-protected | `0b1f125a`, the final image of the JBL protection plan | No |
+
+Legalab owns these files and their approval. The copies here carry the
+`LEGALAB-` prefix like the profile fixtures, and tests pin them. A file moves
+to `approved: true` only in a reviewed change that cites a device readback
+equal to its `snapshotDigest`. The jbl-protected file has null digests. The
+plan keeps O4 open, as `20a5b485` has it, while the Legalab jbl-protected
+preset declares O4 muted. Legalab must name the preset of this image and
+declare its digests before approval.
+
+The helper does not choose a preset. It verifies the one file whose bytes lab
+delivery saves in `approved-room-configuration.json`. The ASFW agent pins the
+same digest in `practice-controls.json`. To verify another preset, lab
+delivers both files in one activation. The changed configuration invalidates
+the old receipt, so the next explicit verification publishes the new form.
+
+### Delivery order
+
+1. Merge this change. The installed helper and its saved v1 file keep
+   publishing v1 receipts. A new helper build with the same file also does.
+2. Install the ASFW app that reads both receipt forms. It admits v1 receipts by
+   the same rule as App 61.
+3. Install a helper built from this change, under a decision still to be
+   made. Then rebind the helper and the
+   agent pin to the approved practice-room v2 file, with Logic closed, and
+   request one verification. App 61 refuses v2 receipts, so step 3 must
+   follow step 2.
+4. After the JBL protection applies, Legalab declares and approves the new
+   image. Lab rebinds both files to it.
+
+Ruling 55, TIN-5385 comment 8b6baa67, lets the #67 helper fix install once
+its review approves. It does not name this change. Step 3 needs its own
+decision, or a helper build that carries #67 and this change under ruling 55.
+This change and #67 conflict only in `CHANGELOG.md`, per `git merge-tree`.

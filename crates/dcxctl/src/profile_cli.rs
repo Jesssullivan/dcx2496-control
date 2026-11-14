@@ -102,7 +102,7 @@ pub fn verify_room(expectation: &Path, snapshot: &Path) -> Result<bool, Box<dyn 
     )?)?;
     let verification = dcx_core::room_verification::verify_room(&snapshot, &bytes)?;
     println!("{}", serde_json::to_string_pretty(&verification)?);
-    Ok(verification.matches)
+    Ok(verification.matches())
 }
 
 /// Read a complete approved-target image using the existing typed bulk frames.
@@ -135,7 +135,7 @@ pub fn refresh_room(
     let comparison_started = Instant::now();
     let comparison = verify_room(captured.capture().snapshot(), admission.expectation())?;
     let comparison_elapsed = u64::try_from(comparison_started.elapsed().as_millis())?;
-    let matches = comparison.matches;
+    let matches = comparison.matches();
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -157,13 +157,16 @@ pub fn refresh_room(
 }
 
 /// Strict offline preflight before a helper initiates its first device read.
+/// It refuses an unapproved preset file, so a helper cannot bind one.
 pub fn validate_room(expectation: &Path) -> Result<(), Box<dyn Error>> {
     let bytes = read_bounded(
         expectation,
         dcx_core::room_verification::MAX_ROOM_EXPECTATION_BYTES,
         "room expectation",
     )?;
-    dcx_core::room_verification::RoomExpectationV1::from_json(&bytes)?;
+    if !dcx_core::room_verification::RoomExpectation::from_json(&bytes)?.approved() {
+        return Err("room expectation refused: preset expectation is not approved".into());
+    }
     println!(
         "{}",
         serde_json::json!({
