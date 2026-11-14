@@ -147,7 +147,7 @@ fn frame_actions(hex: &str) -> usize {
 }
 
 #[test]
-fn committed_plan_chains_to_the_declared_jbl_protection() {
+fn committed_plan_chains_to_the_proposed_jbl_protection() {
     let expected: Value = serde_json::from_slice(EXPECTED).unwrap();
     let applies = expected["applies"].as_array().unwrap();
     assert_eq!(applies.len(), PLANS.len());

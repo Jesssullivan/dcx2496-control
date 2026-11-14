@@ -6,6 +6,10 @@ the JBLs run to their limit with a high-pass and limiter. Write rules:
 `dec-dcx-attended-software-writes-20261019`, P-TIN-170 comment `131db306`.
 Declared target: the `jbl-protected` preset in Legalab
 `profiles/dcx-scene-map.json` and `jblProtection` in `profiles/levels.json`.
+Those files declare the LR24 high-pass at 45 Hz and the limiter on. They
+declare gain 0 dB and a null limiter threshold. This plan proposes -15.0 dB
+trim and a -13.8 dB threshold for those two fields. A Legalab change must
+declare both values, with a basis, before anyone applies the plan.
 
 This is an offline plan. Nothing here was sent to a device. The plan opens no
 serial port. Applying it is an attended act outside this change.
@@ -87,14 +91,15 @@ ceiling. Conversion: dBu equals dBV plus 2.2.
 
 Inferred: the 92 dB on the product page equals the manual's sensitivity
 figure. The page probably labels sensitivity as a continuous rating. The
-manual's sensitivity is taken at the -10 dBV setting with volume at maximum,
-which matches the rack.
+manual states the sensitivity for a -10 dBV input only. It does not state the
+volume knob position. Inferred: the figure holds at volume maximum, the rack
+setting. Every threshold row below rests on that inference.
 
 JBL input for each rating, and the threshold that caps it:
 
 | Switch | Limit | JBL input | Threshold, input minus 22 | Inside -24 to 0 |
 |---|---|---|---|---|
-| -10 dBV | Input clip, +6 dBV | +8.2 dBu, 108 dB at 1 m | -13.8 dB, code 102 | Yes |
+| -10 dBV | Input clip, +6 dBV | +8.2 dBu, about 108 dB at 1 m | -13.8 dB, code 102 | Yes |
 | -10 dBV | 98 dB continuous | -10 + 6 = -4 dBV = -1.8 dBu | -23.8 dB, code 2 | Yes, 0.2 dB above the floor |
 | -10 dBV | 92 dB product page | -10 dBV = -7.8 dBu | -29.8 dB | No |
 | +4 dBu | Input clip, +20.3 dBu | +20.3 dBu | -1.7 dB, code 223 | Yes |
@@ -104,10 +109,16 @@ JBL input for each rating, and the threshold that caps it:
 The +4 dBu rows are inferred. The manual gives no +4 dBu sensitivity. The
 12.1 dB shift is the gap between its two peak input figures, 20.3 - 8.2.
 
+The manual defines maximum continuous SPL with full-bandwidth pink noise,
+C-weighted. The rows treat that figure as a level for a steady signal, so a
+sine reading is an approximation. The 108 dB figure extends the sensitivity
+linearly up to the input clip point. The manual does not state that the
+response stays linear that far.
+
 At -10 dBV with volume at maximum the limiter can stop input clipping, with
-10.2 dB of threshold range to spare. It can hold a sine to the 98 dB
-continuous rating only at -23.8 dB, 0.2 dB above its floor. It cannot hold
-the 92 dB figure at all. Moving the JBL switch to +4 dBu puts every limit in
+10.2 dB of threshold range to spare. It can hold a steady signal near the
+98 dB continuous rating only at -23.8 dB, 0.2 dB above its floor. It cannot
+hold the 92 dB figure at all. Moving the JBL switch to +4 dBu puts every limit in
 the middle of the range.
 
 The plan sets -13.8 dB, the input clip limit at the attested switch position.
@@ -148,7 +159,7 @@ is therefore UNKNOWN. The O4 ceiling range is the same -2.0 to +22.0 dBu.
 | Item | Effect | Evidence |
 |---|---|---|
 | The `jbl-protected` preset declares O3 and O4 muted | `20a5b485` has O4 unmuted, and ruling 54 puts the Alto in the target. This plan leaves O4 as it is. Muting O4 would take a separate mute write | Legalab `profiles/dcx-scene-map.json`, `decisions.jsonl:262` |
-| Legalab files hold gain 0 and a null threshold | The preset gain and `levels.json` threshold need -15.0 and -13.8 to match this plan | Legalab `profiles/levels.json` |
+| Legalab files hold gain 0 and a null threshold | This plan proposes -15.0 and -13.8. A Legalab change must declare them, with a basis, before the plan is applied | Legalab `profiles/levels.json`, `profiles/dcx-scene-map.json` |
 | O1 low-pass and O2 high-pass share code 180 in `20a5b485` | The planner models only the O4 high-pass to O3 low-pass link. If the device links O1 and O2 the same way, apply 4 also moves the O1 low-pass corner to 37 with its type off. The readback then differs from the desired state and the apply returns `rollback_required`. Both filters are off in apply 4, so nothing audible changes | `docs/typed-writes.md`, Linked O3/O4 crossover |
 | Write containment | An earlier apply moved bytes outside its plan. `write verify` checks every readback | TIN-6805 |
 | Limiter and high-pass addresses have no named-device readback | The first readback that passes `write verify` promotes them | `docs/typed-writes.md`, evidence class |
