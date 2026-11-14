@@ -509,3 +509,9 @@ security:
 # Synthetic linker-environment and bundle-dependency refusals, no Apple tools.
 apple-linkage-tests:
     python3 -B -m unittest discover -s tests -p 'test_apple_*.py'
+
+# Offline dry run of the DCX O1/O2 JBL protection plan. Opens no device.
+# Pass --snapshot PATH (the private 20a5b485 capture) to check device digests.
+[positional-arguments]
+jbl-protection-plan *args:
+    bash scripts/jbl-protection-plan-dry-run.sh "$@"

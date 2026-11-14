@@ -1,0 +1,233 @@
+{
+  "schema": "dcx.write-chain-expectation/v1",
+  "purpose": "JBL protection on DCX O1 and O2, the jbl-protected preset of Legalab profiles/dcx-scene-map.json, planned offline from approved snapshot 20a5b485",
+  "baseline_snapshot_digest": "sha256/20a5b485a4b4053b4b7026b9fb53517d210cbb3b456aa7f135b578c9b728b5e7",
+  "baseline_note": "The raw snapshot is a device capture and stays outside Git. Its decode is Legalab docs/agent-notes/2026-11-13-jbl-level/show-20a5b485.json",
+  "policy": {
+    "max_gain_step_db": 3.0,
+    "gain_ceiling_db": 0.0,
+    "max_actions": 16,
+    "allow_routing": false,
+    "allow_unmute": false,
+    "allow_protection_change": false
+  },
+  "max_actions_per_apply": 3,
+  "applies": [
+    {
+      "apply": 1,
+      "plan": "apply-1-trim.write-plan.json",
+      "baseline_snapshot_digest": "sha256/20a5b485a4b4053b4b7026b9fb53517d210cbb3b456aa7f135b578c9b728b5e7",
+      "desired_snapshot_digest": "sha256/e10681a86f2157c6320624a5896e829587dd4e53109d053c6e951f865e7175bb",
+      "writes": [
+        {
+          "output": 1,
+          "field": "gain",
+          "before_code": 150,
+          "after_code": 0,
+          "after": {
+            "gain_db": -15.0
+          }
+        },
+        {
+          "output": 2,
+          "field": "gain",
+          "before_code": 150,
+          "after_code": 0,
+          "after": {
+            "gain_db": -15.0
+          }
+        }
+      ],
+      "linked_effects": [],
+      "apply_frame_hex": "F0002032000E20020502000006020000F7",
+      "rollback_frame_hex": "F0002032000E20020602011605020116F7",
+      "apply_plan_digest": "sha256/0db17d0a9a19d63489c0046c63653d1b91d549984d2b5b0e68b75c60726cee5c",
+      "rollback_plan_digest": "sha256/8e7a56825c29eed6369b8599f534cc42fc6d8fcc7e9a198bf6c36bf749230ec6",
+      "wire_budget": {
+        "apply_actions": 2,
+        "apply_frame_bytes": 17,
+        "apply_direct_frames": 1,
+        "apply_remote_mode_writes": 5,
+        "rollback_direct_frames": 1,
+        "rollback_remote_mode_writes": 3
+      }
+    },
+    {
+      "apply": 2,
+      "plan": "apply-2-limiter-threshold.write-plan.json",
+      "baseline_snapshot_digest": "sha256/e10681a86f2157c6320624a5896e829587dd4e53109d053c6e951f865e7175bb",
+      "desired_snapshot_digest": "sha256/852b277ac8f84c73892ae8493116eba708b5053b85c5262b4b52ff838fa41701",
+      "writes": [
+        {
+          "output": 1,
+          "field": "limiter.threshold",
+          "before_code": 235,
+          "after_code": 102,
+          "after": {
+            "threshold_db": -13.8
+          }
+        },
+        {
+          "output": 2,
+          "field": "limiter.threshold",
+          "before_code": 240,
+          "after_code": 102,
+          "after": {
+            "threshold_db": -13.8
+          }
+        }
+      ],
+      "linked_effects": [],
+      "apply_frame_hex": "F0002032000E20020547006606470066F7",
+      "rollback_frame_hex": "F0002032000E2002064701700547016BF7",
+      "apply_plan_digest": "sha256/d93c066b5a17a3b0513ae296fa5f2497668ded5cc735b2b49b5e583ea7241edc",
+      "rollback_plan_digest": "sha256/c2bab0cb659334ab4c7c0fd7a82d8ebba8a1002f2c6d7220e8dd64cc6bc3be9f",
+      "wire_budget": {
+        "apply_actions": 2,
+        "apply_frame_bytes": 17,
+        "apply_direct_frames": 1,
+        "apply_remote_mode_writes": 5,
+        "rollback_direct_frames": 1,
+        "rollback_remote_mode_writes": 3
+      }
+    },
+    {
+      "apply": 3,
+      "plan": "apply-3-limiter-on.write-plan.json",
+      "baseline_snapshot_digest": "sha256/852b277ac8f84c73892ae8493116eba708b5053b85c5262b4b52ff838fa41701",
+      "desired_snapshot_digest": "sha256/b31a7e38bbe4fd13b23c72dc0d4c360afdae58bb90e56ee34d8d8fa99d3089a2",
+      "writes": [
+        {
+          "output": 1,
+          "field": "limiter.enabled",
+          "before_code": 0,
+          "after_code": 1,
+          "after": {
+            "enabled": true
+          }
+        },
+        {
+          "output": 2,
+          "field": "limiter.enabled",
+          "before_code": 0,
+          "after_code": 1,
+          "after": {
+            "enabled": true
+          }
+        }
+      ],
+      "linked_effects": [],
+      "apply_frame_hex": "F0002032000E20020546000106460001F7",
+      "rollback_frame_hex": "F0002032000E20020646000005460000F7",
+      "apply_plan_digest": "sha256/fec8400029c14e3169d5abb485c2990804066434a5ae25a29d6a1e09c81170bd",
+      "rollback_plan_digest": "sha256/62b21891f47c4e845042e628e3b753501336be10e25ec24dea78386a08803d46",
+      "wire_budget": {
+        "apply_actions": 2,
+        "apply_frame_bytes": 17,
+        "apply_direct_frames": 1,
+        "apply_remote_mode_writes": 5,
+        "rollback_direct_frames": 1,
+        "rollback_remote_mode_writes": 3
+      }
+    },
+    {
+      "apply": 4,
+      "plan": "apply-4-high-pass-corner.write-plan.json",
+      "baseline_snapshot_digest": "sha256/b31a7e38bbe4fd13b23c72dc0d4c360afdae58bb90e56ee34d8d8fa99d3089a2",
+      "desired_snapshot_digest": "sha256/01d578783be2b084c318fb1bd5ff12c0d00f6506c9560fc8c58600e6ea3b7e32",
+      "writes": [
+        {
+          "output": 1,
+          "field": "high_pass.frequency",
+          "before_code": 0,
+          "after_code": 37,
+          "after": {
+            "frequency_hz": 44.575
+          }
+        },
+        {
+          "output": 2,
+          "field": "high_pass.frequency",
+          "before_code": 180,
+          "after_code": 37,
+          "after": {
+            "frequency_hz": 44.575
+          }
+        }
+      ],
+      "linked_effects": [],
+      "apply_frame_hex": "F0002032000E20020543002506430025F7",
+      "rollback_frame_hex": "F0002032000E20020643013405430000F7",
+      "apply_plan_digest": "sha256/f1be2a5413105993c9cdf85031e3406d6f859ea38e4356fd98cb4a698957b542",
+      "rollback_plan_digest": "sha256/1506c64931e25293dc9bb2a77b5c7ab1c4e65de105fd5710e3d5ff1599aa4cfd",
+      "wire_budget": {
+        "apply_actions": 2,
+        "apply_frame_bytes": 17,
+        "apply_direct_frames": 1,
+        "apply_remote_mode_writes": 5,
+        "rollback_direct_frames": 1,
+        "rollback_remote_mode_writes": 3
+      }
+    },
+    {
+      "apply": 5,
+      "plan": "apply-5-high-pass-on.write-plan.json",
+      "baseline_snapshot_digest": "sha256/01d578783be2b084c318fb1bd5ff12c0d00f6506c9560fc8c58600e6ea3b7e32",
+      "desired_snapshot_digest": "sha256/0b1f125af34b24cb9224d8e83565902d72cbb2b06d0124c77353b4d8076bfe35",
+      "writes": [
+        {
+          "output": 1,
+          "field": "high_pass.type",
+          "before_code": 0,
+          "after_code": 8,
+          "after": {
+            "filter": "lr24"
+          }
+        },
+        {
+          "output": 2,
+          "field": "high_pass.type",
+          "before_code": 0,
+          "after_code": 8,
+          "after": {
+            "filter": "lr24"
+          }
+        }
+      ],
+      "linked_effects": [],
+      "apply_frame_hex": "F0002032000E20020542000806420008F7",
+      "rollback_frame_hex": "F0002032000E20020642000005420000F7",
+      "apply_plan_digest": "sha256/9ee9581f53277c3b65f2ad84fee8d5be59e0d15de0159f0aa99a0259a7d71b58",
+      "rollback_plan_digest": "sha256/f529ec519d7c5a06c3a6c53f0faa030aebc634f4b83b7e1a71e8833a66552613",
+      "wire_budget": {
+        "apply_actions": 2,
+        "apply_frame_bytes": 17,
+        "apply_direct_frames": 1,
+        "apply_remote_mode_writes": 5,
+        "rollback_direct_frames": 1,
+        "rollback_remote_mode_writes": 3
+      }
+    }
+  ],
+  "final": {
+    "snapshot_digest": "sha256/0b1f125af34b24cb9224d8e83565902d72cbb2b06d0124c77353b4d8076bfe35",
+    "outputs": {
+      "1": {
+        "gain_code": 0,
+        "high_pass_type_code": 8,
+        "high_pass_frequency_code": 37,
+        "limiter_enabled_code": 1,
+        "limiter_threshold_code": 102,
+        "mute_code": 0
+      },
+      "2": {
+        "gain_code": 0,
+        "high_pass_type_code": 8,
+        "high_pass_frequency_code": 37,
+        "limiter_enabled_code": 1,
+        "limiter_threshold_code": 102,
+        "mute_code": 0
+      }
+    }
+  }
+}

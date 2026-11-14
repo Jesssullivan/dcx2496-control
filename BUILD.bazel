@@ -50,6 +50,12 @@ filegroup(
     srcs = ["fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json"],
 )
 
+# Typed write plans and expected chain for DCX O1/O2 JBL protection.
+filegroup(
+    name = "jbl_protection_plan",
+    srcs = glob(["docs/plans/jbl-protection-20a5b485/*.json"]),
+)
+
 filegroup(
     name = "synthetic_search_fixture",
     srcs = ["fixtures/protocol/SYNTHETIC-search-response-26.hex"],
@@ -103,6 +109,7 @@ test_suite(
     name = "remote_eligible",
     tests = [
         ":toolchain_pin_parity",
+        "//crates/dcx-core:jbl_protection_plan",
         "//crates/dcx-core:profile_chain",
         "//crates/dcx-core:robustness",
         "//crates/dcx-core:unit_tests",

@@ -1,0 +1,11 @@
+{
+  "schema": "dcx.write-plan/v1",
+  "device_id": 0,
+  "allow_routing": false,
+  "allow_unmute": false,
+  "allow_protection_change": false,
+  "changes": [
+    {"kind": "output_gain", "output": 1, "gain_db": -15},
+    {"kind": "output_gain", "output": 2, "gain_db": -15}
+  ]
+}

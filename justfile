@@ -57,6 +57,11 @@ native-feedback-notch: repo::native-feedback-notch
 
 schema-check: repo::schema-check
 
+[script]
+[positional-arguments]
+jbl-protection-plan *args:
+    exec just -- repo::jbl-protection-plan "$@"
+
 apple-project-generate: repo::apple-project-generate
 
 apple-bundle-check: repo::apple-bundle-check
