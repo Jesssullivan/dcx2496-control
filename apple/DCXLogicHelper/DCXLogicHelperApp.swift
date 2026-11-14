@@ -1,17 +1,21 @@
+import AppKit
 import DCXLogicHelperCore
 import SwiftUI
 
 @main
 struct DCXLogicHelperApp: App {
+    @NSApplicationDelegateAdaptor(HelperAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var model = HelperAppModel()
+
+    private var model: HelperAppModel { appDelegate.model }
 
     var body: some Scene {
-        WindowGroup("DCX Logic Helper") {
+        // A Window scene is unique, so a URL open cannot add a second window.
+        // URLs reach the model through HelperAppDelegate, not through a view.
+        Window("DCX Logic Helper", id: "dcx-logic-helper") {
             HelperContentView(model: model)
                 .frame(minWidth: 640, minHeight: 650)
                 .onAppear { model.enterForeground() }
-                .onOpenURL { model.handleRoomRefreshURL($0) }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -30,6 +34,24 @@ struct DCXLogicHelperApp: App {
     }
 }
 
+/// Owns the one model, so a URL needs no live window or view to arrive.
+@MainActor
+final class HelperAppDelegate: NSObject, NSApplicationDelegate {
+    let model = HelperAppModel()
+
+    /// AppKit calls this for each tinyland-dcx URL, at launch or later, with or
+    /// without an open window. The model starts the bridge before it verifies.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { model.handleRoomRefreshURL(url) }
+    }
+
+    /// A sole Window scene would quit the app when it closes. The process stays
+    /// alive. The bridge still starts and stops with the scene phase.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
 @MainActor
 final class HelperAppModel: ObservableObject {
     @Published private(set) var status = "Starting"
@@ -38,6 +60,7 @@ final class HelperAppModel: ObservableObject {
     @Published private(set) var target = "Not configured"
     @Published private(set) var capabilities = "helper.status"
     @Published private(set) var recovery = "None"
+    @Published private(set) var periodicReads = "Not stopped"
     @Published var bindingID = ""
     @Published var ttyPath = "/dev/cu.usbserial-"
     @Published var expectedDeviceAddress = 0
@@ -103,6 +126,7 @@ final class HelperAppModel: ObservableObject {
             "\($0.bindingID), device \($0.expectedDeviceAddress)"
         } ?? "Not configured"
         capabilities = status.capabilities.map(\.rawValue).joined(separator: ", ")
+        periodicReads = runtime?.periodicReaderBlockReason().map { "Stopped: \($0)" } ?? "Not stopped"
         if status.recoveryUnavailable {
             recovery = "Unavailable (durable state is fail-closed)"
         } else if let active = status.recovery {
@@ -279,6 +303,7 @@ private struct HelperContentView: View {
                 GridRow { Text("CoreMIDI"); Text(model.midiOnline ? "Commands + Status online" : "Offline") }
                 GridRow { Text("Operations"); Text(model.capabilities).textSelection(.enabled) }
                 GridRow { Text("Mutation recovery"); Text(model.recovery).textSelection(.enabled) }
+                GridRow { Text("Periodic room reads"); Text(model.periodicReads).textSelection(.enabled) }
             }
             Divider()
             Text("Exact DCX binding")
@@ -355,7 +380,7 @@ private struct HelperContentView: View {
                 Toggle("Verify approved room when this helper opens before Logic", isOn: $model.verifyRoomOnLaunch)
                 Toggle("Allow explicit saved-room refresh from native controls", isOn: $model.allowRoomRefreshRequests)
                 Toggle("Periodically read the approved room while this helper runs", isOn: $model.periodicRoomVerificationEnabled)
-                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. Failed reads stop periodic attempts until an explicit successful verification or configuration change.")
+                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. A failed read stops periodic attempts until an explicit successful verification or configuration change. Three partial reads in a row also stop them.")
                     .font(.caption)
                 Button("Save Approved Room Configuration") { model.saveApprovedRoom() }
                     .disabled(model.verifyingRoom || !model.configured)

@@ -114,10 +114,23 @@ struct ApprovedRoomFailureEnvelope: Decodable {
 
 struct ApprovedRoomCaptureFailed: Error {
     let failure: RoomCaptureFailureV1
-    /// TIN-6964: only a completed, verified-close empty Dump0 or Dump1 timeout may rearm.
+    /// TIN-6964: a completed, verified-close empty Dump0 or Dump1 timeout rearms with backoff.
     var permitsPeriodicRetry: Bool {
+        isVerifiedClosedDumpTimeout && failure.received == 0
+    }
+
+    /// TIN-6964: a completed, verified-close Dump0 or Dump1 timeout after some
+    /// bytes. The periodic reader may retry it on its next period, up to
+    /// `PeriodicRoomVerification.partialReadCap` in a row. Dump0 and Dump1 are
+    /// reads, so no write is replayed. Unknown close or count still latches.
+    var permitsBoundedPartialRetry: Bool {
+        guard let received = failure.received else { return false }
+        return isVerifiedClosedDumpTimeout && received > 0
+    }
+
+    private var isVerifiedClosedDumpTimeout: Bool {
         failure.schemaVersion == "dcx.approved-room-capture-failure/v1" &&
         failure.category == .timeout && (failure.operation == .dump0 || failure.operation == .dump1) &&
-        failure.received == 0 && failure.sessionClosedVerified && failure.closeFailure == nil
+        failure.sessionClosedVerified && failure.closeFailure == nil
     }
 }

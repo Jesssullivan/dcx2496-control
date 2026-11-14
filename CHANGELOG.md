@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Rearm the periodic room reader after a partial dump (TIN-6964). On
+  November 13, 2026, one Dump1 timeout after 491 bytes stopped periodic reads
+  until another capture cleared it. A verified-close Dump0 or Dump1 timeout
+  after some bytes now retries on the next period. Three in a row stop the
+  reader with a visible reason. A partial dump with an unknown close still
+  stops it at once.
+- Keep the DCX Logic Helper to one window (TIN-6964). On November 11, 2026,
+  five `tinyland-dcx://verify-approved-room` opens left six windows in one
+  process. The scene is now a unique window, and the app delegate hands each
+  URL to the one model, so a refresh needs no open window. The six windows
+  shared one model and one runtime, so they never ran more than one periodic
+  reader. A process-wide reader claim is added only as a defensive guard.
 - Add output profile chains: `dcxctl profile plan|verify` (offline) and
   `profile apply` (`typed-write-live` only) move one output to a Legalab
   `DcxOutputProfileV1` (fixture `fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json`)
