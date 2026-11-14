@@ -48,7 +48,8 @@ commits must be carried onto the Helper 10 branch first.
 
 ## Mac unit gate
 
-Run on PZM on November 14 at head `202c1e35`. macOS 26.7.1 build 25G313,
+Run on PZM on November 14 at head `202c1e35`, then again at `0cdcc71c` with
+the same results. `0cdcc71c` adds only this packet. macOS 26.7.1 build 25G313,
 Xcode 27.1 build 27A9275, Apple Swift 6.4. The tree was a fresh clone under
 the LegalabCache rebuildable root. Each command ran under
 `lockf -k -t 1800 ~/git/legalab-lanes/.pzm-build.lock nice -n 10` with
@@ -86,7 +87,7 @@ replaced build 9, and its rollback restored build 9.
 | # | Step | Mark | Basis |
 |---|---|---|---|
 | 1 | Review approves PR 67. The lead merges it or pins its approved head. Name the source revision `REV` | | |
-| 2 | Swift unit tests on PZM at `REV`, unit only, under the shared build lock. Repeat only if `REV` differs from `202c1e35` in Swift source | | **receipt**: Mac unit gate below |
+| 2 | Swift unit tests on PZM at `REV`, unit only, under the shared build lock. Repeat only if `REV` differs from `0cdcc71c` in Swift source | | **receipt**: Mac unit gate above |
 | 3 | `just pzm-dcx-team-signed-build CHECKOUT REV SCRATCH` from lab, with a clean checkout of `REV` under the scratch root | **SIGN**, **PRIV** | **receipt** for Helper 9 on November 2. Not run for `REV` |
 | 4 | Candidate readback before any placement. Run the commands under Readbacks on the signed bundle in scratch. Record the bundle manifest and three executable digests | | **source** |
 | 5 | Write a lab Helper 11 placement adapter. Copy the Helper 9 adapter. Set `OLD` to the Helper 9 manifest above and the old binaries to the Helper 9 new binaries. Set `NEW` and the new binaries from step 4. Bind the owned-App custody to the running App 61 actor, not App 57 | | **UNPROVEN**: no Helper 11 adapter exists. The unmerged Helper 10 adapter on lab `feat/TIN-6964-helper10-placement-20261102` is the closest template |
@@ -112,7 +113,7 @@ the approved configuration already allows.
 | 4 | AU registration | `pluginkit -m -v -i io.tinyland.dcx2496.logic.midi` | One row, version 0.1.10, path inside `/Applications/DCXLogicHelper.app` |
 | 5 | One window after a verify request | `open tinyland-dcx://verify-approved-room`, then the window count below | Exactly one helper window and one helper process |
 | 6 | Room receipt | `cat "$HOME/Library/Application Support/ASFW/LS56/dcx-room-verification.json"` | `status` `match`, `matches` true, `sceneID` `practice-ready`, `sceneRevision` 1, `compiledDigest` starting `60566ba2`, `expectedSnapshotDigest` and `snapshotDigest` starting `20a5b485`, `captureMetrics.closeVerified` true, a `helperInstanceID` new since step 9 |
-| 7 | Reader state | Click Refresh Local Status in the helper window. Or read `log show --last 30m --predicate 'subsystem == "io.tinyland.dcx2496.logic"'` | Periodic room reads reads `Not stopped`. The log has no `periodic room reads stopped` line |
+| 7 | Reader state | Click Refresh Local Status in the helper window. Or read `log show --last 30m --predicate 'subsystem == "io.tinyland.dcx2496.logic"'` | The Periodic room reads row shows `Not stopped`. The log has no `periodic room reads stopped` line |
 
 Window count for row 5. It reads the window list only and needs no
 permission for owner names:
