@@ -5,13 +5,23 @@ import Foundation
 
 /// Live provenance added only after the foreground helper captures the device.
 /// A matching offline comparison alone cannot construct this receipt.
+///
+/// TIN-5385 step 6. `dcx.room-verification/v1` comes from a scene-bound v1
+/// expectation and carries sceneID, sceneRevision and compiledDigest, the
+/// form installed agents read. `dcx.room-verification/v2` comes from an
+/// approved preset-bound v2 expectation. It carries presetID, presetDigest
+/// and dcxBlockDigest and no scene field, so the agent admits every scene that
+/// compiles to that preset and `dcx` block, at any scene revision. Absent
+/// optional fields are omitted on the wire, so a v1 receipt keeps its keys.
 public struct RoomVerificationReceipt: Codable, Equatable, Sendable {
+    public static let schemaV1 = "dcx.room-verification/v1"
+    public static let schemaV2 = "dcx.room-verification/v2"
     public let schemaVersion: String
     public var status: String
     public let helperInstanceID: String
-    public let sceneID: String
-    public let sceneRevision: UInt32
-    public let compiledDigest: String
+    public let sceneID: String?
+    public let sceneRevision: UInt32?
+    public let compiledDigest: String?
     public let presetDigest: String
     public let expectationDigest: String
     public let snapshotDigest: String
@@ -24,6 +34,8 @@ public struct RoomVerificationReceipt: Codable, Equatable, Sendable {
     public let comparedFields: Int
     public var invalidationReason: String?
     public var captureMetrics: RoomCaptureMetrics? = nil
+    public var presetID: String? = nil
+    public var dcxBlockDigest: String? = nil
 
     /// The heartbeat extends helper liveness, never the actual capture age.
     func renewed(at now: Date, capturedAt: Date, ttyPresent: Bool) -> Self? {
@@ -34,18 +46,48 @@ public struct RoomVerificationReceipt: Codable, Equatable, Sendable {
     }
 }
 
+/// The dcxctl comparison of either expectation form: `dcx.room-comparison/v1`
+/// names a scene, `dcx.room-comparison/v2` names a preset and its approval.
 struct RoomComparison: Codable, Sendable {
     let schemaVersion: String
-    let sceneId: String
-    let sceneRevision: UInt32
-    let compiledDigest: String
-    let presetDigest: String
+    let sceneId: String?
+    let sceneRevision: UInt32?
+    let compiledDigest: String?
+    let presetDigest: String?
     let expectationDigest: String
     let snapshotDigest: String
     let expectedSnapshotDigest: String
     let matches: Bool
     let readable: Bool
     let comparedFields: Int
+    var presetId: String? = nil
+    var dcxBlockDigest: String? = nil
+    var approved: Bool? = nil
+
+    /// The receipt schema this comparison may publish, or nil when its binding
+    /// is malformed, mixes the two forms or names an unapproved preset.
+    var receiptSchema: String? {
+        func digest(_ value: String?) -> Bool {
+            guard let value, value.hasPrefix("sha256/"), value.count == 71 else { return false }
+            return value.dropFirst(7).allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) }
+        }
+        func name(_ value: String?) -> Bool {
+            guard let value, !value.isEmpty, value.count <= 96 else { return false }
+            return value.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" }
+        }
+        switch schemaVersion {
+        case "dcx.room-comparison/v1":
+            guard name(sceneId), (sceneRevision ?? 0) > 0, digest(compiledDigest), digest(presetDigest),
+                  presetId == nil, dcxBlockDigest == nil, approved == nil else { return nil }
+            return RoomVerificationReceipt.schemaV1
+        case "dcx.room-comparison/v2":
+            guard sceneId == nil, sceneRevision == nil, compiledDigest == nil, name(presetId),
+                  digest(presetDigest), digest(dcxBlockDigest), approved == true else { return nil }
+            return RoomVerificationReceipt.schemaV2
+        default:
+            return nil
+        }
+    }
 }
 
 /// Heartbeats repeat a bounded attestation without re-reading serial hardware.
@@ -76,20 +118,20 @@ final class RoomVerificationPublisher: @unchecked Sendable {
                  captureMetrics: RoomCaptureMetrics? = nil, captureBinding: Data? = nil) throws -> RoomVerificationReceipt {
         guard bindingIsCurrent() else { throw RoomVerificationError.unavailable }
         let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
-        guard comparison.schemaVersion == "dcx.room-comparison/v1",
+        guard let schema = comparison.receiptSchema, let presetDigest = comparison.presetDigest,
               comparison.expectationDigest == digest,
-              comparison.sceneRevision > 0, comparison.comparedFields > 6,
+              comparison.comparedFields > 6,
               !comparison.matches || (comparison.readable && comparison.snapshotDigest == comparison.expectedSnapshotDigest) else {
             throw RoomVerificationError.invalidComparison
         }
         var value = RoomVerificationReceipt(
-            schemaVersion: "dcx.room-verification/v1",
+            schemaVersion: schema,
             status: comparison.matches ? "match" : "drift",
             helperInstanceID: instanceID,
             sceneID: comparison.sceneId,
             sceneRevision: comparison.sceneRevision,
             compiledDigest: comparison.compiledDigest,
-            presetDigest: comparison.presetDigest,
+            presetDigest: presetDigest,
             expectationDigest: comparison.expectationDigest,
             snapshotDigest: comparison.snapshotDigest,
             expectedSnapshotDigest: comparison.expectedSnapshotDigest,
@@ -102,6 +144,8 @@ final class RoomVerificationPublisher: @unchecked Sendable {
             invalidationReason: nil
         )
         value.captureMetrics = captureMetrics
+        value.presetID = comparison.presetId
+        value.dcxBlockDigest = comparison.dcxBlockDigest
         lock.lock()
         guard bindingIsCurrent() else { lock.unlock(); throw RoomVerificationError.unavailable }
         receipt = value

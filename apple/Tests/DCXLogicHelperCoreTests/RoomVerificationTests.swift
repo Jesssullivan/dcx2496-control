@@ -395,6 +395,91 @@ final class RoomVerificationTests: XCTestCase {
         XCTAssertNil(publisher.captureDate(expectation: expectation))
     }
 
+    // TIN-5385 step 6: a preset-bound expectation publishes a v2 receipt that
+    // names the preset and dcx block, never a scene.
+    func testPresetBoundComparisonPublishesV2ReceiptWithoutSceneFields() throws {
+        let expectation = Data("SYNTHETIC preset expectation".utf8)
+        let capture = ReceiptCapture()
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { value in capture.append(value) })
+        let receipt = try publisher.install(presetComparison(expectation), expectation: expectation,
+            capturedAt: Date(), ttyPath: "/dev/cu.usbserial-SYNTHETIC")
+        XCTAssertEqual(receipt.schemaVersion, "dcx.room-verification/v2")
+        XCTAssertEqual(receipt.presetID, "practice-room")
+        XCTAssertEqual(receipt.dcxBlockDigest, "sha256/" + String(repeating: "e", count: 64))
+        XCTAssertEqual(receipt.presetDigest, "sha256/" + String(repeating: "d", count: 64))
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(receipt)) as? [String: Any])
+        for key in ["sceneID", "sceneRevision", "compiledDigest"] { XCTAssertNil(wire[key], key) }
+        XCTAssertEqual(wire["presetID"] as? String, "practice-room")
+        XCTAssertEqual(capture.values.count, 1)
+        // An invalidated v2 receipt keeps its binding and loses its match.
+        publisher.invalidate("room-verification-failed")
+        let invalidated = try XCTUnwrap(capture.values.last)
+        XCTAssertEqual(invalidated.schemaVersion, "dcx.room-verification/v2")
+        XCTAssertFalse(invalidated.matches)
+    }
+
+    func testSceneBoundReceiptKeepsItsV1WireKeys() throws {
+        let expectation = Data("SYNTHETIC scene expectation".utf8)
+        let receipt = try RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }).install(
+            comparison(expectation), expectation: expectation, capturedAt: Date(), ttyPath: "/SYNTHETIC")
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(receipt)) as? [String: Any])
+        XCTAssertEqual(Set(wire.keys), ["schemaVersion", "status", "helperInstanceID", "sceneID", "sceneRevision",
+            "compiledDigest", "presetDigest", "expectationDigest", "snapshotDigest", "expectedSnapshotDigest",
+            "verifiedAt", "expiresAt", "readable", "matches", "validationScope", "comparedFields"])
+        XCTAssertEqual(wire["schemaVersion"] as? String, "dcx.room-verification/v1")
+        XCTAssertEqual(wire["sceneRevision"] as? Int, 1)
+    }
+
+    func testMixedOrUnapprovedPresetComparisonCannotPublish() throws {
+        let expectation = Data("SYNTHETIC preset expectation".utf8)
+        let capture = ReceiptCapture()
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { value in capture.append(value) })
+        let digest = "sha256/" + String(repeating: "c", count: 64)
+        let refused: [RoomComparison] = [
+            presetComparison(expectation, approved: false),
+            presetComparison(expectation, approved: nil),
+            presetComparison(expectation, presetID: "Practice Room"),
+            presetComparison(expectation, dcxBlockDigest: nil),
+            presetComparison(expectation, sceneID: "practice-ready"),
+            presetComparison(expectation, compiledDigest: digest),
+        ]
+        for value in refused {
+            XCTAssertThrowsError(try publisher.install(value, expectation: expectation, capturedAt: Date(), ttyPath: "/SYNTHETIC"))
+        }
+        var sceneForm = comparison(expectation)
+        sceneForm.dcxBlockDigest = digest
+        XCTAssertThrowsError(try publisher.install(sceneForm, expectation: expectation, capturedAt: Date(), ttyPath: "/SYNTHETIC"))
+        XCTAssertTrue(capture.values.isEmpty)
+    }
+
+    /// The exact dcxctl v2 comparison keys decode, and an unknown schema is refused.
+    func testDcxctlPresetComparisonDecodes() throws {
+        let expectation = Data("SYNTHETIC preset expectation".utf8)
+        let snapshot = "sha256/" + String(repeating: "a", count: 64)
+        var fields: [String: Any] = ["schemaVersion": "dcx.room-comparison/v2",
+            "expectationDigest": "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined(),
+            "presetId": "practice-room", "presetDigest": "sha256/" + String(repeating: "d", count: 64),
+            "dcxBlockDigest": "sha256/" + String(repeating: "e", count: 64), "approved": true,
+            "snapshotDigest": snapshot, "expectedSnapshotDigest": snapshot, "matches": true, "readable": true,
+            "comparedFields": 62, "profiles": [Any]()]
+        let decoded = try JSONDecoder().decode(RoomComparison.self, from: JSONSerialization.data(withJSONObject: fields))
+        XCTAssertEqual(decoded.receiptSchema, "dcx.room-verification/v2")
+        fields["schemaVersion"] = "dcx.room-comparison/v3"
+        let unknown = try JSONDecoder().decode(RoomComparison.self, from: JSONSerialization.data(withJSONObject: fields))
+        XCTAssertNil(unknown.receiptSchema)
+    }
+
+    private func presetComparison(_ expectation: Data, approved: Bool? = true, presetID: String = "practice-room",
+                                  dcxBlockDigest: String? = "sha256/" + String(repeating: "e", count: 64),
+                                  sceneID: String? = nil, compiledDigest: String? = nil) -> RoomComparison {
+        let snapshot = "sha256/" + String(repeating: "a", count: 64)
+        return .init(schemaVersion: "dcx.room-comparison/v2", sceneId: sceneID, sceneRevision: nil,
+              compiledDigest: compiledDigest, presetDigest: "sha256/" + String(repeating: "d", count: 64),
+              expectationDigest: "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined(),
+              snapshotDigest: snapshot, expectedSnapshotDigest: snapshot, matches: true, readable: true, comparedFields: 62,
+              presetId: presetID, dcxBlockDigest: dcxBlockDigest, approved: approved)
+    }
+
     private func waitForJoin(_ gate: RoomVerificationPreparation) {
         let deadline = Date().addingTimeInterval(2)
         while gate.waitingRequestCount == 0 && Date() < deadline { Thread.sleep(forTimeInterval: 0.001) }

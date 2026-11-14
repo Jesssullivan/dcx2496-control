@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add preset-bound room expectations (`dcx.room-expectation/v2`, TIN-5385
+  step 6). One declared file per DCX preset binds `presetId`, `presetDigest`,
+  `dcxBlockDigest` and the approved snapshot. Its comparison and receipt
+  (`dcx.room-verification/v2`) name no scene, so the agent admits any scene
+  revision that compiles to the same preset and `dcx` block. v1 files,
+  comparisons and receipts are unchanged. An unapproved file compares
+  offline but cannot be bound or refreshed. Declared files for
+  practice-room (`20a5b485`, approved) and jbl-protected (`0b1f125a`,
+  unapproved) live in `fixtures/room-expectations/`.
 - Add output profile chains: `dcxctl profile plan|verify` (offline) and
   `profile apply` (`typed-write-live` only) move one output to a Legalab
   `DcxOutputProfileV1` (fixture `fixtures/profiles/LEGALAB-dcx-o4-vocal-1dc18140.json`)

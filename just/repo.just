@@ -97,6 +97,9 @@ fixtures:
     cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 >/dev/null
     ! cargo run --locked --jobs 2 --quiet --package dcxctl -- profile apply-ready fixtures/profiles/safe-muted-v1.json --profile-digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1
     ! cargo run --locked --jobs 2 --quiet --package dcxctl -- rew import fixtures/rew/SYNTHETIC-cut-only.txt --target-output 3 --allow-boost >/dev/null 2>&1
+    # TIN-5385 step 6: a declared approved preset validates; an unapproved one is refused.
+    cargo run --locked --jobs 2 --quiet --package dcxctl -- profile room-validate --expectation fixtures/room-expectations/LEGALAB-practice-room.json >/dev/null
+    ! cargo run --locked --jobs 2 --quiet --package dcxctl -- profile room-validate --expectation fixtures/room-expectations/LEGALAB-jbl-protected.json >/dev/null 2>&1
     cargo build --locked --jobs 2 --quiet --package dcxctl
     bash tests/feedback_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/feedback/SYNTHETIC-ring-out.txt fixtures/rew/SYNTHETIC-feedback-notches.txt fixtures/snapshots/SYNTHETIC-blank-snapshot.json
     bash tests/routing_pipeline.sh "${CARGO_TARGET_DIR:-target}/debug/dcxctl" fixtures/snapshots/SYNTHETIC-blank-snapshot.json fixtures/snapshots/SYNTHETIC-reserve-muted-snapshot.json
