@@ -1,0 +1,11 @@
+{
+  "schema": "dcx.write-plan/v1",
+  "device_id": 0,
+  "allow_routing": false,
+  "allow_unmute": false,
+  "allow_protection_change": false,
+  "changes": [
+    {"kind": "limiter", "output": 1, "threshold_db": -13.8},
+    {"kind": "limiter", "output": 2, "threshold_db": -13.8}
+  ]
+}

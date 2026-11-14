@@ -42,9 +42,20 @@ rust_test(
     deps = [":dcx_core"] + all_crate_deps(normal = True),
 )
 
+# The committed JBL protection plan, chained on a synthetic 20a5b485.
+rust_test(
+    name = "jbl_protection_plan",
+    size = "small",
+    srcs = ["tests/jbl_protection_plan.rs"],
+    compile_data = ["//:jbl_protection_plan"],
+    edition = "2024",
+    deps = [":dcx_core"] + all_crate_deps(normal = True),
+)
+
 test_suite(
     name = "all_tests",
     tests = [
+        ":jbl_protection_plan",
         ":profile_chain",
         ":robustness",
         ":unit_tests",

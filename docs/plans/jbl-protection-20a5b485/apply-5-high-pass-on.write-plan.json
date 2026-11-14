@@ -1,0 +1,11 @@
+{
+  "schema": "dcx.write-plan/v1",
+  "device_id": 0,
+  "allow_routing": false,
+  "allow_unmute": false,
+  "allow_protection_change": false,
+  "changes": [
+    {"kind": "crossover", "output": 1, "side": "high_pass", "filter": "lr24", "frequency_hz": 45},
+    {"kind": "crossover", "output": 2, "side": "high_pass", "filter": "lr24", "frequency_hz": 45}
+  ]
+}
