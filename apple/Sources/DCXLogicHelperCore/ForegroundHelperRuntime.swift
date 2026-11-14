@@ -14,6 +14,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
     private var starting = false
     private let periodic = PeriodicRoomVerification()
     private var periodicTimer: DispatchSourceTimer?
+    private var periodicGeneration: UInt64?
     private let periodicClock = PeriodicRoomClockOwnership()
 
     public init() throws {
@@ -82,12 +83,14 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         let wasRunning = running
         running = false
         let stoppedTimer = periodicTimer
+        let stoppedGeneration = periodicGeneration
         periodicTimer = nil
+        periodicGeneration = nil
         lock.unlock()
         guard wasRunning else { return }
         periodic.stop()
         stoppedTimer?.cancel()
-        if stoppedTimer != nil { periodicClock.end(owner: self) }
+        if let stoppedGeneration { periodicClock.end(owner: self, generation: stoppedGeneration) }
         coordinator.setForeground(false)
         socketServer.stop()
         coreMIDI.stop()
@@ -180,6 +183,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             self.lock.unlock()
         }
         periodicTimer = timer
+        periodicGeneration = generation
         timer.resume()
         lock.unlock()
     }

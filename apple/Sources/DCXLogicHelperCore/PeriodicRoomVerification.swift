@@ -49,9 +49,11 @@ final class PeriodicRoomClockOwnership: @unchecked Sendable {
         return current == candidate
     }
 
-    /// Retires the current generation and releases the claim.
-    func end(owner: AnyObject) {
+    /// Retires `retiring` and releases the claim. A stop that names an older
+    /// generation changes nothing, so a late stop cannot retire a newer clock.
+    func end(owner: AnyObject, generation retiring: UInt64) {
         lock.lock(); defer { lock.unlock() }
+        guard current == retiring else { return }
         current = nil
         claim.release(owner)
     }

@@ -197,7 +197,7 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         guard let first = clock.begin(owner: runtime) else { return XCTFail("start must take the claim") }
         XCTAssertTrue(clock.isCurrent(first))
         XCTAssertFalse(claim.acquire(other), "a started clock holds the claim")
-        clock.end(owner: runtime)
+        clock.end(owner: runtime, generation: first)
         XCTAssertFalse(clock.isCurrent(first), "a stopped clock's late event must not tick")
         XCTAssertTrue(claim.acquire(other), "stop releases the claim")
         claim.release(other)
@@ -205,6 +205,20 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         XCTAssertNotEqual(first, second)
         XCTAssertFalse(clock.isCurrent(first), "an old generation stays stale after restart")
         XCTAssertTrue(clock.isCurrent(second))
+    }
+
+    func testStaleStopDoesNotRetireANewerClock() {
+        let claim = PeriodicRoomReaderClaim()
+        let clock = PeriodicRoomClockOwnership(claim: claim)
+        let runtime = NSObject()
+        guard let first = clock.begin(owner: runtime) else { return XCTFail("start must take the claim") }
+        guard let second = clock.begin(owner: runtime) else { return XCTFail("the owner may start again") }
+        clock.end(owner: runtime, generation: first)
+        XCTAssertTrue(clock.isCurrent(second), "a stop for an older generation must not retire the newer one")
+        XCTAssertFalse(claim.acquire(NSObject()), "the newer clock still holds the claim")
+        clock.end(owner: runtime, generation: second)
+        XCTAssertFalse(clock.isCurrent(second))
+        XCTAssertTrue(claim.acquire(NSObject()))
     }
 
     func testClockRefusedWhileAnotherOwnerHoldsTheClaim() {
