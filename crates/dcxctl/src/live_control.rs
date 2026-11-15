@@ -107,6 +107,10 @@ pub fn capture_approved(
                     "comparison": null,
                     "searchAttempts": error.search_attempts(),
                     "searchEmptyTimeouts": error.empty_search_timeouts(),
+                    "staleSearchRepliesDiscarded": {
+                        "dump0": error.stale_search_replies().dump0,
+                        "dump1": error.stale_search_replies().dump1,
+                    },
                     "captureElapsedMilliseconds": u64::try_from(error.elapsed().as_millis())?,
                     "closeVerified": failure["sessionClosedVerified"],
                     "failure": failure,

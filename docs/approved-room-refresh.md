@@ -24,9 +24,12 @@ Successful JSON has schema `dcx.approved-room-refresh/v1`:
 | `comparisonElapsedMilliseconds` | Actual offline comparison duration |
 | `searchAttempts` | Actual Search exchanges submitted |
 | `searchEmptyTimeouts` | Actual empty Search deadline results |
+| `staleSearchRepliesDiscarded` | `dump0` and `dump1`: Search replies the carrier discarded ahead of each dump, each zero or one. Added for TIN-6964. Output before helper build 14 omits it |
 | `validSearchCount` | One validated same-address identity |
 | `closeVerified` | `true` only after successful complete capture and verified close |
 | `identityPolicy` | `approved-exact-target-one-identity-three-attempts` |
+
+A failed envelope carries `staleSearchRepliesDiscarded` too. The stderr text names the same counts as `stale_search_replies`.
 
 Exit zero means match. Exit one means drift and preserves the complete image. Failures returned by the bulk executor emit `status: failed` with null snapshot and comparison. Measured attempts and elapsed duration remain available. The `failure` object uses `dcx.approved-room-capture-failure/v1` with stable category, operation, response count and finish outcome. Its `sessionClosedVerified` and the outer `closeVerified` agree. Close failure uses a fixed carrier category. Human-readable error text grants no authority. Binding, open and admission failures return no ready envelope.
 
