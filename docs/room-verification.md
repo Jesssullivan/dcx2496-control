@@ -180,7 +180,13 @@ Dump1 are reads, so a retry replays no write. A partial dump with an unknown
 close or byte count still latches at once. A validation failure with an
 unknown close, a byte count, or a Search or meter operation also latches.
 
-A stop at either cap lifts by itself after five minutes. Each further cap stop
+A Search that times out, with or without bytes, or fails in transport, with a
+verified close, also retries on the next period with its own count. Three in a
+row stop periodic reads with `periodic-search-read-cap-reached`. Search is a
+read, and each retry opens a new session. A Search validation failure, such as
+a wrong device, and a Search failure with an unknown close still latch.
+
+A stop at any of the three caps lifts by itself after five minutes. Each further cap stop
 before a successful capture doubles the pause, up to thirty minutes. The first
 read after a pause repeats every binding, recovery and serial admission check.
 Every other periodic failure stays latched until an explicit successful

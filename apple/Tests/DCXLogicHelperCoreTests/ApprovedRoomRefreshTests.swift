@@ -234,6 +234,105 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    func testNovemberFifteenSearchRecordsRearmOnNextPeriod() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            for (label, record) in try self.novemberFifteenSearchRecords() {
+                let schedule = PeriodicRoomVerification(); schedule.start()
+                let now = Date()
+                let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: now).attempt)
+                backend.refreshOverride = record
+                let failure = try self.captureFailure(coordinator, manifest, configuration)
+                XCTAssertEqual(failure.failure.operation, .search, label)
+                XCTAssertTrue(failure.failure.sessionClosedVerified, label)
+                XCTAssertTrue(failure.permitsBoundedSearchRetry, label)
+                XCTAssertFalse(failure.permitsPeriodicRetry, label)
+                XCTAssertFalse(failure.permitsBoundedPartialRetry, label)
+                XCTAssertFalse(failure.permitsBoundedValidationRetry, label)
+                XCTAssertNil(publisher.current(expectation: manifest), label)
+                schedule.complete(attempt, outcome: .searchReadFailure, now: now)
+                XCTAssertNil(schedule.blockReason, label)
+                let retry = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil,
+                    now: now.addingTimeInterval(PeriodicRoomVerification.successDelay)).attempt, label)
+                backend.refreshOverride = nil
+                let receipt = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                    expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                    bindingIsCurrent: { true })
+                XCTAssertTrue(receipt.matches, label)
+                XCTAssertFalse(backend.arguments.contains { $0.contains("apply") || $0.contains("rollback") },
+                    "a Search retry runs no write path")
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                schedule.complete(retry, outcome: .success(capturedAt: try XCTUnwrap(formatter.date(from: receipt.verifiedAt))),
+                    now: now.addingTimeInterval(PeriodicRoomVerification.successDelay))
+                XCTAssertNil(schedule.blockReason, label)
+            }
+        }
+    }
+
+    func testSearchRetryRefusesUnknownCloseValidationAndOtherOperations() throws {
+        try exerciseRetention { coordinator, _, _, backend, manifest, configuration, _ in
+            let refused: [[String: Any]] = [
+                ["category": "timeout", "operation": "search", "received": 10,
+                 "sessionClosedVerified": false, "closeFailure": "cleanup"],
+                ["category": "transport", "operation": "search", "sessionClosedVerified": false, "closeFailure": "unexpected_trailing_frame"],
+                ["category": "validation", "operation": "search"],
+                ["category": "response_limit", "operation": "search", "received": 27],
+                ["category": "budget_exceeded", "operation": "search"],
+                ["category": "search_qualification_incomplete"],
+                ["category": "transport", "operation": "dump0"],
+                ["category": "transport", "operation": "meter"],
+                ["category": "timeout", "operation": "dump1", "received": 0],
+                ["category": "transport"],
+            ]
+            for fields in refused {
+                backend.refreshOverride = try self.failedRefresh(fields)
+                let failure = try self.captureFailure(coordinator, manifest, configuration)
+                XCTAssertFalse(failure.permitsBoundedSearchRetry, "\(fields)")
+            }
+            backend.refreshOverride = try self.failedRefresh(["category": "timeout", "operation": "search", "received": 1])
+            XCTAssertTrue(try self.captureFailure(coordinator, manifest, configuration).permitsBoundedSearchRetry)
+        }
+    }
+
+    func testRuntimeMapsEachCaptureFailureToItsPeriodicOutcome() throws {
+        func label(_ outcome: PeriodicRoomVerification.Outcome) -> String {
+            switch outcome {
+            case .success: return "success"
+            case .busy: return "busy"
+            case .failed: return "failed"
+            case .retryableReadFailure: return "retryable"
+            case .partialReadFailure(let received): return "partial-\(received)"
+            case .validationReadFailure: return "validation"
+            case .searchReadFailure: return "search"
+            }
+        }
+        try exerciseRetention { coordinator, _, _, backend, manifest, configuration, _ in
+            let cases: [([String: Any], String)] = [
+                (["category": "timeout", "operation": "dump0", "received": 0], "retryable"),
+                (["category": "timeout", "operation": "dump1", "received": 7], "partial-7"),
+                (["category": "validation", "operation": "dump0"], "validation"),
+                (["category": "timeout", "operation": "search", "received": 10], "search"),
+                (["category": "timeout", "operation": "search", "received": 0], "search"),
+                (["category": "transport", "operation": "search"], "search"),
+                (["category": "timeout", "operation": "search", "received": 10,
+                  "sessionClosedVerified": false, "closeFailure": "cleanup"], "failed"),
+                (["category": "validation", "operation": "search"], "failed"),
+                (["category": "transport", "operation": "dump0"], "failed"),
+            ]
+            for (fields, expected) in cases {
+                backend.refreshOverride = try self.failedRefresh(fields)
+                let failure = try self.captureFailure(coordinator, manifest, configuration)
+                XCTAssertEqual(label(failure.periodicOutcome(current: true)), expected, "\(fields)")
+                XCTAssertEqual(label(failure.periodicOutcome(current: false)), "failed", "\(fields)")
+            }
+            for (name, record) in try self.novemberFifteenSearchRecords() {
+                backend.refreshOverride = record
+                let failure = try self.captureFailure(coordinator, manifest, configuration)
+                XCTAssertEqual(label(failure.periodicOutcome(current: true)), "search", name)
+            }
+        }
+    }
+
     func testPeriodicStopRestatesTheInvalidatedReceiptWithItsReason() throws {
         let sent = ReceiptLog()
         let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { sent.append($0) }, ttyPresent: { _ in true })
@@ -401,15 +500,32 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         try body(coordinator, publisher, gate, backend, manifest, configuration, first)
     }
 
-    private func failedRefresh(_ fields: [String: Any]) throws -> DCXCTLProcessResult {
+    private func failedRefresh(_ fields: [String: Any], searchAttempts: Int = 2, searchEmptyTimeouts: Int = 1,
+                               elapsedMilliseconds: UInt64 = 5869, stderr: String = "") throws -> DCXCTLProcessResult {
         var failure: [String: Any] = ["schemaVersion": "dcx.approved-room-capture-failure/v1", "sessionClosedVerified": true]
         failure.merge(fields) { _, new in new }
         let closed = failure["sessionClosedVerified"] as? Bool ?? false
         let failed: [String: Any] = ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
             "snapshot": NSNull(), "comparison": NSNull(), "closeVerified": closed,
-            "searchAttempts": 2, "searchEmptyTimeouts": 1, "captureElapsedMilliseconds": 5869, "failure": failure]
+            "searchAttempts": searchAttempts, "searchEmptyTimeouts": searchEmptyTimeouts,
+            "captureElapsedMilliseconds": elapsedMilliseconds, "failure": failure]
         return .init(terminationStatus: 1, stdout: try JSONSerialization.data(withJSONObject: failed),
-            stderr: Data(), durationMilliseconds: 5869)
+            stderr: Data(stderr.utf8), durationMilliseconds: elapsedMilliseconds)
+    }
+
+    /// TIN-6964: the two November 15 Search records from PZM, as the helper
+    /// decodes them. The 06:00:31Z record does not carry its Search counts, so
+    /// this fixture uses the usual two attempts with one empty timeout.
+    private func novemberFifteenSearchRecords() throws -> [(String, DCXCTLProcessResult)] {
+        let trailing = "Error: ApprovedTargetCaptureError { failure: Transport { operation: Search { sequence: 1 }, " +
+            "source: UnexpectedTrailingFrame { received: 26 }, finish_error: None }, search_attempts: 1, " +
+            "empty_search_timeouts: 0, elapsed: 31.8ms }\n"
+        return [
+            ("06:00:31Z", try failedRefresh(["category": "timeout", "operation": "search", "received": 10],
+                elapsedMilliseconds: 6001)),
+            ("22:28:04Z", try failedRefresh(["category": "transport", "operation": "search"],
+                searchAttempts: 1, searchEmptyTimeouts: 0, elapsedMilliseconds: 31, stderr: trailing)),
+        ]
     }
 
     private func captureFailure(_ coordinator: DCXHelperCoordinator, _ manifest: Data,

@@ -1898,6 +1898,53 @@ mod tests {
         }
     }
 
+    /// TIN-6964 fixtures from PZM on November 15. At 06:00:31Z a Search timed
+    /// out after 10 bytes. At 22:28:04Z Search 1 failed in transport with one
+    /// attempt and no empty timeout. Both closed verified. The 06:00:31Z
+    /// record does not name the Search sequence. The fixture uses the usual
+    /// unanswered first Search. Each stays terminal inside the session and
+    /// summarizes as a verified-close Search failure, which is the form the
+    /// helper may retry in a new session.
+    #[test]
+    fn november_15_search_failures_are_terminal_and_summarize_as_verified_close() {
+        use crate::capture_failure::{capture_failure_summary, operation_label};
+        let partial = &identity(0)[..10];
+        let cases = [
+            (
+                vec![
+                    Step::Read(SnapshotRead::timed_out(&[]).unwrap()),
+                    Step::Read(SnapshotRead::timed_out(partial).unwrap()),
+                ],
+                "timeout",
+                Some(10),
+                2,
+                1,
+            ),
+            (vec![Step::Fail], "transport", None, 1, 0),
+        ];
+        for (steps, category, received, attempts, empty) in cases {
+            let (session, log) = FakeSession::new(steps);
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            let value = capture_failure_summary(error.failure());
+            assert_eq!(value.category.as_str(), category);
+            assert_eq!(value.operation.map(operation_label), Some("search"));
+            assert_eq!(value.received, received);
+            assert!(value.session_closed_verified);
+            assert!(value.close_failure.is_none());
+            assert_eq!(error.search_attempts(), attempts);
+            assert_eq!(error.empty_search_timeouts(), empty);
+            assert_eq!(log.borrow().operations.len(), attempts);
+            assert!(log.borrow().modes.is_empty());
+            assert!(log.borrow().writes.is_empty());
+            assert_eq!(log.borrow().finishes, 1);
+        }
+    }
+
     #[test]
     fn approved_dump0_timeout_summary_uses_actual_consuming_finish_result() {
         use crate::capture_failure::{capture_failure_summary, operation_label};

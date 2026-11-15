@@ -230,15 +230,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
                 outcome = .busy
             } catch let failure as ApprovedRoomCaptureFailed {
                 let current = self.periodic.isCurrent(attempt) && self.savedBindingMatches(attempt.binding)
-                if current, failure.permitsPeriodicRetry {
-                    outcome = .retryableReadFailure
-                } else if current, failure.permitsBoundedPartialRetry, let received = failure.failure.received {
-                    outcome = .partialReadFailure(received: received)
-                } else if current, failure.permitsBoundedValidationRetry {
-                    outcome = .validationReadFailure
-                } else {
-                    outcome = .failed
-                }
+                outcome = failure.periodicOutcome(current: current)
             } catch {
                 outcome = .failed
             }

@@ -81,6 +81,9 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         /// A verified-close Dump0 or Dump1 read whose complete frame failed
         /// validation, such as a 26-byte frame where a 1015-byte dump belongs.
         case validationReadFailure
+        /// A verified-close Search read that timed out, with or without bytes,
+        /// or failed in transport, such as an unexpected trailing frame.
+        case searchReadFailure
     }
     static let successDelay: TimeInterval = 30
     /// Partial dumps in a row, with no successful capture between them, that
@@ -89,6 +92,9 @@ final class PeriodicRoomVerification: @unchecked Sendable {
     /// Validation failures in a row, with no successful capture between them,
     /// that stop the periodic reader. The first two retry on the next period.
     static let validationReadCap = 3
+    /// Search failures in a row, with no successful capture between them, that
+    /// stop the periodic reader. The first two retry on the next period.
+    static let searchReadCap = 3
     /// TIN-6964: a stop at a verified-close cap lifts by itself after this
     /// cooldown. Each further cap stop doubles it, up to `maximumCapCooldown`.
     static let capCooldown: TimeInterval = 300
@@ -99,6 +105,8 @@ final class PeriodicRoomVerification: @unchecked Sendable {
     }
     static let validationCapReason =
         "periodic-validation-read-cap-reached: \(validationReadCap) dump frames in a row failed validation"
+    static let searchCapReason =
+        "periodic-search-read-cap-reached: \(searchReadCap) Search reads in a row failed with a verified close"
     static func cooldownSuffix(_ seconds: TimeInterval) -> String {
         "; resumes after \(Int(seconds)) seconds"
     }
@@ -116,6 +124,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
     private var busyCount = 0
     private var partialReadCount = 0
     private var validationReadCount = 0
+    private var searchReadCount = 0
     private var capStopCount = 0
     private var blocked = false
     private var blockedReason: String?
@@ -145,6 +154,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         readFailureCount = 0
         partialReadCount = 0
         validationReadCount = 0
+        searchReadCount = 0
         capStopCount = 0
     }
 
@@ -162,6 +172,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         observedCapture = nil
         partialReadCount = 0
         validationReadCount = 0
+        searchReadCount = 0
         capStopCount = 0
         clearBlock()
     }
@@ -193,6 +204,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             clearBlock()
             partialReadCount = 0
             validationReadCount = 0
+            searchReadCount = 0
             due = now
         }
         guard let binding, active == nil, !blocked, due == nil || now >= due! else {
@@ -240,6 +252,17 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             validationReadCount += 1
             if validationReadCount >= Self.validationReadCap {
                 stopAtCap(Self.validationCapReason, now: now)
+            } else {
+                due = now.addingTimeInterval(Self.successDelay)
+            }
+        case .searchReadFailure:
+            // TIN-6964: its own count. Other read failures and busy admission
+            // do not reset it. Only a successful capture or a changed binding
+            // does. The cap stop lifts after its cooldown, so no verified-close
+            // Search failure stops the reader for good.
+            searchReadCount += 1
+            if searchReadCount >= Self.searchReadCap {
+                stopAtCap(Self.searchCapReason, now: now)
             } else {
                 due = now.addingTimeInterval(Self.successDelay)
             }

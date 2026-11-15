@@ -46,6 +46,17 @@ pub const SEARCH_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
 /// Quiet observation after the explicit `ReceiveDirect` recovery write.
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 const RECOVERY_QUIET_WINDOW: Duration = Duration::from_millis(25);
+/// Continuous quiet a persistent session needs after configuration, before
+/// its first write.
+///
+/// TIN-6964: the kernel aborts the adapter's bulk-in pipe at each close, so
+/// bytes the device sends after a close can reach the host only after the next
+/// open. A single queue sample at open runs before they arrive. They then land
+/// in the first Search window, where the carrier takes the first frame that
+/// ends in `f7` as the response. This window is a bounded allowance, not a
+/// measured adapter latency.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+const OPEN_QUIET_WINDOW: Duration = Duration::from_millis(50);
 
 /// A lower-case, prefixed SHA-256 digest safe for sanitized receipts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -731,13 +742,21 @@ impl<B: SerialBackend> PersistentCarrier<B> {
                     .map_err(|fault| system_error(CarrierStage::SnapshotControlLines, fault))?,
             );
 
-            reject_preexisting_input(&mut backend, deadline)?;
             ensure_before_deadline(&mut backend, deadline, CarrierStage::Configure)?;
             configuration_attempted = true;
             backend
                 .configure(&snapshot, baud)
                 .map_err(|fault| system_error(CarrierStage::Configure, fault))?;
-            reject_preexisting_input(&mut backend, deadline)
+            // No byte of this session has been written yet, so any input is
+            // stale and no response of this session can be lost. Input that
+            // never goes quiet ends the open at its deadline.
+            let mut discard_count = 0_usize;
+            drain_until_quiet(
+                &mut backend,
+                deadline,
+                OPEN_QUIET_WINDOW,
+                &mut discard_count,
+            )
         })();
 
         if let Err(error) = setup {
@@ -1218,30 +1237,31 @@ fn execute_receive_direct_recovery_write<B: SerialBackend>(
         .map_err(|fault| system_error(CarrierStage::DiscardInput, fault))?;
     discard_count += 1;
 
-    drain_until_quiet(backend, deadline, &mut discard_count)?;
+    drain_until_quiet(backend, deadline, RECOVERY_QUIET_WINDOW, &mut discard_count)?;
     Ok((written, discard_count))
 }
 
 /// Discard without parsing until one continuous quiet window is observed.
 ///
-/// Resumed input restarts the fixed quiet observation but never retries the
+/// Resumed input restarts the fixed quiet observation but never retries a
 /// typed write. The common operation deadline bounds the complete drain.
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn drain_until_quiet<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
+    quiet_window: Duration,
     discard_count: &mut usize,
 ) -> Result<(), DarwinCarrierError> {
     loop {
         ensure_before_deadline(backend, deadline, CarrierStage::WaitReadable)?;
-        if remaining(backend, deadline) <= RECOVERY_QUIET_WINDOW {
+        if remaining(backend, deadline) <= quiet_window {
             return Err(DarwinCarrierError::Deadline {
                 stage: CarrierStage::WaitReadable,
             });
         }
         let quiet_started = backend.monotonic_now();
         if backend
-            .wait_readable(RECOVERY_QUIET_WINDOW)
+            .wait_readable(quiet_window)
             .map_err(|fault| system_error(CarrierStage::WaitReadable, fault))?
         {
             ensure_before_deadline(backend, deadline, CarrierStage::DiscardInput)?;
@@ -1256,7 +1276,7 @@ fn drain_until_quiet<B: SerialBackend>(
             }
             continue;
         }
-        if backend.monotonic_now().saturating_sub(quiet_started) < RECOVERY_QUIET_WINDOW {
+        if backend.monotonic_now().saturating_sub(quiet_started) < quiet_window {
             return Err(DarwinCarrierError::Deadline {
                 stage: CarrierStage::WaitReadable,
             });
@@ -1960,8 +1980,10 @@ impl DarwinSearchSession {
     ///
     /// # Errors
     ///
-    /// Fails closed on binding, open, snapshot, configuration, queued-input, or
-    /// cleanup failure. No Search bytes are written while opening the session.
+    /// Fails closed on binding, open, snapshot, configuration or cleanup
+    /// failure, and on input that does not go quiet before the open deadline.
+    /// Stale input is discarded before any write. No Search bytes are written
+    /// while opening the session.
     pub fn open_known_38400(binding: PrivateTtyBinding) -> Result<Self, DarwinCarrierError> {
         Ok(Self {
             inner: PersistentCarrier::open(binding, macos::MacOsBackend::new(), FALLBACK_BAUD)?,
