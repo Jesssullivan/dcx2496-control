@@ -347,6 +347,86 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         }
     }
 
+    // TIN-6964: on November 15 one verified-close Search timeout after 10 bytes
+    // latched build 12 for 16 hours. A Search failure now has its own capped
+    // retry, and its cap stop lifts after the cooldown.
+    func testSearchFailureRearmsOnNextPeriodUntilItsOwnCapThenResumes() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        for _ in 1..<PeriodicRoomVerification.searchReadCap {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            schedule.complete(attempt, outcome: .searchReadFailure, now: now)
+            XCTAssertNil(schedule.blockReason)
+            XCTAssertNil(schedule.resumesAt)
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(29.999)).attempt)
+            now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        }
+        let last = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        schedule.complete(last, outcome: .searchReadFailure, now: now)
+        XCTAssertEqual(schedule.blockReason,
+            "periodic-search-read-cap-reached: 3 Search reads in a row failed with a verified close; resumes after 300 seconds")
+        XCTAssertEqual(schedule.resumesAt, now.addingTimeInterval(300))
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(299.999)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(300)).attempt)
+        XCTAssertNil(schedule.blockReason)
+    }
+
+    func testSearchCountIsSeparateAndOnlySuccessResetsIt() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        let outcomes: [PeriodicRoomVerification.Outcome] = [
+            .searchReadFailure, .validationReadFailure, .partialReadFailure(received: 10),
+            .searchReadFailure, .retryableReadFailure, .busy, .validationReadFailure,
+        ]
+        for outcome in outcomes {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            schedule.complete(attempt, outcome: outcome, now: now)
+            XCTAssertNil(schedule.blockReason, "two of each kind stay under every cap")
+            now = now.addingTimeInterval(PeriodicRoomVerification.maximumCapCooldown)
+        }
+        let third = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        schedule.complete(third, outcome: .searchReadFailure, now: now)
+        XCTAssertEqual(schedule.blockReason?.hasPrefix("periodic-search-read-cap-reached"), true)
+
+        let reset = PeriodicRoomVerification(); reset.start()
+        now = at
+        for _ in 0..<2 {
+            let attempt = try XCTUnwrap(reset.poll(binding: first, capturedAt: nil, now: now).attempt)
+            reset.complete(attempt, outcome: .searchReadFailure, now: now)
+            now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        }
+        let good = try XCTUnwrap(reset.poll(binding: first, capturedAt: nil, now: now).attempt)
+        reset.complete(good, outcome: .success(capturedAt: now), now: now)
+        now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        for _ in 0..<2 {
+            let attempt = try XCTUnwrap(reset.poll(binding: first, capturedAt: nil, now: now).attempt)
+            reset.complete(attempt, outcome: .searchReadFailure, now: now)
+            XCTAssertNil(reset.blockReason)
+            now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        }
+    }
+
+    func testSearchCapStopsShareTheDoublingCooldownAndNeverLatch() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        for cooldown in [300.0, 600, 1200, 1800, 1800] {
+            for _ in 0..<PeriodicRoomVerification.searchReadCap {
+                let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+                schedule.complete(attempt, outcome: .searchReadFailure, now: now)
+                if schedule.blockReason == nil { now = now.addingTimeInterval(PeriodicRoomVerification.successDelay) }
+            }
+            XCTAssertEqual(schedule.blockReason?.hasSuffix("; resumes after \(Int(cooldown)) seconds"), true)
+            XCTAssertEqual(schedule.resumesAt, now.addingTimeInterval(cooldown))
+            now = now.addingTimeInterval(cooldown)
+        }
+        // A Search failure that closed unknown maps to .failed and still latches.
+        let unknown = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        schedule.complete(unknown, outcome: .failed, now: now)
+        XCTAssertEqual(schedule.blockReason, PeriodicRoomVerification.failedReason)
+        XCTAssertNil(schedule.resumesAt)
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(86_400)).attempt)
+    }
+
     func testOnlyOnePeriodicReaderOwnerPerProcessClaim() {
         let claim = PeriodicRoomReaderClaim()
         let firstOwner = NSObject(), secondOwner = NSObject()

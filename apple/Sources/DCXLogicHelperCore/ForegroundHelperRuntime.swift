@@ -236,6 +236,8 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
                     outcome = .partialReadFailure(received: received)
                 } else if current, failure.permitsBoundedValidationRetry {
                     outcome = .validationReadFailure
+                } else if current, failure.permitsBoundedSearchRetry {
+                    outcome = .searchReadFailure
                 } else {
                     outcome = .failed
                 }

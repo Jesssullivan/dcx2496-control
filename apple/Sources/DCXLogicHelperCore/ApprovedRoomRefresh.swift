@@ -139,6 +139,20 @@ struct ApprovedRoomCaptureFailed: Error {
         isVerifiedClosedDump(.validation) && failure.received == nil
     }
 
+    /// TIN-6964: a completed, verified-close Search that timed out after some
+    /// bytes or failed in transport. On November 15 one such Search timeout
+    /// latched the reader for 16 hours. The periodic reader may retry it on its
+    /// next period, up to `PeriodicRoomVerification.searchReadCap` in a row.
+    /// Search is a read, so no write is replayed, and the retry opens a new
+    /// session. Search validation, such as a wrong device, and an unknown or
+    /// failed close still latch.
+    var permitsBoundedSearchRetry: Bool {
+        failure.schemaVersion == "dcx.approved-room-capture-failure/v1" &&
+        (failure.category == .timeout || failure.category == .transport) &&
+        failure.operation == .search &&
+        failure.sessionClosedVerified && failure.closeFailure == nil
+    }
+
     private var isVerifiedClosedDumpTimeout: Bool {
         isVerifiedClosedDump(.timeout)
     }
