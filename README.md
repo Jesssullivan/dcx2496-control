@@ -285,11 +285,12 @@ dcxctl profile verify --profile dcx-o4-vocal.json --snapshot readback.json
   use receive-and-transmit only immediately before the reviewed direct command.
   No unobserved disable frame is invented.
 - A session open drains stale input until one bounded quiet window passes,
-  before any write. After that, queued input blocks a write. Reads have exact response ceilings and stop on
-  timeout, malformed framing, wrong address/part, overflow, or EOF.
+  before any write. After that, queued input blocks a write. Reads have exact
+  response ceilings and stop on timeout, malformed framing, wrong address/part,
+  overflow, or EOF.
 - The separate `recover-receive-direct` operation is the only write path that
-  proceeds past queued input: it discards rather than accepts pending input and can
-  write only the closed, named-device ReceiveDirect command at fixed 38400. It
+  proceeds past queued input: it discards rather than accepts pending input and
+  can write only the closed, named-device ReceiveDirect command at fixed 38400. It
   drains resumed input without parsing until one continuous bounded quiet
   window is observed; it never retries the typed write.
 - Finish restores and reads back the original terminal and modem-line state,

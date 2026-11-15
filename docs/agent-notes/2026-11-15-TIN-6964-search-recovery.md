@@ -62,7 +62,7 @@ it.
 | Rule | Where |
 |---|---|
 | After `configure` and before any write, the open discards input without parsing until one continuous 50 millisecond quiet window passes. Input that never goes quiet ends the open at its 500 millisecond deadline. No reply of the new session can be lost, since nothing was written. After the open, queued input still blocks a write. | `crates/dcx-darwin-tty/src/lib.rs` |
-| A verified-close Search timeout after some bytes, or a Search transport failure, retries on the next 30 second period with its own count. Three in a row stop the reader with `periodic-search-read-cap-reached` and a resume time from the build 13 cooldown. | `apple/Sources/DCXLogicHelperCore/` |
+| A verified-close Search timeout, with or without bytes, or a Search transport failure, retries on the next 30 second period with its own count. Three in a row stop the reader with `periodic-search-read-cap-reached` and a resume time from the build 13 cooldown. | `apple/Sources/DCXLogicHelperCore/` |
 | A Search failure with an unknown or failed close still maps to `.failed` and latches with no timer. So do Search validation, response limit, budget and qualification failures. | `ForegroundHelperRuntime.swift` |
 | Dump0 and Dump1 validation is unchanged. No write is replayed. | none |
 | Helper build 14, version 0.1.13. | `apple/project.yml` |

@@ -294,6 +294,45 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    func testRuntimeMapsEachCaptureFailureToItsPeriodicOutcome() throws {
+        func label(_ outcome: PeriodicRoomVerification.Outcome) -> String {
+            switch outcome {
+            case .success: return "success"
+            case .busy: return "busy"
+            case .failed: return "failed"
+            case .retryableReadFailure: return "retryable"
+            case .partialReadFailure(let received): return "partial-\(received)"
+            case .validationReadFailure: return "validation"
+            case .searchReadFailure: return "search"
+            }
+        }
+        try exerciseRetention { coordinator, _, _, backend, manifest, configuration, _ in
+            let cases: [([String: Any], String)] = [
+                (["category": "timeout", "operation": "dump0", "received": 0], "retryable"),
+                (["category": "timeout", "operation": "dump1", "received": 7], "partial-7"),
+                (["category": "validation", "operation": "dump0"], "validation"),
+                (["category": "timeout", "operation": "search", "received": 10], "search"),
+                (["category": "timeout", "operation": "search", "received": 0], "search"),
+                (["category": "transport", "operation": "search"], "search"),
+                (["category": "timeout", "operation": "search", "received": 10,
+                  "sessionClosedVerified": false, "closeFailure": "cleanup"], "failed"),
+                (["category": "validation", "operation": "search"], "failed"),
+                (["category": "transport", "operation": "dump0"], "failed"),
+            ]
+            for (fields, expected) in cases {
+                backend.refreshOverride = try self.failedRefresh(fields)
+                let failure = try self.captureFailure(coordinator, manifest, configuration)
+                XCTAssertEqual(label(failure.periodicOutcome(current: true)), expected, "\(fields)")
+                XCTAssertEqual(label(failure.periodicOutcome(current: false)), "failed", "\(fields)")
+            }
+            for (name, record) in try self.novemberFifteenSearchRecords() {
+                backend.refreshOverride = record
+                let failure = try self.captureFailure(coordinator, manifest, configuration)
+                XCTAssertEqual(label(failure.periodicOutcome(current: true)), "search", name)
+            }
+        }
+    }
+
     func testPeriodicStopRestatesTheInvalidatedReceiptWithItsReason() throws {
         let sent = ReceiptLog()
         let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { sent.append($0) }, ttyPresent: { _ in true })

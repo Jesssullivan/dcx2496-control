@@ -139,18 +139,32 @@ struct ApprovedRoomCaptureFailed: Error {
         isVerifiedClosedDump(.validation) && failure.received == nil
     }
 
-    /// TIN-6964: a completed, verified-close Search that timed out after some
-    /// bytes or failed in transport. On November 15 one such Search timeout
-    /// latched the reader for 16 hours. The periodic reader may retry it on its
-    /// next period, up to `PeriodicRoomVerification.searchReadCap` in a row.
-    /// Search is a read, so no write is replayed, and the retry opens a new
-    /// session. Search validation, such as a wrong device, and an unknown or
-    /// failed close still latch.
+    /// TIN-6964: a completed, verified-close Search that timed out or failed in
+    /// transport. A timeout qualifies with or without received bytes. On
+    /// November 15 one such Search timeout latched the reader for 16 hours. The
+    /// periodic reader may retry it on its next period, up to
+    /// `PeriodicRoomVerification.searchReadCap` in a row. Search is a read, so
+    /// no write is replayed, and the retry opens a new session. Search
+    /// validation, such as a wrong device, and an unknown or failed close still
+    /// latch.
     var permitsBoundedSearchRetry: Bool {
         failure.schemaVersion == "dcx.approved-room-capture-failure/v1" &&
         (failure.category == .timeout || failure.category == .transport) &&
         failure.operation == .search &&
         failure.sessionClosedVerified && failure.closeFailure == nil
+    }
+
+    /// The periodic outcome for this failure. A failure of a read that is no
+    /// longer current, or of a kind no rule above admits, latches as `.failed`.
+    func periodicOutcome(current: Bool) -> PeriodicRoomVerification.Outcome {
+        guard current else { return .failed }
+        if permitsPeriodicRetry { return .retryableReadFailure }
+        if permitsBoundedPartialRetry, let received = failure.received {
+            return .partialReadFailure(received: received)
+        }
+        if permitsBoundedValidationRetry { return .validationReadFailure }
+        if permitsBoundedSearchRetry { return .searchReadFailure }
+        return .failed
     }
 
     private var isVerifiedClosedDumpTimeout: Bool {

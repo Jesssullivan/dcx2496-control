@@ -180,7 +180,7 @@ Dump1 are reads, so a retry replays no write. A partial dump with an unknown
 close or byte count still latches at once. A validation failure with an
 unknown close, a byte count, or a Search or meter operation also latches.
 
-A Search that times out after some bytes, or fails in transport, with a
+A Search that times out, with or without bytes, or fails in transport, with a
 verified close, also retries on the next period with its own count. Three in a
 row stop periodic reads with `periodic-search-read-cap-reached`. Search is a
 read, and each retry opens a new session. A Search validation failure, such as

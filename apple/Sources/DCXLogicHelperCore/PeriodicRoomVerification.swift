@@ -81,8 +81,8 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         /// A verified-close Dump0 or Dump1 read whose complete frame failed
         /// validation, such as a 26-byte frame where a 1015-byte dump belongs.
         case validationReadFailure
-        /// A verified-close Search read that timed out after some bytes or
-        /// failed in transport, such as an unexpected trailing frame.
+        /// A verified-close Search read that timed out, with or without bytes,
+        /// or failed in transport, such as an unexpected trailing frame.
         case searchReadFailure
     }
     static let successDelay: TimeInterval = 30
