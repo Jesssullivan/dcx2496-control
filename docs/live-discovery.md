@@ -34,7 +34,12 @@ exact baseline state after recovery.
 Every live invocation validates one explicit `/dev/cu.usbserial-*` callout,
 opens it nonblocking and exclusively, snapshots terminal and modem-line state,
 configures fixed 38400 8N1 once, and reuses that descriptor for the complete
-operation. Consuming finish restores and verifies the original state before
+operation. Before its first write, the open discards input without parsing
+until one continuous 50 millisecond quiet window passes. The adapter can hand
+over bytes sent after the previous close only once the next open starts its
+read pipe. No byte of the new session has been written yet, so nothing it
+discards can be a reply to this session. Input that never goes quiet ends the
+open at its 500 millisecond deadline. Consuming finish restores and verifies the original state before
 close. Setup failure performs the same bounded cleanup; a failed restore is a
 failed operation.
 
@@ -77,7 +82,7 @@ first Search may go unanswered, so its pre-inverse identity check uses the same
 paced qualification: one valid identity, at most ten empty-timeout replays,
 inside a 90-second rollback envelope.
 
-Unrecognized queued input blocks every normal operation write; the separate
+After the open, unrecognized queued input blocks every normal operation write; the separate
 recovery command discards it without parsing before its sole closed write. Once
 a transmit-capable mode is attempted, consuming session finish retains the
 bound device and performs one recovery-capable ReceiveDirect quiescence before

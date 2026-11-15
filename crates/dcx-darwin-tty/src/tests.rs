@@ -63,6 +63,8 @@ struct FakeBackend {
     control_lines_readback: i32,
     shared_calls: Option<Rc<RefCell<Vec<Call>>>>,
     shared_writes: Option<Rc<RefCell<Vec<Vec<u8>>>>>,
+    /// Bytes that arrive only after the next discard, such as a reply.
+    refill_on_discard: Option<Vec<u8>>,
 }
 
 impl FakeBackend {
@@ -91,6 +93,7 @@ impl FakeBackend {
             control_lines_readback: 0x2496,
             shared_calls: None,
             shared_writes: None,
+            refill_on_discard: None,
         }
     }
 
@@ -250,6 +253,9 @@ impl SerialBackend for FakeBackend {
     fn discard_input(&mut self) -> Result<(), SystemFault> {
         self.step(CarrierStage::DiscardInput, Call::DiscardInput)?;
         self.inbound.clear();
+        if let Some(refill) = self.refill_on_discard.take() {
+            self.inbound.extend(refill);
+        }
         self.available_script.clear();
         self.preexisting_script.clear();
         self.preexisting_input = 0;
@@ -1020,30 +1026,154 @@ fn draining_sanitized_receipts_does_not_retain_a_duplicate() {
 }
 
 #[test]
-fn persistent_open_discards_preexisting_input_after_rejection_and_preserves_primary_error() {
+fn persistent_open_discards_queued_stale_input_before_any_write() {
     let shared_calls = Rc::new(RefCell::new(Vec::new()));
     let mut backend = FakeBackend::with_inbound([]).with_shared_calls(Rc::clone(&shared_calls));
     backend.preexisting_input = 7;
 
-    assert!(matches!(
-        PersistentCarrier::open(binding(), backend, FALLBACK_BAUD),
-        Err(DarwinCarrierError::PreexistingInput { queued: 7 })
-    ));
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    assert!(!carrier.input_discard_required);
+    assert_eq!(carrier.backend.now, OPEN_QUIET_WINDOW * 2);
+    carrier.finish().unwrap();
 
     let calls = shared_calls.borrow();
     assert_eq!(
-        calls.as_slice(),
+        &calls[..10],
         [
             Call::Open,
             Call::SnapshotTermios,
             Call::SnapshotControlLines,
+            Call::Configure(FALLBACK_BAUD),
+            Call::WaitReadable,
             Call::BytesAvailable,
             Call::DiscardInput,
+            Call::WaitReadable,
             Call::BytesAvailable,
-            Call::Close,
+            Call::RestoreTermios,
         ]
     );
     assert!(!calls.iter().any(|call| matches!(call, Call::Write(_))));
+}
+
+#[test]
+fn persistent_open_discards_input_that_arrives_inside_the_quiet_window() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.wait_script = [(true, Duration::from_millis(5))].into_iter().collect();
+
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+
+    assert_eq!(
+        &carrier.backend.calls[3..],
+        [
+            Call::Configure(FALLBACK_BAUD),
+            Call::WaitReadable,
+            Call::DiscardInput,
+            Call::WaitReadable,
+            Call::BytesAvailable,
+        ]
+    );
+    assert_eq!(
+        carrier.backend.now,
+        Duration::from_millis(5) + OPEN_QUIET_WINDOW
+    );
+    carrier.finish().unwrap();
+}
+
+#[test]
+fn persistent_open_fails_closed_when_input_never_goes_quiet() {
+    let shared_calls = Rc::new(RefCell::new(Vec::new()));
+    let mut backend = FakeBackend::with_inbound([]).with_shared_calls(Rc::clone(&shared_calls));
+    backend.wait_script = (0..20).map(|_| (true, OPEN_QUIET_WINDOW)).collect();
+
+    assert!(matches!(
+        PersistentCarrier::open(binding(), backend, FALLBACK_BAUD),
+        Err(DarwinCarrierError::Deadline {
+            stage: CarrierStage::WaitReadable,
+        })
+    ));
+
+    let calls = shared_calls.borrow();
+    assert!(!calls.iter().any(|call| matches!(call, Call::Write(_))));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| **call == Call::DiscardInput)
+            .count(),
+        9
+    );
+    assert!(calls.contains(&Call::VerifyTermiosRestore));
+    assert!(calls.contains(&Call::VerifyControlLinesRestore));
+    assert_eq!(calls.last(), Some(&Call::Close));
+}
+
+/// TIN-6964 fixture. PZM, November 15 at 06:00:31Z: a Search timed out after
+/// 10 bytes with a verified close. At 22:28:04Z the next read, in a new
+/// session, failed in 42 milliseconds with this record:
+///
+/// `ApprovedTargetCaptureError { failure: Transport { operation: Search {
+/// sequence: 1 }, source: UnexpectedTrailingFrame { received: 26 },
+/// finish_error: None }, search_attempts: 1, empty_search_timeouts: 0,
+/// elapsed: 31.8ms }`
+///
+/// The bytes were not kept. The fixture models the reading the code allows: a
+/// stale frame of at least 8 bytes that ends in `f7`, here the 16-byte tail of
+/// one Search reply, followed by a fresh 26-byte reply.
+fn november_15_stale_tail() -> Vec<u8> {
+    synthetic_response(0)[SEARCH_RESPONSE_LIMIT - 16..].to_vec()
+}
+
+#[test]
+fn november_15_stale_frame_after_the_search_write_still_fails_closed_as_recorded() {
+    let stale = november_15_stale_tail();
+    let fresh = synthetic_response(0);
+    let writes = Rc::new(RefCell::new(Vec::new()));
+    let mut backend = FakeBackend::with_inbound(stale.iter().copied().chain(fresh))
+        .with_shared_writes(Rc::clone(&writes));
+    // Both frames become readable only after the write, past the open window.
+    backend.post_response_input = stale.len();
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let mut pacer = FastPacer::default();
+
+    let error =
+        execute_persistent_snapshot(carrier, &mut pacer, DeviceId::new(0).unwrap()).unwrap_err();
+
+    assert_eq!(
+        format!("{error:?}"),
+        "Transport { operation: Search { sequence: 1 }, source: \
+         UnexpectedTrailingFrame { received: 26 }, finish_error: None }"
+    );
+    assert_eq!(*writes.borrow(), [synthetic_search_request().to_vec()]);
+}
+
+#[test]
+fn november_15_stale_frame_queued_at_open_is_drained_before_the_first_search() {
+    let stale = november_15_stale_tail();
+    let fresh = synthetic_response(0);
+    let shared_calls = Rc::new(RefCell::new(Vec::new()));
+    let mut backend = FakeBackend::with_inbound(stale.iter().copied())
+        .with_shared_calls(Rc::clone(&shared_calls));
+    backend.preexisting_input = stale.len();
+    backend.refill_on_discard = Some(fresh.to_vec());
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+
+    assert!(matches!(
+        execute_known_38400_search(&mut carrier, DeviceId::new(0).unwrap()).unwrap(),
+        Known38400SearchOutcome::Identified(_)
+    ));
+    let receipt = &carrier.receipts()[0];
+    assert_eq!(receipt.rx_bytes, SEARCH_RESPONSE_LIMIT);
+    assert_eq!(receipt.unexpected_trailing_bytes, 0);
+    assert_eq!(receipt.duplicate_response_count, 0);
+    assert_eq!(
+        carrier.backend.writes,
+        [synthetic_search_request().to_vec()]
+    );
+    carrier.finish().unwrap();
+
+    let calls = shared_calls.borrow();
+    let discard = calls.iter().position(|call| *call == Call::DiscardInput);
+    let write = calls.iter().position(|call| matches!(call, Call::Write(_)));
+    assert!(discard.unwrap() < write.unwrap());
 }
 
 #[test]
@@ -1393,14 +1523,15 @@ fn post_write_failure_taints_every_persistent_operation_until_consuming_cleanup(
 
 #[test]
 fn receive_direct_quiescence_bypasses_taint_and_writes_once_without_reading() {
-    let mut backend = FakeBackend::with_inbound([]);
-    backend.wait_script = [
+    let backend = FakeBackend::with_inbound([]);
+    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    // The open's own quiet window consumed one wait. Script the quiescence.
+    carrier.backend.wait_script = [
         (true, Duration::from_millis(1)),
         (false, RECOVERY_QUIET_WINDOW),
     ]
     .into_iter()
     .collect();
-    let mut carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
     carrier.input_discard_required = true;
     let device = DeviceId::new(0).unwrap();
 
