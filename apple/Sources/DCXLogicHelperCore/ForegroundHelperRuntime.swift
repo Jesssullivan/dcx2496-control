@@ -198,7 +198,11 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         let saved = try? checkedSavedBinding()
         let enabled = saved?.approved.periodicVerificationEnabled == true
         let capturedAt = saved.flatMap { coordinator.roomCaptureDate(expectation: $0.approved.expectation) }
+        let wasBlocked = periodic.blockReason != nil
         let step = periodic.poll(binding: enabled ? saved?.key : nil, capturedAt: capturedAt, now: Date())
+        if wasBlocked, periodic.blockReason == nil, step.attempt != nil {
+            Self.log.notice("periodic room reads resumed")
+        }
         if step.invalidatesPriorBinding { coordinator.invalidateApprovedRoomBinding() }
         guard let attempt = step.attempt, let saved else { return }
         // Only this lifecycle-owned worker can schedule a periodic device read.
@@ -230,6 +234,8 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
                     outcome = .retryableReadFailure
                 } else if current, failure.permitsBoundedPartialRetry, let received = failure.failure.received {
                     outcome = .partialReadFailure(received: received)
+                } else if current, failure.permitsBoundedValidationRetry {
+                    outcome = .validationReadFailure
                 } else {
                     outcome = .failed
                 }
@@ -239,6 +245,10 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             self.periodic.complete(attempt, outcome: outcome, now: Date())
             if let reason = self.periodic.blockReason {
                 Self.log.error("periodic room reads stopped: \(reason, privacy: .public)")
+                // The failed read already invalidated the receipt. Restate it
+                // with the stop reason, so an agent sees the reader stopped and
+                // can request its own room read. A successful read clears it.
+                self.coordinator.reportPeriodicReadsStopped(reason)
             }
         }
     }

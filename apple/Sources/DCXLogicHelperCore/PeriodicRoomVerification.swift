@@ -78,14 +78,32 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         case retryableReadFailure
         /// A verified-close Dump0 or Dump1 timeout after `received` bytes.
         case partialReadFailure(received: UInt32)
+        /// A verified-close Dump0 or Dump1 read whose complete frame failed
+        /// validation, such as a 26-byte frame where a 1015-byte dump belongs.
+        case validationReadFailure
     }
     static let successDelay: TimeInterval = 30
     /// Partial dumps in a row, with no successful capture between them, that
     /// stop the periodic reader. The first two retry on the next period.
     static let partialReadCap = 3
+    /// Validation failures in a row, with no successful capture between them,
+    /// that stop the periodic reader. The first two retry on the next period.
+    static let validationReadCap = 3
+    /// TIN-6964: a stop at a verified-close cap lifts by itself after this
+    /// cooldown. Each further cap stop doubles it, up to `maximumCapCooldown`.
+    static let capCooldown: TimeInterval = 300
+    static let maximumCapCooldown: TimeInterval = 1800
     static let failedReason = "periodic-read-failed"
     static func partialCapReason(received: UInt32) -> String {
         "periodic-partial-read-cap-reached: \(partialReadCap) partial dumps in a row, last received \(received) bytes"
+    }
+    static let validationCapReason =
+        "periodic-validation-read-cap-reached: \(validationReadCap) dump frames in a row failed validation"
+    static func cooldownSuffix(_ seconds: TimeInterval) -> String {
+        "; resumes after \(Int(seconds)) seconds"
+    }
+    static func cooldown(afterStops stops: Int) -> TimeInterval {
+        min(maximumCapCooldown, capCooldown * pow(2, Double(max(stops, 1) - 1)))
     }
     private let lock = NSLock()
     private var running = false
@@ -97,13 +115,37 @@ final class PeriodicRoomVerification: @unchecked Sendable {
     private var readFailureCount = 0
     private var busyCount = 0
     private var partialReadCount = 0
+    private var validationReadCount = 0
+    private var capStopCount = 0
     private var blocked = false
     private var blockedReason: String?
+    /// Set only for a verified-close cap stop. A latched failure has none.
+    private var resumeAt: Date?
 
     /// Why periodic reads stopped, or nil while they may run.
     var blockReason: String? {
         lock.lock(); defer { lock.unlock() }
         return blocked ? blockedReason : nil
+    }
+
+    /// When a cap stop lifts by itself, or nil while running or latched.
+    var resumesAt: Date? {
+        lock.lock(); defer { lock.unlock() }
+        return blocked ? resumeAt : nil
+    }
+
+    private func clearBlock() {
+        blocked = false
+        blockedReason = nil
+        resumeAt = nil
+    }
+
+    private func resetReadCounts() {
+        busyCount = 0
+        readFailureCount = 0
+        partialReadCount = 0
+        validationReadCount = 0
+        capStopCount = 0
     }
 
     func start() {
@@ -119,8 +161,9 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         due = nil
         observedCapture = nil
         partialReadCount = 0
-        blocked = false
-        blockedReason = nil
+        validationReadCount = 0
+        capStopCount = 0
+        clearBlock()
     }
 
     func poll(binding checkedBinding: Data?, capturedAt: Date?, now: Date) -> Step {
@@ -132,11 +175,8 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             generation &+= 1
             binding = checkedBinding
             due = now
-            busyCount = 0
-            readFailureCount = 0
-            partialReadCount = 0
-            blocked = false
-            blockedReason = nil
+            resetReadCounts()
+            clearBlock()
             observedCapture = nil
         }
         // A real explicit/URL/startup capture defers the periodic deadline too.
@@ -144,11 +184,16 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         if let capturedAt, capturedAt <= now, observedCapture == nil || capturedAt > observedCapture! {
             observedCapture = capturedAt
             due = now.addingTimeInterval(Self.successDelay)
-            blocked = false
-            blockedReason = nil
-            busyCount = 0
-            readFailureCount = 0
+            clearBlock()
+            resetReadCounts()
+        }
+        // A verified-close cap stop lifts after its cooldown. The next read
+        // repeats every binding, recovery and serial admission check.
+        if blocked, let resumeAt, now >= resumeAt {
+            clearBlock()
             partialReadCount = 0
+            validationReadCount = 0
+            due = now
         }
         guard let binding, active == nil, !blocked, due == nil || now >= due! else {
             return Step(invalidatesPriorBinding: invalidates, attempt: nil)
@@ -172,9 +217,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         case let .success(capturedAt):
             observedCapture = capturedAt
             due = now.addingTimeInterval(Self.successDelay)
-            busyCount = 0
-            readFailureCount = 0
-            partialReadCount = 0
+            resetReadCounts()
         case .busy:
             busyCount = min(busyCount + 1, 6)
             due = now.addingTimeInterval(min(300, 15 * pow(2, Double(busyCount - 1))))
@@ -187,9 +230,16 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             // successful capture or a changed binding does.
             partialReadCount += 1
             if partialReadCount >= Self.partialReadCap {
-                blocked = true
-                blockedReason = Self.partialCapReason(received: received)
-                due = nil
+                stopAtCap(Self.partialCapReason(received: received), now: now)
+            } else {
+                due = now.addingTimeInterval(Self.successDelay)
+            }
+        case .validationReadFailure:
+            // Its own count. Empty timeouts, partial dumps and busy admission
+            // do not reset it. Only a successful capture or a changed binding does.
+            validationReadCount += 1
+            if validationReadCount >= Self.validationReadCap {
+                stopAtCap(Self.validationCapReason, now: now)
             } else {
                 due = now.addingTimeInterval(Self.successDelay)
             }
@@ -197,7 +247,17 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             // Unknown or failed transport retirement is never retried by a timer.
             blocked = true
             blockedReason = Self.failedReason
+            resumeAt = nil
             due = nil
         }
+    }
+
+    private func stopAtCap(_ reason: String, now: Date) {
+        capStopCount += 1
+        let cooldown = Self.cooldown(afterStops: capStopCount)
+        blocked = true
+        blockedReason = reason + Self.cooldownSuffix(cooldown)
+        resumeAt = now.addingTimeInterval(cooldown)
+        due = nil
     }
 }

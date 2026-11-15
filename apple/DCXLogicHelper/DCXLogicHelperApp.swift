@@ -380,7 +380,7 @@ private struct HelperContentView: View {
                 Toggle("Verify approved room when this helper opens before Logic", isOn: $model.verifyRoomOnLaunch)
                 Toggle("Allow explicit saved-room refresh from native controls", isOn: $model.allowRoomRefreshRequests)
                 Toggle("Periodically read the approved room while this helper runs", isOn: $model.periodicRoomVerificationEnabled)
-                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. A failed read stops periodic attempts until an explicit successful verification or configuration change. Three partial reads in a row also stop them.")
+                Text("Opt-in reads can run while Logic plays. Readiness expires while a fresh capture is unavailable. Three partial or three malformed dump reads in a row pause periodic attempts for five minutes or more, then they resume. Drift, an unknown close and other failures stop them until an explicit successful verification or configuration change.")
                     .font(.caption)
                 Button("Save Approved Room Configuration") { model.saveApprovedRoom() }
                     .disabled(model.verifyingRoom || !model.configured)

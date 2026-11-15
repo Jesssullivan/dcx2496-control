@@ -168,9 +168,11 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         }
         let last = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
         schedule.complete(last, outcome: .partialReadFailure(received: 491), now: now)
-        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(10000)).attempt)
         XCTAssertEqual(schedule.blockReason,
-            "periodic-partial-read-cap-reached: 3 partial dumps in a row, last received 491 bytes")
+            "periodic-partial-read-cap-reached: 3 partial dumps in a row, last received 491 bytes; resumes after 300 seconds")
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(299.999)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(300)).attempt)
+        XCTAssertNil(schedule.blockReason)
     }
     func testSuccessResetsThePartialReadCount() throws {
         let schedule = PeriodicRoomVerification(); schedule.start()
@@ -200,9 +202,9 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         schedule.complete(busy, outcome: .busy, now: at.addingTimeInterval(75))
         let three = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(90)).attempt)
         schedule.complete(three, outcome: .partialReadFailure(received: 7), now: at.addingTimeInterval(90))
-        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(10000)).attempt)
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(389)).attempt)
         XCTAssertEqual(schedule.blockReason,
-            "periodic-partial-read-cap-reached: 3 partial dumps in a row, last received 7 bytes")
+            "periodic-partial-read-cap-reached: 3 partial dumps in a row, last received 7 bytes; resumes after 300 seconds")
     }
     func testCapReasonClearsOnExplicitCaptureOrChangedBinding() throws {
         for clearByCapture in [true, false] {
@@ -232,6 +234,117 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         schedule.complete(retry, outcome: .failed, now: at.addingTimeInterval(30))
         XCTAssertEqual(schedule.blockReason, PeriodicRoomVerification.failedReason)
         XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(10000)).attempt)
+    }
+
+    // TIN-6964: on November 15 a 26-byte frame arrived where the 1015-byte
+    // Dump0 belongs, with a verified close. Build 12 stopped on that one read.
+    func testValidationFailureRearmsOnNextPeriodUntilItsOwnCap() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        for _ in 1..<PeriodicRoomVerification.validationReadCap {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            schedule.complete(attempt, outcome: .validationReadFailure, now: now)
+            XCTAssertNil(schedule.blockReason)
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(29.999)).attempt)
+            now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        }
+        let last = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        schedule.complete(last, outcome: .validationReadFailure, now: now)
+        XCTAssertEqual(schedule.blockReason,
+            "periodic-validation-read-cap-reached: 3 dump frames in a row failed validation; resumes after 300 seconds")
+        XCTAssertEqual(schedule.resumesAt, now.addingTimeInterval(300))
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(299.999)).attempt)
+    }
+
+    func testTheNovemberFifteenSequenceNoLongerStopsTheReader() throws {
+        // Five empty timeouts, each followed by a success, then one validation failure.
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        for _ in 0..<5 {
+            let failed = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            schedule.complete(failed, outcome: .retryableReadFailure, now: now)
+            now = now.addingTimeInterval(15)
+            let good = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            schedule.complete(good, outcome: .success(capturedAt: now), now: now)
+            now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        }
+        let validation = try XCTUnwrap(schedule.poll(binding: first, capturedAt: now.addingTimeInterval(-30), now: now).attempt)
+        schedule.complete(validation, outcome: .validationReadFailure, now: now)
+        XCTAssertNil(schedule.blockReason)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(30)).attempt)
+    }
+
+    func testValidationAndPartialCountsAreSeparateAndOnlySuccessResetsThem() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        let outcomes: [PeriodicRoomVerification.Outcome] = [
+            .validationReadFailure, .partialReadFailure(received: 491), .retryableReadFailure,
+            .validationReadFailure, .partialReadFailure(received: 12), .busy,
+        ]
+        for outcome in outcomes {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            schedule.complete(attempt, outcome: outcome, now: now)
+            XCTAssertNil(schedule.blockReason, "two of each kind stay under both caps")
+            now = now.addingTimeInterval(PeriodicRoomVerification.maximumCapCooldown)
+        }
+        let third = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        schedule.complete(third, outcome: .validationReadFailure, now: now)
+        XCTAssertEqual(schedule.blockReason?.hasPrefix("periodic-validation-read-cap-reached"), true)
+
+        let reset = PeriodicRoomVerification(); reset.start()
+        now = at
+        for _ in 0..<2 {
+            let attempt = try XCTUnwrap(reset.poll(binding: first, capturedAt: nil, now: now).attempt)
+            reset.complete(attempt, outcome: .validationReadFailure, now: now)
+            now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        }
+        let good = try XCTUnwrap(reset.poll(binding: first, capturedAt: nil, now: now).attempt)
+        reset.complete(good, outcome: .success(capturedAt: now), now: now)
+        now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        for _ in 0..<2 {
+            let attempt = try XCTUnwrap(reset.poll(binding: first, capturedAt: nil, now: now).attempt)
+            reset.complete(attempt, outcome: .validationReadFailure, now: now)
+            XCTAssertNil(reset.blockReason)
+            now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        }
+    }
+
+    func testCapStopResumesAfterABoundedDoublingCooldown() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        for cooldown in [300.0, 600, 1200, 1800, 1800] {
+            for _ in 0..<PeriodicRoomVerification.validationReadCap {
+                let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+                schedule.complete(attempt, outcome: .validationReadFailure, now: now)
+                if schedule.blockReason == nil { now = now.addingTimeInterval(PeriodicRoomVerification.successDelay) }
+            }
+            XCTAssertEqual(schedule.blockReason?.hasSuffix("; resumes after \(Int(cooldown)) seconds"), true)
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(cooldown - 0.001)).attempt)
+            now = now.addingTimeInterval(cooldown)
+        }
+        // A success restores the first cooldown.
+        let good = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        schedule.complete(good, outcome: .success(capturedAt: now), now: now)
+        now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        for _ in 0..<PeriodicRoomVerification.validationReadCap {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            schedule.complete(attempt, outcome: .validationReadFailure, now: now)
+            if schedule.blockReason == nil { now = now.addingTimeInterval(PeriodicRoomVerification.successDelay) }
+        }
+        XCTAssertEqual(schedule.resumesAt, now.addingTimeInterval(300))
+    }
+
+    func testLatchedFailureNeverResumesByItself() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let validation = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+        schedule.complete(validation, outcome: .validationReadFailure, now: at)
+        let unknown = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(30)).attempt)
+        schedule.complete(unknown, outcome: .failed, now: at.addingTimeInterval(30))
+        XCTAssertEqual(schedule.blockReason, PeriodicRoomVerification.failedReason)
+        XCTAssertNil(schedule.resumesAt)
+        for seconds in [300.0, 1800, 86_400] {
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(seconds)).attempt)
+        }
     }
 
     func testOnlyOnePeriodicReaderOwnerPerProcessClaim() {
