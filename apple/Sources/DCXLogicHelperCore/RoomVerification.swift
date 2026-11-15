@@ -104,6 +104,12 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     private var ttyPath: String?
     private var timer: DispatchSourceTimer?
     private var bindingIsCurrent: @Sendable () -> Bool = { true }
+    /// The last receipt sent as invalidated. A periodic stop restates it.
+    private var lastInvalidated: RoomVerificationReceipt?
+
+    static func periodicStopReason(_ reason: String) -> String {
+        "periodic-reads-stopped: " + reason
+    }
 
     init(startHeartbeats: Bool = true, submit: (@Sendable (RoomVerificationReceipt) -> Void)? = nil,
          ttyPresent: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) {
@@ -149,6 +155,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         lock.lock()
         guard bindingIsCurrent() else { lock.unlock(); throw RoomVerificationError.unavailable }
         receipt = value
+        lastInvalidated = nil
         self.bindingIsCurrent = bindingIsCurrent
         self.captureBinding = captureBinding
         self.capturedAt = capturedAt
@@ -202,12 +209,25 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         capturedAt = nil
         ttyPath = nil
         bindingIsCurrent = { true }
-        lock.unlock()
-        guard var value = invalidated else { return }
+        guard var value = invalidated else { lock.unlock(); return }
         value.status = "invalidated"
         value.matches = false
         value.expiresAt = Self.timestamp(Date(timeIntervalSince1970: 0))
         value.invalidationReason = reason
+        lastInvalidated = value
+        lock.unlock()
+        submit(value)
+    }
+
+    /// Resends the last invalidated receipt with a new reason. It does nothing
+    /// while a receipt is live or when none was invalidated, so it can never
+    /// restore readiness or replace a newer capture.
+    func restateInvalidation(_ reason: String) {
+        lock.lock()
+        guard receipt == nil, var value = lastInvalidated else { lock.unlock(); return }
+        value.invalidationReason = reason
+        lastInvalidated = value
+        lock.unlock()
         submit(value)
     }
 

@@ -170,15 +170,29 @@ invalid comparison and drift latch periodic reads off. An explicit successful
 verification or a changed approved configuration resets that latch.
 
 A Dump0 or Dump1 timeout after some bytes, with a verified close, retries on
-the next thirty-second period. Three such partial dumps with no successful
-capture between them latch periodic reads off. The reason names the cap and the
-last byte count. The helper window shows it under Periodic room reads, and the
-unified log records it under `io.tinyland.dcx2496.logic`. Dump0 and Dump1 are
-reads, so a retry replays no write. A partial dump with an unknown close or
-byte count still latches at once. Leaving the foreground or stopping the
-reader clears the partial count and the latch, so the cap counts within one
-foreground session. No timer
-performs parameter repair, rollback or unknown-child recovery.
+the next thirty-second period. A Dump0 or Dump1 read whose complete frame fails
+validation, with a verified close, also retries on the next period. It keeps
+its own count. Three partial dumps, or three validation failures, with no
+successful capture between them stop periodic reads. The reason names the cap
+and when reads resume. The helper window shows it under Periodic room reads,
+and the unified log records it under `io.tinyland.dcx2496.logic`. Dump0 and
+Dump1 are reads, so a retry replays no write. A partial dump with an unknown
+close or byte count still latches at once. A validation failure with an
+unknown close, a byte count, or a Search or meter operation also latches.
+
+A stop at either cap lifts by itself after five minutes. Each further cap stop
+before a successful capture doubles the pause, up to thirty minutes. The first
+read after a pause repeats every binding, recovery and serial admission check.
+Every other periodic failure stays latched until an explicit successful
+verification or a changed approved configuration. That covers drift, invalid
+comparison, unknown close and child failures. [Approved room
+refresh](approved-room-refresh.md) keeps them latched. When periodic reads stop, the helper resends the
+invalidated receipt with `invalidationReason` set to
+`periodic-reads-stopped:` and the stop reason. An agent that sees it can open
+the fixed refresh URL. A successful read there clears the latch. Leaving the
+foreground or stopping the reader clears the counts and the stop, so the caps
+count within one foreground session. No timer performs parameter repair,
+rollback or unknown-child recovery.
 
 Saved helper configuration, target, callout and exact expectation bytes must
 match before capture and publication. Foreground exit or a changed binding

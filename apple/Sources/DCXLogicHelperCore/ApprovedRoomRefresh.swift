@@ -128,9 +128,24 @@ struct ApprovedRoomCaptureFailed: Error {
         return isVerifiedClosedDumpTimeout && received > 0
     }
 
+    /// TIN-6964: a completed, verified-close Dump0 or Dump1 read whose complete
+    /// frame failed validation. On November 15 a 26-byte frame arrived where the
+    /// 1015-byte Dump0 belongs. The periodic reader may retry it on its next
+    /// period, up to `PeriodicRoomVerification.validationReadCap` in a row.
+    /// Dump0 and Dump1 are reads, so no write is replayed. The producer reports
+    /// no byte count for a complete frame, so a validation record that carries
+    /// one is not the producer's form and still latches. Unknown close latches.
+    var permitsBoundedValidationRetry: Bool {
+        isVerifiedClosedDump(.validation) && failure.received == nil
+    }
+
     private var isVerifiedClosedDumpTimeout: Bool {
+        isVerifiedClosedDump(.timeout)
+    }
+
+    private func isVerifiedClosedDump(_ category: RoomCaptureFailureV1.Category) -> Bool {
         failure.schemaVersion == "dcx.approved-room-capture-failure/v1" &&
-        failure.category == .timeout && (failure.operation == .dump0 || failure.operation == .dump1) &&
+        failure.category == category && (failure.operation == .dump0 || failure.operation == .dump1) &&
         failure.sessionClosedVerified && failure.closeFailure == nil
     }
 }

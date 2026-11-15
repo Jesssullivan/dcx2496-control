@@ -180,6 +180,12 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         invalidateRoomVerification("saved-approved-room-binding-changed")
     }
 
+    /// Names a periodic reader stop in the already invalidated receipt. It
+    /// changes no live receipt and starts no device operation.
+    func reportPeriodicReadsStopped(_ reason: String) {
+        roomVerification.restateInvalidation(RoomVerificationPublisher.periodicStopReason(reason))
+    }
+
     /// Periodic refresh bypasses completed-cache reuse, never an active flight.
     func verifyBoundRoom(expectation: Data, forceFresh: Bool,
                          expectedConfiguration: HelperConfigurationV1? = nil, approvedTargetRefresh: Bool = false,

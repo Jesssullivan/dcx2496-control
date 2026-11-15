@@ -179,6 +179,97 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    // TIN-6964: the November 15 03:08:08Z record. A 26-byte frame where the
+    // 1015-byte Dump0 belongs, received null, session closed verified.
+    func testVerifiedCloseDumpValidationFailureRearmsOnNextPeriod() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let now = Date()
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: now).attempt)
+            backend.refreshOverride = try self.failedRefresh(["category": "validation", "operation": "dump0"])
+            let failure = try self.captureFailure(coordinator, manifest, configuration)
+            XCTAssertNil(failure.failure.received)
+            XCTAssertFalse(failure.permitsPeriodicRetry)
+            XCTAssertFalse(failure.permitsBoundedPartialRetry)
+            XCTAssertTrue(failure.permitsBoundedValidationRetry)
+            XCTAssertNil(publisher.current(expectation: manifest))
+            schedule.complete(attempt, outcome: .validationReadFailure, now: now)
+            XCTAssertNil(schedule.blockReason)
+            let retry = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: now.addingTimeInterval(30)).attempt)
+            backend.refreshOverride = nil
+            let receipt = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+                expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+                bindingIsCurrent: { true })
+            XCTAssertTrue(receipt.matches)
+            XCTAssertFalse(backend.arguments.contains { $0.contains("apply") || $0.contains("rollback") },
+                "a read retry runs no write path")
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            schedule.complete(retry, outcome: .success(capturedAt: try XCTUnwrap(formatter.date(from: receipt.verifiedAt))),
+                now: now.addingTimeInterval(30))
+            XCTAssertNil(schedule.blockReason)
+        }
+    }
+
+    func testValidationRetryRefusesUnknownCloseCountsSearchAndOtherCategories() throws {
+        try exerciseRetention { coordinator, _, _, backend, manifest, configuration, _ in
+            let refused: [[String: Any]] = [
+                ["category": "validation", "operation": "dump0", "sessionClosedVerified": false, "closeFailure": "cleanup"],
+                ["category": "validation", "operation": "dump0", "received": 26],
+                ["category": "validation", "operation": "search"],
+                ["category": "validation", "operation": "meter"],
+                ["category": "validation"],
+                ["category": "response_limit", "operation": "dump0", "received": 1016],
+                ["category": "transport", "operation": "dump0"],
+            ]
+            for fields in refused {
+                backend.refreshOverride = try self.failedRefresh(fields)
+                let failure = try self.captureFailure(coordinator, manifest, configuration)
+                XCTAssertFalse(failure.permitsBoundedValidationRetry, "\(fields)")
+                XCTAssertFalse(failure.permitsPeriodicRetry, "\(fields)")
+                XCTAssertFalse(failure.permitsBoundedPartialRetry, "\(fields)")
+            }
+            backend.refreshOverride = try self.failedRefresh(["category": "validation", "operation": "dump1"])
+            XCTAssertTrue(try self.captureFailure(coordinator, manifest, configuration).permitsBoundedValidationRetry)
+        }
+    }
+
+    func testPeriodicStopRestatesTheInvalidatedReceiptWithItsReason() throws {
+        let sent = ReceiptLog()
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { sent.append($0) }, ttyPresent: { _ in true })
+        let manifest = Data("SYNTHETIC stop reason".utf8)
+        publisher.restateInvalidation("periodic-reads-stopped: never installed")
+        XCTAssertTrue(sent.values.isEmpty, "no receipt was ever invalidated")
+        let value = try decode(fixture(expectation: manifest))
+        _ = try publisher.install(value.comparison, expectation: manifest, capturedAt: Date(), ttyPath: "/SYNTHETIC")
+        publisher.restateInvalidation("periodic-reads-stopped: live")
+        XCTAssertEqual(sent.values.count, 1, "a live receipt is never replaced by a stop reason")
+        publisher.invalidate("room-verification-failed")
+        let reason = RoomVerificationPublisher.periodicStopReason(PeriodicRoomVerification.failedReason)
+        publisher.restateInvalidation(reason)
+        let restated = try XCTUnwrap(sent.values.last)
+        XCTAssertEqual(restated.status, "invalidated")
+        XCTAssertFalse(restated.matches)
+        XCTAssertEqual(restated.invalidationReason, "periodic-reads-stopped: periodic-read-failed")
+        XCTAssertNil(publisher.current(expectation: manifest))
+        _ = try publisher.install(value.comparison, expectation: manifest, capturedAt: Date(), ttyPath: "/SYNTHETIC")
+        let count = sent.values.count
+        publisher.invalidate("expired-or-disconnected")
+        _ = try publisher.install(value.comparison, expectation: manifest, capturedAt: Date(), ttyPath: "/SYNTHETIC")
+        publisher.restateInvalidation(reason)
+        XCTAssertEqual(sent.values.count, count + 2, "a stop reported after a new capture changes nothing")
+    }
+
+    func testCoordinatorReportsAStopOnlyAfterTheFailedReadInvalidated() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, _ in
+            backend.refreshOverride = try self.failedRefresh(["category": "validation", "operation": "dump0"])
+            _ = try self.captureFailure(coordinator, manifest, configuration)
+            coordinator.reportPeriodicReadsStopped(PeriodicRoomVerification.validationCapReason)
+            XCTAssertNil(publisher.current(expectation: manifest))
+            XCTAssertFalse(publisher.canRetainDuringRead(binding: manifest))
+        }
+    }
+
     func testPeriodicReadFailureImmediatelyInvalidatesRetainedProof() throws {
         try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, first in
             backend.beforeRefresh = {
@@ -310,6 +401,26 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         try body(coordinator, publisher, gate, backend, manifest, configuration, first)
     }
 
+    private func failedRefresh(_ fields: [String: Any]) throws -> DCXCTLProcessResult {
+        var failure: [String: Any] = ["schemaVersion": "dcx.approved-room-capture-failure/v1", "sessionClosedVerified": true]
+        failure.merge(fields) { _, new in new }
+        let closed = failure["sessionClosedVerified"] as? Bool ?? false
+        let failed: [String: Any] = ["schemaVersion": "dcx.approved-room-refresh/v1", "status": "failed",
+            "snapshot": NSNull(), "comparison": NSNull(), "closeVerified": closed,
+            "searchAttempts": 2, "searchEmptyTimeouts": 1, "captureElapsedMilliseconds": 5869, "failure": failure]
+        return .init(terminationStatus: 1, stdout: try JSONSerialization.data(withJSONObject: failed),
+            stderr: Data(), durationMilliseconds: 5869)
+    }
+
+    private func captureFailure(_ coordinator: DCXHelperCoordinator, _ manifest: Data,
+                                _ configuration: HelperConfigurationV1) throws -> ApprovedRoomCaptureFailed {
+        var captureError: ApprovedRoomCaptureFailed?
+        XCTAssertThrowsError(try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
+            expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
+            bindingIsCurrent: { true })) { captureError = $0 as? ApprovedRoomCaptureFailed }
+        return try XCTUnwrap(captureError)
+    }
+
     private func decode(_ object: [String: Any]) throws -> ApprovedRoomRefresh {
         try BridgeJSONCodec.decoder().decode(ApprovedRoomRefresh.self, from: JSONSerialization.data(withJSONObject: object))
     }
@@ -360,4 +471,11 @@ private final class RetentionFlag: @unchecked Sendable {
     private var enabled = true
     var value: Bool { lock.lock(); defer { lock.unlock() }; return enabled }
     func disable() { lock.lock(); enabled = false; lock.unlock() }
+}
+
+private final class ReceiptLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [RoomVerificationReceipt] = []
+    var values: [RoomVerificationReceipt] { lock.lock(); defer { lock.unlock() }; return stored }
+    func append(_ value: RoomVerificationReceipt) { lock.lock(); stored.append(value); lock.unlock() }
 }
