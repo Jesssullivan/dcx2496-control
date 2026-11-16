@@ -170,9 +170,12 @@ invalid comparison and drift latch periodic reads off. An explicit successful
 verification or a changed approved configuration resets that latch.
 
 A Dump0 or Dump1 timeout after some bytes, with a verified close, retries on
-the next thirty-second period. A Dump0 or Dump1 read whose complete frame fails
-validation, with a verified close, also retries on the next period. It keeps
-its own count. Three partial dumps, or three validation failures, with no
+the next thirty-second period. While a kept receipt holds it retries after
+three seconds.
+See [Keeping the receipt after a clean read
+failure](#keeping-the-receipt-after-a-clean-read-failure). A Dump0 or Dump1
+read whose complete frame fails validation, with a verified close, also
+retries on the next period. It keeps its own count. Three partial dumps, or three validation failures, with no
 successful capture between them stop periodic reads. The reason names the cap
 and when reads resume. The helper window shows it under Periodic room reads,
 and the unified log records it under `io.tinyland.dcx2496.logic`. Dump0 and
@@ -181,9 +184,10 @@ close or byte count still latches at once. A validation failure with an
 unknown close, a byte count, or a Search or meter operation also latches.
 
 A Search that times out, with or without bytes, or fails in transport, with a
-verified close, also retries on the next period with its own count. Three in a
-row stop periodic reads with `periodic-search-read-cap-reached`. Search is a
-read, and each retry opens a new session. A Search validation failure, such as
+verified close, also retries on the next period with its own count. While a
+kept receipt holds it retries after three seconds. Three in a row stop periodic reads
+with `periodic-search-read-cap-reached`. Search is a read, and each retry
+opens a new session. A Search validation failure, such as
 a wrong device, and a Search failure with an unknown close still latch.
 
 A stop at any of the three caps lifts by itself after five minutes. Each further cap stop
@@ -200,6 +204,78 @@ foreground or stopping the reader clears the counts and the stop, so the caps
 count within one foreground session. No timer performs parameter repair,
 rollback or unknown-child recovery.
 
+### Keeping the receipt after a clean read failure
+
+Helper build 15 implements ruling 70 of TIN-5385 comment 50be9d3b. Before
+build 15, every failed periodic read invalidated the room receipt at once. On
+November 16 about 2 agent passes in 280 were refused that way. Now a periodic
+read keeps the last good receipt when all of these hold:
+
+| Condition | Where it is checked |
+|---|---|
+| The read is a periodic `profile room-refresh` read that retains its prior proof | `DCXHelperCoordinator.captureRoom` |
+| The failure is an empty or partial Dump0 or Dump1 timeout, or a Search timeout or transport failure | `ApprovedRoomCaptureFailed.keepsPriorReceipt` |
+| The session close is verified and no close failure is named | the same property |
+| The saved binding still matches and the receipt still matches and is under sixty seconds old | `RoomVerificationPublisher.retainedCaptureDate` |
+| The attempt is current and its failure stops no reader | `PeriodicRoomVerification.complete` |
+
+The `room-refresh` child sends Search, Dump0, Dump1 and remote-mode requests.
+It writes no parameter. Every bridge device operation invalidates the receipt
+before it starts, so no session that wrote can keep it.
+
+A kept receipt changes no field. Its `verifiedAt` stays the original capture
+time. The heartbeat renews `expiresAt` from that capture only, so the receipt
+ends sixty seconds after its capture with `expired-or-disconnected`, as any
+receipt does. A failed read never extends it. Each `expiresAt` is the latest
+whole millisecond that reads back no later than capture plus sixty seconds.
+The timestamp keeps three decimals, and a rounded timestamp could read back
+up to half a millisecond past that limit.
+
+The next periodic read is due three seconds after the failed read ends, not
+back to back. The lead set this spacing within ruling 70, so a short burst on
+the serial line does not spend a retry cap of three within a few seconds. The
+runtime moves its five-second check to that time, and the read passes every
+binding, recovery and serial admission guard again.
+
+The existing caps still apply, and the retries change when they are spent:
+
+| Kind | Under a kept receipt | Effect |
+|---|---|---|
+| Empty Dump0 or Dump1 timeout | Retries after three seconds and leaves the backoff count alone. At most three such retries run under one kept receipt | It has no stop cap. The fourth empty timeout under the same kept receipt ends the receipt with `room-verification-failed` and takes the normal backoff, from the count it had before the retries. A newer kept capture or a success starts a new count |
+| Partial Dump0 or Dump1 timeout | Retries after three seconds and counts toward its cap of three | Three failures inside one receipt lifetime stop reads for the five-minute cooldown. The earliest is six seconds after the first, plus the read times. Build 14 spread the same three over about sixty seconds |
+| Search timeout or transport failure | Retries after three seconds and counts toward its cap of three | The same as the partial dump |
+
+The lead set the empty retry cap of three within ruling 70 too. A burst of
+three partial or Search failures can still stop periodic reads where build 14
+would have recovered on its third period. A longer fault reaches the cooldown
+sooner than in build 14. Neither rate is measured yet.
+
+The receipt is invalidated at once in these cases:
+
+| Case | Reason sent |
+|---|---|
+| Unknown or failed close | `room-verification-failed` |
+| The fourth empty dump timeout under one kept receipt | `room-verification-failed` |
+| A validation failure. The record does not say whether the frame named another device or state | `room-verification-failed` |
+| Any other failure kind, a child that left no failure envelope, or a stale attempt | `room-verification-failed` |
+| The failure spends a retry cap or latches the reader | `periodic-reads-stopped:` and the stop reason |
+| Any bridge device operation | `device-operation` |
+| Drift | the drift receipt replaces it |
+
+The coordinator keeps the receipt before the periodic schedule rules on it.
+For a stale attempt or a spent cap, the receipt stays live from the end of the
+read until the schedule ends it. That window covers the diagnostic write and
+one schedule call. The receipt is a real capture under sixty seconds old in
+that window, and every device operation invalidates it before it starts.
+When a device operation ends the kept receipt before the schedule records the
+read, the coordinator tells the schedule no receipt is kept. The read then
+takes its normal delay and count, not the spaced retry.
+
+An explicit button read never keeps a receipt. A startup or URL read that
+starts its own flight never keeps one either. A startup or URL read that joins
+an in-flight periodic read gets that read's outcome. When the periodic read
+keeps the receipt, the joined request still gets the capture failure.
+
 Saved helper configuration, target, callout and exact expectation bytes must
 match before capture and publication. Foreground exit or a changed binding
 invalidates pending work. Joined requests add their binding checks to the shared
@@ -212,7 +288,8 @@ full configuration, callout, expectation and identity-policy key must match.
 Admission reloads recovery authority first. Heartbeats retain the original
 capture time, so expiration still blocks readiness during an unfinished read.
 The new result replaces the old proof atomically. Drift, failed capture,
-foreground exit or changed authority invalidate the prior proof. Mutating
+foreground exit or changed authority invalidate the prior proof. The clean read
+failures listed above are the one exception to failed capture. Mutating
 operations and explicit fresh reads still invalidate before capture.
 `helper.status.activeTransactionID` remains `room-verification` during a read.
 A fresh prior proof means the earlier capture remains valid, not that the
@@ -318,6 +395,8 @@ remain separate qualification steps.
 ## Failure diagnostics
 
 A failed room capture invalidates readiness before any diagnostic storage work.
+A clean periodic read failure that keeps its receipt under ruling 70 still
+writes its diagnostic record.
 The helper keeps the original failure and automatic-retry latch. Optional
 `helper.status` metadata identifies the attempt, phase, typed failure, completed
 child exit code and duration, output digests and whether close was verified.

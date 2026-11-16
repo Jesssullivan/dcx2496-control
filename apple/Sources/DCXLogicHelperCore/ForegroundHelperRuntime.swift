@@ -210,6 +210,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         Task.detached { [weak self] in
             guard let self else { return }
             let outcome: PeriodicRoomVerification.Outcome
+            var kept: Date?
             do {
                 guard self.periodic.isCurrent(attempt), self.savedBindingMatches(attempt.binding), saved.approved.periodicVerificationEnabled else {
                     throw RoomVerificationError.unavailable
@@ -231,18 +232,34 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             } catch let failure as ApprovedRoomCaptureFailed {
                 let current = self.periodic.isCurrent(attempt) && self.savedBindingMatches(attempt.binding)
                 outcome = failure.periodicOutcome(current: current)
+                kept = failure.keptReceiptCapturedAt
             } catch {
                 outcome = .failed
             }
-            self.periodic.complete(attempt, outcome: outcome, now: Date())
+            // TIN-6964, ruling 70: the schedule decides whether a receipt the
+            // coordinator kept survives. A kept receipt is never renewed past
+            // its own capture limit, and a failed read never extends it.
+            let retrySoon = self.coordinator.completePeriodicRead(attempt, outcome: outcome,
+                keptReceiptCapturedAt: kept, schedule: self.periodic, now: Date())
+            if retrySoon {
+                Self.log.notice("periodic room read failed with a verified close. The last receipt stays until its capture limit")
+                self.requestPeriodicTick(after: PeriodicRoomVerification.keptRetrySpacing)
+            }
             if let reason = self.periodic.blockReason {
+                // The coordinator ended the receipt or restated it with this reason.
                 Self.log.error("periodic room reads stopped: \(reason, privacy: .public)")
-                // The failed read already invalidated the receipt. Restate it
-                // with the stop reason, so an agent sees the reader stopped and
-                // can request its own room read. A successful read clears it.
-                self.coordinator.reportPeriodicReadsStopped(reason)
             }
         }
+    }
+
+    /// TIN-6964, ruling 70: moves the next periodic check to `delay` seconds
+    /// from now, the retry spacing under a kept receipt. The schedule set the
+    /// read due at the same spacing from an earlier time, so the check finds
+    /// it due. It still passes every binding, recovery and serial admission guard.
+    private func requestPeriodicTick(after delay: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        guard running, let generation = periodicGeneration, periodicClock.isCurrent(generation) else { return }
+        periodicTimer?.schedule(deadline: .now() + delay)
     }
 
     private static let log = Logger(subsystem: "io.tinyland.dcx2496.logic", category: "periodic-room")

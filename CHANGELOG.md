@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Keep the room receipt after a clean periodic read failure in helper build
+  15 (TIN-6964). Ruling 70 of TIN-5385 comment 50be9d3b asks for it. Before, every failed
+  periodic read invalidated the receipt at once, so about 2 agent passes in
+  280 were refused on November 16. Now an empty or partial Dump0 or Dump1
+  timeout, or a Search timeout or transport failure, with a verified close
+  keeps the last good receipt. The next read is due three seconds later,
+  within the existing caps. The receipt keeps its capture time, and the
+  heartbeat still ends it sixty seconds after that capture. Its `expiresAt`
+  is clamped to the latest whole millisecond that reads back no later than
+  that limit. An unknown or failed close, a validation failure, any other
+  failure, a device operation or a spent retry cap still invalidates it at
+  once. A retry of an empty dump timeout leaves its backoff count alone. At
+  most three run under one kept receipt, and the fourth ends it and takes
+  the normal backoff. Partial and Search retries still count toward their
+  caps of three, so a burst of three inside one receipt lifetime stops reads
+  for the cooldown, no sooner than six seconds after the first. When a
+  device operation ends the kept receipt before the schedule records the
+  read, the read takes its normal delay, not the spaced retry. Helper build 15 is version 0.1.14.
+  It also carries the failed window bytes below.
 - Allow the device to set Dump0 byte 101 from 0 to 1 in a typed write.
   TIN-6805 tracks it. Legalab ruling 69, Linear TIN-5385 comment `50be9d3b`:
   "Yes, value 1 only (Recommended)". `ALLOWED_DEVICE_MOVES` holds that one move
@@ -39,7 +58,7 @@
   seven days before it writes the next one, beside its cap of eight. The age
   cap trusts each record's modification time, so the count cap of eight is
   the hard bound. The read path is unchanged. Apply and rollback emit no
-  bytes. Helper build 14 is unchanged.
+  bytes. Helper build 14 is unchanged. Helper build 15 carries it.
 - Discard one stale Search reply ahead of a dump (TIN-6964). On November 15,
   2026, at 22:32:59Z, a 26-byte frame arrived where the 1015-byte Dump0
   belongs. In a Dump0 or Dump1 window the carrier now discards one complete

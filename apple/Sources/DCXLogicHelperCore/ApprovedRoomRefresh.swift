@@ -137,13 +137,34 @@ struct ApprovedRoomFailureEnvelope: Decodable {
 
 struct ApprovedRoomCaptureFailed: Error {
     let failure: RoomCaptureFailureV1
-    /// TIN-6964: a completed, verified-close empty Dump0 or Dump1 timeout rearms with backoff.
+    /// TIN-6964, ruling 70: the capture time of the receipt the coordinator
+    /// kept after this failure, or nil when it invalidated the receipt. Only a
+    /// periodic read sets it, and only when `keepsPriorReceipt` holds.
+    var keptReceiptCapturedAt: Date? = nil
+
+    /// TIN-6964, ruling 70: a periodic read that failed this way may keep the
+    /// last good receipt until its own sixty-second capture limit. It covers
+    /// the three kinds the periodic reader retries without a write: an empty
+    /// or partial Dump0 or Dump1 timeout and a Search timeout or transport
+    /// failure, each with a verified close. A validation failure is left out,
+    /// because the record does not say whether the frame named another device
+    /// or another state. An unknown or failed close is left out too. The
+    /// protected `room-refresh` child writes no parameter, and every bridge
+    /// device operation invalidates the receipt before it starts.
+    var keepsPriorReceipt: Bool {
+        permitsPeriodicRetry || permitsBoundedPartialRetry || permitsBoundedSearchRetry
+    }
+    /// TIN-6964: a completed, verified-close empty Dump0 or Dump1 timeout
+    /// rearms with backoff, or after `PeriodicRoomVerification.keptRetrySpacing`
+    /// while a kept receipt holds under ruling 70, at most
+    /// `PeriodicRoomVerification.keptEmptyRetryCap` times per kept receipt.
     var permitsPeriodicRetry: Bool {
         isVerifiedClosedDumpTimeout && failure.received == 0
     }
 
     /// TIN-6964: a completed, verified-close Dump0 or Dump1 timeout after some
-    /// bytes. The periodic reader may retry it on its next period, up to
+    /// bytes. The periodic reader may retry it on its next period, or after
+    /// the retry spacing while a kept receipt holds under ruling 70, up to
     /// `PeriodicRoomVerification.partialReadCap` in a row. Dump0 and Dump1 are
     /// reads, so no write is replayed. Unknown close or count still latches.
     var permitsBoundedPartialRetry: Bool {
@@ -165,7 +186,8 @@ struct ApprovedRoomCaptureFailed: Error {
     /// TIN-6964: a completed, verified-close Search that timed out or failed in
     /// transport. A timeout qualifies with or without received bytes. On
     /// November 15 one such Search timeout latched the reader for 16 hours. The
-    /// periodic reader may retry it on its next period, up to
+    /// periodic reader may retry it on its next period, or after the retry
+    /// spacing while a kept receipt holds under ruling 70, up to
     /// `PeriodicRoomVerification.searchReadCap` in a row. Search is a read, so
     /// no write is replayed, and the retry opens a new session. Search
     /// validation, such as a wrong device, and an unknown or failed close still

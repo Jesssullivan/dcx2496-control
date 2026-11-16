@@ -216,6 +216,9 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 return try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt,
                     approvedTargetRefresh: approvedTargetRefresh,
                     retainFreshDuringRead: retainFreshDuringRead && forceFresh && approvedTargetRefresh)
+            } catch let failed as ApprovedRoomCaptureFailed where failed.keptReceiptCapturedAt != nil {
+                // TIN-6964, ruling 70: captureRoom kept the last good receipt.
+                throw failed
             } catch {
                 roomVerification.invalidate("room-verification-failed")
                 throw error
@@ -381,13 +384,57 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             )
         }
         } catch {
-            roomVerification.invalidate("room-verification-failed")
+            let kept = keptReceiptCaptureDate(after: error, retainFreshDuringRead: retainFreshDuringRead, attempt: attempt)
+            if kept == nil { roomVerification.invalidate("room-verification-failed") }
             let metadata = roomFailureDiagnostics.record(diagnostic, error: error)
             stateLock.lock()
             lastRoomFailure = metadata
             stateLock.unlock()
+            if let kept, var failed = error as? ApprovedRoomCaptureFailed {
+                failed.keptReceiptCapturedAt = kept
+                throw failed
+            }
             throw error
         }
+    }
+
+    /// TIN-6964, ruling 70: a periodic read that failed with a verified close
+    /// and no write keeps the last good receipt. The receipt keeps its own
+    /// capture time, so it still expires sixty seconds after that capture.
+    /// Every other failure, and any changed binding, returns nil.
+    private func keptReceiptCaptureDate(after error: Error, retainFreshDuringRead: Bool,
+                                        attempt: RoomVerificationPreparation.Attempt) -> Date? {
+        guard retainFreshDuringRead, let failed = error as? ApprovedRoomCaptureFailed,
+              failed.keepsPriorReceipt, attempt.bindingChecks.isValid() else { return nil }
+        return roomVerification.retainedCaptureDate(binding: attempt.key)
+    }
+
+    /// TIN-6964, ruling 70: ends a kept receipt when the periodic reader says
+    /// so. It touches no newer capture. True when it invalidated the receipt.
+    @discardableResult
+    func invalidateKeptRoomReceipt(capturedAt: Date, reason: String) -> Bool {
+        roomVerification.invalidateKept(capturedAt: capturedAt, reason: reason)
+    }
+
+    /// TIN-6964, ruling 70: records a finished periodic read in `schedule` and
+    /// acts on its ruling about a kept receipt. A refused keep ends the
+    /// receipt with the schedule's reason. When the reader stopped and this
+    /// call ended nothing, the stop reason is restated, so an agent sees the
+    /// reader stopped. True when the receipt stays kept and the next periodic
+    /// read is due after `PeriodicRoomVerification.keptRetrySpacing`.
+    func completePeriodicRead(_ attempt: PeriodicRoomVerification.Attempt, outcome: PeriodicRoomVerification.Outcome,
+                              keptReceiptCapturedAt kept: Date?, schedule: PeriodicRoomVerification,
+                              now: Date) -> Bool {
+        // A device operation may have ended the kept receipt after the read.
+        // The schedule then sees no kept receipt and uses its normal backoff.
+        let live = kept.map { roomVerification.holdsKept(capturedAt: $0) } ?? false
+        let disposition = schedule.complete(attempt, outcome: outcome, now: now, keptCapturedAt: live ? kept : nil)
+        var ended = false
+        if case let .invalidate(reason) = disposition, live, let kept {
+            ended = invalidateKeptRoomReceipt(capturedAt: kept, reason: reason)
+        }
+        if let reason = schedule.blockReason, !ended { reportPeriodicReadsStopped(reason) }
+        return disposition == .keep
     }
 
     /// Offline preflight for persisting an independently approved expectation.
