@@ -115,7 +115,8 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     }
 
     /// `clock` gives the time for the first expiry, each timer heartbeat and
-    /// each liveness check that names no time. Tests inject it so no expiry depends on wall time.
+    /// each liveness check that names no time. Tests inject it, so no expiry
+    /// they check depends on wall time.
     init(startHeartbeats: Bool = true, submit: (@Sendable (RoomVerificationReceipt) -> Void)? = nil,
          ttyPresent: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
          clock: @escaping @Sendable () -> Date = { Date() }) {
@@ -294,10 +295,10 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     }
 
     fileprivate static func timestamp(_ date: Date) -> String {
-        formatter().string(from: date)
+        makeFormatter().string(from: date)
     }
 
-    private static func formatter() -> ISO8601DateFormatter {
+    private static func makeFormatter() -> ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
@@ -313,7 +314,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     /// The formatter keeps three decimals and may round up, so a plain
     /// timestamp of `bound` can read back up to half a millisecond later.
     static func timestamp(notAfter bound: Date) -> String {
-        let formatter = formatter()
+        let formatter = makeFormatter()
         var milliseconds = (bound.timeIntervalSince1970 * 1000).rounded(.down)
         for _ in 0..<4 {
             let text = formatter.string(from: Date(timeIntervalSince1970: milliseconds / 1000))
