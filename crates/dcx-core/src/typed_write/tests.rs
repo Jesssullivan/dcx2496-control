@@ -2090,6 +2090,8 @@ fn pa_leg_replay_refuses_every_other_device_move() {
     let dump0 = crate::SnapshotSection::Dump0;
     let dump1 = crate::SnapshotSection::Dump1;
     // Each case is one device move that no plan field or rule explains.
+    // The first case reads 101 as a modified flag, per the TIN-6805
+    // acceptance text. Its allowed values wait on the operator ruling.
     let cases: [(&str, SnapshotV1, (crate::SnapshotSection, usize)); 5] = [
         (
             "Dump0 101 at a value other than 1",
@@ -2144,10 +2146,12 @@ fn pa_leg_replay_refuses_every_other_device_move() {
 /// TIN-6805 acceptance 1: the plan declares Dump0 101 as a device-maintained
 /// flag that a software write may set to 1, so a compliant PA-leg write
 /// returns `applied`. It fails on main because no plan predicts that byte.
+/// The value 1 follows the TIN-6805 acceptance text, which reads 101 as a
+/// modified flag. The allowed values still wait on the operator ruling.
 /// Run it with
 /// `cargo test -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
 #[test]
-#[ignore = "TIN-6805: Dump0 101 has no containment rule yet; the PA-leg replay ends rollback_required"]
+#[ignore = "TIN-6805: Dump0 101 has no containment rule yet. The PA-leg replay ends rollback_required"]
 fn pa_leg_replay_compliant_write_is_contained_and_verified() {
     let base = linked_baseline();
     let transaction = pa_leg_transaction(&base);
