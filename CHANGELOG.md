@@ -7,16 +7,19 @@
   periodic read invalidated the receipt at once, so about 2 agent passes in
   280 were refused on November 16. Now an empty or partial Dump0 or Dump1
   timeout, or a Search timeout or transport failure, with a verified close
-  keeps the last good receipt. The next read is due at once, within the
-  existing caps. The receipt keeps its capture time, and the heartbeat still
-  ends it sixty seconds after that capture. An unknown or failed close, a
-  validation failure, any other failure, a device operation or a spent retry
-  cap still invalidates it at once. An at-once retry of an empty dump
-  timeout leaves its backoff count alone. Partial and Search retries still
-  count toward their caps of three, so a burst of three inside one receipt
-  lifetime stops reads for the cooldown. When a device operation ends the
-  kept receipt before the schedule records the read, the read takes its
-  normal delay, not the at-once retry. Helper build 15 is version 0.1.14.
+  keeps the last good receipt. The next read is due three seconds later,
+  within the existing caps. The receipt keeps its capture time, and the
+  heartbeat still ends it sixty seconds after that capture. Its `expiresAt`
+  is clamped to the latest whole millisecond that reads back no later than
+  that limit. An unknown or failed close, a validation failure, any other
+  failure, a device operation or a spent retry cap still invalidates it at
+  once. A retry of an empty dump timeout leaves its backoff count alone. At
+  most three run under one kept receipt, and the fourth ends it and takes
+  the normal backoff. Partial and Search retries still count toward their
+  caps of three, so a burst of three inside one receipt lifetime stops reads
+  for the cooldown, no sooner than six seconds after the first. When a
+  device operation ends the kept receipt before the schedule records the
+  read, the read takes its normal delay, not the spaced retry. Helper build 15 is version 0.1.14.
   It also carries the failed window bytes below.
 - Pin the PA-leg write containment gap with tests. TIN-6805 tracks it. The
   tests replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame

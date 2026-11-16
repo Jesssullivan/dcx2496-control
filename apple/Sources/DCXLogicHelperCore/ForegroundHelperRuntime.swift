@@ -239,11 +239,11 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             // TIN-6964, ruling 70: the schedule decides whether a receipt the
             // coordinator kept survives. A kept receipt is never renewed past
             // its own capture limit, and a failed read never extends it.
-            let readAgainNow = self.coordinator.completePeriodicRead(attempt, outcome: outcome,
+            let retrySoon = self.coordinator.completePeriodicRead(attempt, outcome: outcome,
                 keptReceiptCapturedAt: kept, schedule: self.periodic, now: Date())
-            if readAgainNow {
+            if retrySoon {
                 Self.log.notice("periodic room read failed with a verified close. The last receipt stays until its capture limit")
-                self.requestPeriodicTickNow()
+                self.requestPeriodicTick(after: PeriodicRoomVerification.keptRetrySpacing)
             }
             if let reason = self.periodic.blockReason {
                 // The coordinator ended the receipt or restated it with this reason.
@@ -252,12 +252,14 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
         }
     }
 
-    /// TIN-6964, ruling 70: brings the next periodic check forward to now. The
-    /// check still passes every binding, recovery and serial admission guard.
-    private func requestPeriodicTickNow() {
+    /// TIN-6964, ruling 70: moves the next periodic check to `delay` seconds
+    /// from now, the retry spacing under a kept receipt. The schedule set the
+    /// read due at the same spacing from an earlier time, so the check finds
+    /// it due. It still passes every binding, recovery and serial admission guard.
+    private func requestPeriodicTick(after delay: TimeInterval) {
         lock.lock(); defer { lock.unlock() }
         guard running, let generation = periodicGeneration, periodicClock.isCurrent(generation) else { return }
-        periodicTimer?.schedule(deadline: .now())
+        periodicTimer?.schedule(deadline: .now() + delay)
     }
 
     private static let log = Logger(subsystem: "io.tinyland.dcx2496.logic", category: "periodic-room")

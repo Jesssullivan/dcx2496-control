@@ -5,6 +5,8 @@ import XCTest
 final class PeriodicRoomVerificationTests: XCTestCase {
     private let at = Date(timeIntervalSince1970: 1_000)
     private let first = Data("SYNTHETIC approved binding".utf8)
+    /// The capture time of a synthetic kept receipt, thirty seconds before `at`.
+    private let kept = Date(timeIntervalSince1970: 970)
 
     func testDisabledOrAbsentBindingNeverSchedulesDeviceRead() {
         let schedule = PeriodicRoomVerification()
@@ -429,16 +431,45 @@ final class PeriodicRoomVerificationTests: XCTestCase {
 
     // MARK: TIN-6964, ruling 70
 
-    func testKeptReceiptRetriesAtOnceForEachCleanReadKind() throws {
+    /// A retry under a kept receipt waits three seconds, never back to back.
+    func testKeptReceiptRetriesAfterTheSpacingForEachCleanReadKind() throws {
+        XCTAssertEqual(PeriodicRoomVerification.keptRetrySpacing, 3)
         let kinds: [PeriodicRoomVerification.Outcome] = [
             .retryableReadFailure, .partialReadFailure(received: 491), .searchReadFailure,
         ]
+        let spacing = PeriodicRoomVerification.keptRetrySpacing
         for outcome in kinds {
             let schedule = PeriodicRoomVerification(); schedule.start()
             let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
-            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: at, receiptKept: true), .keep)
+            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: at, keptCapturedAt: kept), .keep)
             XCTAssertNil(schedule.blockReason)
-            XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at).attempt, "due at once")
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at).attempt, "not back to back")
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(spacing - 0.001)).attempt)
+            XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(spacing)).attempt)
+        }
+    }
+
+    /// A burst of partial or Search failures under a kept receipt spends the
+    /// cap of three no sooner than two spacings after the first failure, and
+    /// each spaced retry still counts toward the cap.
+    func testSpacedKeptRetriesStillCountTowardTheirCaps() throws {
+        let spacing = PeriodicRoomVerification.keptRetrySpacing
+        for outcome: PeriodicRoomVerification.Outcome in [.partialReadFailure(received: 491), .searchReadFailure] {
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            var now = at
+            for index in 1...3 {
+                let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+                let disposition = schedule.complete(attempt, outcome: outcome, now: now, keptCapturedAt: kept)
+                if index < 3 {
+                    XCTAssertEqual(disposition, .keep)
+                    XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(spacing - 0.001)).attempt)
+                    now = now.addingTimeInterval(spacing)
+                } else {
+                    XCTAssertEqual(disposition,
+                        .invalidate(RoomVerificationPublisher.periodicStopReason(try XCTUnwrap(schedule.blockReason))))
+                }
+            }
+            XCTAssertEqual(now.timeIntervalSince(at), 2 * spacing)
         }
     }
 
@@ -466,7 +497,7 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         for (outcome, expected) in cases {
             let schedule = PeriodicRoomVerification(); schedule.start()
             let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
-            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: at, receiptKept: true), expected)
+            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: at, keptCapturedAt: kept), expected)
         }
     }
 
@@ -480,7 +511,7 @@ final class PeriodicRoomVerificationTests: XCTestCase {
             var now = at
             for index in 1...cap {
                 let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
-                let disposition = schedule.complete(attempt, outcome: outcome, now: now, receiptKept: true)
+                let disposition = schedule.complete(attempt, outcome: outcome, now: now, keptCapturedAt: kept)
                 if index < cap {
                     XCTAssertEqual(disposition, .keep)
                 } else {
@@ -488,7 +519,7 @@ final class PeriodicRoomVerificationTests: XCTestCase {
                     XCTAssertEqual(disposition, .invalidate(RoomVerificationPublisher.periodicStopReason(reason)))
                     XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
                 }
-                now = now.addingTimeInterval(1)
+                now = now.addingTimeInterval(PeriodicRoomVerification.keptRetrySpacing)
             }
         }
     }
@@ -498,13 +529,13 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         let schedule = PeriodicRoomVerification(); schedule.start()
         let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
         _ = schedule.poll(binding: Data("SYNTHETIC changed binding".utf8), capturedAt: nil, now: at)
-        XCTAssertEqual(schedule.complete(attempt, outcome: .searchReadFailure, now: at, receiptKept: true), refused)
-        XCTAssertEqual(schedule.complete(attempt, outcome: .searchReadFailure, now: at, receiptKept: true), refused,
+        XCTAssertEqual(schedule.complete(attempt, outcome: .searchReadFailure, now: at, keptCapturedAt: kept), refused)
+        XCTAssertEqual(schedule.complete(attempt, outcome: .searchReadFailure, now: at, keptCapturedAt: kept), refused,
             "a completion repeated for an attempt no longer active")
         let stopped = PeriodicRoomVerification(); stopped.start()
         let old = try XCTUnwrap(stopped.poll(binding: first, capturedAt: nil, now: at).attempt)
         stopped.stop()
-        XCTAssertEqual(stopped.complete(old, outcome: .searchReadFailure, now: at, receiptKept: true), refused)
+        XCTAssertEqual(stopped.complete(old, outcome: .searchReadFailure, now: at, keptCapturedAt: kept), refused)
     }
 
     func testAKeptFailureNeitherResetsCountsNorMovesTheCapture() throws {
@@ -512,30 +543,59 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         let capture = at.addingTimeInterval(-30)
         XCTAssertNil(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(-30)).attempt)
         let one = try XCTUnwrap(schedule.poll(binding: first, capturedAt: capture, now: at).attempt)
-        XCTAssertEqual(schedule.complete(one, outcome: .searchReadFailure, now: at, receiptKept: true), .keep)
+        XCTAssertEqual(schedule.complete(one, outcome: .searchReadFailure, now: at, keptCapturedAt: kept), .keep)
         // The heartbeat keeps reporting the same capture. It never defers or resets anything.
         let two = try XCTUnwrap(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(5)).attempt)
-        XCTAssertEqual(schedule.complete(two, outcome: .searchReadFailure, now: at.addingTimeInterval(5), receiptKept: true), .keep)
+        XCTAssertEqual(schedule.complete(two, outcome: .searchReadFailure, now: at.addingTimeInterval(5), keptCapturedAt: kept), .keep)
         let three = try XCTUnwrap(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(10)).attempt)
-        XCTAssertEqual(schedule.complete(three, outcome: .searchReadFailure, now: at.addingTimeInterval(10), receiptKept: true),
+        XCTAssertEqual(schedule.complete(three, outcome: .searchReadFailure, now: at.addingTimeInterval(10), keptCapturedAt: kept),
             .invalidate(RoomVerificationPublisher.periodicStopReason(try XCTUnwrap(schedule.blockReason))))
     }
 
-    /// An at-once retry of an empty dump timeout leaves the backoff count
-    /// alone, so the first backoff after the kept receipt ends is the one
-    /// build 14 used for a first failure.
-    func testKeptEmptyDumpRetriesDoNotInflateTheLaterBackoff() throws {
+    /// Three empty dump retries run under one kept receipt and leave the
+    /// backoff count alone. The fourth empty timeout ends the receipt and
+    /// takes the first backoff build 14 used, 15 seconds, not an inflated one.
+    func testKeptEmptyDumpRetriesStopAtTheCapAndDoNotInflateTheBackoff() throws {
+        XCTAssertEqual(PeriodicRoomVerification.keptEmptyRetryCap, 3)
         let schedule = PeriodicRoomVerification(); schedule.start()
         var now = at
-        for _ in 0..<6 {
+        for _ in 0..<PeriodicRoomVerification.keptEmptyRetryCap {
             let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
-            XCTAssertEqual(schedule.complete(attempt, outcome: .retryableReadFailure, now: now, receiptKept: true), .keep)
-            now = now.addingTimeInterval(10)
+            XCTAssertEqual(schedule.complete(attempt, outcome: .retryableReadFailure, now: now, keptCapturedAt: kept), .keep)
+            now = now.addingTimeInterval(PeriodicRoomVerification.keptRetrySpacing)
         }
-        let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
-        XCTAssertEqual(schedule.complete(attempt, outcome: .retryableReadFailure, now: now), .none)
+        var attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        XCTAssertEqual(schedule.complete(attempt, outcome: .retryableReadFailure, now: now, keptCapturedAt: kept),
+            .invalidate(PeriodicRoomVerification.keptReceiptRefusedReason), "the fourth empty timeout ends the receipt")
+        XCTAssertNil(schedule.blockReason, "an empty timeout never stops the reader")
         XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(14.999)).attempt)
-        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(15)).attempt)
+        now = now.addingTimeInterval(15)
+        attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        XCTAssertEqual(schedule.complete(attempt, outcome: .retryableReadFailure, now: now), .none)
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(29.999)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(30)).attempt)
+    }
+
+    /// The empty retry cap counts per kept receipt. A newer kept capture
+    /// starts a new count, and a success clears it.
+    func testKeptEmptyRetryCapCountsPerKeptReceipt() throws {
+        let spacing = PeriodicRoomVerification.keptRetrySpacing
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        func emptyTimeout(_ capture: Date?) throws -> PeriodicRoomVerification.KeptReceipt {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            defer { now = now.addingTimeInterval(spacing) }
+            return schedule.complete(attempt, outcome: .retryableReadFailure, now: now, keptCapturedAt: capture)
+        }
+        for _ in 0..<3 { XCTAssertEqual(try emptyTimeout(kept), .keep) }
+        let newer = kept.addingTimeInterval(20)
+        for _ in 0..<3 { XCTAssertEqual(try emptyTimeout(newer), .keep, "a newer kept capture has its own count") }
+        XCTAssertEqual(try emptyTimeout(newer), .invalidate(PeriodicRoomVerification.keptReceiptRefusedReason))
+        now = now.addingTimeInterval(60)
+        let success = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        schedule.complete(success, outcome: .success(capturedAt: now), now: now)
+        now = now.addingTimeInterval(PeriodicRoomVerification.successDelay)
+        for _ in 0..<3 { XCTAssertEqual(try emptyTimeout(newer), .keep, "a success clears the count") }
     }
 
     /// Partial and Search retries under a kept receipt still count toward
@@ -546,7 +606,7 @@ final class PeriodicRoomVerificationTests: XCTestCase {
             var now = at
             for _ in 0..<2 {
                 let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
-                XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: now, receiptKept: true), .keep)
+                XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: now, keptCapturedAt: kept), .keep)
                 now = now.addingTimeInterval(10)
             }
             let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)

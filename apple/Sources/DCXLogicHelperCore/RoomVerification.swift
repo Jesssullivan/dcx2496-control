@@ -38,10 +38,12 @@ public struct RoomVerificationReceipt: Codable, Equatable, Sendable {
     public var dcxBlockDigest: String? = nil
 
     /// The heartbeat extends helper liveness, never the actual capture age.
+    /// TIN-6964, ruling 70: `expiresAt` reads back no later than capture
+    /// plus sixty seconds, at millisecond precision too.
     func renewed(at now: Date, capturedAt: Date, ttyPresent: Bool) -> Self? {
         guard ttyPresent, now >= capturedAt, now.timeIntervalSince(capturedAt) < 60 else { return nil }
         var value = self
-        value.expiresAt = RoomVerificationPublisher.timestamp(min(capturedAt.addingTimeInterval(60), now.addingTimeInterval(2)))
+        value.expiresAt = RoomVerificationPublisher.expiryTimestamp(capturedAt: capturedAt, now: now)
         return value
     }
 }
@@ -98,6 +100,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     private let submit: @Sendable (RoomVerificationReceipt) -> Void
     private let startHeartbeats: Bool
     private let ttyPresent: @Sendable (String) -> Bool
+    private let clock: @Sendable () -> Date
     private var receipt: RoomVerificationReceipt?
     private var captureBinding: Data?
     private var capturedAt: Date?
@@ -111,12 +114,16 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         "periodic-reads-stopped: " + reason
     }
 
+    /// `clock` gives the time for the first expiry, each timer heartbeat and
+    /// each liveness check that names no time. Tests inject it so no expiry depends on wall time.
     init(startHeartbeats: Bool = true, submit: (@Sendable (RoomVerificationReceipt) -> Void)? = nil,
-         ttyPresent: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) {
+         ttyPresent: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+         clock: @escaping @Sendable () -> Date = { Date() }) {
         let sender = PracticeMIDISender()
         self.submit = submit ?? { value in sender.send(value) }
         self.startHeartbeats = startHeartbeats
         self.ttyPresent = ttyPresent
+        self.clock = clock
     }
 
     func install(_ comparison: RoomComparison, expectation: Data, capturedAt: Date, ttyPath: String,
@@ -142,7 +149,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
             snapshotDigest: comparison.snapshotDigest,
             expectedSnapshotDigest: comparison.expectedSnapshotDigest,
             verifiedAt: Self.timestamp(capturedAt),
-            expiresAt: Self.timestamp(min(capturedAt.addingTimeInterval(60), Date().addingTimeInterval(2))),
+            expiresAt: Self.expiryTimestamp(capturedAt: capturedAt, now: clock()),
             readable: comparison.readable,
             matches: comparison.matches,
             validationScope: "exact-approved-snapshot-and-reviewed-profiles",
@@ -164,7 +171,10 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         let timer: DispatchSourceTimer? = startHeartbeats
             ? DispatchSource.makeTimerSource(queue: DispatchQueue(label: "io.tinyland.dcx.room-attestation")) : nil
         timer?.schedule(deadline: .now(), repeating: .seconds(1))
-        timer?.setEventHandler { [weak self] in self?.publish() }
+        timer?.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.publish(now: self.clock())
+        }
         self.timer = timer
         submit(value)
         lock.unlock()
@@ -174,7 +184,8 @@ final class RoomVerificationPublisher: @unchecked Sendable {
 
     /// Reuse liveness only while the original capture remains fresh. This never
     /// changes verifiedAt or publishes a new capture timestamp.
-    func current(expectation: Data, now: Date = Date()) -> RoomVerificationReceipt? {
+    func current(expectation: Data, now: Date? = nil) -> RoomVerificationReceipt? {
+        let now = now ?? clock()
         let digest = "sha256/" + SHA256.hash(data: expectation).map { String(format: "%02x", $0) }.joined()
         lock.lock()
         defer { lock.unlock() }
@@ -185,7 +196,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
 
     /// Only the admitted periodic read may retain a matching, unexpired proof.
     /// The existing heartbeat retains its original capture timestamp and binding.
-    func canRetainDuringRead(binding: Data, now: Date = Date()) -> Bool {
+    func canRetainDuringRead(binding: Data, now: Date? = nil) -> Bool {
         retainedCaptureDate(binding: binding, now: now) != nil
     }
 
@@ -193,7 +204,8 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     /// the periodic read with `binding` may keep, or nil. The same checks as
     /// `canRetainDuringRead` apply, so a kept receipt is never past its own
     /// sixty-second capture limit. Keeping it changes no field.
-    func retainedCaptureDate(binding: Data, now: Date = Date()) -> Date? {
+    func retainedCaptureDate(binding: Data, now: Date? = nil) -> Date? {
+        let now = now ?? clock()
         lock.lock(); defer { lock.unlock() }
         guard captureBinding == binding, bindingIsCurrent(), let receipt,
               receipt.matches, let capturedAt, let ttyPath,
@@ -267,7 +279,7 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     /// One heartbeat. It renews `expiresAt` from the original capture time
     /// only, so a kept receipt after a failed read expires at that capture
     /// plus sixty seconds, the same as any other receipt.
-    func publish(now: Date = Date()) {
+    func publish(now: Date) {
         lock.lock()
         guard var value = receipt, let capturedAt, let ttyPath else { lock.unlock(); return }
         guard bindingIsCurrent(), let renewed = value.renewed(at: now, capturedAt: capturedAt,
@@ -282,9 +294,33 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     }
 
     fileprivate static func timestamp(_ date: Date) -> String {
+        formatter().string(from: date)
+    }
+
+    private static func formatter() -> ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        return formatter
+    }
+
+    /// TIN-6964, ruling 70: the receipt expiry for a heartbeat at `now`, two
+    /// seconds ahead and never past capture plus sixty seconds.
+    static func expiryTimestamp(capturedAt: Date, now: Date) -> String {
+        timestamp(notAfter: min(capturedAt.addingTimeInterval(60), now.addingTimeInterval(2)))
+    }
+
+    /// The latest millisecond timestamp that reads back no later than `bound`.
+    /// The formatter keeps three decimals and may round up, so a plain
+    /// timestamp of `bound` can read back up to half a millisecond later.
+    static func timestamp(notAfter bound: Date) -> String {
+        let formatter = formatter()
+        var milliseconds = (bound.timeIntervalSince1970 * 1000).rounded(.down)
+        for _ in 0..<4 {
+            let text = formatter.string(from: Date(timeIntervalSince1970: milliseconds / 1000))
+            if let readBack = formatter.date(from: text), readBack <= bound { return text }
+            milliseconds -= 1
+        }
+        return formatter.string(from: Date(timeIntervalSince1970: milliseconds / 1000))
     }
 
     deinit { timer?.cancel() }

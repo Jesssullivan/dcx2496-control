@@ -170,7 +170,8 @@ invalid comparison and drift latch periodic reads off. An explicit successful
 verification or a changed approved configuration resets that latch.
 
 A Dump0 or Dump1 timeout after some bytes, with a verified close, retries on
-the next thirty-second period. While a kept receipt holds it retries at once.
+the next thirty-second period. While a kept receipt holds it retries after
+three seconds.
 See [Keeping the receipt after a clean read
 failure](#keeping-the-receipt-after-a-clean-read-failure). A Dump0 or Dump1
 read whose complete frame fails validation, with a verified close, also
@@ -184,7 +185,7 @@ unknown close, a byte count, or a Search or meter operation also latches.
 
 A Search that times out, with or without bytes, or fails in transport, with a
 verified close, also retries on the next period with its own count. While a
-kept receipt holds it retries at once. Three in a row stop periodic reads
+kept receipt holds it retries after three seconds. Three in a row stop periodic reads
 with `periodic-search-read-cap-reached`. Search is a read, and each retry
 opens a new session. A Search validation failure, such as
 a wrong device, and a Search failure with an unknown close still latch.
@@ -225,27 +226,36 @@ before it starts, so no session that wrote can keep it.
 A kept receipt changes no field. Its `verifiedAt` stays the original capture
 time. The heartbeat renews `expiresAt` from that capture only, so the receipt
 ends sixty seconds after its capture with `expired-or-disconnected`, as any
-receipt does. A failed read never extends it. The next periodic read is due at
-once. The runtime brings its five-second check forward, and that read passes
-every binding, recovery and serial admission guard again.
+receipt does. A failed read never extends it. Each `expiresAt` is the latest
+whole millisecond that reads back no later than capture plus sixty seconds.
+The timestamp keeps three decimals, and a rounded timestamp could read back
+up to half a millisecond past that limit.
+
+The next periodic read is due three seconds after the failed read ends, not
+back to back. The lead set this spacing within ruling 70, so a short burst on
+the serial line does not spend a retry cap of three within a few seconds. The
+runtime moves its five-second check to that time, and the read passes every
+binding, recovery and serial admission guard again.
 
 The existing caps still apply, and the retries change when they are spent:
 
 | Kind | Under a kept receipt | Effect |
 |---|---|---|
-| Empty Dump0 or Dump1 timeout | Retries at once and leaves the backoff count alone | It has no stop cap. The sixty-second limit bounds the retries. After that, the backoff starts from the count it had before the kept receipt |
-| Partial Dump0 or Dump1 timeout | Retries at once and counts toward its cap of three | Three failures inside one receipt lifetime stop reads for the five-minute cooldown. Build 14 spread the same three over about sixty seconds |
-| Search timeout or transport failure | Retries at once and counts toward its cap of three | The same as the partial dump |
+| Empty Dump0 or Dump1 timeout | Retries after three seconds and leaves the backoff count alone. At most three such retries run under one kept receipt | It has no stop cap. The fourth empty timeout under the same kept receipt ends the receipt with `room-verification-failed` and takes the normal backoff, from the count it had before the retries. A newer kept capture or a success starts a new count |
+| Partial Dump0 or Dump1 timeout | Retries after three seconds and counts toward its cap of three | Three failures inside one receipt lifetime stop reads for the five-minute cooldown. The earliest is six seconds after the first, plus the read times. Build 14 spread the same three over about sixty seconds |
+| Search timeout or transport failure | Retries after three seconds and counts toward its cap of three | The same as the partial dump |
 
-A short burst of three partial or Search failures can therefore stop periodic
-reads where build 14 would have recovered on its third period. A longer fault
-reaches the cooldown sooner than in build 14. Neither rate is measured yet.
+The lead set the empty retry cap of three within ruling 70 too. A burst of
+three partial or Search failures can still stop periodic reads where build 14
+would have recovered on its third period. A longer fault reaches the cooldown
+sooner than in build 14. Neither rate is measured yet.
 
 The receipt is invalidated at once in these cases:
 
 | Case | Reason sent |
 |---|---|
 | Unknown or failed close | `room-verification-failed` |
+| The fourth empty dump timeout under one kept receipt | `room-verification-failed` |
 | A validation failure. The record does not say whether the frame named another device or state | `room-verification-failed` |
 | Any other failure kind, a child that left no failure envelope, or a stale attempt | `room-verification-failed` |
 | The failure spends a retry cap or latches the reader | `periodic-reads-stopped:` and the stop reason |
@@ -259,7 +269,7 @@ one schedule call. The receipt is a real capture under sixty seconds old in
 that window, and every device operation invalidates it before it starts.
 When a device operation ends the kept receipt before the schedule records the
 read, the coordinator tells the schedule no receipt is kept. The read then
-takes its normal delay and count, not the at-once retry.
+takes its normal delay and count, not the spaced retry.
 
 An explicit button read never keeps a receipt. A startup or URL read that
 starts its own flight never keeps one either. A startup or URL read that joins

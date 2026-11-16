@@ -420,14 +420,15 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     /// acts on its ruling about a kept receipt. A refused keep ends the
     /// receipt with the schedule's reason. When the reader stopped and this
     /// call ended nothing, the stop reason is restated, so an agent sees the
-    /// reader stopped. True when the next periodic read should start now.
+    /// reader stopped. True when the receipt stays kept and the next periodic
+    /// read is due after `PeriodicRoomVerification.keptRetrySpacing`.
     func completePeriodicRead(_ attempt: PeriodicRoomVerification.Attempt, outcome: PeriodicRoomVerification.Outcome,
                               keptReceiptCapturedAt kept: Date?, schedule: PeriodicRoomVerification,
                               now: Date) -> Bool {
         // A device operation may have ended the kept receipt after the read.
         // The schedule then sees no kept receipt and uses its normal backoff.
         let live = kept.map { roomVerification.holdsKept(capturedAt: $0) } ?? false
-        let disposition = schedule.complete(attempt, outcome: outcome, now: now, receiptKept: live)
+        let disposition = schedule.complete(attempt, outcome: outcome, now: now, keptCapturedAt: live ? kept : nil)
         var ended = false
         if case let .invalidate(reason) = disposition, live, let kept {
             ended = invalidateKeptRoomReceipt(capturedAt: kept, reason: reason)

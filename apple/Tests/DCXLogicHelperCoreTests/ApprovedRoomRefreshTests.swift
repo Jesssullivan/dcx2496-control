@@ -532,7 +532,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
 
     /// The November 16 fault pair on PZM: a Search timeout after 10 bytes,
     /// then a Search transport error, then a match. Each failure keeps the
-    /// first receipt unchanged, the next read is due at once, and the match
+    /// first receipt unchanged, the next read is due after the retry spacing, and the match
     /// replaces the receipt.
     func testNovemberSixteenSearchFaultPairKeepsTheReceiptUntilTheMatch() throws {
         try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, first in
@@ -558,12 +558,12 @@ final class ApprovedRoomRefreshTests: XCTestCase {
                 XCTAssertTrue(live.matches, label)
                 XCTAssertLessThanOrEqual(try XCTUnwrap(self.date(live.expiresAt)), firstCapture.addingTimeInterval(60), label)
                 XCTAssertEqual(schedule.complete(attempt, outcome: failure.periodicOutcome(current: true), now: now,
-                    receiptKept: true), .keep, label)
+                    keptCapturedAt: failure.keptReceiptCapturedAt), .keep, label)
                 XCTAssertNil(schedule.blockReason, label)
-                now = now.addingTimeInterval(1)
+                now = now.addingTimeInterval(PeriodicRoomVerification.keptRetrySpacing)
             }
             let retry = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: firstCapture, now: now).attempt,
-                "the next read is due at once")
+                "the next read is due after the retry spacing")
             backend.refreshOverride = nil
             let receipt = try coordinator.verifyBoundRoom(expectation: manifest, forceFresh: true,
                 expectedConfiguration: configuration, approvedTargetRefresh: true, retainFreshDuringRead: true,
@@ -672,7 +672,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
     }
 
     /// A device operation that ends the kept receipt between the read and the
-    /// schedule call turns the at-once retry into the normal delay.
+    /// schedule call turns the spaced retry into the normal delay.
     func testDeviceOperationBeforeTheScheduleCallTakesTheNormalDelay() throws {
         try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, first in
             let firstCapture = try XCTUnwrap(self.date(first.verifiedAt))
@@ -690,7 +690,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
                 keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: now))
             XCTAssertNil(schedule.blockReason)
             XCTAssertNil(schedule.poll(binding: manifest, capturedAt: nil, now: now).attempt,
-                "no at-once retry once the kept receipt is gone")
+                "no spaced retry once the kept receipt is gone")
             XCTAssertNotNil(schedule.poll(binding: manifest, capturedAt: nil,
                 now: now.addingTimeInterval(PeriodicRoomVerification.successDelay)).attempt,
                 "the read is due after the normal Search delay")
@@ -710,7 +710,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
                 let failure = try self.captureFailure(coordinator, manifest, configuration)
                 let kept = try XCTUnwrap(failure.keptReceiptCapturedAt)
                 let disposition = schedule.complete(attempt, outcome: failure.periodicOutcome(current: true), now: now,
-                    receiptKept: true)
+                    keptCapturedAt: failure.keptReceiptCapturedAt)
                 if index < PeriodicRoomVerification.searchReadCap {
                     XCTAssertEqual(disposition, .keep)
                 } else {
@@ -718,7 +718,7 @@ final class ApprovedRoomRefreshTests: XCTestCase {
                     XCTAssertEqual(disposition, .invalidate(reason))
                     XCTAssertTrue(coordinator.invalidateKeptRoomReceipt(capturedAt: kept, reason: reason))
                 }
-                now = now.addingTimeInterval(1)
+                now = now.addingTimeInterval(PeriodicRoomVerification.keptRetrySpacing)
             }
             XCTAssertNil(publisher.current(expectation: manifest))
             let last = try XCTUnwrap(sent.values.last)
@@ -749,12 +749,12 @@ final class ApprovedRoomRefreshTests: XCTestCase {
 
             // Spent cap: the second and third failures. The third ends the
             // kept receipt with the stop reason, once, with no restatement.
-            now = now.addingTimeInterval(1)
+            now = now.addingTimeInterval(PeriodicRoomVerification.keptRetrySpacing)
             attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: firstCapture, now: now).attempt)
             failure = try self.captureFailure(coordinator, manifest, configuration)
             XCTAssertTrue(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
                 keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: now))
-            now = now.addingTimeInterval(1)
+            now = now.addingTimeInterval(PeriodicRoomVerification.keptRetrySpacing)
             attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: firstCapture, now: now).attempt)
             failure = try self.captureFailure(coordinator, manifest, configuration)
             XCTAssertNotNil(failure.keptReceiptCapturedAt)
@@ -772,13 +772,13 @@ final class ApprovedRoomRefreshTests: XCTestCase {
             // Stale attempt: the binding changed in the schedule after the
             // coordinator kept the receipt. The receipt ends at once.
             let schedule = PeriodicRoomVerification(); schedule.start()
-            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: Date()).attempt)
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: self.at).attempt)
             backend.refreshOverride = try self.failedRefresh(["category": "transport", "operation": "search"])
             let failure = try self.captureFailure(coordinator, manifest, configuration)
             XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, first.verifiedAt)
-            _ = schedule.poll(binding: Data("SYNTHETIC changed binding".utf8), capturedAt: nil, now: Date())
+            _ = schedule.poll(binding: Data("SYNTHETIC changed binding".utf8), capturedAt: nil, now: self.at)
             XCTAssertFalse(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
-                keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: Date()))
+                keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: self.at))
             XCTAssertNil(publisher.current(expectation: manifest), "a stale attempt ends the kept receipt")
             XCTAssertEqual(sent.values.last?.invalidationReason, PeriodicRoomVerification.keptReceiptRefusedReason)
         }
@@ -786,13 +786,13 @@ final class ApprovedRoomRefreshTests: XCTestCase {
             // No kept receipt: a latching failure was invalidated by the
             // coordinator, and the stop reason is restated after it.
             let schedule = PeriodicRoomVerification(); schedule.start()
-            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: Date()).attempt)
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: self.at).attempt)
             backend.refreshOverride = try self.failedRefresh(["category": "timeout", "operation": "search", "received": 10,
                 "sessionClosedVerified": false, "closeFailure": "cleanup"])
             let failure = try self.captureFailure(coordinator, manifest, configuration)
             XCTAssertNil(failure.keptReceiptCapturedAt)
             XCTAssertFalse(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
-                keptReceiptCapturedAt: nil, schedule: schedule, now: Date()))
+                keptReceiptCapturedAt: nil, schedule: schedule, now: self.at))
             XCTAssertNil(publisher.current(expectation: manifest))
             XCTAssertEqual(sent.values.last?.invalidationReason,
                 RoomVerificationPublisher.periodicStopReason(PeriodicRoomVerification.failedReason))
@@ -800,13 +800,14 @@ final class ApprovedRoomRefreshTests: XCTestCase {
     }
 
     func testInvalidateKeptNeverTouchesANewerCapture() throws {
-        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
+        let newer = Date(timeIntervalSince1970: 1_794_816_000)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true },
+            clock: { newer.addingTimeInterval(1) })
         let manifest = Data("SYNTHETIC newer capture".utf8)
         let value = try decode(fixture(expectation: manifest))
-        let old = Date().addingTimeInterval(-20)
+        let old = newer.addingTimeInterval(-20)
         _ = try publisher.install(value.comparison, expectation: manifest, capturedAt: old, ttyPath: "/SYNTHETIC",
             captureBinding: Data([1]))
-        let newer = Date()
         let receipt = try publisher.install(value.comparison, expectation: manifest, capturedAt: newer, ttyPath: "/SYNTHETIC",
             captureBinding: Data([1]))
         XCTAssertFalse(publisher.invalidateKept(capturedAt: old, reason: "room-verification-failed"))
@@ -818,13 +819,17 @@ final class ApprovedRoomRefreshTests: XCTestCase {
 
     /// The receipt never outlives sixty seconds from its capture. The heartbeat
     /// that rewrites expiresAt every second follows the same limit, and a
-    /// kept receipt cannot be kept again once it is past it.
+    /// kept receipt cannot be kept again once it is past it. The capture time
+    /// sits 0.6 milliseconds past a whole millisecond. A timestamp that rounds
+    /// would read back later than capture plus sixty seconds. The clock is
+    /// injected, so no assertion depends on wall time.
     func testKeptReceiptAndItsHeartbeatEndAtTheCaptureLimit() throws {
         let sent = ReceiptLog()
-        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { sent.append($0) }, ttyPresent: { _ in true })
+        let captured = Date(timeIntervalSince1970: 1_794_816_000.0006)
+        let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { sent.append($0) },
+            ttyPresent: { _ in true }, clock: { captured.addingTimeInterval(50) })
         let manifest = Data("SYNTHETIC kept receipt limit".utf8)
         let value = try decode(fixture(expectation: manifest))
-        let captured = Date().addingTimeInterval(-50)
         let installed = try publisher.install(value.comparison, expectation: manifest, capturedAt: captured,
             ttyPath: "/SYNTHETIC", captureBinding: Data([1]))
         XCTAssertEqual(publisher.retainedCaptureDate(binding: Data([1]), now: captured.addingTimeInterval(59.9)), captured)
@@ -844,6 +849,28 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         XCTAssertEqual(expired.invalidationReason, "expired-or-disconnected")
         XCTAssertNil(publisher.current(expectation: manifest))
         XCTAssertNil(publisher.retainedCaptureDate(binding: Data([1]), now: captured.addingTimeInterval(55)))
+    }
+
+    /// TIN-6964, ruling 70: every expiry reads back no later than its bound,
+    /// for each sub-millisecond offset, and the clamp costs under two
+    /// milliseconds. Fixed dates only.
+    func testExpiryTimestampNeverReadsBackPastItsBound() throws {
+        let base = 1_794_816_000.0
+        for tenth in 0..<10 {
+            for whole in [0.0, 0.5, 59.999] {
+                let bound = Date(timeIntervalSince1970: base + whole + Double(tenth) / 10_000)
+                let readBack = try XCTUnwrap(date(RoomVerificationPublisher.timestamp(notAfter: bound)))
+                XCTAssertLessThanOrEqual(readBack, bound, "offset \(whole) s and \(tenth) tenths of a millisecond")
+                XCTAssertGreaterThan(readBack, bound.addingTimeInterval(-0.002))
+            }
+        }
+        let capture = Date(timeIntervalSince1970: base + 0.0006)
+        for seconds in [0.0, 57.9, 58.0, 58.5, 59.9, 59.9999] {
+            let expiry = try XCTUnwrap(date(RoomVerificationPublisher.expiryTimestamp(capturedAt: capture,
+                now: capture.addingTimeInterval(seconds))))
+            XCTAssertLessThanOrEqual(expiry, capture.addingTimeInterval(60), "at \(seconds) seconds")
+            XCTAssertLessThanOrEqual(expiry, capture.addingTimeInterval(seconds + 2), "at \(seconds) seconds")
+        }
     }
 
     private func exerciseRetention(initialBinding: @escaping @Sendable () -> Bool = { true },
