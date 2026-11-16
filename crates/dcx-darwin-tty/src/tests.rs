@@ -3,15 +3,20 @@ use std::{cell::RefCell, collections::VecDeque, path::PathBuf, rc::Rc, time::Dur
 use dcx_core::{
     SnapshotSection,
     meter::METER_RESPONSE_LEN,
+    output_profile::profile_digest,
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DeviceId, DirectParameterAction, RemoteMode,
     },
+    room_verification::ApprovedRoomRefreshAdmission,
 };
 use dcx_transport::{
     Known38400SearchError, Known38400SearchOutcome, RepeatPacer, SearchExecutionError,
     SearchOperationKind, SearchOutcome, execute_known_38400_search, execute_search,
     meter::{LIVE_METER_REQUEST_COUNT, execute_live_meter},
-    snapshot::{SNAPSHOT_OPERATION_TIMEOUT, execute_persistent_snapshot},
+    snapshot::{
+        MAX_WINDOW_BYTES, SNAPSHOT_OPERATION_TIMEOUT, WindowFailure,
+        execute_approved_target_snapshot, execute_persistent_snapshot,
+    },
 };
 
 use super::*;
@@ -1322,6 +1327,7 @@ fn dump_reader_reports_a_discarded_search_reply_and_keeps_it_when_not_enabled() 
         false,
         Some(DeviceId::new(0).unwrap()),
         &mut 0,
+        &mut WindowBytes::default(),
     )
     .unwrap();
     assert_eq!(
@@ -1343,6 +1349,7 @@ fn dump_reader_reports_a_discarded_search_reply_and_keeps_it_when_not_enabled() 
             false,
             None,
             &mut 0,
+            &mut WindowBytes::default(),
         ),
         Err(DarwinCarrierError::UnexpectedTrailingFrame { received })
             if received == DUMP0_RESPONSE_LEN
@@ -1359,6 +1366,7 @@ fn dump_reader_reports_a_discarded_search_reply_and_keeps_it_when_not_enabled() 
         false,
         Some(DeviceId::new(0).unwrap()),
         &mut 0,
+        &mut WindowBytes::default(),
     )
     .unwrap();
     assert_eq!(bounded.read.end(), SnapshotReadEnd::TimedOut);
@@ -1388,6 +1396,7 @@ fn dump_reader_keeps_the_discard_count_when_a_carrier_error_follows() {
             false,
             Some(DeviceId::new(0).unwrap()),
             &mut stale,
+            &mut WindowBytes::default(),
         ),
         Err(DarwinCarrierError::UnexpectedTrailingFrame { received })
             if received == identity.len()
@@ -1409,6 +1418,7 @@ fn dump_reader_keeps_the_discard_count_when_a_carrier_error_follows() {
             false,
             Some(DeviceId::new(0).unwrap()),
             &mut stale,
+            &mut WindowBytes::default(),
         ),
         Err(DarwinCarrierError::EndOfFile { received: 10 })
     ));
@@ -1472,6 +1482,319 @@ fn carrier_reports_a_discard_ahead_of_a_dump0_carrier_error() {
         "{error:?}"
     );
     assert_eq!(*after_error.borrow(), vec![1]);
+}
+
+/// Forwards to a carrier and records, after each exchange, the operation and
+/// the window bytes the carrier kept for it.
+struct WindowRecorder<S> {
+    inner: S,
+    windows: Rc<RefCell<Vec<(SnapshotOperationKind, WindowBytes)>>>,
+}
+
+impl<S: PersistentSnapshotSession> PersistentSnapshotSession for WindowRecorder<S> {
+    type Error = S::Error;
+
+    fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
+        let kind = operation.kind();
+        let result = self.inner.exchange(operation);
+        let window = self
+            .inner
+            .last_exchange_window_bytes()
+            .expect("the carrier keeps window bytes");
+        self.windows.borrow_mut().push((kind, window));
+        result
+    }
+
+    fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
+        self.inner.write_remote_mode(command)
+    }
+
+    fn finish(self) -> Result<(), Self::Error> {
+        self.inner.finish()
+    }
+}
+
+/// Run the ten-identity snapshot over `backend` and return its error and the
+/// window of the last exchange.
+fn last_window(backend: FakeBackend) -> (String, SnapshotOperationKind, WindowBytes, Vec<Vec<u8>>) {
+    let writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = backend.with_shared_writes(Rc::clone(&writes));
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let windows = Rc::new(RefCell::new(Vec::new()));
+    let session = WindowRecorder {
+        inner: carrier,
+        windows: Rc::clone(&windows),
+    };
+    let error = execute_persistent_snapshot(
+        session,
+        &mut FastPacer::default(),
+        DeviceId::new(0).unwrap(),
+    )
+    .unwrap_err();
+    let (kind, window) = windows.borrow().last().cloned().unwrap();
+    let writes = writes.borrow().clone();
+    (format!("{error:?}"), kind, window, writes)
+}
+
+/// TIN-6964 shape: Dump0 or Dump1 timed out with no byte. The window is
+/// empty too, so no echo and no stray frame arrived either.
+#[test]
+fn an_empty_dump_timeout_keeps_an_empty_window() {
+    let (error, kind, window, writes) = last_window(november_15_dump0_window(&[], &[]));
+    assert_eq!(
+        error,
+        "Timeout { operation: Dump0, received: 0, finish_error: None }"
+    );
+    assert_eq!(kind, SnapshotOperationKind::Dump0);
+    assert_eq!(window, WindowBytes::default());
+    assert_eq!(dump0_writes(&writes), 1);
+
+    let (error, kind, window, _writes) =
+        last_window(november_15_dump0_window(&[], &[synthetic_dump(0, 0)]));
+    assert_eq!(
+        error,
+        "Timeout { operation: Dump1, received: 0, finish_error: None }"
+    );
+    assert_eq!(kind, SnapshotOperationKind::Dump1);
+    assert_eq!(window.received(), 0);
+    assert!(window.kept().is_empty());
+}
+
+/// TIN-6964 shape: a Search timed out with 10 bytes, 06:00:31Z.
+#[test]
+fn a_search_timeout_with_ten_bytes_keeps_the_ten_bytes() {
+    let partial = synthetic_response(0)[..10].to_vec();
+    let (error, kind, window, writes) =
+        last_window(FakeBackend::with_inbound(partial.iter().copied()));
+    assert_eq!(
+        error,
+        "Timeout { operation: Search { sequence: 1 }, received: 10, finish_error: None }"
+    );
+    assert_eq!(kind, SnapshotOperationKind::Search { sequence: 1 });
+    assert_eq!(window.received(), 10);
+    assert_eq!(window.kept(), partial.as_slice());
+    assert_eq!(window.hex(), "f0002032000e0053594e");
+    assert_eq!(writes, [synthetic_search_request().to_vec()]);
+}
+
+/// TIN-6964 shape: a 26-byte frame where Dump0 belongs, 22:32:59Z. The
+/// window keeps every frame read after the Dump0 write, discarded or not.
+#[test]
+fn a_26_byte_frame_in_the_dump0_window_keeps_its_bytes() {
+    let other_device = synthetic_response(1).to_vec();
+    let (error, kind, window, writes) = last_window(november_15_dump0_window(
+        std::slice::from_ref(&other_device),
+        &[],
+    ));
+    assert_eq!(error, NOVEMBER_15_DUMP0_FAILURE);
+    assert_eq!(kind, SnapshotOperationKind::Dump0);
+    assert_eq!(window.received(), 26);
+    assert_eq!(window.kept(), other_device.as_slice());
+    assert_eq!(dump0_writes(&writes), 1);
+
+    // A discarded Search reply and the second one that failed validation.
+    let identity = synthetic_response(0).to_vec();
+    let (error, _kind, window, writes) = last_window(november_15_dump0_window(
+        &[identity.clone(), identity.clone()],
+        &[],
+    ));
+    assert_eq!(error, NOVEMBER_15_DUMP0_FAILURE);
+    assert_eq!(window.received(), 52);
+    assert_eq!(
+        window.kept(),
+        [identity.clone(), identity].concat().as_slice()
+    );
+    assert_eq!(dump0_writes(&writes), 1);
+}
+
+/// The 22:28:04Z shape: a stale tail then a reply in the first Search window.
+#[test]
+fn an_unexpected_trailing_search_frame_keeps_both_frames() {
+    let stale = november_15_stale_tail();
+    let fresh = synthetic_response(0);
+    let mut backend = FakeBackend::with_inbound(stale.iter().copied().chain(fresh));
+    backend.post_response_input = stale.len();
+    let (error, kind, window, _writes) = last_window(backend);
+    assert!(
+        error.contains("UnexpectedTrailingFrame { received: 26 }"),
+        "{error}"
+    );
+    assert_eq!(kind, SnapshotOperationKind::Search { sequence: 1 });
+    assert_eq!(window.kept(), [stale, fresh.to_vec()].concat().as_slice());
+}
+
+#[test]
+fn a_long_partial_dump_keeps_only_the_capped_prefix() {
+    let dump0 = synthetic_dump(0, 0);
+    let (error, _kind, window, _writes) =
+        last_window(november_15_dump0_window(&[], &[dump0[..600].to_vec()]));
+    assert_eq!(
+        error,
+        "Timeout { operation: Dump0, received: 600, finish_error: None }"
+    );
+    assert_eq!(window.received(), 600);
+    assert_eq!(window.kept(), &dump0[..MAX_WINDOW_BYTES]);
+    assert!(window.truncated());
+}
+
+#[test]
+fn each_exchange_starts_with_a_fresh_window() {
+    let backend = november_15_dump0_window(&[], &[synthetic_dump(0, 0), synthetic_dump(0, 1)]);
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let windows = Rc::new(RefCell::new(Vec::new()));
+    let session = WindowRecorder {
+        inner: carrier,
+        windows: Rc::clone(&windows),
+    };
+    execute_persistent_snapshot(
+        session,
+        &mut FastPacer::default(),
+        DeviceId::new(0).unwrap(),
+    )
+    .unwrap();
+    let windows = windows.borrow();
+    // Search 1 empty, ten answered Searches, Dump0 and Dump1.
+    assert_eq!(windows.len(), 13);
+    assert_eq!(windows[0].1, WindowBytes::default());
+    for (_kind, window) in &windows[1..11] {
+        assert_eq!(window.kept(), synthetic_response(0).as_slice());
+    }
+    assert_eq!(windows[11].1.received(), DUMP0_RESPONSE_LEN);
+    assert_eq!(windows[12].1.received(), DUMP1_RESPONSE_LEN);
+}
+
+/// Admission for the approved path from the checked-in v2 fixture. The
+/// approved capture uses only its device address.
+fn approved_admission() -> ApprovedRoomRefreshAdmission {
+    let bytes = include_bytes!("../../../fixtures/room-expectations/LEGALAB-practice-room.json");
+    ApprovedRoomRefreshAdmission::from_json(
+        bytes,
+        &profile_digest(bytes),
+        DeviceId::new(0).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The approved path over the real carrier: Search 1 times out empty, Search
+/// 2 is answered, and `ahead` is readable in the Dump0 window before `dumps`.
+fn approved_dump0_window(ahead: &[Vec<u8>], dumps: &[Vec<u8>]) -> FakeBackend {
+    let mut inbound = synthetic_response(0).to_vec();
+    let mut extra = 0;
+    for frame in ahead {
+        inbound.extend_from_slice(frame);
+        extra += frame.len();
+    }
+    for frame in dumps {
+        inbound.extend_from_slice(frame);
+    }
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.available_script = [0, 0].into_iter().collect();
+    backend.dump_window_extra = [extra, 0].into_iter().collect();
+    backend
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+/// TIN-6964 end to end: the approved executor runs over `PersistentCarrier`
+/// and returns the failed window it copied out of the carrier.
+#[test]
+fn approved_capture_over_the_carrier_keeps_the_26_byte_frame_in_dump0() {
+    let other_device = synthetic_response(1).to_vec();
+    let writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = approved_dump0_window(std::slice::from_ref(&other_device), &[])
+        .with_shared_writes(Rc::clone(&writes));
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+
+    assert_eq!(format!("{:?}", error.failure()), NOVEMBER_15_DUMP0_FAILURE);
+    assert_eq!(error.search_attempts(), 2);
+    assert_eq!(error.empty_search_timeouts(), 1);
+    let window = error.failure_window().unwrap();
+    assert_eq!(window.operation(), SnapshotOperationKind::Dump0);
+    assert_eq!(window.failure(), WindowFailure::Validation);
+    assert_eq!(window.bytes().kept(), other_device.as_slice());
+    let hex = hex_of(&other_device);
+    assert!(
+        window.private_record_line().ends_with(&format!(
+            "\"received\":26,\"kept\":26,\"truncated\":false,\"hex\":\"{hex}\"}}"
+        )),
+        "{}",
+        window.private_record_line()
+    );
+    let debug = format!("{error:?}");
+    assert!(!debug.contains(&hex), "{debug}");
+    // One Dump0 request. No request was written again.
+    assert_eq!(dump0_writes(&writes.borrow()), 1);
+}
+
+#[test]
+fn approved_capture_over_the_carrier_keeps_an_empty_dump0_timeout_window() {
+    let carrier =
+        PersistentCarrier::open(binding(), approved_dump0_window(&[], &[]), FALLBACK_BAUD).unwrap();
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+    assert_eq!(
+        format!("{:?}", error.failure()),
+        "Timeout { operation: Dump0, received: 0, finish_error: None }"
+    );
+    let window = error.failure_window().unwrap();
+    assert_eq!(window.failure(), WindowFailure::Timeout);
+    assert_eq!(window.bytes(), &WindowBytes::default());
+}
+
+/// A short write fails Search 1 before any read. The window is empty, and
+/// the record names a transport failure, not a timeout.
+#[test]
+fn approved_capture_over_the_carrier_names_a_short_write_as_transport() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.short_write = Some(1);
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+    assert!(
+        format!("{:?}", error.failure()).contains("ShortWrite"),
+        "{error:?}"
+    );
+    let window = error.failure_window().unwrap();
+    assert_eq!(
+        window.operation(),
+        SnapshotOperationKind::Search { sequence: 1 }
+    );
+    assert_eq!(window.failure(), WindowFailure::Transport);
+    assert_eq!(window.bytes().received(), 0);
+    assert!(
+        window
+            .private_record_line()
+            .contains("\"failure\":\"transport\",\"received\":0,")
+    );
+}
+
+/// Three empty Search timeouts end in qualification, not in one exchange, so
+/// the approved capture keeps no window. A known limit, TIN-6964.
+#[test]
+fn approved_capture_over_the_carrier_keeps_no_window_after_three_empty_searches() {
+    let carrier =
+        PersistentCarrier::open(binding(), FakeBackend::with_inbound([]), FALLBACK_BAUD).unwrap();
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+    assert!(
+        format!("{:?}", error.failure()).starts_with("SearchQualificationIncomplete"),
+        "{error:?}"
+    );
+    assert_eq!(error.search_attempts(), 3);
+    assert!(error.failure_window().is_none());
 }
 
 #[test]
@@ -2384,6 +2707,7 @@ fn snapshot_search_reader_strips_echo_and_consumes_all_already_queued_replays() 
         true,
         None,
         &mut 0,
+        &mut WindowBytes::default(),
     )
     .unwrap();
 
@@ -2418,6 +2742,7 @@ fn snapshot_search_reader_returns_before_a_late_replay_becomes_readable() {
         true,
         None,
         &mut 0,
+        &mut WindowBytes::default(),
     )
     .unwrap();
 
@@ -2452,6 +2777,7 @@ fn snapshot_search_reader_finishes_an_already_queued_replay_prefix() {
         true,
         None,
         &mut 0,
+        &mut WindowBytes::default(),
     )
     .unwrap();
 
@@ -2485,6 +2811,7 @@ fn snapshot_search_reader_rejects_an_unfinished_queued_replay_prefix() {
             true,
             None,
             &mut 0,
+            &mut WindowBytes::default(),
         ),
         Err(DarwinCarrierError::UnexpectedTrailingFrame { received })
             if received == partial.len()

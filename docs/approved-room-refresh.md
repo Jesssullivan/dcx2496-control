@@ -52,6 +52,35 @@ An empty timeout count measures the response accumulator. The carrier may have c
 
 Authority: user implementation direction and Root's separate typed-failure source scope, TIN-6964. Lexical: XL-ACC-004
 
+## Failed window bytes
+
+Linear: TIN-6964. Nothing here ran on a device.
+
+When a Search, Dump0 or Dump1 exchange fails in transport, times out, hits its limit or fails validation, `dcxctl profile room-refresh` writes one JSON line to stderr after the failed envelope. Budget, pacing, Search qualification, remote-mode and close failures write none. A success writes none, and the executor does not copy bytes out of the carrier then. The carrier still holds the last window in memory until its next exchange or close. It cannot clear the window on a good read, because validation runs in the executor after the carrier returns, and a frame that fails validation needs its bytes.
+
+| Field | Meaning |
+|---|---|
+| `schemaVersion` | `dcx.failure-window-bytes/v1` |
+| `operation` | `search`, `dump0` or `dump1` |
+| `sequence` | The Search attempt number, or null for a dump |
+| `failure` | `transport`, `timeout`, `responseLimit` or `validation` |
+| `received` | Every byte read after that request was written, kept or not |
+| `kept` | Bytes kept, at most 128, from the first byte read |
+| `truncated` | Whether `received` exceeds `kept` |
+| `hex` | Lowercase hex of the kept bytes |
+
+The window holds every byte the carrier read after the write: a request echo, a discarded Search reply, the frame that failed and any trailing frame. The carrier records each byte as it reads it. It adds no read, no wait and no write, and it changes no deadline or retry.
+
+A window with `received` 0 is ambiguous without `failure`. A `timeout` means the deadline passed with no byte. A `transport` failure can come before the first read, as with `InputRecoveryRequired`, `PreexistingInput` or `ShortWrite`, and then its window is empty too. The carrier error on the last stderr line names which one it was.
+
+An empty Search timeout is a known limit. The approved path replays it, and three of them end in `SearchQualificationIncomplete`, which belongs to no single exchange. That record keeps no window. Each of those Search windows held no response byte, but it may have held an exact request echo, and that echo is not kept. The read path is not changed to keep it.
+
+The line goes to stderr only. The helper keeps child stderr in its private record under `RoomDiagnostics`, which has mode `0700` with records at `0600`. The stdout envelope, the room receipt, helper status and the unified log never carry the bytes. The stdout envelope stays one line of compact JSON, byte for byte the form it had before this line was added. The error text on the last stderr line keeps its earlier form. It never carries the window, but some errors name a few byte values, as they did before. `WrongManufacturer` names three header bytes, and `WrongModel` and `NonSevenBitData` each name one.
+
+Two caps bound how many records hold bytes. The store keeps at most eight records. Before it writes a record, it removes any record older than seven days. A record older than that stays only until the next failure is recorded. The age test trusts each record's modification time. A record dated in the future never expires, so the count cap of eight is the hard bound.
+
+Apply and rollback read their dumps through the same carrier. The carrier keeps the window in memory for those reads too, but neither path writes it anywhere. They are out of scope here.
+
 
 ## Periodic recovery
 

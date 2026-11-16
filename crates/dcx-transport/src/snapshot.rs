@@ -82,6 +82,162 @@ pub struct StaleSearchReplies {
     pub dump1: u8,
 }
 
+/// Bytes a carrier keeps from one Search or dump window, from the first byte.
+///
+/// TIN-6964: three fault shapes stayed unexplained because failure records
+/// kept no bytes. The cap keeps a failure record small. It covers one request
+/// echo, a discarded 26-byte Search reply and a 26-byte frame, or the header of
+/// a partial dump.
+pub const MAX_WINDOW_BYTES: usize = 128;
+
+/// Bytes read in one exchange window, after its request was written.
+///
+/// It counts every byte read and keeps the first [`MAX_WINDOW_BYTES`] of them.
+/// Debug output shows only the counts, so an error's Debug text never carries
+/// device bytes.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct WindowBytes {
+    received: usize,
+    kept: Vec<u8>,
+}
+
+impl WindowBytes {
+    /// Count one byte read in this window and keep it while under the cap.
+    pub fn push(&mut self, byte: u8) {
+        self.received = self.received.saturating_add(1);
+        if self.kept.len() < MAX_WINDOW_BYTES {
+            self.kept.push(byte);
+        }
+    }
+
+    /// Forget the window, at the start of the next exchange.
+    pub fn clear(&mut self) {
+        self.received = 0;
+        self.kept.clear();
+    }
+
+    /// Bytes read in the window, kept or not.
+    pub const fn received(&self) -> usize {
+        self.received
+    }
+
+    /// The first bytes read, at most [`MAX_WINDOW_BYTES`].
+    pub fn kept(&self) -> &[u8] {
+        &self.kept
+    }
+
+    /// Whether the window read more bytes than it kept.
+    pub fn truncated(&self) -> bool {
+        self.received > self.kept.len()
+    }
+
+    /// Lowercase hex of the kept bytes.
+    pub fn hex(&self) -> String {
+        use fmt::Write as _;
+        let mut text = String::with_capacity(self.kept.len() * 2);
+        for byte in &self.kept {
+            let _ = write!(text, "{byte:02x}");
+        }
+        text
+    }
+}
+
+impl fmt::Debug for WindowBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WindowBytes")
+            .field("received", &self.received)
+            .field("kept", &self.kept.len())
+            .finish()
+    }
+}
+
+/// The bytes of the exchange that failed an approved capture.
+///
+/// Only a Search, Dump0 or Dump1 exchange that failed in transport, timed
+/// out, hit its response limit or failed validation carries one. A success
+/// carries none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureWindow {
+    operation: SnapshotOperationKind,
+    failure: WindowFailure,
+    bytes: WindowBytes,
+}
+
+/// How the exchange that kept a [`FailureWindow`] failed.
+///
+/// A transport failure can come before the first read, as with a short write
+/// or input that needs recovery, so its window may be empty. The record names
+/// the kind so such a window is not read as an empty timeout. TIN-6964.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFailure {
+    /// The carrier returned an error.
+    Transport,
+    /// The deadline passed without a complete response.
+    Timeout,
+    /// The response passed its byte limit.
+    ResponseLimit,
+    /// A complete response failed validation.
+    Validation,
+}
+
+impl WindowFailure {
+    /// The fixed name the private record line uses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Timeout => "timeout",
+            Self::ResponseLimit => "responseLimit",
+            Self::Validation => "validation",
+        }
+    }
+}
+
+/// Schema of the one-line private failure-window record.
+pub const FAILURE_WINDOW_SCHEMA: &str = "dcx.failure-window-bytes/v1";
+
+impl FailureWindow {
+    /// The failed exchange.
+    pub const fn operation(&self) -> SnapshotOperationKind {
+        self.operation
+    }
+
+    /// How that exchange failed.
+    pub const fn failure(&self) -> WindowFailure {
+        self.failure
+    }
+
+    /// The bytes read in that exchange window.
+    pub const fn bytes(&self) -> &WindowBytes {
+        &self.bytes
+    }
+
+    /// One JSON line for the helper's private failure record.
+    ///
+    /// Every value is a number, a fixed name or lowercase hex, so the line is
+    /// built without a JSON library. `dcxctl` writes it to stderr only. The
+    /// helper keeps that stderr in its private record and nowhere else.
+    pub fn private_record_line(&self) -> String {
+        let (operation, sequence) = match self.operation {
+            SnapshotOperationKind::Search { sequence } => ("search", Some(sequence)),
+            SnapshotOperationKind::Dump0 => ("dump0", None),
+            SnapshotOperationKind::Dump1 => ("dump1", None),
+            SnapshotOperationKind::Meter { sequence } => ("meter", Some(sequence)),
+        };
+        let sequence = sequence.map_or_else(|| "null".to_owned(), |value| value.to_string());
+        format!(
+            "{{\"schemaVersion\":\"{FAILURE_WINDOW_SCHEMA}\",\"operation\":\"{operation}\",\
+             \"sequence\":{sequence},\"failure\":\"{}\",\"received\":{},\"kept\":{},\
+             \"truncated\":{},\"hex\":\"{}\"}}",
+            self.failure.as_str(),
+            self.bytes.received(),
+            self.bytes.kept().len(),
+            self.bytes.truncated(),
+            self.bytes.hex(),
+        )
+    }
+}
+
 /// Complete bulk image plus counters measured from this session's operations.
 #[derive(Debug)]
 pub struct ApprovedTargetCapture {
@@ -116,7 +272,7 @@ impl ApprovedTargetCapture {
 }
 
 /// A failed attempt with actual counters and elapsed time, never a ready receipt.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[error("approved-target bulk capture failed: {failure}")]
 pub struct ApprovedTargetCaptureError<
     E: StdError + Send + Sync + 'static,
@@ -128,6 +284,27 @@ pub struct ApprovedTargetCaptureError<
     empty_search_timeouts: usize,
     stale_search_replies: StaleSearchReplies,
     elapsed: Duration,
+    // Boxed so the error stays small. Most failures carry none.
+    failure_window: Option<Box<FailureWindow>>,
+}
+
+/// Debug keeps the text it had before `failure_window` existed. `dcxctl`
+/// prints it as its error line, and the window bytes go only on their own
+/// private line.
+#[allow(clippy::missing_fields_in_debug)]
+impl<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static> fmt::Debug
+    for ApprovedTargetCaptureError<E, P>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovedTargetCaptureError")
+            .field("failure", &self.failure)
+            .field("search_attempts", &self.search_attempts)
+            .field("empty_search_timeouts", &self.empty_search_timeouts)
+            .field("stale_search_replies", &self.stale_search_replies)
+            .field("elapsed", &self.elapsed)
+            .finish()
+    }
 }
 
 impl<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>
@@ -154,6 +331,11 @@ impl<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>
     pub const fn failure(&self) -> &SnapshotCaptureError<E, P> {
         &self.failure
     }
+    /// The bytes read in the failed Search or dump window, when the failure
+    /// belongs to that exchange and the session keeps window bytes.
+    pub fn failure_window(&self) -> Option<&FailureWindow> {
+        self.failure_window.as_deref()
+    }
 }
 
 struct CountedSnapshotSession<'a, S> {
@@ -161,6 +343,7 @@ struct CountedSnapshotSession<'a, S> {
     attempts: &'a mut usize,
     empty_timeouts: &'a mut usize,
     stale: &'a mut StaleSearchReplies,
+    last_operation: Option<SnapshotOperationKind>,
 }
 
 impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshotSession<'_, S> {
@@ -170,6 +353,7 @@ impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshot
         if search {
             *self.attempts += 1;
         }
+        self.last_operation = Some(operation.kind());
         let result = self.session.exchange(operation);
         if search
             && result.as_ref().is_ok_and(|read| {
@@ -206,8 +390,39 @@ impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshot
     fn last_exchange_stale_search_replies(&self) -> usize {
         self.session.last_exchange_stale_search_replies()
     }
+    fn last_exchange_window_bytes(&self) -> Option<WindowBytes> {
+        self.session.last_exchange_window_bytes()
+    }
     fn finish(self) -> Result<(), Self::Error> {
         self.session.finish()
+    }
+}
+
+/// The exchange a failure belongs to, for the failures an exchange causes.
+///
+/// Budget, pacing, qualification, remote-mode and close failures return
+/// `None`, so their records keep no window bytes.
+fn failed_exchange<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>(
+    failure: &SnapshotCaptureError<E, P>,
+) -> Option<(SnapshotOperationKind, WindowFailure)> {
+    match failure {
+        SnapshotCaptureError::Transport { operation, .. } => {
+            Some((*operation, WindowFailure::Transport))
+        }
+        SnapshotCaptureError::Timeout { operation, .. } => {
+            Some((*operation, WindowFailure::Timeout))
+        }
+        SnapshotCaptureError::ResponseLimit { operation, .. } => {
+            Some((*operation, WindowFailure::ResponseLimit))
+        }
+        SnapshotCaptureError::Validation { operation, .. } => {
+            Some((*operation, WindowFailure::Validation))
+        }
+        SnapshotCaptureError::Pacing { .. }
+        | SnapshotCaptureError::BudgetExceeded { .. }
+        | SnapshotCaptureError::SearchQualificationIncomplete { .. }
+        | SnapshotCaptureError::RemoteMode { .. }
+        | SnapshotCaptureError::Finish { .. } => None,
     }
 }
 
@@ -240,6 +455,7 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
         attempts: &mut attempts,
         empty_timeouts: &mut empty_timeouts,
         stale: &mut stale,
+        last_operation: None,
     };
     let body = capture_body(
         &mut counted,
@@ -250,6 +466,15 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
         started,
         APPROVED_TARGET_SNAPSHOT_BUDGET,
     );
+    // Read the window only on failure, before close. A success copies no
+    // bytes out of the carrier.
+    let window = if body.is_err() {
+        counted
+            .last_operation
+            .zip(counted.last_exchange_window_bytes())
+    } else {
+        None
+    };
     let finish = counted.finish();
     let elapsed = pacer.elapsed().saturating_sub(started);
     let capture = finish_capture(body, finish, APPROVED_TARGET_SEARCH_COUNT)
@@ -263,12 +488,27 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
                 Ok(capture)
             }
         })
-        .map_err(|failure| ApprovedTargetCaptureError {
-            failure,
-            search_attempts: attempts,
-            empty_search_timeouts: empty_timeouts,
-            stale_search_replies: stale,
-            elapsed,
+        .map_err(|failure| {
+            // Keep the window only when the failure names the exchange that
+            // read it.
+            let failure_window = window.and_then(|(operation, bytes)| {
+                let (failed, kind) = failed_exchange(&failure)?;
+                (failed == operation).then(|| {
+                    Box::new(FailureWindow {
+                        operation,
+                        failure: kind,
+                        bytes,
+                    })
+                })
+            });
+            ApprovedTargetCaptureError {
+                failure,
+                search_attempts: attempts,
+                empty_search_timeouts: empty_timeouts,
+                stale_search_replies: stale,
+                elapsed,
+                failure_window,
+            }
         })?;
     Ok(ApprovedTargetCapture {
         capture,
@@ -560,6 +800,15 @@ pub trait PersistentSnapshotSession: Sized {
     /// so a discard ahead of a carrier error is still counted. TIN-6964.
     fn last_exchange_stale_search_replies(&self) -> usize {
         0
+    }
+
+    /// Bytes the most recent [`Self::exchange`] read after its write.
+    ///
+    /// The approved capture reads this only after a failed Search or dump
+    /// exchange, for the private failure record. TIN-6964. A session that
+    /// keeps no bytes returns `None`. Reading it changes no device state.
+    fn last_exchange_window_bytes(&self) -> Option<WindowBytes> {
+        None
     }
 
     /// Restore, verify, and close the single session.
@@ -1769,6 +2018,8 @@ mod tests {
         modes: Vec<RemoteModeCommand>,
         writes: Vec<DirectParameterCommand>,
         finishes: usize,
+        /// Times the executor asked for the last exchange window.
+        window_reads: usize,
     }
 
     enum Step {
@@ -1786,6 +2037,8 @@ mod tests {
         /// Zero-based remote-mode write that fails.
         fail_mode_index: Option<usize>,
         last_stale: usize,
+        /// Window bytes reported for whichever exchange ran last.
+        window: Option<WindowBytes>,
     }
 
     impl FakeSession {
@@ -1799,6 +2052,7 @@ mod tests {
                     fail_finish: false,
                     fail_mode_index: None,
                     last_stale: 0,
+                    window: None,
                 },
                 log,
             )
@@ -1823,6 +2077,11 @@ mod tests {
 
         fn last_exchange_stale_search_replies(&self) -> usize {
             self.last_stale
+        }
+
+        fn last_exchange_window_bytes(&self) -> Option<WindowBytes> {
+            self.log.borrow_mut().window_reads += 1;
+            self.window.clone()
         }
 
         fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
@@ -2263,6 +2522,257 @@ mod tests {
             error.stale_search_replies(),
             StaleSearchReplies { dump0: 1, dump1: 0 }
         );
+    }
+
+    fn window_of(bytes: &[u8]) -> WindowBytes {
+        let mut window = WindowBytes::default();
+        for byte in bytes {
+            window.push(*byte);
+        }
+        window
+    }
+
+    #[test]
+    fn window_bytes_keep_the_first_bytes_up_to_the_cap_and_debug_shows_counts_only() {
+        let bytes = (0..300_u16)
+            .map(|value| u8::try_from(value % 128).unwrap())
+            .collect::<Vec<_>>();
+        let window = window_of(&bytes);
+        assert_eq!(window.received(), 300);
+        assert_eq!(window.kept(), &bytes[..MAX_WINDOW_BYTES]);
+        assert!(window.truncated());
+        assert_eq!(window.hex().len(), MAX_WINDOW_BYTES * 2);
+        assert!(window.hex().starts_with("00010203"));
+        assert_eq!(
+            format!("{window:?}"),
+            "WindowBytes { received: 300, kept: 128 }"
+        );
+
+        let short = window_of(&[0xf0, 0x7f, 0xf7]);
+        assert!(!short.truncated());
+        assert_eq!(short.hex(), "f07ff7");
+        let mut cleared = short;
+        cleared.clear();
+        assert_eq!(cleared, WindowBytes::default());
+    }
+
+    /// TIN-6964 shape: a 26-byte frame where Dump0 belongs, 22:32:59Z.
+    #[test]
+    fn a_26_byte_frame_in_the_dump0_window_keeps_its_bytes_on_failure() {
+        let frame = identity(0);
+        let (mut session, log) =
+            FakeSession::new(november_15_steps(SnapshotRead::complete(&frame).unwrap()));
+        session.window = Some(window_of(&frame));
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+
+        assert_eq!(format!("{:?}", error.failure()), NOVEMBER_15_DUMP0_FAILURE);
+        let window = error.failure_window().unwrap();
+        assert_eq!(window.operation(), SnapshotOperationKind::Dump0);
+        assert_eq!(window.bytes().received(), 26);
+        assert_eq!(window.bytes().kept(), frame.as_slice());
+        // The synthetic identity frame, `SYNTHETIC-IDENTITY` in hex at bytes 7 to 24.
+        let hex = "f0002032000e0053594e5448455449432d4944454e54495459f7";
+        assert_eq!(
+            window.private_record_line(),
+            format!(
+                "{{\"schemaVersion\":\"dcx.failure-window-bytes/v1\",\"operation\":\"dump0\",\
+                 \"sequence\":null,\"failure\":\"validation\",\"received\":26,\"kept\":26,\
+                 \"truncated\":false,\"hex\":\"{hex}\"}}"
+            )
+        );
+        // The error's Debug text, which dcxctl prints, carries no window bytes.
+        let debug = format!("{error:?}");
+        assert!(!debug.contains(hex), "{debug}");
+        assert!(!debug.contains("WindowBytes"), "{debug}");
+        assert!(!debug.contains("failure_window"), "{debug}");
+        assert_eq!(log.borrow().window_reads, 1);
+    }
+
+    /// TIN-6964 shape: Dump0 or Dump1 timed out with no byte.
+    #[test]
+    fn an_empty_dump_timeout_keeps_an_empty_window() {
+        let image = snapshot(0, 1, 2);
+        for dump1 in [false, true] {
+            let mut steps = vec![Step::Read(
+                SnapshotRead::complete(image.frame(SnapshotSection::Identity)).unwrap(),
+            )];
+            if dump1 {
+                steps.push(Step::Read(
+                    SnapshotRead::complete(image.frame(SnapshotSection::Dump0)).unwrap(),
+                ));
+            }
+            steps.push(Step::Read(SnapshotRead::timed_out(&[]).unwrap()));
+            let (mut session, _log) = FakeSession::new(steps);
+            session.window = Some(WindowBytes::default());
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            let operation = if dump1 {
+                SnapshotOperationKind::Dump1
+            } else {
+                SnapshotOperationKind::Dump0
+            };
+            assert!(matches!(
+                error.failure(),
+                SnapshotCaptureError::Timeout { operation: failed, received: 0, .. }
+                    if *failed == operation
+            ));
+            let window = error.failure_window().unwrap();
+            assert_eq!(window.operation(), operation);
+            assert_eq!(window.bytes().received(), 0);
+            assert!(window.bytes().kept().is_empty());
+            assert!(
+                window
+                    .private_record_line()
+                    .ends_with("\"failure\":\"timeout\",\"received\":0,\"kept\":0,\"truncated\":false,\"hex\":\"\"}")
+            );
+        }
+    }
+
+    /// TIN-6964 shape: a Search timed out with 10 bytes, 06:00:31Z.
+    #[test]
+    fn a_search_timeout_with_ten_bytes_keeps_them() {
+        let partial = &identity(0)[..10];
+        let (mut session, _log) =
+            FakeSession::new([Step::Read(SnapshotRead::timed_out(partial).unwrap())]);
+        session.window = Some(window_of(partial));
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::Timeout {
+                operation: SnapshotOperationKind::Search { sequence: 1 },
+                received: 10,
+                ..
+            }
+        ));
+        let window = error.failure_window().unwrap();
+        assert_eq!(
+            window.operation(),
+            SnapshotOperationKind::Search { sequence: 1 }
+        );
+        assert_eq!(window.bytes().kept(), partial);
+        assert!(
+            window
+                .private_record_line()
+                .contains("\"operation\":\"search\",\"sequence\":1,\"failure\":\"timeout\",\"received\":10,\"kept\":10")
+        );
+    }
+
+    /// A transport failure before any read, such as a short write, keeps an
+    /// empty window too. The record names the failure, so it does not read
+    /// as an empty timeout.
+    #[test]
+    fn an_empty_transport_window_is_named_apart_from_an_empty_timeout() {
+        let cases = [
+            // The carrier fails Search 1 before it reads a byte.
+            (vec![Step::Fail], WindowFailure::Transport, "transport"),
+            // Dump0 times out with no byte.
+            (
+                vec![
+                    Step::Read(SnapshotRead::complete(&identity(0)).unwrap()),
+                    Step::Read(SnapshotRead::timed_out(&[]).unwrap()),
+                ],
+                WindowFailure::Timeout,
+                "timeout",
+            ),
+        ];
+        for (steps, failure, name) in cases {
+            let (mut session, _log) = FakeSession::new(steps);
+            session.window = Some(WindowBytes::default());
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            let window = error.failure_window().unwrap();
+            assert_eq!(window.failure(), failure);
+            assert_eq!(window.bytes().received(), 0);
+            assert!(
+                window
+                    .private_record_line()
+                    .contains(&format!("\"failure\":\"{name}\",\"received\":0,")),
+                "{}",
+                window.private_record_line()
+            );
+        }
+    }
+
+    #[test]
+    fn a_success_never_reads_window_bytes() {
+        let (mut session, log) = FakeSession::new(november_15_steps(
+            SnapshotRead::complete(snapshot(0, 1, 2).frame(SnapshotSection::Dump0)).unwrap(),
+        ));
+        session.window = Some(window_of(&identity(0)));
+        let captured = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured.capture().snapshot(), &snapshot(0, 1, 2));
+        assert_eq!(log.borrow().window_reads, 0);
+    }
+
+    #[test]
+    fn failures_outside_an_exchange_keep_no_window() {
+        // Transmit fails after a valid Search. The last exchange was Search 1.
+        let image = snapshot(0, 1, 2);
+        let (mut session, _log) = FakeSession::new([Step::Read(
+            SnapshotRead::complete(image.frame(SnapshotSection::Identity)).unwrap(),
+        )]);
+        session.fail_mode_index = Some(0);
+        session.window = Some(window_of(image.frame(SnapshotSection::Identity)));
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::RemoteMode { .. }
+        ));
+        assert!(error.failure_window().is_none());
+
+        // Three empty Searches end in qualification, not in one exchange.
+        let (mut session, _log) = FakeSession::new(
+            (0..APPROVED_TARGET_SEARCH_ATTEMPT_LIMIT)
+                .map(|_| Step::Read(SnapshotRead::timed_out(&[]).unwrap())),
+        );
+        session.window = Some(WindowBytes::default());
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.failure_window().is_none());
+
+        // A session that keeps no bytes reports none.
+        let (session, _log) = FakeSession::new(november_15_steps(
+            SnapshotRead::complete(&identity(0)).unwrap(),
+        ));
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.failure_window().is_none());
     }
 
     #[test]
