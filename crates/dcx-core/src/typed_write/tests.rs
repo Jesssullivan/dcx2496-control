@@ -1901,3 +1901,263 @@ fn no_other_output_pair_is_linked() {
         assert!(base.linked_predictions(&[action]).is_empty());
     }
 }
+
+// TIN-6805 replay of the 2026-10-20 PA-leg write (`dcxctl-tw-9c56384`,
+// `pa.dcx-write-plan.json`). The raw S0 and S2b frames stay on PZM, so the
+// baseline is synthetic. It holds the recorded pre-write values at the bytes
+// the event touched: O1-O3 unmuted, O4 high-pass BW24 at code 180, O3
+// low-pass frequency at code 180 (Dump1 205 = 52, carrier 212 = 81) and
+// Dump0 101 = 0 with its carrier Dump0 108 bit 0 clear. The record names
+// three bytes outside the plan: Dump0 101 0 -> 1, Dump1 205 52 -> 74 and
+// Dump1 212 81 -> 80.
+
+/// The PA-leg plan: mute O1-O3, then O4 high-pass LR24 at 100 Hz (code 74).
+fn pa_leg_transaction(base: &SnapshotV1) -> WriteTransactionV1 {
+    let mut document = plan(vec![
+        TypedChange::OutputMute {
+            output: 1,
+            muted: true,
+        },
+        TypedChange::OutputMute {
+            output: 2,
+            muted: true,
+        },
+        TypedChange::OutputMute {
+            output: 3,
+            muted: true,
+        },
+        TypedChange::Crossover {
+            output: 4,
+            side: CrossoverSide::HighPass,
+            filter: CrossoverFilter::LinkwitzRiley24,
+            frequency_hz: Some(100.0),
+        },
+    ]);
+    // Moving an active 987 Hz high-pass down to 99 Hz loosens protection.
+    document.allow_protection_change = true;
+    let policy = WritePolicyV1 {
+        allow_protection_change: true,
+        ..WritePolicyV1::default()
+    };
+    plan_writes(base, &document, &policy).unwrap()
+}
+
+/// Dump0 frame offset of the device-maintained byte in the `XCUR` setup
+/// header (decoded offset 77, packing group 11 position 0), and its carrier.
+const DUMP0_XCUR_FLAG: usize = 101;
+const DUMP0_XCUR_FLAG_CARRIER: usize = 108;
+
+/// A readback shaped as the device produced it: the desired state plus the
+/// Dump0 101 move. The device keeps each dump's modulo-128 trailer balance,
+/// so a +1 at 101 lowers the Dump0 trailer by 1.
+fn with_dump0(snapshot: &SnapshotV1, patch: impl FnOnce(&mut Vec<u8>)) -> SnapshotV1 {
+    let mut dump0 = snapshot.frame(crate::SnapshotSection::Dump0).to_vec();
+    patch(&mut dump0);
+    SnapshotV1::from_frames(
+        snapshot.frame(crate::SnapshotSection::Identity),
+        &dump0,
+        snapshot.frame(crate::SnapshotSection::Dump1),
+    )
+    .unwrap()
+}
+
+fn device_moves_xcur_flag(snapshot: &SnapshotV1, value: u8) -> SnapshotV1 {
+    with_dump0(snapshot, |dump0| {
+        let before = dump0[DUMP0_XCUR_FLAG];
+        dump0[DUMP0_XCUR_FLAG] = value;
+        let trailer = dump0.len() - 2;
+        dump0[trailer] = dump0[trailer].wrapping_add(before).wrapping_sub(value) & 0x7f;
+    })
+}
+
+fn uncontained_offsets(
+    plan: &ApplyPlanV1,
+    readback: &SnapshotV1,
+) -> Vec<(crate::SnapshotSection, usize, u8, u8)> {
+    plan.uncontained_changes(readback)
+        .unwrap()
+        .into_iter()
+        .map(|change| (change.section, change.offset, change.before, change.after))
+        .collect()
+}
+
+#[test]
+fn pa_leg_replay_frame_addresses_only_the_planned_fields() {
+    let base = linked_baseline();
+    let dump0 = base.frame(crate::SnapshotSection::Dump0);
+    assert_eq!(
+        (
+            dump0[DUMP0_XCUR_FLAG],
+            dump0[DUMP0_XCUR_FLAG_CARRIER] & 0x01
+        ),
+        (0, 0)
+    );
+    let transaction = pa_leg_transaction(&base);
+    // Five actions: three mutes and the O4 high-pass frequency and type.
+    let mut addresses = wires(&transaction)
+        .iter()
+        .map(|wire| (wire[0], wire[1]))
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    assert_eq!(
+        addresses,
+        [
+            (output_channel(1), MUTE_PARAMETER),
+            (output_channel(2), MUTE_PARAMETER),
+            (output_channel(3), MUTE_PARAMETER),
+            (output_channel(4), HIGH_PASS_TYPE_PARAMETER),
+            (output_channel(4), HIGH_PASS_FREQUENCY_PARAMETER),
+        ]
+    );
+    // No planned action owns any bit of the three moved bytes: the encoder
+    // and planner did not write them. The device moved them.
+    let masks = transaction.apply_plan.projected_masks();
+    let mask = |section, offset| masks.get(&(section, offset)).copied().unwrap_or(0);
+    assert_eq!(mask(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG), 0);
+    assert_eq!(
+        mask(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG_CARRIER) & 0x01,
+        0
+    );
+    assert_eq!(mask(crate::SnapshotSection::Dump1, 205), 0);
+    assert_eq!(mask(crate::SnapshotSection::Dump1, 212), 0);
+    // The O1-O3 mutes put the Dump0 trailer inside the plan, so a balanced
+    // trailer move there is never reported on its own.
+    assert_eq!(
+        mask(crate::SnapshotSection::Dump0, DUMP0_RESPONSE_LEN - 2),
+        0xff
+    );
+    // The O3 low-pass move is predicted as the observed linked follower.
+    let [effect] = transaction.linked_effects.as_slice() else {
+        panic!("one linked effect expected")
+    };
+    assert_eq!((effect.driver_output, effect.follower_output), (4, 3));
+    assert_eq!((effect.before_code, effect.after_code), (180, 74));
+    assert_eq!(effect.evidence, "observed");
+    // The desired snapshot does not predict the Dump0 101 move.
+    let desired = transaction.apply_plan.desired();
+    assert_eq!(
+        desired.frame(crate::SnapshotSection::Dump0)[DUMP0_XCUR_FLAG],
+        0
+    );
+}
+
+#[test]
+fn pa_leg_replay_containment_flags_only_dump0_101_today() {
+    let base = linked_baseline();
+    let transaction = pa_leg_transaction(&base);
+    let plan = &transaction.apply_plan;
+    let readback = device_moves_xcur_flag(plan.desired(), 1);
+    // All five written values read back, and the O3 follower is linked.
+    let verification = verify_written_values(plan, &readback).unwrap();
+    assert_eq!(verification.values.len(), 5);
+    assert!(verification.values.iter().all(|value| value.matches));
+    let [linked] = verification.linked_changes.as_slice() else {
+        panic!("one linked change expected")
+    };
+    assert!(linked.contained);
+    assert_eq!(
+        linked
+            .changes
+            .iter()
+            .map(|change| (change.offset, change.before, change.after))
+            .collect::<Vec<_>>(),
+        [(205, 52, 74), (212, 81, 80)]
+    );
+    // Containment names Dump0 101 and nothing else, so a repeat is caught
+    // and the apply ends rollback_required.
+    assert_eq!(
+        uncontained_offsets(plan, &readback),
+        [(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG, 0, 1)]
+    );
+    assert_eq!(verification.uncontained_changes, 1);
+    assert_eq!(verification.status, "inconsistent");
+    assert!(!verification.readback_matches_desired);
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    apply.verify_apply_readback(&readback).unwrap();
+    assert_eq!(
+        apply.state(),
+        crate::ApplyTransactionState::RollbackRequired
+    );
+}
+
+#[test]
+fn pa_leg_replay_refuses_every_other_device_move() {
+    let base = linked_baseline();
+    let transaction = pa_leg_transaction(&base);
+    let plan = &transaction.apply_plan;
+    let desired = plan.desired();
+    let dump0 = crate::SnapshotSection::Dump0;
+    let dump1 = crate::SnapshotSection::Dump1;
+    // Each case is one device move that no plan field or rule explains.
+    let cases: [(&str, SnapshotV1, (crate::SnapshotSection, usize)); 5] = [
+        (
+            "Dump0 101 at a value other than 1",
+            device_moves_xcur_flag(desired, 2),
+            (dump0, DUMP0_XCUR_FLAG),
+        ),
+        (
+            "the high bit of Dump0 101 in carrier 108",
+            with_dump0(desired, |frame| frame[DUMP0_XCUR_FLAG_CARRIER] |= 0x01),
+            (dump0, DUMP0_XCUR_FLAG_CARRIER),
+        ),
+        (
+            "O3 low-pass at a code other than the written driver code",
+            with_dump1(desired, |frame| frame[205] = 75),
+            (dump1, 205),
+        ),
+        (
+            "an O3 limiter bit in the shared carrier 212",
+            with_dump1(desired, |frame| frame[212] &= !0x10),
+            (dump1, 212),
+        ),
+        (
+            "the O4 low-pass frequency",
+            with_dump1(desired, |frame| {
+                let location = reviewed_address(8, LOW_PASS_FREQUENCY_PARAMETER)
+                    .unwrap()
+                    .location;
+                frame[location.low_offset()] ^= 0x01;
+            }),
+            (
+                dump1,
+                reviewed_address(8, LOW_PASS_FREQUENCY_PARAMETER)
+                    .unwrap()
+                    .location
+                    .low_offset(),
+            ),
+        ),
+    ];
+    for (name, readback, (section, offset)) in cases {
+        let uncontained = uncontained_offsets(plan, &readback);
+        assert!(
+            uncontained
+                .iter()
+                .any(|&(seen, at, _, _)| (seen, at) == (section, offset)),
+            "{name}: expected {section:?} {offset} uncontained, got {uncontained:?}"
+        );
+        let verification = verify_written_values(plan, &readback).unwrap();
+        assert_eq!(verification.status, "inconsistent", "{name}");
+    }
+}
+
+/// TIN-6805 acceptance 1: the plan declares Dump0 101 as a device-maintained
+/// flag that a software write may set to 1, so a compliant PA-leg write
+/// returns `applied`. It fails on main because no plan predicts that byte.
+/// Run it with
+/// `cargo test -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
+#[test]
+#[ignore = "TIN-6805: Dump0 101 has no containment rule yet; the PA-leg replay ends rollback_required"]
+fn pa_leg_replay_compliant_write_is_contained_and_verified() {
+    let base = linked_baseline();
+    let transaction = pa_leg_transaction(&base);
+    let plan = &transaction.apply_plan;
+    let readback = device_moves_xcur_flag(plan.desired(), 1);
+    assert_eq!(uncontained_offsets(plan, &readback), []);
+    let verification = verify_written_values(plan, &readback).unwrap();
+    assert_eq!(verification.status, "consistent");
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    apply.verify_apply_readback(&readback).unwrap();
+    assert_eq!(apply.state(), crate::ApplyTransactionState::Verified);
+}
