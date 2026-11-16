@@ -56,7 +56,7 @@ Authority: user implementation direction and Root's separate typed-failure sourc
 
 Linear: TIN-6964. Nothing here ran on a device.
 
-When a Search, Dump0 or Dump1 exchange fails in transport, times out, hits its limit or fails validation, `dcxctl profile room-refresh` writes one JSON line to stderr after the failed envelope. Budget, pacing, Search qualification, remote-mode and close failures write none. A success writes none, and the executor does not copy bytes out of the carrier then.
+When a Search, Dump0 or Dump1 exchange fails in transport, times out, hits its limit or fails validation, `dcxctl profile room-refresh` writes one JSON line to stderr after the failed envelope. Budget, pacing, Search qualification, remote-mode and close failures write none. A success writes none, and the executor does not copy bytes out of the carrier then. The carrier still holds the last window in memory until its next exchange or close. It cannot clear the window on a good read, because validation runs in the executor after the carrier returns, and a frame that fails validation needs its bytes.
 
 | Field | Meaning |
 |---|---|

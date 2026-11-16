@@ -98,33 +98,31 @@ pub fn capture_approved(
         Ok(captured) => Ok(captured),
         Err(error) => {
             let failure = approved_capture_failure_receipt(error.failure());
-            println!(
-                "{}",
-                serde_json::json!({
-                    "schemaVersion": "dcx.approved-room-refresh/v1",
-                    "status": "failed",
-                    "snapshot": null,
-                    "comparison": null,
-                    "searchAttempts": error.search_attempts(),
-                    "searchEmptyTimeouts": error.empty_search_timeouts(),
-                    "staleSearchRepliesDiscarded": {
-                        "dump0": error.stale_search_replies().dump0,
-                        "dump1": error.stale_search_replies().dump1,
-                    },
-                    "captureElapsedMilliseconds": u64::try_from(error.elapsed().as_millis())?,
-                    "closeVerified": failure["sessionClosedVerified"],
-                    "failure": failure,
-                    "error": error.to_string(),
-                })
-            );
-            // TIN-6964: the bytes of the failed Search or dump window go to
-            // stderr only. The helper keeps stderr in its private failure
-            // record. They never reach the stdout envelope above, and a
-            // failed write here changes nothing else.
-            if let Some(window) = error.failure_window() {
-                use std::io::Write as _;
-                let _ = writeln!(io::stderr(), "{}", window.private_record_line());
-            }
+            let envelope = serde_json::json!({
+                "schemaVersion": "dcx.approved-room-refresh/v1",
+                "status": "failed",
+                "snapshot": null,
+                "comparison": null,
+                "searchAttempts": error.search_attempts(),
+                "searchEmptyTimeouts": error.empty_search_timeouts(),
+                "staleSearchRepliesDiscarded": {
+                    "dump0": error.stale_search_replies().dump0,
+                    "dump1": error.stale_search_replies().dump1,
+                },
+                "captureElapsedMilliseconds": u64::try_from(error.elapsed().as_millis())?,
+                "closeVerified": failure["sessionClosedVerified"],
+                "failure": failure,
+                "error": error.to_string(),
+            });
+            let window_line = error
+                .failure_window()
+                .map(dcx_transport::snapshot::FailureWindow::private_record_line);
+            write_approved_failure(
+                &mut io::stdout().lock(),
+                &mut io::stderr().lock(),
+                &envelope,
+                window_line.as_deref(),
+            )?;
             Err(error.into())
         }
     }
@@ -548,6 +546,126 @@ fn require_device(expected: DeviceId, actual: DeviceId) -> Result<(), io::Error>
     }
 }
 
+/// Writes the failed approved-refresh envelope to `stdout`, then the failed
+/// window line to `stderr` when the capture kept one. TIN-6964.
+///
+/// The window bytes go to stderr only. The helper keeps child stderr in its
+/// private failure record, and the envelope that it parses from stdout never
+/// carries them. A failed stderr write is ignored so it cannot change the
+/// result. Only the failure path calls this, so a success writes no line.
+#[cfg_attr(
+    not(all(feature = "live-control", target_os = "macos")),
+    allow(dead_code)
+)]
+fn write_approved_failure(
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+    envelope: &serde_json::Value,
+    window_line: Option<&str>,
+) -> io::Result<()> {
+    writeln!(stdout, "{}", serde_json::to_string_pretty(envelope)?)?;
+    if let Some(line) = window_line {
+        let _ = writeln!(stderr, "{line}");
+    }
+    Ok(())
+}
+
 fn invalid_input(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_approved_failure;
+    use std::io;
+
+    // The shape `FailureWindow::private_record_line` writes. The host build
+    // of dcxctl has no transport crate, so the line is spelled out here.
+    const WINDOW_LINE: &str = "{\"schemaVersion\":\"dcx.failure-window-bytes/v1\",\
+        \"operation\":\"dump0\",\"sequence\":null,\"received\":26,\"kept\":26,\
+        \"truncated\":false,\"hex\":\"f000204200\"}";
+
+    fn envelope() -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": "dcx.approved-room-refresh/v1",
+            "status": "failed",
+            "snapshot": null,
+            "error": "approved-target bulk capture failed",
+        })
+    }
+
+    struct BrokenWriter;
+
+    impl io::Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("closed"))
+        }
+    }
+
+    #[test]
+    fn failure_window_line_goes_to_stderr_only() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_approved_failure(&mut stdout, &mut stderr, &envelope(), Some(WINDOW_LINE)).unwrap();
+        let expected = format!("{}\n", serde_json::to_string_pretty(&envelope()).unwrap());
+        assert_eq!(String::from_utf8(stdout).unwrap(), expected);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("{WINDOW_LINE}\n")
+        );
+    }
+
+    #[test]
+    fn stdout_envelope_is_the_same_with_or_without_a_window() {
+        let mut with_window = Vec::new();
+        let mut without_window = Vec::new();
+        write_approved_failure(
+            &mut with_window,
+            &mut Vec::new(),
+            &envelope(),
+            Some(WINDOW_LINE),
+        )
+        .unwrap();
+        write_approved_failure(&mut without_window, &mut Vec::new(), &envelope(), None).unwrap();
+        assert_eq!(with_window, without_window);
+        let text = String::from_utf8(with_window).unwrap();
+        assert!(!text.contains("failure-window-bytes"), "{text}");
+        assert!(!text.contains("f000204200"), "{text}");
+    }
+
+    #[test]
+    fn no_window_writes_no_stderr_line() {
+        let mut stderr = Vec::new();
+        write_approved_failure(&mut Vec::new(), &mut stderr, &envelope(), None).unwrap();
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn a_failed_stderr_write_changes_nothing_else() {
+        let mut stdout = Vec::new();
+        write_approved_failure(
+            &mut stdout,
+            &mut BrokenWriter,
+            &envelope(),
+            Some(WINDOW_LINE),
+        )
+        .unwrap();
+        assert!(!stdout.is_empty());
+    }
+
+    #[test]
+    fn a_failed_stdout_write_is_returned() {
+        let mut stderr = Vec::new();
+        let result = write_approved_failure(
+            &mut BrokenWriter,
+            &mut stderr,
+            &envelope(),
+            Some(WINDOW_LINE),
+        );
+        assert!(result.is_err());
+    }
 }
