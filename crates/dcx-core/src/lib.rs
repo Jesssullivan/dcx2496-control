@@ -27,8 +27,9 @@ pub use rew::{
     map_filter_to_output_slot,
 };
 pub use snapshot::{
-    ApplyPlanError, ApplyPlanV1, ApplyTransactionError, ApplyTransactionState, ApplyTransactionV1,
-    ByteChangeV1, LinkedChangeV1, LinkedPrediction, PlanCarrierError, ReadbackVerificationV1,
-    RollbackPlanV1, SnapshotDiffError, SnapshotDiffV1, SnapshotError, SnapshotProjectionError,
-    SnapshotSection, SnapshotSectionChange, SnapshotV1,
+    ALLOWED_DEVICE_MOVES, AllowedDeviceMove, ApplyPlanError, ApplyPlanV1, ApplyTransactionError,
+    ApplyTransactionState, ApplyTransactionV1, ByteChangeV1, DeviceMoveV1, LinkedChangeV1,
+    LinkedPrediction, PlanCarrierError, ReadbackVerificationV1, RollbackPlanV1, SnapshotDiffError,
+    SnapshotDiffV1, SnapshotError, SnapshotProjectionError, SnapshotSection, SnapshotSectionChange,
+    SnapshotV1,
 };

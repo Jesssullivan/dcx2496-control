@@ -194,6 +194,7 @@ pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn 
     )?)?;
     let uncontained = plan.uncontained_changes(&readback)?;
     let linked = plan.linked_changes(&readback)?;
+    let device_moves = plan.device_moves(&readback)?;
     let projected = plan
         .projected_masks()
         .into_iter()
@@ -212,6 +213,7 @@ pub fn verify_containment(plan: &Path, readback: &Path) -> Result<bool, Box<dyn 
         "projected_offsets": projected,
         "uncontained_changes": uncontained,
         "linked_changes": linked,
+        "device_moves": device_moves,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(contained)
@@ -229,8 +231,10 @@ pub fn apply(tty: PathBuf, expected_device: u8, plan: &Path) -> Result<(), Box<d
 }
 
 /// Run one already-validated apply carrier (see [`apply`]). Returns whether
-/// the readback matched the desired snapshot; `control apply` keeps its
-/// historical exit 0 after printing a `rollback_required` status.
+/// the readback verified: it matched the desired snapshot exactly, or, in a
+/// typed write, once the allowed device moves listed under `device_moves`
+/// are put back. `control apply` keeps its historical exit 0 after printing a
+/// `rollback_required` status.
 ///
 /// A post-apply readback that fails with a transport or read error is
 /// repeated only as a fresh read-only snapshot on the same exact callout, at
@@ -249,8 +253,8 @@ pub fn apply_loaded(
 }
 
 /// [`apply_loaded`] without printing: the apply receipt and whether the
-/// readback matched the desired snapshot. `dcxctl profile apply` collects one
-/// receipt per chain step.
+/// readback verified. `readback_matches_desired` stays exact digest
+/// equality. `dcxctl profile apply` collects one receipt per chain step.
 #[cfg(all(feature = "live-control", target_os = "macos"))]
 pub fn apply_loaded_report(
     tty: PathBuf,
@@ -282,7 +286,7 @@ pub fn apply_loaded_report(
         .map(capture_failure_receipt)
         .collect();
     let retry_stop = retry_stop.map(ReadbackRetryStop::label);
-    let (readback, readback_matches_desired) = match result {
+    let (readback, verified) = match result {
         Ok(ApplyReadbackOutcome::Verified(captured)) => (captured, true),
         Ok(ApplyReadbackOutcome::RollbackRequired(captured)) => (captured, false),
         Err(error) if transaction.state() == ApplyTransactionState::RollbackRequired => {
@@ -304,8 +308,10 @@ pub fn apply_loaded_report(
         }
         Err(error) => return Err(error.into()),
     };
+    let readback_matches_desired = readback.snapshot().digest() == plan.desired_snapshot_digest();
+    let device_moves = plan.device_moves(readback.snapshot())?;
     let output = serde_json::json!({
-        "status": if readback_matches_desired { "verified" } else { "rollback_required" },
+        "status": if verified { "verified" } else { "rollback_required" },
         "transaction_id": plan.digest(),
         "baseline_snapshot_digest": plan.baseline_snapshot_digest(),
         "desired_snapshot_digest": plan.desired_snapshot_digest(),
@@ -315,8 +321,9 @@ pub fn apply_loaded_report(
         "readback_retry_stop": retry_stop,
         "rollback_available": plan.command().is_some(),
         "readback_matches_desired": readback_matches_desired,
+        "device_moves": device_moves,
     });
-    Ok((output, readback_matches_desired))
+    Ok((output, verified))
 }
 
 /// Sanitized class of one carrier failure: a fixed label, never bytes or
@@ -443,7 +450,10 @@ fn refuse_typed_lane(
 }
 
 /// Run one already-validated rollback carrier (see [`rollback`]). Returns
-/// whether the restored readback equals the baseline; `control rollback`
+/// whether the rollback verified: the restored readback equals the
+/// baseline exactly, or, in a typed write, once the allowed device moves
+/// listed under `device_moves` are put back. `equals_baseline` stays exact
+/// digest equality. `control rollback`
 /// keeps its historical exit 0 after printing `state_unresolved` with a
 /// captured readback.
 #[cfg(all(feature = "live-control", target_os = "macos"))]
@@ -458,7 +468,7 @@ pub fn rollback_loaded(
     let binding = PrivateTtyBinding::new(tty)?;
     let session = DarwinSearchSession::open_known_38400(binding)?;
     let mut pacer = SystemPacer::new();
-    let (restored, equals_baseline) =
+    let (restored, rolled_back) =
         match execute_rollback_readback(session, &mut pacer, &mut transaction) {
             Ok(RollbackReadbackOutcome::RolledBack(captured)) => (captured, true),
             Ok(RollbackReadbackOutcome::Faulted(captured)) => (captured, false),
@@ -476,15 +486,18 @@ pub fn rollback_loaded(
             }
             Err(error) => return Err(error.into()),
         };
+    let equals_baseline = restored.snapshot().digest() == plan.baseline().digest();
+    let device_moves = plan.apply_plan().device_moves(restored.snapshot())?;
     let output = serde_json::json!({
-        "status": if equals_baseline { "rolled_back" } else { "state_unresolved" },
+        "status": if rolled_back { "rolled_back" } else { "state_unresolved" },
         "transaction_id": plan.apply_plan_digest(),
         "baseline_snapshot_digest": plan.baseline().digest(),
         "restored": restored.snapshot(),
         "equals_baseline": equals_baseline,
+        "device_moves": device_moves,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(equals_baseline)
+    Ok(rolled_back)
 }
 
 fn field_changes(

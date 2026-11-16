@@ -1651,7 +1651,8 @@ pub struct WriteVerificationV1 {
     /// Always [`WRITE_VERIFICATION_SCHEMA`].
     pub schema: &'static str,
     /// `consistent` only when every value matches, nothing changed outside
-    /// the plan's projected bits, and the readback equals the desired state.
+    /// the plan's projected bits, and the readback equals the desired state,
+    /// exactly or once the listed `device_moves` are put back.
     pub status: &'static str,
     /// Apply plan digest.
     pub transaction_id: String,
@@ -1659,6 +1660,9 @@ pub struct WriteVerificationV1 {
     pub readback_snapshot_digest: String,
     /// Whether the readback equals the plan's desired snapshot exactly.
     pub readback_matches_desired: bool,
+    /// Allowed device moves the readback shows (see
+    /// [`crate::ALLOWED_DEVICE_MOVES`]); reported, never silently dropped.
+    pub device_moves: Vec<crate::DeviceMoveV1>,
     /// Per-action written values.
     pub values: Vec<WrittenValueCheckV1>,
     /// Bytes that changed outside the plan's projected bits and outside
@@ -1671,7 +1675,9 @@ pub struct WriteVerificationV1 {
 
 /// Check that every value an apply plan wrote appears at its transcribed dump
 /// location in a later readback, that nothing else changed, and that the
-/// readback equals the desired snapshot.
+/// readback equals the desired snapshot. An allowed device move (Dump0 101
+/// from 0 to 1, Legalab ruling 69) does not break consistency and is listed
+/// under `device_moves`.
 ///
 /// # Errors
 ///
@@ -1700,7 +1706,8 @@ pub fn verify_written_values(
         });
     }
     let readback_matches_desired = readback.digest() == plan.desired_snapshot_digest();
-    let consistent = readback_matches_desired
+    let readback_verification = plan.verify_readback(readback)?;
+    let consistent = readback_verification.is_verified()
         && uncontained.is_empty()
         && values.iter().all(|value| value.matches);
     Ok(WriteVerificationV1 {
@@ -1713,6 +1720,7 @@ pub fn verify_written_values(
         transaction_id: plan.digest().to_owned(),
         readback_snapshot_digest: readback.digest().to_owned(),
         readback_matches_desired,
+        device_moves: readback_verification.device_moves().to_vec(),
         values,
         uncontained_changes: uncontained.len(),
         linked_changes,

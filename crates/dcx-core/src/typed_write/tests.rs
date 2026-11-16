@@ -2046,10 +2046,11 @@ fn pa_leg_replay_frame_addresses_only_the_planned_fields() {
 }
 
 #[test]
-fn pa_leg_replay_containment_flags_only_dump0_101_today() {
+fn pa_leg_replay_reports_the_dump0_101_device_move_under_its_own_field() {
     let base = linked_baseline();
     let transaction = pa_leg_transaction(&base);
     let plan = &transaction.apply_plan;
+    assert!(plan.admits_device_moves());
     let readback = device_moves_xcur_flag(plan.desired(), 1);
     // All five written values read back, and the O3 follower is linked.
     let verification = verify_written_values(plan, &readback).unwrap();
@@ -2067,22 +2068,63 @@ fn pa_leg_replay_containment_flags_only_dump0_101_today() {
             .collect::<Vec<_>>(),
         [(205, 52, 74), (212, 81, 80)]
     );
-    // Containment names Dump0 101 and nothing else, so a repeat is caught
-    // and the apply ends rollback_required.
+    // Ruling 69: the device move is contained and reported on its own.
+    let expected_move = crate::DeviceMoveV1 {
+        classification: "device",
+        rule: "dump0_101_set_by_device",
+        section: crate::SnapshotSection::Dump0,
+        offset: DUMP0_XCUR_FLAG,
+        before: 0,
+        after: 1,
+    };
     assert_eq!(
-        uncontained_offsets(plan, &readback),
-        [(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG, 0, 1)]
+        verification.device_moves,
+        std::slice::from_ref(&expected_move)
     );
-    assert_eq!(verification.uncontained_changes, 1);
-    assert_eq!(verification.status, "inconsistent");
+    assert_eq!(
+        plan.device_moves(&readback).unwrap(),
+        std::slice::from_ref(&expected_move)
+    );
+    assert_eq!(verification.uncontained_changes, 0);
     assert!(!verification.readback_matches_desired);
+    assert_eq!(verification.status, "consistent");
+    let json = serde_json::to_value(&verification).unwrap();
+    assert_eq!(
+        json["device_moves"],
+        serde_json::json!([{
+            "classification": "device",
+            "rule": "dump0_101_set_by_device",
+            "section": "dump0",
+            "offset": 101,
+            "before": 0,
+            "after": 1,
+        }])
+    );
     let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
     apply.begin_apply().unwrap();
-    apply.verify_apply_readback(&readback).unwrap();
-    assert_eq!(
-        apply.state(),
-        crate::ApplyTransactionState::RollbackRequired
-    );
+    let receipt = apply.verify_apply_readback(&readback).unwrap();
+    assert!(!receipt.is_exact());
+    assert!(receipt.is_verified());
+    assert_eq!(receipt.device_moves(), [expected_move]);
+    assert_eq!(apply.state(), crate::ApplyTransactionState::Verified);
+}
+
+/// The device move breaks no check when it does not happen: an exact
+/// readback still verifies and reports no move.
+#[test]
+fn pa_leg_replay_exact_readback_reports_no_device_move() {
+    let base = linked_baseline();
+    let transaction = pa_leg_transaction(&base);
+    let plan = &transaction.apply_plan;
+    let verification = verify_written_values(plan, plan.desired()).unwrap();
+    assert_eq!(verification.status, "consistent");
+    assert!(verification.readback_matches_desired);
+    assert!(verification.device_moves.is_empty());
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    let receipt = apply.verify_apply_readback(plan.desired()).unwrap();
+    assert!(receipt.is_exact() && receipt.is_verified());
+    assert!(receipt.device_moves().is_empty());
 }
 
 #[test]
@@ -2094,13 +2136,30 @@ fn pa_leg_replay_refuses_every_other_device_move() {
     let dump0 = crate::SnapshotSection::Dump0;
     let dump1 = crate::SnapshotSection::Dump1;
     // Each case is one device move that no plan field or rule explains.
-    // The first case reads 101 as a modified flag, per the TIN-6805
-    // acceptance text. Its allowed values wait on the operator ruling.
-    let cases: [(&str, SnapshotV1, (crate::SnapshotSection, usize)); 5] = [
+    // Ruling 69 allows Dump0 101 to move from 0 to 1 only, with the Dump0
+    // trailer kept in balance.
+    let cases: [(&str, SnapshotV1, (crate::SnapshotSection, usize)); 8] = [
         (
             "Dump0 101 at a value other than 1",
             device_moves_xcur_flag(desired, 2),
             (dump0, DUMP0_XCUR_FLAG),
+        ),
+        (
+            "Dump0 101 at the maximum 7-bit value",
+            device_moves_xcur_flag(desired, 0x7f),
+            (dump0, DUMP0_XCUR_FLAG),
+        ),
+        (
+            "Dump0 101 at 1 with the Dump0 trailer left unbalanced",
+            with_dump0(desired, |frame| frame[DUMP0_XCUR_FLAG] = 1),
+            (dump0, DUMP0_XCUR_FLAG),
+        ),
+        (
+            "Dump0 101 at 1 and its high bit set in carrier 108",
+            with_dump0(&device_moves_xcur_flag(desired, 1), |frame| {
+                frame[DUMP0_XCUR_FLAG_CARRIER] |= 0x01;
+            }),
+            (dump0, DUMP0_XCUR_FLAG_CARRIER),
         ),
         (
             "the high bit of Dump0 101 in carrier 108",
@@ -2144,18 +2203,22 @@ fn pa_leg_replay_refuses_every_other_device_move() {
         );
         let verification = verify_written_values(plan, &readback).unwrap();
         assert_eq!(verification.status, "inconsistent", "{name}");
+        let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+        apply.begin_apply().unwrap();
+        apply.verify_apply_readback(&readback).unwrap();
+        assert_eq!(
+            apply.state(),
+            crate::ApplyTransactionState::RollbackRequired,
+            "{name}"
+        );
     }
 }
 
-/// TIN-6805 acceptance 1: the plan declares Dump0 101 as a device-maintained
-/// flag that a software write may set to 1, so a compliant PA-leg write
-/// returns `applied`. It fails on main because no plan predicts that byte.
-/// The value 1 follows the TIN-6805 acceptance text, which reads 101 as a
-/// modified flag. The allowed values still wait on the operator ruling.
-/// Run it with
-/// `nix develop -c cargo test --locked -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
+/// TIN-6805 acceptance 1, under ruling 69 (Linear TIN-5385 comment
+/// `50be9d3b`, "Yes, value 1 only"): a compliant PA-leg write whose
+/// readback shows the device setting Dump0 101 from 0 to 1 is contained,
+/// consistent and verified.
 #[test]
-#[ignore = "TIN-6805: Dump0 101 has no containment rule yet. The PA-leg replay ends rollback_required"]
 fn pa_leg_replay_compliant_write_is_contained_and_verified() {
     let base = linked_baseline();
     let transaction = pa_leg_transaction(&base);
@@ -2168,4 +2231,173 @@ fn pa_leg_replay_compliant_write_is_contained_and_verified() {
     apply.begin_apply().unwrap();
     apply.verify_apply_readback(&readback).unwrap();
     assert_eq!(apply.state(), crate::ApplyTransactionState::Verified);
+}
+
+/// The reverse move, 1 to 0, stays refused: the rule names one direction.
+#[test]
+fn pa_leg_replay_refuses_dump0_101_moving_from_1_to_0() {
+    let base = device_moves_xcur_flag(&linked_baseline(), 1);
+    let transaction = pa_leg_transaction(&base);
+    let plan = &transaction.apply_plan;
+    let readback = device_moves_xcur_flag(plan.desired(), 0);
+    assert_eq!(
+        uncontained_offsets(plan, &readback),
+        [(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG, 1, 0)]
+    );
+    assert!(plan.device_moves(&readback).unwrap().is_empty());
+    let verification = verify_written_values(plan, &readback).unwrap();
+    assert_eq!(verification.status, "inconsistent");
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    apply.verify_apply_readback(&readback).unwrap();
+    assert_eq!(
+        apply.state(),
+        crate::ApplyTransactionState::RollbackRequired
+    );
+    // A baseline already at 1 that stays at 1 is no move at all.
+    let verification = verify_written_values(plan, plan.desired()).unwrap();
+    assert_eq!(verification.status, "consistent");
+    assert!(verification.device_moves.is_empty());
+}
+
+/// A typed write that leaves Dump0 alone does not mask the Dump0 trailer, so
+/// the trailer balance is checked on its own: a balanced move is contained,
+/// an unbalanced one names both bytes.
+#[test]
+fn device_move_in_a_dump1_only_typed_write_needs_a_balanced_trailer() {
+    let base = linked_baseline();
+    let transaction = o4_hpf_lr24_100hz(&base);
+    let plan = &transaction.apply_plan;
+    assert!(plan.admits_device_moves());
+    let trailer = DUMP0_RESPONSE_LEN - 2;
+    let masks = plan.projected_masks();
+    assert!(!masks.contains_key(&(crate::SnapshotSection::Dump0, trailer)));
+    let balanced = device_moves_xcur_flag(plan.desired(), 1);
+    assert_eq!(uncontained_offsets(plan, &balanced), []);
+    assert_eq!(
+        verify_written_values(plan, &balanced).unwrap().status,
+        "consistent"
+    );
+    let unbalanced = with_dump0(plan.desired(), |frame| frame[DUMP0_XCUR_FLAG] = 1);
+    let base_trailer = base.frame(crate::SnapshotSection::Dump0)[trailer];
+    assert_eq!(
+        uncontained_offsets(plan, &unbalanced),
+        [(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG, 0, 1)]
+    );
+    assert_eq!(
+        unbalanced.frame(crate::SnapshotSection::Dump0)[trailer],
+        base_trailer
+    );
+    assert!(plan.device_moves(&unbalanced).unwrap().is_empty());
+    assert_eq!(
+        verify_written_values(plan, &unbalanced).unwrap().status,
+        "inconsistent"
+    );
+    // A balanced move beside a second unplanned, also balanced, Dump0 byte
+    // move excuses only 101.
+    let other = DUMP0_XCUR_FLAG + 1;
+    let with_other = with_dump0(&balanced, |frame| {
+        let before = frame[other];
+        frame[other] ^= 0x01;
+        frame[trailer] = frame[trailer]
+            .wrapping_add(before)
+            .wrapping_sub(frame[other])
+            & 0x7f;
+    });
+    let uncontained = uncontained_offsets(plan, &with_other);
+    assert!(uncontained.iter().any(
+        |&(section, offset, _, _)| (section, offset) == (crate::SnapshotSection::Dump0, other)
+    ));
+    assert!(
+        !uncontained
+            .iter()
+            .any(|&(section, offset, _, _)| (section, offset)
+                == (crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG))
+    );
+    assert_eq!(
+        verify_written_values(plan, &with_other).unwrap().status,
+        "inconsistent"
+    );
+}
+
+/// The rule covers typed writes only. A plan without a typed-write-lane
+/// address, here the O4 mute, keeps exact equality.
+#[test]
+fn device_move_stays_uncontained_outside_a_typed_write() {
+    let base = Builder::new().snapshot();
+    let mute = DirectParameterAction::new(output_channel(4), MUTE_PARAMETER, 1).unwrap();
+    let transaction = ApplyTransactionV1::stage_projected(base, vec![mute]).unwrap();
+    let plan = transaction.apply_plan();
+    assert!(!plan.admits_device_moves());
+    let readback = device_moves_xcur_flag(plan.desired(), 1);
+    assert!(plan.device_moves(&readback).unwrap().is_empty());
+    let uncontained = uncontained_offsets(plan, &readback);
+    assert!(
+        uncontained
+            .iter()
+            .any(|&(section, offset, _, _)| (section, offset)
+                == (crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG))
+    );
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    let receipt = apply.verify_apply_readback(&readback).unwrap();
+    assert!(!receipt.is_verified());
+    assert!(receipt.device_moves().is_empty());
+    assert_eq!(
+        apply.state(),
+        crate::ApplyTransactionState::RollbackRequired
+    );
+}
+
+/// Rollback after a write that moved Dump0 101: the inverse cannot reach
+/// the byte, so a restored readback that differs from the baseline only by
+/// that allowed move rolls back and reports it. Any other value at 101, an
+/// unbalanced trailer or a carrier bit still faults.
+#[test]
+fn pa_leg_replay_rollback_accepts_dump0_101_left_at_1() {
+    let base = linked_baseline();
+    let transaction = pa_leg_transaction(&base);
+    let rollback_after = |restored: &SnapshotV1| {
+        let mut rollback = ApplyTransactionV1::resume_rollback(&transaction.rollback_plan).unwrap();
+        rollback.begin_rollback().unwrap();
+        let receipt = rollback.verify_rollback_readback(restored).unwrap().clone();
+        (rollback.state(), receipt)
+    };
+    let (state, receipt) = rollback_after(&device_moves_xcur_flag(&base, 1));
+    assert_eq!(state, crate::ApplyTransactionState::RolledBack);
+    assert!(!receipt.is_exact());
+    assert!(receipt.is_verified());
+    assert_eq!(
+        receipt
+            .device_moves()
+            .iter()
+            .map(|change| (change.rule, change.offset, change.before, change.after))
+            .collect::<Vec<_>>(),
+        [("dump0_101_set_by_device", DUMP0_XCUR_FLAG, 0, 1)]
+    );
+    // The byte back at 0 is an exact restore with no move.
+    let (state, receipt) = rollback_after(&base);
+    assert_eq!(state, crate::ApplyTransactionState::RolledBack);
+    assert!(receipt.is_exact() && receipt.device_moves().is_empty());
+    for (name, restored) in [
+        ("value 2", device_moves_xcur_flag(&base, 2)),
+        (
+            "unbalanced trailer",
+            with_dump0(&base, |frame| frame[DUMP0_XCUR_FLAG] = 1),
+        ),
+        (
+            "carrier bit",
+            with_dump0(&device_moves_xcur_flag(&base, 1), |frame| {
+                frame[DUMP0_XCUR_FLAG_CARRIER] |= 0x01;
+            }),
+        ),
+        (
+            "an O1 mute left written",
+            device_moves_xcur_flag(transaction.apply_plan.desired(), 1),
+        ),
+    ] {
+        let (state, receipt) = rollback_after(&restored);
+        assert_eq!(state, crate::ApplyTransactionState::Faulted, "{name}");
+        assert!(!receipt.is_verified(), "{name}");
+    }
 }

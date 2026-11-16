@@ -103,7 +103,10 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   modelled linked crossover (an O4 high-pass frequency write moving O3
   low-pass frequency to the same code, `docs/typed-writes.md`) is reported
   as `linked`, not dropped; its inferred reverse direction is reported but
-  stays uncontained. An apply readback that fails in transport is
+  stays uncontained. In a typed write the device may set Dump0 byte 101
+  from 0 to 1 with a balanced trailer (Legalab ruling 69, TIN-5385
+  `50be9d3b`); apply, rollback and containment report it under
+  `device_moves` and refuse every other value. An apply readback that fails in transport is
   repeated only as a fresh read-only G1 snapshot, 20 s later and only while
   it fits the 150 s apply envelope (fixed constants, no write re-sent). Missing
   post-write capture remains explicit uncertainty: apply `readback` and
