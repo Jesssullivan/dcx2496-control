@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Pin the PA-leg write containment gap with tests (TIN-6805). The tests
-  replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame
+- Pin the PA-leg write containment gap with tests. TIN-6805 tracks it. The
+  tests replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame
   addresses only the five planned fields. The linked O3 low-pass move at
   Dump1 205 and 212 is contained today. Dump0 101 is the one byte that
   containment still flags, so a repeat ends `rollback_required`. Any other

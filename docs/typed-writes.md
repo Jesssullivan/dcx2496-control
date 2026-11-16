@@ -33,11 +33,12 @@ low-pass move described below, so that readback did not pass `write verify`
 and no address is promoted by it.
 
 Today the linked O3 low-pass move is contained, and Dump0 101 is the one
-byte containment still flags (TIN-6805). The `pa_leg_replay_*` tests in
-`crates/dcx-core/src/typed_write/tests.rs` replay that write. The ignored
+byte containment still flags. TIN-6805 tracks that gap. The
+`pa_leg_replay_*` tests in `crates/dcx-core/src/typed_write/tests.rs` replay
+that write. The ignored
 `pa_leg_replay_compliant_write_is_contained_and_verified` fails until Dump0
 101 has a containment rule. Run it with
-`cargo test -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
+`nix develop -c cargo test --locked -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
 
 ## Flow
 

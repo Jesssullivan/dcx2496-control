@@ -1902,16 +1902,18 @@ fn no_other_output_pair_is_linked() {
     }
 }
 
-// TIN-6805 replay of the 2026-10-20 PA-leg write (`dcxctl-tw-9c56384`,
-// `pa.dcx-write-plan.json`). The raw S0 and S2b frames stay on PZM, so the
-// baseline is synthetic. It holds the recorded pre-write values at the bytes
-// the event touched: O1-O3 unmuted, O4 high-pass BW24 at code 180, O3
-// low-pass frequency at code 180 (Dump1 205 = 52, carrier 212 = 81) and
-// Dump0 101 = 0 with its carrier Dump0 108 bit 0 clear. The record names
+// TIN-6805 replays the 2026-10-20 PA-leg write. Its receipt is
+// `dcxctl-tw-9c56384` and its plan is `pa.dcx-write-plan.json`. The raw S0
+// and S2b frames stay on PZM, so the baseline is synthetic. It holds the
+// recorded pre-write values at the bytes the event touched: O1-O3 unmuted,
+// O4 high-pass BW24 at code 180, O3 low-pass frequency at code 180 and
+// Dump0 101 = 0 with its carrier Dump0 108 bit 0 clear. The O3 low-pass code
+// sits at Dump1 205 = 52 with carrier Dump1 212 = 81. The record names
 // three bytes outside the plan: Dump0 101 0 -> 1, Dump1 205 52 -> 74 and
 // Dump1 212 81 -> 80.
 
-/// The PA-leg plan: mute O1-O3, then O4 high-pass LR24 at 100 Hz (code 74).
+/// The PA-leg plan: mute O1-O3, then set O4 high-pass LR24 at 100 Hz, which
+/// encodes as code 74.
 fn pa_leg_transaction(base: &SnapshotV1) -> WriteTransactionV1 {
     let mut document = plan(vec![
         TypedChange::OutputMute {
@@ -1943,13 +1945,12 @@ fn pa_leg_transaction(base: &SnapshotV1) -> WriteTransactionV1 {
 }
 
 /// Dump0 frame offset of the device-maintained byte in the `XCUR` setup
-/// header (decoded offset 77, packing group 11 position 0), and its carrier.
+/// header, and its carrier. Frame offset 101 is decoded offset 77, at packing
+/// group 11 position 0.
 const DUMP0_XCUR_FLAG: usize = 101;
 const DUMP0_XCUR_FLAG_CARRIER: usize = 108;
 
-/// A readback shaped as the device produced it: the desired state plus the
-/// Dump0 101 move. The device keeps each dump's modulo-128 trailer balance,
-/// so a +1 at 101 lowers the Dump0 trailer by 1.
+/// Returns a copy of the snapshot with its Dump0 frame patched in place.
 fn with_dump0(snapshot: &SnapshotV1, patch: impl FnOnce(&mut Vec<u8>)) -> SnapshotV1 {
     let mut dump0 = snapshot.frame(crate::SnapshotSection::Dump0).to_vec();
     patch(&mut dump0);
@@ -1961,6 +1962,9 @@ fn with_dump0(snapshot: &SnapshotV1, patch: impl FnOnce(&mut Vec<u8>)) -> Snapsh
     .unwrap()
 }
 
+/// A readback shaped as the device produced it: the snapshot plus the Dump0
+/// 101 move. The device keeps each dump's modulo-128 trailer balance, so a
+/// +1 at 101 lowers the Dump0 trailer by 1.
 fn device_moves_xcur_flag(snapshot: &SnapshotV1, value: u8) -> SnapshotV1 {
     with_dump0(snapshot, |dump0| {
         let before = dump0[DUMP0_XCUR_FLAG];
@@ -2149,7 +2153,7 @@ fn pa_leg_replay_refuses_every_other_device_move() {
 /// The value 1 follows the TIN-6805 acceptance text, which reads 101 as a
 /// modified flag. The allowed values still wait on the operator ruling.
 /// Run it with
-/// `cargo test -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
+/// `nix develop -c cargo test --locked -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
 #[test]
 #[ignore = "TIN-6805: Dump0 101 has no containment rule yet. The PA-leg replay ends rollback_required"]
 fn pa_leg_replay_compliant_write_is_contained_and_verified() {
