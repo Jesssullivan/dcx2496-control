@@ -45,7 +45,10 @@ final class RoomFailureDiagnosticStore: @unchecked Sendable {
     static let maximumStderrBytes = 16 * 1024
     /// A record older than this is removed before the next record is written.
     /// With `maximumRecords` it bounds how many records hold the failed
-    /// window bytes that dcxctl writes to stderr. TIN-6964.
+    /// window bytes that dcxctl writes to stderr. The age test trusts the
+    /// record's modification time. A record dated in the future, for example
+    /// after a clock step, never expires, so `maximumRecords` is the hard
+    /// bound. TIN-6964.
     static let maximumRecordAge: TimeInterval = 7 * 24 * 60 * 60
     static let directoryName = "RoomDiagnostics"
     private let root: URL

@@ -77,7 +77,7 @@ An empty Search timeout is a known limit. The approved path replays it, and thre
 
 The line goes to stderr only. The helper keeps child stderr in its private record under `RoomDiagnostics`, which has mode `0700` with records at `0600`. The stdout envelope, the room receipt, helper status and the unified log never carry the bytes. The stdout envelope stays one line of compact JSON, byte for byte the form it had before this line was added. The error text on the last stderr line keeps its earlier form. It never carries the window, but some errors name a few byte values, as they did before. `WrongManufacturer` names three header bytes, and `WrongModel` and `NonSevenBitData` each name one.
 
-Two caps bound how many records hold bytes. The store keeps at most eight records. Before it writes a record, it removes any record older than seven days. A record older than that stays only until the next failure is recorded.
+Two caps bound how many records hold bytes. The store keeps at most eight records. Before it writes a record, it removes any record older than seven days. A record older than that stays only until the next failure is recorded. The age test trusts each record's modification time. A record dated in the future never expires, so the count cap of eight is the hard bound.
 
 Apply and rollback read their dumps through the same carrier. The carrier keeps the window in memory for those reads too, but neither path writes it anywhere. They are out of scope here.
 

@@ -585,11 +585,20 @@ mod tests {
     // The shape `FailureWindow::private_record_line` writes. The host build
     // of dcxctl has no transport crate, so the line is spelled out here. The
     // hex is the 26-byte synthetic identity frame the transport tests use.
-    const WINDOW_HEX: &str = "f0002032000e0053594e5448455449432d4944454e54495459f7";
-    const WINDOW_LINE: &str = "{\"schemaVersion\":\"dcx.failure-window-bytes/v1\",\
-        \"operation\":\"dump0\",\"sequence\":null,\"failure\":\"validation\",\
-        \"received\":26,\"kept\":26,\"truncated\":false,\
-        \"hex\":\"f0002032000e0053594e5448455449432d4944454e54495459f7\"}";
+    macro_rules! window_hex {
+        () => {
+            "f0002032000e0053594e5448455449432d4944454e54495459f7"
+        };
+    }
+    const WINDOW_HEX: &str = window_hex!();
+    const WINDOW_LINE: &str = concat!(
+        "{\"schemaVersion\":\"dcx.failure-window-bytes/v1\",",
+        "\"operation\":\"dump0\",\"sequence\":null,\"failure\":\"validation\",",
+        "\"received\":26,\"kept\":26,\"truncated\":false,",
+        "\"hex\":\"",
+        window_hex!(),
+        "\"}"
+    );
 
     fn envelope() -> serde_json::Value {
         serde_json::json!({

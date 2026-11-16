@@ -6,12 +6,14 @@
   shapes stayed unexplained because failure records kept no bytes. When a
   `room-refresh` Search or dump exchange fails, `dcxctl` writes one
   `dcx.failure-window-bytes/v1` line to stderr. It holds the failure kind,
-  the first 128 bytes read after that request, in hex, and the total count. The helper keeps
-  that stderr in its private failure record. The stdout envelope, the room
-  receipt and helper status carry no bytes. A success writes no line. The
-  helper now also removes private records older than seven days before it
-  writes the next one, beside its cap of eight. The read path is unchanged.
-  Apply and rollback emit no bytes. Helper build 14 is unchanged.
+  the first 128 bytes read after that request, in hex, and the total count.
+  The helper keeps that stderr in its private failure record. The stdout
+  envelope, the room receipt and helper status carry no bytes. A success
+  writes no line. The helper now also removes private records older than
+  seven days before it writes the next one, beside its cap of eight. The age
+  cap trusts each record's modification time, so the count cap of eight is
+  the hard bound. The read path is unchanged. Apply and rollback emit no
+  bytes. Helper build 14 is unchanged.
 - Discard one stale Search reply ahead of a dump (TIN-6964). On November 15,
   2026, at 22:32:59Z, a 26-byte frame arrived where the 1015-byte Dump0
   belongs. In a Dump0 or Dump1 window the carrier now discards one complete
