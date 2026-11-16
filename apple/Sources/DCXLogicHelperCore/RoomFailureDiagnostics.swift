@@ -43,13 +43,19 @@ final class RoomFailureDiagnosticStore: @unchecked Sendable {
     static let maximumRecords = 8
     static let maximumRecordBytes = 32 * 1024
     static let maximumStderrBytes = 16 * 1024
+    /// A record older than this is removed before the next record is written.
+    /// With `maximumRecords` it bounds how many records hold the failed
+    /// window bytes that dcxctl writes to stderr. TIN-6964.
+    static let maximumRecordAge: TimeInterval = 7 * 24 * 60 * 60
     static let directoryName = "RoomDiagnostics"
     private let root: URL
     private let lock = NSLock()
     private let beforePersist: @Sendable () -> Void
-    init(parent: URL, beforePersist: @escaping @Sendable () -> Void = {}) {
+    private let now: @Sendable () -> Date
+    init(parent: URL, beforePersist: @escaping @Sendable () -> Void = {}, now: @escaping @Sendable () -> Date = { Date() }) {
         root = parent.appendingPathComponent(Self.directoryName, isDirectory: true)
         self.beforePersist = beforePersist
+        self.now = now
     }
     private enum StoreError: Error { case custody, bounds, io }
 
@@ -130,7 +136,11 @@ final class RoomFailureDiagnosticStore: @unchecked Sendable {
         guard !files.contains(where: { $0.0 == leaf }) else { throw StoreError.custody }
         // No writes occur until all retained entries have passed custody checks.
         files.sort { ($0.1, $0.2, $0.0) < ($1.1, $1.2, $1.0) }
-        for file in files.prefix(max(0, files.count - Self.maximumRecords + 1)) {
+        // Remove records past the age cap first, then the oldest over the count cap.
+        let cutoff = Int64(floor(now().timeIntervalSince1970 - Self.maximumRecordAge))
+        let expired = files.prefix { $0.1 < cutoff }.count
+        let overCount = max(0, files.count - expired - Self.maximumRecords + 1)
+        for file in files.prefix(expired + overCount) {
             guard unlinkat(directory, file.0, 0) == 0 else { throw StoreError.io }
         }
         let fd = openat(directory, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)

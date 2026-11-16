@@ -30,7 +30,7 @@ use dcx_transport::{
     SearchTransport,
     snapshot::{
         MAX_STALE_SEARCH_REPLIES_PER_DUMP, PersistentApplySession, PersistentSnapshotSession,
-        SnapshotOperation, SnapshotOperationKind, SnapshotRead, SnapshotReadEnd,
+        SnapshotOperation, SnapshotOperationKind, SnapshotRead, SnapshotReadEnd, WindowBytes,
     },
 };
 use dcx_transport::{
@@ -709,6 +709,9 @@ struct PersistentCarrier<B: SerialBackend> {
     /// Search replies the most recent snapshot exchange discarded, kept so a
     /// receipt can count them when the exchange then fails.
     last_exchange_stale: usize,
+    /// Bytes the most recent snapshot exchange read after its write, capped.
+    /// Kept in memory only. The approved capture copies them out on failure.
+    last_exchange_window: WindowBytes,
     receive_direct_cleanup_device: Option<DeviceId>,
 }
 
@@ -819,6 +822,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             input_discard_required: false,
             last_search_response: None,
             last_exchange_stale: 0,
+            last_exchange_window: WindowBytes::default(),
             receive_direct_cleanup_device: None,
         })
     }
@@ -1007,6 +1011,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         operation: SnapshotOperation,
     ) -> Result<SnapshotRead, DarwinCarrierError> {
         self.last_exchange_stale = 0;
+        self.last_exchange_window.clear();
         self.require_usable_input()?;
         let mut write_attempted = false;
         let result = self.run_snapshot_exchange_usable(operation, &mut write_attempted);
@@ -1063,6 +1068,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             matches!(operation.kind(), SnapshotOperationKind::Search { .. }),
             stale_search_device,
             &mut self.last_exchange_stale,
+            &mut self.last_exchange_window,
         )?;
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. })
             && let Some(response) = bounded.response
@@ -1192,6 +1198,10 @@ impl<B: SerialBackend> PersistentSnapshotSession for PersistentCarrier<B> {
 
     fn last_exchange_stale_search_replies(&self) -> usize {
         self.last_exchange_stale
+    }
+
+    fn last_exchange_window_bytes(&self) -> Option<WindowBytes> {
+        Some(self.last_exchange_window.clone())
     }
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
@@ -1699,6 +1709,8 @@ fn fixed_search_response(
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 trait WireObserver {
     fn consumed(&mut self, count: usize);
+    /// One byte read from the wire. Only the snapshot window observer keeps it.
+    fn byte(&mut self, _value: u8) {}
     fn duplicate(&mut self);
     fn unexpected(&mut self, received: usize) -> DarwinCarrierError;
     fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError;
@@ -1727,6 +1739,30 @@ impl WireObserver for ReceiptBuilder {
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 impl WireObserver for () {
     fn consumed(&mut self, _count: usize) {}
+
+    fn duplicate(&mut self) {}
+
+    fn unexpected(&mut self, received: usize) -> DarwinCarrierError {
+        DarwinCarrierError::UnexpectedTrailingFrame { received }
+    }
+
+    fn overflow(&mut self, received: usize, queued: usize) -> DarwinCarrierError {
+        DarwinCarrierError::Overflow { received, queued }
+    }
+}
+
+/// Records the bytes of one snapshot exchange window and otherwise acts as
+/// `()`. It adds no read and changes no deadline. TIN-6964.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+struct WindowObserver<'a>(&'a mut WindowBytes);
+
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+impl WireObserver for WindowObserver<'_> {
+    fn consumed(&mut self, _count: usize) {}
+
+    fn byte(&mut self, value: u8) {
+        self.0.push(value);
+    }
 
     fn duplicate(&mut self) {}
 
@@ -1872,6 +1908,7 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
                 queued_budget -= 1;
                 frame.push(byte[0]);
                 observer.consumed(1);
+                observer.byte(byte[0]);
             }
             ReadProgress::Bytes(_) | ReadProgress::EndOfFile => {
                 return Err(DarwinCarrierError::EndOfFile {
@@ -1908,7 +1945,11 @@ fn is_search_reply_from(frame: &[u8], device: DeviceId) -> bool {
 /// in the same window becomes the response, so validation refuses it. Nothing
 /// is written here, so no request is replayed. `stale` holds the discard
 /// count even when the read then fails, so a receipt can still report it.
+/// `window` likewise keeps the bytes read in this window, capped, for the
+/// private failure record. Every byte the reads below take is recorded, and
+/// recording it adds no read and no wait.
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+#[allow(clippy::too_many_arguments)]
 fn read_snapshot_bounded<B: SerialBackend>(
     backend: &mut B,
     deadline: Duration,
@@ -1917,8 +1958,10 @@ fn read_snapshot_bounded<B: SerialBackend>(
     consume_all_queued_search_replays: bool,
     stale_search_device: Option<DeviceId>,
     stale: &mut usize,
+    window: &mut WindowBytes,
 ) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
-    let mut observer = ();
+    window.clear();
+    let mut observer = WindowObserver(window);
     let mut echo_skipped = false;
     *stale = 0;
     let response = loop {
@@ -2088,6 +2131,10 @@ impl PersistentSnapshotSession for DarwinSearchSession {
 
     fn last_exchange_stale_search_replies(&self) -> usize {
         self.inner.last_exchange_stale
+    }
+
+    fn last_exchange_window_bytes(&self) -> Option<WindowBytes> {
+        Some(self.inner.last_exchange_window.clone())
     }
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {

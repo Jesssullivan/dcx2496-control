@@ -230,6 +230,39 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
         }
         XCTAssertLessThanOrEqual(total, 8 * 32 * 1024)
     }
+    /// TIN-6964: dcxctl writes the failed window bytes to stderr as one line.
+    /// They stay in the private record and never reach status metadata.
+    func testFailedWindowBytesStayInThePrivateRecordOnly() throws {
+        let hex = "f0002032000e0053594e5448455449432d4944454e54495459f7"
+        let line = #"{"schemaVersion":"dcx.failure-window-bytes/v1","operation":"dump0","sequence":null,"received":26,"kept":26,"truncated":false,"hex":"\#(hex)"}"#
+        let stderr = Data((line + "\nError: ApprovedTargetCaptureError { SYNTHETIC }\n").utf8)
+        let stdout = try JSONSerialization.data(withJSONObject: failedEnvelope())
+        let (value, root) = try exercise(.init(refresh: .success(result(exit: 1, stdout: stdout, stderr: stderr))))
+        XCTAssertEqual(value.captureFailure?.operation, .dump0)
+        XCTAssertEqual(value.stderrRetainedByteCount, stderr.count)
+        let metadata = String(decoding: try BridgeJSONCodec.encoder().encode(value), as: UTF8.self)
+        XCTAssertFalse(metadata.contains(hex)); XCTAssertFalse(metadata.contains("failure-window-bytes"))
+        let record = try Data(contentsOf: root.appendingPathComponent(try XCTUnwrap(value.privateRecord)))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: record) as? [String: Any])
+        XCTAssertEqual(Data(base64Encoded: try XCTUnwrap(object["stderr"] as? String)), stderr)
+    }
+    func testAgeCapRemovesExpiredRecordsBeforeTheNextWrite() throws {
+        final class Clock: @unchecked Sendable { var offset: TimeInterval = 0 }
+        let clock = Clock(); let root = try directory()
+        let store = RoomFailureDiagnosticStore(parent: root, now: { Date().addingTimeInterval(clock.offset) })
+        let folder = root.appendingPathComponent("RoomDiagnostics")
+        func count() throws -> Int { try FileManager.default.contentsOfDirectory(atPath: folder.path).count }
+        for _ in 0..<3 { XCTAssertFalse(store.record(.init(), error: RoomVerificationError.busy).persistenceUnavailable) }
+        XCTAssertEqual(try count(), 3)
+        clock.offset = RoomFailureDiagnosticStore.maximumRecordAge - 60 * 60
+        XCTAssertFalse(store.record(.init(), error: RoomVerificationError.busy).persistenceUnavailable)
+        XCTAssertEqual(try count(), 4)
+        clock.offset = RoomFailureDiagnosticStore.maximumRecordAge + 60 * 60
+        let newest = store.record(.init(), error: RoomVerificationError.busy)
+        XCTAssertFalse(newest.persistenceUnavailable)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path),
+                       [String(try XCTUnwrap(newest.privateRecord).dropFirst("RoomDiagnostics/".count))])
+    }
     func testRepeatedAttemptCannotOverwriteItsExclusiveRecord() throws {
         let root = try directory(); let store = RoomFailureDiagnosticStore(parent: root); let attempt = RoomFailureAttempt()
         let first = store.record(attempt, error: RoomVerificationError.busy)

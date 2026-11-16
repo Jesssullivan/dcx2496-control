@@ -117,6 +117,14 @@ pub fn capture_approved(
                     "error": error.to_string(),
                 })
             );
+            // TIN-6964: the bytes of the failed Search or dump window go to
+            // stderr only. The helper keeps stderr in its private failure
+            // record. They never reach the stdout envelope above, and a
+            // failed write here changes nothing else.
+            if let Some(window) = error.failure_window() {
+                use std::io::Write as _;
+                let _ = writeln!(io::stderr(), "{}", window.private_record_line());
+            }
             Err(error.into())
         }
     }

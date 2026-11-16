@@ -324,7 +324,10 @@ child exit code and duration, output digests and whether close was verified.
 A timeout or absent child never implies verified serial close.
 
 Private records live under `DCXLogicBridge/RoomDiagnostics`. The store admits
-at most eight records, each bounded to 32 kibibytes. It retains at most 16
+at most eight records, each bounded to 32 kibibytes. Before each write it
+removes records older than seven days. A failed approved read can leave the
+bytes of its failed window in that stderr, as
+[Approved room refresh](approved-room-refresh.md) describes. It retains at most 16
 kibibytes of child stderr per record. Directory permissions are `0700` and
 exclusive record permissions are `0600`. Redirected directory leaves, symlinks,
 hardlinks, collisions and unexpected files refuse persistence. Status exposes
