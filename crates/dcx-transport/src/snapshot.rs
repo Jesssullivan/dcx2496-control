@@ -141,7 +141,8 @@ impl<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>
     pub const fn empty_search_timeouts(&self) -> usize {
         self.empty_search_timeouts
     }
-    /// Stale Search replies discarded ahead of each dump frame that was read.
+    /// Stale Search replies discarded ahead of each dump frame, also when
+    /// that dump read then failed.
     pub const fn stale_search_replies(&self) -> StaleSearchReplies {
         self.stale_search_replies
     }
@@ -177,9 +178,16 @@ impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshot
         {
             *self.empty_timeouts += 1;
         }
-        if let Ok(read) = &result {
-            // `SnapshotRead` bounds the count, so it always fits.
-            let stale = u8::try_from(read.stale_search_replies()).unwrap_or(u8::MAX);
+        let stale = match &result {
+            Ok(read) => read.stale_search_replies(),
+            Err(_) => self
+                .session
+                .last_exchange_stale_search_replies()
+                .min(MAX_STALE_SEARCH_REPLIES_PER_DUMP),
+        };
+        if stale != 0 {
+            // Both sources are bounded by the per-dump limit, so it always fits.
+            let stale = u8::try_from(stale).unwrap_or(u8::MAX);
             match operation.kind() {
                 SnapshotOperationKind::Dump0 => {
                     self.stale.dump0 = self.stale.dump0.saturating_add(stale);
@@ -194,6 +202,9 @@ impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshot
     }
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
         self.session.write_remote_mode(command)
+    }
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        self.session.last_exchange_stale_search_replies()
     }
     fn finish(self) -> Result<(), Self::Error> {
         self.session.finish()
@@ -541,6 +552,15 @@ pub trait PersistentSnapshotSession: Sized {
     ///
     /// Returns a platform error and issues no internal retry.
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error>;
+
+    /// Stale Search replies the most recent [`Self::exchange`] discarded.
+    ///
+    /// A failed exchange returns no [`SnapshotRead`], so a session that
+    /// discards frames reports the count here. Receipts read it after an error
+    /// so a discard ahead of a carrier error is still counted. TIN-6964.
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        0
+    }
 
     /// Restore, verify, and close the single session.
     ///
@@ -1754,6 +1774,8 @@ mod tests {
     enum Step {
         Read(SnapshotRead),
         Fail,
+        /// A carrier error after the session discarded this many frames.
+        FailAfterDiscard(usize),
     }
 
     struct FakeSession {
@@ -1763,6 +1785,7 @@ mod tests {
         fail_finish: bool,
         /// Zero-based remote-mode write that fails.
         fail_mode_index: Option<usize>,
+        last_stale: usize,
     }
 
     impl FakeSession {
@@ -1775,6 +1798,7 @@ mod tests {
                     fail_write: false,
                     fail_finish: false,
                     fail_mode_index: None,
+                    last_stale: 0,
                 },
                 log,
             )
@@ -1786,10 +1810,19 @@ mod tests {
 
         fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
             self.log.borrow_mut().operations.push(operation);
+            self.last_stale = 0;
             match self.steps.pop_front().expect("test supplied a step") {
                 Step::Read(read) => Ok(read),
                 Step::Fail => Err(FakeSessionError),
+                Step::FailAfterDiscard(stale) => {
+                    self.last_stale = stale;
+                    Err(FakeSessionError)
+                }
             }
+        }
+
+        fn last_exchange_stale_search_replies(&self) -> usize {
+            self.last_stale
         }
 
         fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
@@ -2190,6 +2223,46 @@ mod tests {
             StaleSearchReplies { dump0: 1, dump1: 0 }
         );
         assert!(format!("{error:?}").contains("StaleSearchReplies { dump0: 1, dump1: 0 }"));
+    }
+
+    #[test]
+    fn a_discard_before_a_carrier_error_is_still_reported_on_failure() {
+        let mut steps = november_15_steps(SnapshotRead::timed_out(&[]).unwrap());
+        steps[2] = Step::FailAfterDiscard(1);
+        let (session, log) = FakeSession::new(steps);
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::Transport {
+                operation: SnapshotOperationKind::Dump0,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.stale_search_replies(),
+            StaleSearchReplies { dump0: 1, dump1: 0 }
+        );
+        assert_eq!(log.borrow().operations.len(), 3);
+
+        // A session that reports more than the bound is clamped to it.
+        let mut steps = november_15_steps(SnapshotRead::timed_out(&[]).unwrap());
+        steps[2] = Step::FailAfterDiscard(MAX_STALE_SEARCH_REPLIES_PER_DUMP + 1);
+        let (session, _log) = FakeSession::new(steps);
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.stale_search_replies(),
+            StaleSearchReplies { dump0: 1, dump1: 0 }
+        );
     }
 
     #[test]

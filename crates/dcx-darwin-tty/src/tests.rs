@@ -1321,6 +1321,7 @@ fn dump_reader_reports_a_discarded_search_reply_and_keeps_it_when_not_enabled() 
         &request,
         false,
         Some(DeviceId::new(0).unwrap()),
+        &mut 0,
     )
     .unwrap();
     assert_eq!(
@@ -1341,6 +1342,7 @@ fn dump_reader_reports_a_discarded_search_reply_and_keeps_it_when_not_enabled() 
             &request,
             false,
             None,
+            &mut 0,
         ),
         Err(DarwinCarrierError::UnexpectedTrailingFrame { received })
             if received == DUMP0_RESPONSE_LEN
@@ -1356,11 +1358,120 @@ fn dump_reader_reports_a_discarded_search_reply_and_keeps_it_when_not_enabled() 
         &request,
         false,
         Some(DeviceId::new(0).unwrap()),
+        &mut 0,
     )
     .unwrap();
     assert_eq!(bounded.read.end(), SnapshotReadEnd::TimedOut);
     assert_eq!(bounded.read.received_len(), 0);
     assert_eq!(bounded.read.stale_search_replies(), 1);
+}
+
+#[test]
+fn dump_reader_keeps_the_discard_count_when_a_carrier_error_follows() {
+    let identity = synthetic_response(0);
+    let dump0 = synthetic_dump(0, 0);
+    let request = [0xf0, 0, 0x20, 0x32, 0, 0x0e, 0x50, 1, 0, 0, 0xf7];
+
+    // Stale reply, the dump, then a queued trailing frame.
+    let mut trailing =
+        FakeBackend::with_inbound(identity.into_iter().chain(dump0.clone()).chain(identity));
+    trailing.written = true;
+    trailing.read_goal = identity.len() + dump0.len();
+    trailing.post_response_input = identity.len();
+    let mut stale = 0;
+    assert!(matches!(
+        read_snapshot_bounded(
+            &mut trailing,
+            Duration::from_secs(2),
+            DUMP0_RESPONSE_LEN,
+            &request,
+            false,
+            Some(DeviceId::new(0).unwrap()),
+            &mut stale,
+        ),
+        Err(DarwinCarrierError::UnexpectedTrailingFrame { received })
+            if received == identity.len()
+    ));
+    assert_eq!(stale, 1);
+
+    // Stale reply, then end of file inside the dump.
+    let mut eof = FakeBackend::with_inbound(identity.into_iter().chain(dump0.clone()));
+    eof.written = true;
+    eof.read_goal = identity.len() + dump0.len();
+    eof.eof_after = Some(identity.len() + 10);
+    let mut stale = 0;
+    assert!(matches!(
+        read_snapshot_bounded(
+            &mut eof,
+            Duration::from_secs(2),
+            DUMP0_RESPONSE_LEN,
+            &request,
+            false,
+            Some(DeviceId::new(0).unwrap()),
+            &mut stale,
+        ),
+        Err(DarwinCarrierError::EndOfFile { received: 10 })
+    ));
+    assert_eq!(stale, 1);
+}
+
+/// Forwards to a carrier and records its discard count after each failed
+/// exchange, as the approved capture reads it.
+struct StaleRecorder<S> {
+    inner: S,
+    after_error: Rc<RefCell<Vec<usize>>>,
+}
+
+impl<S: PersistentSnapshotSession> PersistentSnapshotSession for StaleRecorder<S> {
+    type Error = S::Error;
+
+    fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
+        let result = self.inner.exchange(operation);
+        if result.is_err() {
+            self.after_error
+                .borrow_mut()
+                .push(self.inner.last_exchange_stale_search_replies());
+        }
+        result
+    }
+
+    fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
+        self.inner.write_remote_mode(command)
+    }
+
+    fn finish(self) -> Result<(), Self::Error> {
+        self.inner.finish()
+    }
+}
+
+#[test]
+fn carrier_reports_a_discard_ahead_of_a_dump0_carrier_error() {
+    let identity = synthetic_response(0).to_vec();
+    let mut backend = november_15_dump0_window(
+        std::slice::from_ref(&identity),
+        &[synthetic_dump(0, 0), identity.clone()],
+    );
+    // The Dump0 window also holds the trailing frame.
+    backend.dump_window_extra = [identity.len() * 2, 0].into_iter().collect();
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let after_error = Rc::new(RefCell::new(Vec::new()));
+    let session = StaleRecorder {
+        inner: carrier,
+        after_error: Rc::clone(&after_error),
+    };
+
+    let error = execute_persistent_snapshot(
+        session,
+        &mut FastPacer::default(),
+        DeviceId::new(0).unwrap(),
+    )
+    .unwrap_err();
+
+    assert!(
+        format!("{error:?}").contains("UnexpectedTrailingFrame { received: 26 }"),
+        "{error:?}"
+    );
+    assert_eq!(*after_error.borrow(), vec![1]);
 }
 
 #[test]
@@ -2272,6 +2383,7 @@ fn snapshot_search_reader_strips_echo_and_consumes_all_already_queued_replays() 
         &request,
         true,
         None,
+        &mut 0,
     )
     .unwrap();
 
@@ -2305,6 +2417,7 @@ fn snapshot_search_reader_returns_before_a_late_replay_becomes_readable() {
         &request,
         true,
         None,
+        &mut 0,
     )
     .unwrap();
 
@@ -2338,6 +2451,7 @@ fn snapshot_search_reader_finishes_an_already_queued_replay_prefix() {
         &request,
         true,
         None,
+        &mut 0,
     )
     .unwrap();
 
@@ -2370,6 +2484,7 @@ fn snapshot_search_reader_rejects_an_unfinished_queued_replay_prefix() {
             &request,
             true,
             None,
+            &mut 0,
         ),
         Err(DarwinCarrierError::UnexpectedTrailingFrame { received })
             if received == partial.len()

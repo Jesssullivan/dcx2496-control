@@ -706,6 +706,9 @@ struct PersistentCarrier<B: SerialBackend> {
     control_lines_snapshot: i32,
     input_discard_required: bool,
     last_search_response: Option<[u8; SEARCH_RESPONSE_LIMIT]>,
+    /// Search replies the most recent snapshot exchange discarded, kept so a
+    /// receipt can count them when the exchange then fails.
+    last_exchange_stale: usize,
     receive_direct_cleanup_device: Option<DeviceId>,
 }
 
@@ -815,6 +818,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             control_lines_snapshot,
             input_discard_required: false,
             last_search_response: None,
+            last_exchange_stale: 0,
             receive_direct_cleanup_device: None,
         })
     }
@@ -1002,6 +1006,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         &mut self,
         operation: SnapshotOperation,
     ) -> Result<SnapshotRead, DarwinCarrierError> {
+        self.last_exchange_stale = 0;
         self.require_usable_input()?;
         let mut write_attempted = false;
         let result = self.run_snapshot_exchange_usable(operation, &mut write_attempted);
@@ -1057,6 +1062,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             request.as_bytes(),
             matches!(operation.kind(), SnapshotOperationKind::Search { .. }),
             stale_search_device,
+            &mut self.last_exchange_stale,
         )?;
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. })
             && let Some(response) = bounded.response
@@ -1182,6 +1188,10 @@ impl<B: SerialBackend> PersistentSnapshotSession for PersistentCarrier<B> {
 
     fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
         self.run_snapshot_exchange(operation)
+    }
+
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        self.last_exchange_stale
     }
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
@@ -1896,7 +1906,8 @@ fn is_search_reply_from(frame: &[u8], device: DeviceId) -> bool {
 /// from that device is discarded and reported in the read. TIN-6964: on
 /// November 15 such a 26-byte frame arrived where Dump0 belongs. A second one
 /// in the same window becomes the response, so validation refuses it. Nothing
-/// is written here, so no request is replayed.
+/// is written here, so no request is replayed. `stale` holds the discard
+/// count even when the read then fails, so a receipt can still report it.
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn read_snapshot_bounded<B: SerialBackend>(
     backend: &mut B,
@@ -1905,15 +1916,16 @@ fn read_snapshot_bounded<B: SerialBackend>(
     request: &[u8],
     consume_all_queued_search_replays: bool,
     stale_search_device: Option<DeviceId>,
+    stale: &mut usize,
 ) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
     let mut observer = ();
     let mut echo_skipped = false;
-    let mut stale = 0_usize;
+    *stale = 0;
     let response = loop {
         match read_one_frame(backend, deadline, limit, &mut observer)? {
             FramedRead::TimedOut(partial) => {
                 return Ok(BoundedRead {
-                    read: SnapshotRead::timed_out(&partial)?.with_stale_search_replies(stale)?,
+                    read: SnapshotRead::timed_out(&partial)?.with_stale_search_replies(*stale)?,
                     response: None,
                 });
             }
@@ -1921,16 +1933,16 @@ fn read_snapshot_bounded<B: SerialBackend>(
                 echo_skipped = true;
             }
             FramedRead::Complete(frame)
-                if stale < MAX_STALE_SEARCH_REPLIES_PER_DUMP
+                if *stale < MAX_STALE_SEARCH_REPLIES_PER_DUMP
                     && stale_search_device
                         .is_some_and(|device| is_search_reply_from(&frame, device)) =>
             {
-                stale += 1;
+                *stale += 1;
             }
             FramedRead::Complete(response) => break response,
         }
     };
-    let read = SnapshotRead::complete(&response)?.with_stale_search_replies(stale)?;
+    let read = SnapshotRead::complete(&response)?.with_stale_search_replies(*stale)?;
     if consume_all_queued_search_replays {
         finish_queued_snapshot_search_replays(backend, deadline, limit, &response, &mut observer)?;
     } else {
@@ -2072,6 +2084,10 @@ impl PersistentSnapshotSession for DarwinSearchSession {
 
     fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
         self.inner.run_snapshot_exchange(operation)
+    }
+
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        self.inner.last_exchange_stale
     }
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {

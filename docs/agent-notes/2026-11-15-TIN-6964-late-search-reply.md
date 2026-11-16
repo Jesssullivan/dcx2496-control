@@ -1,7 +1,7 @@
 # A Search reply in the Dump0 window on November 15, 2026
 
 Linear: TIN-6964. Source: `origin/main` at `9ff6e73`, helper build 14. Line
-numbers below are on this branch. No serial port was opened and no DCX command
+numbers below are on commit `c927aba` of this branch. No serial port was opened and no DCX command
 was sent for this note. The records were read on PZM from the helper's
 `RoomDiagnostics` folder. Each record's base64 `stderr` was decoded there.
 
@@ -57,10 +57,11 @@ second Dump0 window.
 The hypothesis says the DCX answered Search 1 late, after its window, and that
 answer was taken as Dump0.
 
-- **Confirmed.** A frame of exactly the Search reply's length was taken as the
-  Dump0 frame. The dump reader takes the first complete frame and does not
-  match it to the request. Any Search reply that arrives after the Dump0 write
-  and before the dump is taken this way.
+- **Confirmed.** A 26-byte frame was taken as the Dump0 frame. The dump
+  reader takes the first complete frame and does not match it to the request.
+  Any Search reply that arrives after the Dump0 write and before the dump is
+  taken this way. That the 26-byte frame was a Search reply is not confirmed.
+  The length matches. The record keeps no bytes.
 - **Refuted, as a reply arriving on its own time.** A Search 1 reply that came
   any time in the 5 second gap would have failed Search 2 with
   `PreexistingInput`. No record shows that. Search 2 was answered in its
@@ -75,6 +76,15 @@ answer was taken as Dump0.
   millisecond apart. A second frame a few milliseconds later passes all three
   and lands in the Dump0 window. Byte-identical copies are already a known
   shape, which `reconcile_late_search_response` handles.
+- **Supported by 22:28:04Z.** That read failed in Search 1 with
+  `UnexpectedTrailingFrame { received: 26 }` after 32 milliseconds.
+  `finish_queued_snapshot_search_replays` consumes a queued frame that is
+  byte-identical to the accepted reply and refuses any other
+  (`lib.rs:1796-1818`). A 26-byte timeout is ruled out at 32 milliseconds. So
+  the device sent a complete 26-byte frame that differed from the reply just
+  accepted. Two 26-byte frames back to back are possible, and they need not be
+  identical. A byte-identity rule would miss such a frame. The discard
+  therefore parses the frame as a Search reply for the bound device.
 - **Refuted, for these records.** The first Search window is too short. Search
   1 never got a reply inside 5.5 seconds, and Search 2 always got one inside
   0.475. A longer window would not have caught a reply that came after 5.5
@@ -87,9 +97,9 @@ answer was taken as Dump0.
 | In a Dump0 or Dump1 window, after this session accepted a Search reply, the carrier discards one complete frame that parses as a Search reply from the bound device. It then keeps reading inside the same deadline. | `crates/dcx-darwin-tty/src/lib.rs:1886-1940`, `lib.rs:1044-1052` |
 | A second such frame in the same window becomes the response. The executor refuses it with `InvalidDumpLength`. Any other frame, such as another device's reply, a wrong function byte or a byte above `0x7f`, is refused the same way. | `crates/dcx-transport/src/snapshot.rs:65-73` |
 | Dump validation is unchanged. No request is written again. The dump deadline and the 20 second capture budget are unchanged. | none |
-| `SnapshotRead` carries the discard count. The approved capture counts it per window. Success and failure stdout carry `staleSearchRepliesDiscarded` with `dump0` and `dump1`. Failure stderr shows `stale_search_replies`. | `snapshot.rs`, `crates/dcxctl/src/live_control.rs`, `crates/dcxctl/src/profile_cli.rs` |
+| `SnapshotRead` carries the discard count. When the exchange then fails with a carrier error, such as `UnexpectedTrailingFrame` or `EndOfFile`, the session keeps the count and the approved capture reads it through `last_exchange_stale_search_replies`. The approved capture counts it per window. Success and failure stdout carry `staleSearchRepliesDiscarded` with `dump0` and `dump1`. Failure stderr shows `stale_search_replies`. | `snapshot.rs`, `crates/dcxctl/src/live_control.rs`, `crates/dcxctl/src/profile_cli.rs` |
 | The schema stays `dcx.approved-room-refresh/v1`. The helper decodes the field when present and refuses a count above one. Older helpers ignore the key. Output without it still decodes. | `apple/Sources/DCXLogicHelperCore/ApprovedRoomRefresh.swift` |
-| Helper build 14 and version 0.1.13 are unchanged. | `apple/project.yml` |
+| Helper build 14 and version 0.1.13 are unchanged. Build 14 at `9ff6e73` does not emit the field. A helper built from this branch keeps the number 14 and does. | `apple/project.yml` |
 
 The discard also applies to the dump reads in apply readback, which use the
 same carrier. Only the approved capture reports the count.
@@ -107,6 +117,7 @@ ReceiveDirect. It writes no parameter. This branch adds no write.
 | `dump_reader_reports_a_discarded_search_reply_and_keeps_it_when_not_enabled` | The count on a complete and a timed-out read, and no discard without an accepted Search. |
 | `november_15_record_shape_is_unchanged_when_the_carrier_returns_the_26_byte_frame` | The executor reproduces the 22:32:59Z record: 2 attempts, 1 empty timeout. |
 | `november_15_discarded_search_reply_is_counted_on_the_dump0_window` and `a_discard_before_a_dump_timeout_is_still_reported_on_failure` | The count reaches the capture and its error. |
+| `a_discard_before_a_carrier_error_is_still_reported_on_failure`, `dump_reader_keeps_the_discard_count_when_a_carrier_error_follows` and `carrier_reports_a_discard_ahead_of_a_dump0_carrier_error` | A discard followed by `UnexpectedTrailingFrame` or `EndOfFile` still reports `dump0: 1`. |
 | `testStaleSearchReplyCountsAreOptionalAndBounded` and `testFailedEnvelopeCarriesBoundedStaleSearchReplyCounts` | Swift decoding with and without the field, and a count of 2 refused. |
 
 ## What stays unknown
@@ -118,9 +129,11 @@ ReceiveDirect. It writes no parameter. This branch adds no write.
 - Whether the device sends the dump after the stale reply. On November 15 the
   carrier returned before any dump byte was queued. A Dump0 timeout with
   `dump0: 1` would show it did not.
-- Whether the frame is Search 1's answer or a copy of Search 2's. The bytes
-  would likely be identical. Only wire timestamps from a bench read with raw
-  bytes kept would separate them.
+- Whether the frame is Search 1's answer or a copy of Search 2's. The
+  22:28:04Z record shows the device can follow an accepted reply with a
+  26-byte frame that is not identical to it, so equal bytes cannot be
+  assumed. Only wire timestamps from a bench read with raw bytes kept would
+  separate the two.
 - Why Search 1 goes unanswered. The 2026-11-11 note points at device state
   after the previous session's ReceiveDirect. That is not shown.
 - The Dump0 and Dump1 timeouts with 0 bytes. This change does not address

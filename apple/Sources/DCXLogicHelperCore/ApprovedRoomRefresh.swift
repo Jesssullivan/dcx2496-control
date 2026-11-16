@@ -2,7 +2,8 @@ import Foundation
 import DCXLogicBridge
 
 /// TIN-6964: stale Search replies the carrier discarded ahead of each dump
-/// frame. Producers before helper build 14 omit the field, so it is optional.
+/// frame. Producers before TIN-6964, including the build 14 helper at 9ff6e73,
+/// omit the field, so it is optional.
 /// The carrier discards at most one per dump window.
 public struct StaleSearchRepliesDiscarded: Codable, Equatable, Sendable {
     public static let perDumpLimit: UInt32 = 1
