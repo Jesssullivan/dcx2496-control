@@ -103,11 +103,18 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   modelled linked crossover (an O4 high-pass frequency write moving O3
   low-pass frequency to the same code, `docs/typed-writes.md`) is reported
   as `linked`, not dropped; its inferred reverse direction is reported but
-  stays uncontained. An apply readback that fails in transport is
-  repeated only as a fresh read-only G1 snapshot, 20 s later and only while
-  it fits the 150 s apply envelope (fixed constants, no write re-sent). Missing
-  post-write capture remains explicit uncertainty: apply `readback` and
-  rollback `restored` may be omitted or null, never synthesized.
+  stays uncontained. In a typed write the device may set Dump0 byte 101
+  from 0 to 1 with a balanced trailer and carrier 108 bit 0 clear. Legalab
+  ruling 69, TIN-5385 `50be9d3b`, allows it. Apply, rollback and containment
+  report it under `device_moves` and refuse every other value. A rollback
+  that leaves only that move ends `rolled_back` with `equals_baseline:
+  false`, under Legalab ruling 89, TIN-5385 `38e47c36`. An uncertain apply
+  or rollback receipt prints `device_moves: null`. An apply readback
+  that fails in transport is repeated only as a fresh read-only G1
+  snapshot, 20 s later and only while it fits the 150 s apply envelope
+  (fixed constants, no write re-sent). Missing post-write capture remains
+  explicit uncertainty: apply `readback` and rollback `restored` may be
+  omitted or null, never synthesized.
 - `dcxctl profile plan|verify` are offline. `profile apply` (behind
   `typed-write-live`) runs a reviewed chain of ordinary `write apply`
   transactions toward a Legalab `DcxOutputProfileV1`, PEQ, gain and

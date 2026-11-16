@@ -1037,6 +1037,123 @@ pub struct LinkedChangeV1 {
     pub contained: bool,
 }
 
+/// One unplanned frame byte the device itself may move during a typed write,
+/// with its exact before and after values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowedDeviceMove {
+    /// Stable rule label, reported in [`DeviceMoveV1::rule`].
+    pub rule: &'static str,
+    /// Dump holding the byte.
+    pub section: SnapshotSection,
+    /// Frame offset, header included.
+    pub offset: usize,
+    /// 7-of-8 carrier byte and bit that hold the high bit of `offset`. The
+    /// bit must be clear in both the expected snapshot and the readback, so
+    /// the logical value is exactly `before` and then exactly `after`.
+    pub carrier: (usize, u8),
+    /// The only value the byte may hold before the move.
+    pub before: u8,
+    /// The only value the device may leave in it.
+    pub after: u8,
+}
+
+/// The closed set of allowed device moves.
+///
+/// Dump0 frame byte 101 is an unmapped status byte in the `XCUR` setup
+/// header. On 2026-10-20 the device set it from 0 to 1 during a typed write.
+/// Legalab ruling 69 (Linear TIN-5385 comment `50be9d3b`, "Yes, value 1
+/// only") lets the device make that one move. Any other value, the reverse
+/// move, its high bit in carrier byte 108 set or moved, and a move that
+/// breaks the Dump0 modulo-128 trailer balance stay refused. The carrier
+/// follows the 7-of-8 rule in [`crate::layout`]: offset 101 is payload 88,
+/// so its carrier is `13 + 88 + 7 = 108`, bit `88 % 8 = 0`.
+pub const ALLOWED_DEVICE_MOVES: [AllowedDeviceMove; 1] = [AllowedDeviceMove {
+    rule: "dump0_101_set_by_device",
+    section: SnapshotSection::Dump0,
+    offset: 101,
+    carrier: (108, 0),
+    before: 0,
+    after: 1,
+}];
+
+/// One allowed device move seen in a readback; see [`ALLOWED_DEVICE_MOVES`].
+///
+/// The dump trailer moved with it so the dump kept its modulo-128 balance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceMoveV1 {
+    /// Always `device`.
+    pub classification: &'static str,
+    /// [`AllowedDeviceMove::rule`].
+    pub rule: &'static str,
+    /// Dump holding the byte.
+    pub section: SnapshotSection,
+    /// Frame offset, header included.
+    pub offset: usize,
+    /// Expected byte.
+    pub before: u8,
+    /// Readback byte.
+    pub after: u8,
+}
+
+impl SnapshotV1 {
+    /// This readback with every allowed device move against `expected` put
+    /// back, and the moves found.
+    ///
+    /// A move counts only when `expected` holds the rule's `before` value,
+    /// this readback holds its `after` value, the rule's carrier bit is clear
+    /// in both, and this readback keeps the dump's modulo-128 trailer
+    /// balance of `expected`. Putting it back
+    /// restores the byte and moves the trailer by the same amount, so the
+    /// balance holds. Every other byte is left as read.
+    fn without_device_moves(&self, expected: &Self) -> (Self, Vec<DeviceMoveV1>) {
+        let mut dump0 = self.dump0.frame.clone();
+        let mut dump1 = self.dump1.frame.clone();
+        let mut moves = Vec::new();
+        for rule in ALLOWED_DEVICE_MOVES {
+            let (frame, wanted) = match rule.section {
+                SnapshotSection::Dump0 => (&mut dump0, &expected.dump0.frame),
+                SnapshotSection::Dump1 => (&mut dump1, &expected.dump1.frame),
+                SnapshotSection::Identity => continue,
+            };
+            let trailer = frame.len() - 2;
+            let balance = |bytes: &[u8]| seven_bit_sum(&bytes[PACKED_PAYLOAD_START..=trailer]);
+            let (carrier, bit) = rule.carrier;
+            let high_bit = 1u8 << bit;
+            if wanted[rule.offset] != rule.before
+                || frame[rule.offset] != rule.after
+                || wanted[carrier] & high_bit != 0
+                || frame[carrier] & high_bit != 0
+                || balance(frame.as_slice()) != balance(wanted.as_slice())
+            {
+                continue;
+            }
+            frame[rule.offset] = rule.before;
+            frame[trailer] = frame[trailer]
+                .wrapping_add(rule.after)
+                .wrapping_sub(rule.before)
+                & 0x7f;
+            moves.push(DeviceMoveV1 {
+                classification: "device",
+                rule: rule.rule,
+                section: rule.section,
+                offset: rule.offset,
+                before: rule.before,
+                after: rule.after,
+            });
+        }
+        if moves.is_empty() {
+            return (self.clone(), moves);
+        }
+        match Self::from_frames(&self.identity.frame, &dump0, &dump1) {
+            Ok(restored) => (restored, moves),
+            // The frames differ from valid frames in two payload bytes only,
+            // so this cannot fail. If it did, nothing is excused.
+            Err(_) => (self.clone(), Vec::new()),
+        }
+    }
+}
+
 /// Closed, bounded apply plan bound to exact observed and desired snapshots.
 ///
 /// Actions are explicit opaque wire-level tuples, not inferred semantic
@@ -1251,11 +1368,22 @@ impl ApplyPlanV1 {
     /// Bits of a matched observed [`Self::linked_changes`] follower field are
     /// not uncontained; any other bit of those bytes, a follower that moved to
     /// any other code, and every inferred-direction move still are.
+    ///
+    /// In a typed write (see [`Self::admits_device_moves`]) an allowed
+    /// device move, listed by [`Self::device_moves`], is put back before the
+    /// comparison, so neither its byte nor its trailer step is uncontained.
     pub fn uncontained_changes(
         &self,
         readback: &SnapshotV1,
     ) -> Result<Vec<ByteChangeV1>, SnapshotDiffError> {
         self.require_readback_device(readback)?;
+        let normalized;
+        let readback = if self.admits_device_moves() {
+            normalized = readback.without_device_moves(&self.baseline).0;
+            &normalized
+        } else {
+            readback
+        };
         let mut allowed = self.projected_masks();
         for (change, masks) in self.matched_linked_changes(readback) {
             // An inferred direction is reported but never contained.
@@ -1305,6 +1433,49 @@ impl ApplyPlanV1 {
             .into_iter()
             .map(|(change, _)| change)
             .collect())
+    }
+
+    /// Whether [`ALLOWED_DEVICE_MOVES`] apply to this plan: true only for a
+    /// typed write, a plan with at least one typed-write-lane address (see
+    /// [`ReviewedAddress::is_typed_lane`]). PEQ, O4 mute and routing plans
+    /// keep exact equality.
+    pub fn admits_device_moves(&self) -> bool {
+        self.command.as_ref().is_some_and(|command| {
+            command.actions().iter().any(|action| {
+                reviewed_address(action.channel(), action.parameter())
+                    .is_some_and(ReviewedAddress::is_typed_lane)
+            })
+        })
+    }
+
+    /// Allowed device moves a readback shows against the bound baseline;
+    /// empty unless [`Self::admits_device_moves`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects a readback from another device.
+    pub fn device_moves(
+        &self,
+        readback: &SnapshotV1,
+    ) -> Result<Vec<DeviceMoveV1>, SnapshotDiffError> {
+        self.require_readback_device(readback)?;
+        if !self.admits_device_moves() {
+            return Ok(Vec::new());
+        }
+        Ok(readback.without_device_moves(&self.baseline).1)
+    }
+
+    /// Compare a complete post-apply readback to the desired snapshot, the
+    /// check [`ApplyTransactionV1::verify_apply_readback`] runs.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a readback from another device.
+    pub fn verify_readback(
+        &self,
+        readback: &SnapshotV1,
+    ) -> Result<ReadbackVerificationV1, SnapshotDiffError> {
+        ReadbackVerificationV1::compare(&self.desired, readback, self.admits_device_moves())
     }
 
     fn require_readback_device(&self, readback: &SnapshotV1) -> Result<(), SnapshotDiffError> {
@@ -2179,7 +2350,7 @@ fn plan_digest(
     digest_hasher(hasher.finalize())
 }
 
-/// Exact desired/readback comparison receipt.
+/// Desired/readback comparison receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadbackVerificationV1 {
@@ -2187,27 +2358,58 @@ pub struct ReadbackVerificationV1 {
     expected_snapshot_digest: String,
     observed_snapshot_digest: String,
     exact: bool,
+    /// Allowed device moves seen in the readback; always empty for a plan
+    /// that does not admit them.
+    device_moves: Vec<DeviceMoveV1>,
+    /// `exact`, or equal once the listed device moves are put back.
+    verified: bool,
 }
 
 impl ReadbackVerificationV1 {
-    fn compare(expected: &SnapshotV1, observed: &SnapshotV1) -> Result<Self, SnapshotDiffError> {
+    fn compare(
+        expected: &SnapshotV1,
+        observed: &SnapshotV1,
+        admit_device_moves: bool,
+    ) -> Result<Self, SnapshotDiffError> {
         if expected.device_id != observed.device_id {
             return Err(SnapshotDiffError::DeviceMismatch {
                 observed: observed.device_id.get(),
                 desired: expected.device_id.get(),
             });
         }
+        let exact = expected == observed;
+        let (device_moves, verified) = if exact || !admit_device_moves {
+            (Vec::new(), exact)
+        } else {
+            let (restored, moves) = observed.without_device_moves(expected);
+            let verified = !moves.is_empty() && restored == *expected;
+            (moves, verified)
+        };
         Ok(Self {
             device_id: expected.device_id,
             expected_snapshot_digest: expected.snapshot_digest.clone(),
             observed_snapshot_digest: observed.snapshot_digest.clone(),
-            exact: expected == observed,
+            exact,
+            device_moves,
+            verified,
         })
     }
 
     /// Whether every exact identity and dump byte matched.
     pub const fn is_exact(&self) -> bool {
         self.exact
+    }
+
+    /// Whether the readback matched exactly, or matched once the allowed
+    /// device moves in [`Self::device_moves`] are put back.
+    pub const fn is_verified(&self) -> bool {
+        self.verified
+    }
+
+    /// Allowed device moves seen in the readback; see
+    /// [`ALLOWED_DEVICE_MOVES`].
+    pub fn device_moves(&self) -> &[DeviceMoveV1] {
+        &self.device_moves
     }
 
     /// Expected complete snapshot digest.
@@ -2229,13 +2431,15 @@ pub enum ApplyTransactionState {
     Staged,
     /// The caller reports allowlisted steps are being executed.
     Applying,
-    /// Apply readback exactly matched desired state.
+    /// Apply readback matched desired state exactly, or once the allowed
+    /// device moves of a typed write are put back.
     Verified,
     /// Apply readback differed; rollback to the immutable baseline is required.
     RollbackRequired,
     /// The caller reports rollback steps are being executed.
     RollingBack,
-    /// Complete rollback readback exactly matched the baseline.
+    /// Complete rollback readback matched the baseline exactly, or once the
+    /// allowed device moves of a typed write are put back (Legalab ruling 89).
     RolledBack,
     /// Rollback readback did not restore exact baseline equality.
     Faulted,
@@ -2399,9 +2603,11 @@ impl ApplyTransactionV1 {
 
     /// Compare complete post-apply readback to desired state.
     ///
-    /// Exact equality verifies the transaction. Any same-device mismatch moves
-    /// directly to `RollbackRequired`; wrong-device evidence is rejected with
-    /// no state change.
+    /// Exact equality verifies the transaction. In a typed write so does a
+    /// readback that differs only by allowed device moves (see
+    /// [`ALLOWED_DEVICE_MOVES`]); the receipt lists them. Any other
+    /// same-device mismatch moves directly to `RollbackRequired`;
+    /// wrong-device evidence is rejected with no state change.
     ///
     /// # Errors
     ///
@@ -2411,8 +2617,12 @@ impl ApplyTransactionV1 {
         observed: &SnapshotV1,
     ) -> Result<&ReadbackVerificationV1, ApplyTransactionError> {
         self.require_state(ApplyTransactionState::Applying)?;
-        let receipt = ReadbackVerificationV1::compare(&self.desired, observed)?;
-        self.state = if receipt.is_exact() {
+        let receipt = ReadbackVerificationV1::compare(
+            &self.desired,
+            observed,
+            self.apply_plan.admits_device_moves(),
+        )?;
+        self.state = if receipt.is_verified() {
             ApplyTransactionState::Verified
         } else {
             ApplyTransactionState::RollbackRequired
@@ -2444,7 +2654,12 @@ impl ApplyTransactionV1 {
 
     /// Compare complete rollback readback to the immutable baseline.
     ///
-    /// A same-device mismatch is terminal `Faulted`; wrong-device evidence is
+    /// In a typed write a readback that differs from the baseline only by
+    /// allowed device moves restores it: the device moved the byte, no write
+    /// can put it back, and the receipt lists it with `is_exact` false.
+    /// Legalab ruling 89 (Linear TIN-5385 comment `38e47c36`, "Yes, and the
+    /// receipt says so") allows this for Dump0 101 at 1. Any other
+    /// same-device mismatch is terminal `Faulted`; wrong-device evidence is
     /// rejected without changing state.
     ///
     /// # Errors
@@ -2455,8 +2670,12 @@ impl ApplyTransactionV1 {
         observed: &SnapshotV1,
     ) -> Result<&ReadbackVerificationV1, ApplyTransactionError> {
         self.require_state(ApplyTransactionState::RollingBack)?;
-        let receipt = ReadbackVerificationV1::compare(&self.baseline, observed)?;
-        self.state = if receipt.is_exact() {
+        let receipt = ReadbackVerificationV1::compare(
+            &self.baseline,
+            observed,
+            self.apply_plan.admits_device_moves(),
+        )?;
+        self.state = if receipt.is_verified() {
             ApplyTransactionState::RolledBack
         } else {
             ApplyTransactionState::Faulted
