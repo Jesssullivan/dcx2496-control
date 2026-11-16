@@ -37,6 +37,51 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         XCTAssertThrowsError(try decode(failed))
     }
 
+    /// TIN-6964: helper build 14 reports the stale Search replies its carrier
+    /// discarded ahead of each dump. Earlier producers omit the field.
+    func testStaleSearchReplyCountsAreOptionalAndBounded() throws {
+        let window = (at.addingTimeInterval(-10), at.addingTimeInterval(2))
+        let old = try decode(fixture())
+        _ = try old.validate(expectedDevice: 0, terminationStatus: 0, startedAt: window.0, now: window.1)
+        XCTAssertNil(old.metrics.staleSearchRepliesDiscarded)
+
+        var counted = try fixture(); counted["staleSearchRepliesDiscarded"] = ["dump0": 1, "dump1": 0]
+        let value = try decode(counted)
+        _ = try value.validate(expectedDevice: 0, terminationStatus: 0, startedAt: window.0, now: window.1)
+        XCTAssertEqual(value.metrics.staleSearchRepliesDiscarded, .init(dump0: 1, dump1: 0))
+
+        for over in [["dump0": 2, "dump1": 0], ["dump0": 0, "dump1": 2]] {
+            var object = try fixture(); object["staleSearchRepliesDiscarded"] = over
+            XCTAssertThrowsError(try decode(object).validate(expectedDevice: 0, terminationStatus: 0,
+                startedAt: window.0, now: window.1), "\(over)")
+        }
+        var partial = try fixture(); partial["staleSearchRepliesDiscarded"] = ["dump0": 1]
+        XCTAssertThrowsError(try decode(partial))
+    }
+
+    /// TIN-6964: the 22:32:59Z record on PZM, with and without the build 14 count.
+    func testFailedEnvelopeCarriesBoundedStaleSearchReplyCounts() throws {
+        let stderr = "Error: ApprovedTargetCaptureError { failure: Validation { operation: Dump0, " +
+            "source: InvalidDumpLength { part: Part0, expected: 1015, actual: 26 }, finish_error: None }, " +
+            "search_attempts: 2, empty_search_timeouts: 1, elapsed: 5.856639167s }\n"
+        let record = try failedRefresh(["category": "validation", "operation": "dump0"],
+            elapsedMilliseconds: 5856, stderr: stderr)
+        let old = try XCTUnwrap(ApprovedRoomFailureEnvelope.decodeIfFailed(record.stdout, terminationStatus: 1))
+        XCTAssertNil(old.staleSearchRepliesDiscarded)
+        XCTAssertTrue(ApprovedRoomCaptureFailed(failure: old.failure).permitsBoundedValidationRetry)
+
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: record.stdout) as? [String: Any])
+        object["staleSearchRepliesDiscarded"] = ["dump0": 1, "dump1": 0]
+        let counted = try XCTUnwrap(ApprovedRoomFailureEnvelope.decodeIfFailed(
+            JSONSerialization.data(withJSONObject: object), terminationStatus: 1))
+        XCTAssertEqual(counted.staleSearchRepliesDiscarded, .init(dump0: 1, dump1: 0))
+        XCTAssertTrue(ApprovedRoomCaptureFailed(failure: counted.failure).permitsBoundedValidationRetry)
+
+        object["staleSearchRepliesDiscarded"] = ["dump0": 2, "dump1": 0]
+        XCTAssertThrowsError(try ApprovedRoomFailureEnvelope.decodeIfFailed(
+            JSONSerialization.data(withJSONObject: object), terminationStatus: 1))
+    }
+
     func testProtectedHelperPathSuppliesExactExpectationDigestAndNeverGenericSnapshotOrWrites() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

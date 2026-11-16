@@ -62,6 +62,25 @@ pub const APPROVED_TARGET_SEARCH_COUNT: usize = 1;
 pub const APPROVED_TARGET_SEARCH_ATTEMPT_LIMIT: usize = 3;
 /// Fixed full-bulk refresh budget, including modes and verified close admission.
 pub const APPROVED_TARGET_SNAPSHOT_BUDGET: Duration = Duration::from_secs(20);
+/// Stale Search replies a carrier may discard in one Dump0 or Dump1 window.
+///
+/// TIN-6964: on November 15 a 26-byte frame arrived where the 1015-byte Dump0
+/// belongs, about as soon as Dump0 was written. A carrier may discard one
+/// complete Search reply that validates for the bound device ahead of the
+/// dump, and then keeps waiting for the dump inside the same deadline. A
+/// second such frame in the same window becomes the read, and validation
+/// refuses it. The dump request is never written again.
+pub const MAX_STALE_SEARCH_REPLIES_PER_DUMP: usize = 1;
+
+/// Stale Search replies the carrier discarded in each dump window. Each count
+/// is at most [`MAX_STALE_SEARCH_REPLIES_PER_DUMP`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaleSearchReplies {
+    /// Discarded ahead of the Dump0 frame.
+    pub dump0: u8,
+    /// Discarded ahead of the Dump1 frame.
+    pub dump1: u8,
+}
 
 /// Complete bulk image plus counters measured from this session's operations.
 #[derive(Debug)]
@@ -69,6 +88,7 @@ pub struct ApprovedTargetCapture {
     capture: CapturedSnapshotV1,
     search_attempts: usize,
     empty_search_timeouts: usize,
+    stale_search_replies: StaleSearchReplies,
     elapsed: Duration,
 }
 
@@ -84,6 +104,10 @@ impl ApprovedTargetCapture {
     /// Empty Search deadline results actually received before the valid identity.
     pub const fn empty_search_timeouts(&self) -> usize {
         self.empty_search_timeouts
+    }
+    /// Stale Search replies discarded ahead of each dump frame.
+    pub const fn stale_search_replies(&self) -> StaleSearchReplies {
+        self.stale_search_replies
     }
     /// Monotonic executor elapsed time, from before identity to after close.
     pub const fn elapsed(&self) -> Duration {
@@ -102,6 +126,7 @@ pub struct ApprovedTargetCaptureError<
     failure: SnapshotCaptureError<E, P>,
     search_attempts: usize,
     empty_search_timeouts: usize,
+    stale_search_replies: StaleSearchReplies,
     elapsed: Duration,
 }
 
@@ -115,6 +140,11 @@ impl<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>
     /// Actual empty Search timeout count, never nonempty or malformed reads.
     pub const fn empty_search_timeouts(&self) -> usize {
         self.empty_search_timeouts
+    }
+    /// Stale Search replies discarded ahead of each dump frame, also when
+    /// that dump read then failed.
+    pub const fn stale_search_replies(&self) -> StaleSearchReplies {
+        self.stale_search_replies
     }
     /// Executor elapsed through its attempted verified close.
     pub const fn elapsed(&self) -> Duration {
@@ -130,6 +160,7 @@ struct CountedSnapshotSession<'a, S> {
     session: S,
     attempts: &'a mut usize,
     empty_timeouts: &'a mut usize,
+    stale: &'a mut StaleSearchReplies,
 }
 
 impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshotSession<'_, S> {
@@ -147,10 +178,33 @@ impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshot
         {
             *self.empty_timeouts += 1;
         }
+        let stale = match &result {
+            Ok(read) => read.stale_search_replies(),
+            Err(_) => self
+                .session
+                .last_exchange_stale_search_replies()
+                .min(MAX_STALE_SEARCH_REPLIES_PER_DUMP),
+        };
+        if stale != 0 {
+            // Both sources are bounded by the per-dump limit, so it always fits.
+            let stale = u8::try_from(stale).unwrap_or(u8::MAX);
+            match operation.kind() {
+                SnapshotOperationKind::Dump0 => {
+                    self.stale.dump0 = self.stale.dump0.saturating_add(stale);
+                }
+                SnapshotOperationKind::Dump1 => {
+                    self.stale.dump1 = self.stale.dump1.saturating_add(stale);
+                }
+                SnapshotOperationKind::Search { .. } | SnapshotOperationKind::Meter { .. } => {}
+            }
+        }
         result
     }
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
         self.session.write_remote_mode(command)
+    }
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        self.session.last_exchange_stale_search_replies()
     }
     fn finish(self) -> Result<(), Self::Error> {
         self.session.finish()
@@ -180,10 +234,12 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
     let started = pacer.elapsed();
     let mut attempts = 0;
     let mut empty_timeouts = 0;
+    let mut stale = StaleSearchReplies::default();
     let mut counted = CountedSnapshotSession {
         session,
         attempts: &mut attempts,
         empty_timeouts: &mut empty_timeouts,
+        stale: &mut stale,
     };
     let body = capture_body(
         &mut counted,
@@ -211,12 +267,14 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
             failure,
             search_attempts: attempts,
             empty_search_timeouts: empty_timeouts,
+            stale_search_replies: stale,
             elapsed,
         })?;
     Ok(ApprovedTargetCapture {
         capture,
         search_attempts: attempts,
         empty_search_timeouts: empty_timeouts,
+        stale_search_replies: stale,
         elapsed,
     })
 }
@@ -370,6 +428,7 @@ pub enum SnapshotReadEnd {
 pub struct SnapshotRead {
     end: SnapshotReadEnd,
     bytes: Vec<u8>,
+    stale_search_replies: usize,
 }
 
 impl SnapshotRead {
@@ -386,6 +445,7 @@ impl SnapshotRead {
         Ok(Self {
             end: SnapshotReadEnd::Complete,
             bytes: bytes.to_vec(),
+            stale_search_replies: 0,
         })
     }
 
@@ -401,7 +461,22 @@ impl SnapshotRead {
         Ok(Self {
             end: SnapshotReadEnd::TimedOut,
             bytes: bytes.to_vec(),
+            stale_search_replies: 0,
         })
+    }
+
+    /// Record the stale Search replies the carrier discarded ahead of this
+    /// dump read, inside the same operation deadline.
+    ///
+    /// # Errors
+    ///
+    /// A count above [`MAX_STALE_SEARCH_REPLIES_PER_DUMP`] is refused.
+    pub fn with_stale_search_replies(mut self, count: usize) -> Result<Self, SnapshotReadError> {
+        if count > MAX_STALE_SEARCH_REPLIES_PER_DUMP {
+            return Err(SnapshotReadError::StaleSearchReplies(count));
+        }
+        self.stale_search_replies = count;
+        Ok(self)
     }
 
     /// Read completion state.
@@ -412,6 +487,12 @@ impl SnapshotRead {
     /// Bounded byte count without exposing contents.
     pub const fn received_len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Stale Search replies discarded ahead of this read. Only a Dump0 or
+    /// Dump1 read carries a nonzero count.
+    pub const fn stale_search_replies(&self) -> usize {
+        self.stale_search_replies
     }
 
     fn bytes(&self) -> &[u8] {
@@ -425,6 +506,7 @@ impl fmt::Debug for SnapshotRead {
             .debug_struct("SnapshotRead")
             .field("end", &self.end)
             .field("received", &self.bytes.len())
+            .field("stale_search_replies", &self.stale_search_replies)
             .field("bytes", &"[redacted]")
             .finish()
     }
@@ -439,6 +521,9 @@ pub enum SnapshotReadError {
     /// A timed-out read reached or exceeded the hard frame ceiling.
     #[error("timed-out snapshot read has {0} bytes; hard ceiling was reached")]
     TimeoutLength(usize),
+    /// A carrier reported more discarded stale Search replies than allowed.
+    #[error("snapshot read discarded {0} stale Search replies; the bound is one")]
+    StaleSearchReplies(usize),
 }
 
 /// One already-open, exclusive, fixed-38400 session.
@@ -467,6 +552,15 @@ pub trait PersistentSnapshotSession: Sized {
     ///
     /// Returns a platform error and issues no internal retry.
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error>;
+
+    /// Stale Search replies the most recent [`Self::exchange`] discarded.
+    ///
+    /// A failed exchange returns no [`SnapshotRead`], so a session that
+    /// discards frames reports the count here. Receipts read it after an error
+    /// so a discard ahead of a carrier error is still counted. TIN-6964.
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        0
+    }
 
     /// Restore, verify, and close the single session.
     ///
@@ -1680,6 +1774,8 @@ mod tests {
     enum Step {
         Read(SnapshotRead),
         Fail,
+        /// A carrier error after the session discarded this many frames.
+        FailAfterDiscard(usize),
     }
 
     struct FakeSession {
@@ -1689,6 +1785,7 @@ mod tests {
         fail_finish: bool,
         /// Zero-based remote-mode write that fails.
         fail_mode_index: Option<usize>,
+        last_stale: usize,
     }
 
     impl FakeSession {
@@ -1701,6 +1798,7 @@ mod tests {
                     fail_write: false,
                     fail_finish: false,
                     fail_mode_index: None,
+                    last_stale: 0,
                 },
                 log,
             )
@@ -1712,10 +1810,19 @@ mod tests {
 
         fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
             self.log.borrow_mut().operations.push(operation);
+            self.last_stale = 0;
             match self.steps.pop_front().expect("test supplied a step") {
                 Step::Read(read) => Ok(read),
                 Step::Fail => Err(FakeSessionError),
+                Step::FailAfterDiscard(stale) => {
+                    self.last_stale = stale;
+                    Err(FakeSessionError)
+                }
             }
+        }
+
+        fn last_exchange_stale_search_replies(&self) -> usize {
+            self.last_stale
         }
 
         fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
@@ -2022,6 +2129,150 @@ mod tests {
         assert_eq!(error.empty_search_timeouts(), 1);
         assert!(log.borrow().modes.is_empty());
         assert_eq!(log.borrow().finishes, 1);
+    }
+
+    /// TIN-6964: the 22:32:59Z approved read on PZM, as the executor reports
+    /// it. A 26-byte frame was taken where the 1015-byte Dump0 belongs.
+    const NOVEMBER_15_DUMP0_FAILURE: &str = "Validation { operation: Dump0, source: \
+        InvalidDumpLength { part: Part0, expected: 1015, actual: 26 }, finish_error: None }";
+
+    fn november_15_steps(dump0: SnapshotRead) -> Vec<Step> {
+        let image = snapshot(0, 1, 2);
+        vec![
+            Step::Read(SnapshotRead::timed_out(&[]).unwrap()),
+            Step::Read(SnapshotRead::complete(image.frame(SnapshotSection::Identity)).unwrap()),
+            Step::Read(dump0),
+            Step::Read(SnapshotRead::complete(image.frame(SnapshotSection::Dump1)).unwrap()),
+        ]
+    }
+
+    #[test]
+    fn november_15_record_shape_is_unchanged_when_the_carrier_returns_the_26_byte_frame() {
+        let (session, log) = FakeSession::new(november_15_steps(
+            SnapshotRead::complete(&identity(0)).unwrap(),
+        ));
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(format!("{:?}", error.failure()), NOVEMBER_15_DUMP0_FAILURE);
+        assert_eq!(error.search_attempts(), 2);
+        assert_eq!(error.empty_search_timeouts(), 1);
+        assert_eq!(error.stale_search_replies(), StaleSearchReplies::default());
+        assert_eq!(log.borrow().operations.len(), 3);
+        assert_eq!(log.borrow().finishes, 1);
+    }
+
+    #[test]
+    fn november_15_discarded_search_reply_is_counted_on_the_dump0_window() {
+        let dump0 = SnapshotRead::complete(snapshot(0, 1, 2).frame(SnapshotSection::Dump0))
+            .unwrap()
+            .with_stale_search_replies(1)
+            .unwrap();
+        let (session, log) = FakeSession::new(november_15_steps(dump0));
+        let captured = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured.capture().snapshot(), &snapshot(0, 1, 2));
+        assert_eq!(captured.search_attempts(), 2);
+        assert_eq!(captured.empty_search_timeouts(), 1);
+        assert_eq!(
+            captured.stale_search_replies(),
+            StaleSearchReplies { dump0: 1, dump1: 0 }
+        );
+        let log = log.borrow();
+        assert_eq!(
+            log.operations
+                .iter()
+                .filter(|operation| operation.kind() == SnapshotOperationKind::Dump0)
+                .count(),
+            1
+        );
+        assert_eq!(log.finishes, 1);
+    }
+
+    #[test]
+    fn a_discard_before_a_dump_timeout_is_still_reported_on_failure() {
+        let (session, _log) = FakeSession::new(november_15_steps(
+            SnapshotRead::timed_out(&[])
+                .unwrap()
+                .with_stale_search_replies(1)
+                .unwrap(),
+        ));
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::Timeout {
+                operation: SnapshotOperationKind::Dump0,
+                received: 0,
+                finish_error: None,
+            }
+        ));
+        assert_eq!(
+            error.stale_search_replies(),
+            StaleSearchReplies { dump0: 1, dump1: 0 }
+        );
+        assert!(format!("{error:?}").contains("StaleSearchReplies { dump0: 1, dump1: 0 }"));
+    }
+
+    #[test]
+    fn a_discard_before_a_carrier_error_is_still_reported_on_failure() {
+        let mut steps = november_15_steps(SnapshotRead::timed_out(&[]).unwrap());
+        steps[2] = Step::FailAfterDiscard(1);
+        let (session, log) = FakeSession::new(steps);
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            SnapshotCaptureError::Transport {
+                operation: SnapshotOperationKind::Dump0,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.stale_search_replies(),
+            StaleSearchReplies { dump0: 1, dump1: 0 }
+        );
+        assert_eq!(log.borrow().operations.len(), 3);
+
+        // A session that reports more than the bound is clamped to it.
+        let mut steps = november_15_steps(SnapshotRead::timed_out(&[]).unwrap());
+        steps[2] = Step::FailAfterDiscard(MAX_STALE_SEARCH_REPLIES_PER_DUMP + 1);
+        let (session, _log) = FakeSession::new(steps);
+        let error = approved_target_snapshot(
+            session,
+            &mut FakePacer::default(),
+            DeviceId::new(0).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.stale_search_replies(),
+            StaleSearchReplies { dump0: 1, dump1: 0 }
+        );
+    }
+
+    #[test]
+    fn a_read_cannot_report_more_than_one_discarded_search_reply() {
+        assert_eq!(
+            SnapshotRead::complete(&identity(0))
+                .unwrap()
+                .with_stale_search_replies(MAX_STALE_SEARCH_REPLIES_PER_DUMP + 1),
+            Err(SnapshotReadError::StaleSearchReplies(2))
+        );
     }
 
     #[test]

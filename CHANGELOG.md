@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Discard one stale Search reply ahead of a dump (TIN-6964). On November 15,
+  2026, at 22:32:59Z, a 26-byte frame arrived where the 1015-byte Dump0
+  belongs. In a Dump0 or Dump1 window the carrier now discards one complete
+  Search reply that validates for the bound device and keeps waiting for the
+  dump inside the same deadline. A second one, or any other frame, still
+  fails validation. No request is written again. `room-refresh` output adds
+  `staleSearchRepliesDiscarded` with `dump0` and `dump1` counts, also when a
+  carrier error follows the discard. Helper build 14 accepts output with or
+  without it. The dump reads in apply and rollback readback use the same
+  carrier and may discard one Search reply too. They stay read-only and no
+  write is replayed.
 - Add preset-bound room expectations (`dcx.room-expectation/v2`, TIN-5385
   step 6). One declared file per DCX preset binds `presetId`, `presetDigest`,
   `dcxBlockDigest` and the approved snapshot. Its comparison and receipt

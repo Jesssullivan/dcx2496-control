@@ -148,6 +148,10 @@ pub fn refresh_room(
             "captureElapsedMilliseconds": u64::try_from(captured.elapsed().as_millis())?,
             "searchAttempts": captured.search_attempts(),
             "searchEmptyTimeouts": captured.empty_search_timeouts(),
+            "staleSearchRepliesDiscarded": {
+                "dump0": captured.stale_search_replies().dump0,
+                "dump1": captured.stale_search_replies().dump1,
+            },
             "validSearchCount": captured.capture().valid_search_count(),
             "closeVerified": captured.capture().close_verified(),
             "identityPolicy": "approved-exact-target-one-identity-three-attempts",

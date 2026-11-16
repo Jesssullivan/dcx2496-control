@@ -6,9 +6,10 @@
 //! byte-write method, retry loop, or durable raw capture. While one descriptor
 //! remains open, the carrier may retain exactly one fixed-size accepted Search
 //! response solely to reject or consume a byte-identical late replay. That
-//! ephemeral value is never logged, serialized, or included in receipts. Tests
-//! exercise the same state machine through injected fake syscalls without
-//! opening a device.
+//! ephemeral value is never logged, serialized, or included in receipts. Once
+//! it is held, a dump read may discard one valid Search reply from the bound
+//! device ahead of the dump and report the count. Tests exercise the same
+//! state machine through injected fake syscalls without opening a device.
 
 use std::{
     fmt,
@@ -21,15 +22,15 @@ use dcx_core::protocol::{DeviceId, ProtocolError, RemoteMode};
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 use dcx_core::{
     discovery::FALLBACK_BAUD,
-    protocol::{DirectParameterCommand, MAX_FRAME_LEN, RemoteModeCommand},
+    protocol::{DirectParameterCommand, MAX_FRAME_LEN, RemoteModeCommand, SearchResponse26},
 };
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 use dcx_transport::{
     SEARCH_ATTEMPT_TIMEOUT, SEARCH_REQUEST_LEN, SEARCH_RESPONSE_LIMIT, SearchRead, SearchReadEnd,
     SearchTransport,
     snapshot::{
-        PersistentApplySession, PersistentSnapshotSession, SnapshotOperation,
-        SnapshotOperationKind, SnapshotRead, SnapshotReadEnd,
+        MAX_STALE_SEARCH_REPLIES_PER_DUMP, PersistentApplySession, PersistentSnapshotSession,
+        SnapshotOperation, SnapshotOperationKind, SnapshotRead, SnapshotReadEnd,
     },
 };
 use dcx_transport::{
@@ -705,6 +706,9 @@ struct PersistentCarrier<B: SerialBackend> {
     control_lines_snapshot: i32,
     input_discard_required: bool,
     last_search_response: Option<[u8; SEARCH_RESPONSE_LIMIT]>,
+    /// Search replies the most recent snapshot exchange discarded, kept so a
+    /// receipt can count them when the exchange then fails.
+    last_exchange_stale: usize,
     receive_direct_cleanup_device: Option<DeviceId>,
 }
 
@@ -814,6 +818,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
             control_lines_snapshot,
             input_discard_required: false,
             last_search_response: None,
+            last_exchange_stale: 0,
             receive_direct_cleanup_device: None,
         })
     }
@@ -1001,6 +1006,7 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         &mut self,
         operation: SnapshotOperation,
     ) -> Result<SnapshotRead, DarwinCarrierError> {
+        self.last_exchange_stale = 0;
         self.require_usable_input()?;
         let mut write_attempted = false;
         let result = self.run_snapshot_exchange_usable(operation, &mut write_attempted);
@@ -1039,12 +1045,24 @@ impl<B: SerialBackend> PersistentCarrier<B> {
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. }) {
             self.attempt_count += 1;
         }
+        // A stale Search reply is recognised only in a dump window, and only
+        // once this session has accepted a Search reply.
+        let stale_search_device = match operation.kind() {
+            SnapshotOperationKind::Dump0 | SnapshotOperationKind::Dump1
+                if self.last_search_response.is_some() =>
+            {
+                Some(operation.expected_device())
+            }
+            _ => None,
+        };
         let bounded = read_snapshot_bounded(
             &mut self.backend,
             deadline,
             operation.response_limit(),
             request.as_bytes(),
             matches!(operation.kind(), SnapshotOperationKind::Search { .. }),
+            stale_search_device,
+            &mut self.last_exchange_stale,
         )?;
         if matches!(operation.kind(), SnapshotOperationKind::Search { .. })
             && let Some(response) = bounded.response
@@ -1170,6 +1188,10 @@ impl<B: SerialBackend> PersistentSnapshotSession for PersistentCarrier<B> {
 
     fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
         self.run_snapshot_exchange(operation)
+    }
+
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        self.last_exchange_stale
     }
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
@@ -1867,6 +1889,25 @@ fn read_one_frame<B: SerialBackend, O: WireObserver>(
     }
 }
 
+/// Whether `frame` is one complete Search reply from `device`.
+///
+/// A Search reply is exactly 26 bytes with function `0x00`. A dump frame is
+/// 1015 or 911 bytes with function `0x10`, so no dump frame can pass.
+#[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
+fn is_search_reply_from(frame: &[u8], device: DeviceId) -> bool {
+    frame.len() == SEARCH_RESPONSE_LIMIT
+        && SearchResponse26::parse(frame).is_ok_and(|reply| reply.device() == device)
+}
+
+/// Read one snapshot response frame inside the operation deadline.
+///
+/// An exact request echo is skipped once. When `stale_search_device` is set,
+/// which the carrier does only for Dump0 and Dump1, one complete Search reply
+/// from that device is discarded and reported in the read. TIN-6964: on
+/// November 15 such a 26-byte frame arrived where Dump0 belongs. A second one
+/// in the same window becomes the response, so validation refuses it. Nothing
+/// is written here, so no request is replayed. `stale` holds the discard
+/// count even when the read then fails, so a receipt can still report it.
 #[cfg(any(test, all(target_os = "macos", not(bazel_test_no_native))))]
 fn read_snapshot_bounded<B: SerialBackend>(
     backend: &mut B,
@@ -1874,30 +1915,34 @@ fn read_snapshot_bounded<B: SerialBackend>(
     limit: usize,
     request: &[u8],
     consume_all_queued_search_replays: bool,
+    stale_search_device: Option<DeviceId>,
+    stale: &mut usize,
 ) -> Result<BoundedRead<SnapshotRead>, DarwinCarrierError> {
     let mut observer = ();
-    let first = read_one_frame(backend, deadline, limit, &mut observer)?;
-    let response = match first {
-        FramedRead::TimedOut(partial) => {
-            return Ok(BoundedRead {
-                read: SnapshotRead::timed_out(&partial)?,
-                response: None,
-            });
-        }
-        FramedRead::Complete(frame) if frame.as_slice() == request => {
-            match read_one_frame(backend, deadline, limit, &mut observer)? {
-                FramedRead::Complete(response) => response,
-                FramedRead::TimedOut(partial) => {
-                    return Ok(BoundedRead {
-                        read: SnapshotRead::timed_out(&partial)?,
-                        response: None,
-                    });
-                }
+    let mut echo_skipped = false;
+    *stale = 0;
+    let response = loop {
+        match read_one_frame(backend, deadline, limit, &mut observer)? {
+            FramedRead::TimedOut(partial) => {
+                return Ok(BoundedRead {
+                    read: SnapshotRead::timed_out(&partial)?.with_stale_search_replies(*stale)?,
+                    response: None,
+                });
             }
+            FramedRead::Complete(frame) if !echo_skipped && frame.as_slice() == request => {
+                echo_skipped = true;
+            }
+            FramedRead::Complete(frame)
+                if *stale < MAX_STALE_SEARCH_REPLIES_PER_DUMP
+                    && stale_search_device
+                        .is_some_and(|device| is_search_reply_from(&frame, device)) =>
+            {
+                *stale += 1;
+            }
+            FramedRead::Complete(response) => break response,
         }
-        FramedRead::Complete(response) => response,
     };
-    let read = SnapshotRead::complete(&response)?;
+    let read = SnapshotRead::complete(&response)?.with_stale_search_replies(*stale)?;
     if consume_all_queued_search_replays {
         finish_queued_snapshot_search_replays(backend, deadline, limit, &response, &mut observer)?;
     } else {
@@ -2039,6 +2084,10 @@ impl PersistentSnapshotSession for DarwinSearchSession {
 
     fn exchange(&mut self, operation: SnapshotOperation) -> Result<SnapshotRead, Self::Error> {
         self.inner.run_snapshot_exchange(operation)
+    }
+
+    fn last_exchange_stale_search_replies(&self) -> usize {
+        self.inner.last_exchange_stale
     }
 
     fn write_remote_mode(&mut self, command: &RemoteModeCommand) -> Result<(), Self::Error> {
