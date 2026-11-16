@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Pin the PA-leg write containment gap with tests. TIN-6805 tracks it. The
+  tests replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame
+  addresses only the five planned fields. The linked O3 low-pass move at
+  Dump1 205 and 212 is contained today. Dump0 101 is the one byte that
+  containment still flags, so a repeat ends `rollback_required`. Any other
+  device move stays uncontained. An ignored test states acceptance 1 and
+  fails until Dump0 101 has a containment rule. No source behaviour changed.
 - Keep the bytes of a failed approved read window (TIN-6964). Three fault
   shapes stayed unexplained because failure records kept no bytes. When a
   `room-refresh` Search or dump exchange fails, `dcxctl` writes one
