@@ -14,7 +14,9 @@
   cap still invalidates it at once. An at-once retry of an empty dump
   timeout leaves its backoff count alone. Partial and Search retries still
   count toward their caps of three, so a burst of three inside one receipt
-  lifetime stops reads for the cooldown. Helper build 15 is version 0.1.14.
+  lifetime stops reads for the cooldown. When a device operation ends the
+  kept receipt before the schedule records the read, the read takes its
+  normal delay, not the at-once retry. Helper build 15 is version 0.1.14.
   It also carries the failed window bytes below.
 - Pin the PA-leg write containment gap with tests. TIN-6805 tracks it. The
   tests replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame

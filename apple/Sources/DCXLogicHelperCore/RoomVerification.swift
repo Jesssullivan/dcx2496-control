@@ -201,6 +201,14 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         return capturedAt
     }
 
+    /// TIN-6964, ruling 70: true while the live receipt still carries
+    /// `capturedAt`. A device operation that ended the kept receipt makes it
+    /// false, so the periodic reader falls back to its normal backoff.
+    func holdsKept(capturedAt kept: Date) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return receipt != nil && capturedAt == kept
+    }
+
     /// TIN-6964, ruling 70: invalidates the kept receipt only while the live
     /// receipt still carries `capturedAt`. A newer capture is never touched.
     /// True when this call invalidated it.

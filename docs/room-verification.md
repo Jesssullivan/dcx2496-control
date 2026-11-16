@@ -172,9 +172,9 @@ verification or a changed approved configuration resets that latch.
 A Dump0 or Dump1 timeout after some bytes, with a verified close, retries on
 the next thirty-second period. While a kept receipt holds it retries at once.
 See [Keeping the receipt after a clean read
-failure](#keeping-the-receipt-after-a-clean-read-failure). A Dump0 or Dump1 read whose complete frame fails
-validation, with a verified close, also retries on the next period. It keeps
-its own count. Three partial dumps, or three validation failures, with no
+failure](#keeping-the-receipt-after-a-clean-read-failure). A Dump0 or Dump1
+read whose complete frame fails validation, with a verified close, also
+retries on the next period. It keeps its own count. Three partial dumps, or three validation failures, with no
 successful capture between them stop periodic reads. The reason names the cap
 and when reads resume. The helper window shows it under Periodic room reads,
 and the unified log records it under `io.tinyland.dcx2496.logic`. Dump0 and
@@ -184,8 +184,9 @@ unknown close, a byte count, or a Search or meter operation also latches.
 
 A Search that times out, with or without bytes, or fails in transport, with a
 verified close, also retries on the next period with its own count. While a
-kept receipt holds it retries at once. Three in a row stop periodic reads with `periodic-search-read-cap-reached`. Search is a
-read, and each retry opens a new session. A Search validation failure, such as
+kept receipt holds it retries at once. Three in a row stop periodic reads
+with `periodic-search-read-cap-reached`. Search is a read, and each retry
+opens a new session. A Search validation failure, such as
 a wrong device, and a Search failure with an unknown close still latch.
 
 A stop at any of the three caps lifts by itself after five minutes. Each further cap stop
@@ -256,6 +257,9 @@ For a stale attempt or a spent cap, the receipt stays live from the end of the
 read until the schedule ends it. That window covers the diagnostic write and
 one schedule call. The receipt is a real capture under sixty seconds old in
 that window, and every device operation invalidates it before it starts.
+When a device operation ends the kept receipt before the schedule records the
+read, the coordinator tells the schedule no receipt is kept. The read then
+takes its normal delay and count, not the at-once retry.
 
 An explicit button read never keeps a receipt. A startup or URL read that
 starts its own flight never keeps one either. A startup or URL read that joins

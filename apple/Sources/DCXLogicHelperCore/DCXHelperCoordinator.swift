@@ -424,9 +424,12 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
     func completePeriodicRead(_ attempt: PeriodicRoomVerification.Attempt, outcome: PeriodicRoomVerification.Outcome,
                               keptReceiptCapturedAt kept: Date?, schedule: PeriodicRoomVerification,
                               now: Date) -> Bool {
-        let disposition = schedule.complete(attempt, outcome: outcome, now: now, receiptKept: kept != nil)
+        // A device operation may have ended the kept receipt after the read.
+        // The schedule then sees no kept receipt and uses its normal backoff.
+        let live = kept.map { roomVerification.holdsKept(capturedAt: $0) } ?? false
+        let disposition = schedule.complete(attempt, outcome: outcome, now: now, receiptKept: live)
         var ended = false
-        if case let .invalidate(reason) = disposition, let kept {
+        if case let .invalidate(reason) = disposition, live, let kept {
             ended = invalidateKeptRoomReceipt(capturedAt: kept, reason: reason)
         }
         if let reason = schedule.blockReason, !ended { reportPeriodicReadsStopped(reason) }

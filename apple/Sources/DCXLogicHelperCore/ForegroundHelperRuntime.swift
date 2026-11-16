@@ -242,7 +242,7 @@ public final class ForegroundHelperRuntime: @unchecked Sendable {
             let readAgainNow = self.coordinator.completePeriodicRead(attempt, outcome: outcome,
                 keptReceiptCapturedAt: kept, schedule: self.periodic, now: Date())
             if readAgainNow {
-                Self.log.notice("periodic room read failed with a verified close; the last receipt stays until its capture limit")
+                Self.log.notice("periodic room read failed with a verified close. The last receipt stays until its capture limit")
                 self.requestPeriodicTickNow()
             }
             if let reason = self.periodic.blockReason {

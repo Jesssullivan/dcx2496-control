@@ -671,6 +671,32 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    /// A device operation that ends the kept receipt between the read and the
+    /// schedule call turns the at-once retry into the normal delay.
+    func testDeviceOperationBeforeTheScheduleCallTakesTheNormalDelay() throws {
+        try exerciseRetention { coordinator, publisher, _, backend, manifest, configuration, first in
+            let firstCapture = try XCTUnwrap(self.date(first.verifiedAt))
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            _ = schedule.poll(binding: manifest, capturedAt: firstCapture, now: firstCapture)
+            let now = firstCapture.addingTimeInterval(PeriodicRoomVerification.successDelay)
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: firstCapture, now: now).attempt)
+            backend.refreshOverride = try self.failedRefresh(["category": "transport", "operation": "search"])
+            let failure = try self.captureFailure(coordinator, manifest, configuration)
+            XCTAssertNotNil(failure.keptReceiptCapturedAt)
+            let other = try DCXTargetReference(bindingID: "SYNTHETIC-other-binding", expectedDeviceAddress: 0)
+            _ = coordinator.handle(try BridgeRequest(body: .snapshotCapture(.init(target: other))))
+            XCTAssertNil(publisher.current(expectation: manifest))
+            XCTAssertFalse(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
+                keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: now))
+            XCTAssertNil(schedule.blockReason)
+            XCTAssertNil(schedule.poll(binding: manifest, capturedAt: nil, now: now).attempt,
+                "no at-once retry once the kept receipt is gone")
+            XCTAssertNotNil(schedule.poll(binding: manifest, capturedAt: nil,
+                now: now.addingTimeInterval(PeriodicRoomVerification.successDelay)).attempt,
+                "the read is due after the normal Search delay")
+        }
+    }
+
     func testRetryCapSpentEndsTheKeptReceiptWithTheStopReason() throws {
         let sent = ReceiptLog()
         try exerciseRetention(submit: { sent.append($0) }) { coordinator, publisher, _, backend, manifest, configuration, first in
