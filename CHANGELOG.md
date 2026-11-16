@@ -10,8 +10,8 @@
   typed-write-lane address. Containment, `write verify`, the apply readback
   and the rollback readback then pass, and each receipt lists the move
   under `device_moves`. Value 2 or any value but 1, a move from 1 to 0, an
-  unbalanced trailer, carrier 108 bit 0 and any other unplanned byte still
-  fail. PEQ, O4 mute and routing plans keep exact equality.
+  unbalanced trailer, carrier 108 bit 0 set or moved in either snapshot and
+  any other unplanned byte still fail. PEQ, O4 mute and routing plans keep exact equality.
   `readback_matches_desired` and `equals_baseline` stay exact digest
   equality. A rollback readback that keeps the byte at 1 now ends
   `rolled_back`. `pa_leg_replay_compliant_write_is_contained_and_verified`

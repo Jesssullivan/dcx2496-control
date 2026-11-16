@@ -2401,3 +2401,72 @@ fn pa_leg_replay_rollback_accepts_dump0_101_left_at_1() {
         assert!(!receipt.is_verified(), "{name}");
     }
 }
+
+/// The rule's carrier is the 7-of-8 carrier of Dump0 101 per the layout
+/// packing rule: payload 88, carrier `13 + 88 + 7 = 108`, bit 0.
+#[test]
+fn dump0_101_rule_names_its_7_of_8_carrier() {
+    let [rule] = crate::ALLOWED_DEVICE_MOVES;
+    let payload = rule.offset - crate::layout::PACKED_PAYLOAD_START;
+    assert_eq!(
+        rule.carrier,
+        (
+            crate::layout::PACKED_PAYLOAD_START + 8 * (payload / 8) + 7,
+            u8::try_from(payload % 8).unwrap()
+        )
+    );
+    assert_eq!(rule.carrier, (DUMP0_XCUR_FLAG_CARRIER, 0));
+    assert_eq!((rule.before, rule.after), (0, 1));
+}
+
+/// A baseline whose carrier 108 bit 0 is already set holds Dump0 101 at the
+/// logical value 128, not 0. Low bits moving 0 to 1 there take the logical
+/// value from 128 to 129, which ruling 69 does not allow. Apply, write verify
+/// and rollback all refuse it and report no device move.
+#[test]
+fn pa_leg_replay_refuses_dump0_101_when_its_carrier_bit_is_set() {
+    // Set the carrier bit and keep the Dump0 trailer in balance.
+    let base = with_dump0(&linked_baseline(), |frame| {
+        let trailer = frame.len() - 2;
+        let before = frame[DUMP0_XCUR_FLAG_CARRIER];
+        frame[DUMP0_XCUR_FLAG_CARRIER] |= 0x01;
+        frame[trailer] = frame[trailer]
+            .wrapping_add(before)
+            .wrapping_sub(frame[DUMP0_XCUR_FLAG_CARRIER])
+            & 0x7f;
+    });
+    assert_eq!(
+        base.frame(crate::SnapshotSection::Dump0)[DUMP0_XCUR_FLAG_CARRIER] & 0x01,
+        0x01
+    );
+    let transaction = pa_leg_transaction(&base);
+    let plan = &transaction.apply_plan;
+    assert!(plan.admits_device_moves());
+    let readback = device_moves_xcur_flag(plan.desired(), 1);
+    assert_eq!(
+        uncontained_offsets(plan, &readback),
+        [(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG, 0, 1)]
+    );
+    assert!(plan.device_moves(&readback).unwrap().is_empty());
+    let verification = verify_written_values(plan, &readback).unwrap();
+    assert_eq!(verification.status, "inconsistent");
+    assert!(verification.device_moves.is_empty());
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    let receipt = apply.verify_apply_readback(&readback).unwrap();
+    assert!(!receipt.is_verified());
+    assert!(receipt.device_moves().is_empty());
+    assert_eq!(
+        apply.state(),
+        crate::ApplyTransactionState::RollbackRequired
+    );
+    // Rollback with the low bits left at 1 under the set carrier bit faults.
+    let mut rollback = ApplyTransactionV1::resume_rollback(&transaction.rollback_plan).unwrap();
+    rollback.begin_rollback().unwrap();
+    let receipt = rollback
+        .verify_rollback_readback(&device_moves_xcur_flag(&base, 1))
+        .unwrap();
+    assert!(!receipt.is_verified());
+    assert!(receipt.device_moves().is_empty());
+    assert_eq!(rollback.state(), crate::ApplyTransactionState::Faulted);
+}

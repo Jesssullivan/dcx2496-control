@@ -1047,6 +1047,10 @@ pub struct AllowedDeviceMove {
     pub section: SnapshotSection,
     /// Frame offset, header included.
     pub offset: usize,
+    /// 7-of-8 carrier byte and bit that hold the high bit of `offset`. The
+    /// bit must be clear in both the expected snapshot and the readback, so
+    /// the logical value is exactly `before` and then exactly `after`.
+    pub carrier: (usize, u8),
     /// The only value the byte may hold before the move.
     pub before: u8,
     /// The only value the device may leave in it.
@@ -1059,12 +1063,15 @@ pub struct AllowedDeviceMove {
 /// header. On 2026-10-20 the device set it from 0 to 1 during a typed write.
 /// Legalab ruling 69 (Linear TIN-5385 comment `50be9d3b`, "Yes, value 1
 /// only") lets the device make that one move. Any other value, the reverse
-/// move, a move of its high bit in carrier byte 108, and a move that breaks
-/// the Dump0 modulo-128 trailer balance stay refused.
+/// move, its high bit in carrier byte 108 set or moved, and a move that
+/// breaks the Dump0 modulo-128 trailer balance stay refused. The carrier
+/// follows the 7-of-8 rule in [`crate::layout`]: offset 101 is payload 88,
+/// so its carrier is `13 + 88 + 7 = 108`, bit `88 % 8 = 0`.
 pub const ALLOWED_DEVICE_MOVES: [AllowedDeviceMove; 1] = [AllowedDeviceMove {
     rule: "dump0_101_set_by_device",
     section: SnapshotSection::Dump0,
     offset: 101,
+    carrier: (108, 0),
     before: 0,
     after: 1,
 }];
@@ -1094,8 +1101,9 @@ impl SnapshotV1 {
     /// back, and the moves found.
     ///
     /// A move counts only when `expected` holds the rule's `before` value,
-    /// this readback holds its `after` value, and this readback keeps the
-    /// dump's modulo-128 trailer balance of `expected`. Putting it back
+    /// this readback holds its `after` value, the rule's carrier bit is clear
+    /// in both, and this readback keeps the dump's modulo-128 trailer
+    /// balance of `expected`. Putting it back
     /// restores the byte and moves the trailer by the same amount, so the
     /// balance holds. Every other byte is left as read.
     fn without_device_moves(&self, expected: &Self) -> (Self, Vec<DeviceMoveV1>) {
@@ -1110,8 +1118,12 @@ impl SnapshotV1 {
             };
             let trailer = frame.len() - 2;
             let balance = |bytes: &[u8]| seven_bit_sum(&bytes[PACKED_PAYLOAD_START..=trailer]);
+            let (carrier, bit) = rule.carrier;
+            let high_bit = 1u8 << bit;
             if wanted[rule.offset] != rule.before
                 || frame[rule.offset] != rule.after
+                || wanted[carrier] & high_bit != 0
+                || frame[carrier] & high_bit != 0
                 || balance(frame.as_slice()) != balance(wanted.as_slice())
             {
                 continue;

@@ -28,9 +28,9 @@ is the check a readback must pass before an address can be called observed.
 Observed 2026-10-20 (PA leg): a separate snapshot after the apply read back
 all five written values (O1-O3 mutes, O4 high-pass type LR24 and frequency
 code 74, 99.35 Hz) at their transcribed offsets, but containment also flagged
-Dump0 byte 101 (`0 -> 1`, unexplained, out of scope here) and the linked O3
-low-pass move described below, so that readback did not pass `write verify`
-and no address is promoted by it.
+Dump0 byte 101 moving from 0 to 1 and the linked O3 low-pass move described
+below, so that readback did not pass `write verify` and no address is
+promoted by it. "Device-set status byte" below now covers the byte 101 move.
 
 Today the linked O3 low-pass move is contained, and the Dump0 101 move is
 an allowed device move under Legalab ruling 69 (TIN-6805, see "Device-set
@@ -418,14 +418,17 @@ The rule is one entry in `ALLOWED_DEVICE_MOVES`
 | Expected 0, readback 2 or any value but 1 | Uncontained |
 | Expected 1, readback 0 | Uncontained |
 | Readback 1 with the Dump0 trailer not moved to match | Uncontained |
-| Carrier 108 bit 0 set | Uncontained |
+| Carrier 108 bit 0 set or moved, in the expected snapshot or the readback | Uncontained |
 | A plan with no typed-write-lane address | Uncontained, exact equality as before |
 
 It applies only to a typed write, a plan with at least one
 typed-write-lane address. PEQ, O4 mute and routing carriers keep exact
 equality. When the move matches, the byte is put back to 0 and the trailer
 moved by the same step, and every other byte must then still pass the
-ordinary checks. The move counts against the plan's baseline for
+ordinary checks. The rule also requires carrier 108 bit 0 clear in both
+snapshots, so the logical value is exactly 0 before and exactly 1 after. A
+baseline that already holds that bit holds 128 at the byte, and a move to
+129 is refused. The move counts against the plan's baseline for
 containment, the desired snapshot for the apply readback, and the baseline
 for the rollback readback.
 
