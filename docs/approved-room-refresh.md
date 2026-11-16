@@ -63,6 +63,7 @@ When a Search, Dump0 or Dump1 exchange fails in transport, times out, hits its l
 | `schemaVersion` | `dcx.failure-window-bytes/v1` |
 | `operation` | `search`, `dump0` or `dump1` |
 | `sequence` | The Search attempt number, or null for a dump |
+| `failure` | `transport`, `timeout`, `responseLimit` or `validation` |
 | `received` | Every byte read after that request was written, kept or not |
 | `kept` | Bytes kept, at most 128, from the first byte read |
 | `truncated` | Whether `received` exceeds `kept` |
@@ -70,7 +71,11 @@ When a Search, Dump0 or Dump1 exchange fails in transport, times out, hits its l
 
 The window holds every byte the carrier read after the write: a request echo, a discarded Search reply, the frame that failed and any trailing frame. The carrier records each byte as it reads it. It adds no read, no wait and no write, and it changes no deadline or retry.
 
-The line goes to stderr only. The helper keeps child stderr in its private record under `RoomDiagnostics`, which has mode `0700` with records at `0600`. The stdout envelope, the room receipt, helper status and the unified log never carry the bytes. The stdout envelope stays one line of compact JSON, byte for byte the form it had before this line was added. The error text on the last stderr line keeps its earlier form and names no byte.
+A window with `received` 0 is ambiguous without `failure`. A `timeout` means the deadline passed with no byte. A `transport` failure can come before the first read, as with `InputRecoveryRequired`, `PreexistingInput` or `ShortWrite`, and then its window is empty too. The carrier error on the last stderr line names which one it was.
+
+An empty Search timeout is a known limit. The approved path replays it, and three of them end in `SearchQualificationIncomplete`, which belongs to no single exchange. That record keeps no window. Each of those Search windows held no response byte, but it may have held an exact request echo, and that echo is not kept. The read path is not changed to keep it.
+
+The line goes to stderr only. The helper keeps child stderr in its private record under `RoomDiagnostics`, which has mode `0700` with records at `0600`. The stdout envelope, the room receipt, helper status and the unified log never carry the bytes. The stdout envelope stays one line of compact JSON, byte for byte the form it had before this line was added. The error text on the last stderr line keeps its earlier form. It never carries the window, but some errors name a few byte values, as they did before. `WrongManufacturer` names three header bytes, and `WrongModel` and `NonSevenBitData` each name one.
 
 Two caps bound how many records hold bytes. The store keeps at most eight records. Before it writes a record, it removes any record older than seven days. A record older than that stays only until the next failure is recorded.
 

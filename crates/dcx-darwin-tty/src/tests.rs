@@ -3,15 +3,20 @@ use std::{cell::RefCell, collections::VecDeque, path::PathBuf, rc::Rc, time::Dur
 use dcx_core::{
     SnapshotSection,
     meter::METER_RESPONSE_LEN,
+    output_profile::profile_digest,
     protocol::{
         DUMP0_RESPONSE_LEN, DUMP1_RESPONSE_LEN, DeviceId, DirectParameterAction, RemoteMode,
     },
+    room_verification::ApprovedRoomRefreshAdmission,
 };
 use dcx_transport::{
     Known38400SearchError, Known38400SearchOutcome, RepeatPacer, SearchExecutionError,
     SearchOperationKind, SearchOutcome, execute_known_38400_search, execute_search,
     meter::{LIVE_METER_REQUEST_COUNT, execute_live_meter},
-    snapshot::{MAX_WINDOW_BYTES, SNAPSHOT_OPERATION_TIMEOUT, execute_persistent_snapshot},
+    snapshot::{
+        MAX_WINDOW_BYTES, SNAPSHOT_OPERATION_TIMEOUT, WindowFailure,
+        execute_approved_target_snapshot, execute_persistent_snapshot,
+    },
 };
 
 use super::*;
@@ -1656,6 +1661,140 @@ fn each_exchange_starts_with_a_fresh_window() {
     }
     assert_eq!(windows[11].1.received(), DUMP0_RESPONSE_LEN);
     assert_eq!(windows[12].1.received(), DUMP1_RESPONSE_LEN);
+}
+
+/// Admission for the approved path from the checked-in v2 fixture. The
+/// approved capture uses only its device address.
+fn approved_admission() -> ApprovedRoomRefreshAdmission {
+    let bytes = include_bytes!("../../../fixtures/room-expectations/LEGALAB-practice-room.json");
+    ApprovedRoomRefreshAdmission::from_json(
+        bytes,
+        &profile_digest(bytes),
+        DeviceId::new(0).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The approved path over the real carrier: Search 1 times out empty, Search
+/// 2 is answered, and `ahead` is readable in the Dump0 window before `dumps`.
+fn approved_dump0_window(ahead: &[Vec<u8>], dumps: &[Vec<u8>]) -> FakeBackend {
+    let mut inbound = synthetic_response(0).to_vec();
+    let mut extra = 0;
+    for frame in ahead {
+        inbound.extend_from_slice(frame);
+        extra += frame.len();
+    }
+    for frame in dumps {
+        inbound.extend_from_slice(frame);
+    }
+    let mut backend = FakeBackend::with_inbound(inbound);
+    backend.available_script = [0, 0].into_iter().collect();
+    backend.dump_window_extra = [extra, 0].into_iter().collect();
+    backend
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+/// TIN-6964 end to end: the approved executor runs over `PersistentCarrier`
+/// and returns the failed window it copied out of the carrier.
+#[test]
+fn approved_capture_over_the_carrier_keeps_the_26_byte_frame_in_dump0() {
+    let other_device = synthetic_response(1).to_vec();
+    let writes = Rc::new(RefCell::new(Vec::new()));
+    let backend = approved_dump0_window(std::slice::from_ref(&other_device), &[])
+        .with_shared_writes(Rc::clone(&writes));
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+
+    assert_eq!(format!("{:?}", error.failure()), NOVEMBER_15_DUMP0_FAILURE);
+    assert_eq!(error.search_attempts(), 2);
+    assert_eq!(error.empty_search_timeouts(), 1);
+    let window = error.failure_window().unwrap();
+    assert_eq!(window.operation(), SnapshotOperationKind::Dump0);
+    assert_eq!(window.failure(), WindowFailure::Validation);
+    assert_eq!(window.bytes().kept(), other_device.as_slice());
+    let hex = hex_of(&other_device);
+    assert!(
+        window.private_record_line().ends_with(&format!(
+            "\"received\":26,\"kept\":26,\"truncated\":false,\"hex\":\"{hex}\"}}"
+        )),
+        "{}",
+        window.private_record_line()
+    );
+    let debug = format!("{error:?}");
+    assert!(!debug.contains(&hex), "{debug}");
+    // One Dump0 request. No request was written again.
+    assert_eq!(dump0_writes(&writes.borrow()), 1);
+}
+
+#[test]
+fn approved_capture_over_the_carrier_keeps_an_empty_dump0_timeout_window() {
+    let carrier =
+        PersistentCarrier::open(binding(), approved_dump0_window(&[], &[]), FALLBACK_BAUD).unwrap();
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+    assert_eq!(
+        format!("{:?}", error.failure()),
+        "Timeout { operation: Dump0, received: 0, finish_error: None }"
+    );
+    let window = error.failure_window().unwrap();
+    assert_eq!(window.failure(), WindowFailure::Timeout);
+    assert_eq!(window.bytes(), &WindowBytes::default());
+}
+
+/// A short write fails Search 1 before any read. The window is empty, and
+/// the record names a transport failure, not a timeout.
+#[test]
+fn approved_capture_over_the_carrier_names_a_short_write_as_transport() {
+    let mut backend = FakeBackend::with_inbound([]);
+    backend.short_write = Some(1);
+    let carrier = PersistentCarrier::open(binding(), backend, FALLBACK_BAUD).unwrap();
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+    assert!(
+        format!("{:?}", error.failure()).contains("ShortWrite"),
+        "{error:?}"
+    );
+    let window = error.failure_window().unwrap();
+    assert_eq!(
+        window.operation(),
+        SnapshotOperationKind::Search { sequence: 1 }
+    );
+    assert_eq!(window.failure(), WindowFailure::Transport);
+    assert_eq!(window.bytes().received(), 0);
+    assert!(
+        window
+            .private_record_line()
+            .contains("\"failure\":\"transport\",\"received\":0,")
+    );
+}
+
+/// Three empty Search timeouts end in qualification, not in one exchange, so
+/// the approved capture keeps no window. A known limit, TIN-6964.
+#[test]
+fn approved_capture_over_the_carrier_keeps_no_window_after_three_empty_searches() {
+    let carrier =
+        PersistentCarrier::open(binding(), FakeBackend::with_inbound([]), FALLBACK_BAUD).unwrap();
+    let error =
+        execute_approved_target_snapshot(carrier, &mut FastPacer::default(), &approved_admission())
+            .unwrap_err();
+    assert!(
+        format!("{:?}", error.failure()).starts_with("SearchQualificationIncomplete"),
+        "{error:?}"
+    );
+    assert_eq!(error.search_attempts(), 3);
+    assert!(error.failure_window().is_none());
 }
 
 #[test]

@@ -583,10 +583,13 @@ mod tests {
     use std::io;
 
     // The shape `FailureWindow::private_record_line` writes. The host build
-    // of dcxctl has no transport crate, so the line is spelled out here.
+    // of dcxctl has no transport crate, so the line is spelled out here. The
+    // hex is the 26-byte synthetic identity frame the transport tests use.
+    const WINDOW_HEX: &str = "f0002032000e0053594e5448455449432d4944454e54495459f7";
     const WINDOW_LINE: &str = "{\"schemaVersion\":\"dcx.failure-window-bytes/v1\",\
-        \"operation\":\"dump0\",\"sequence\":null,\"received\":26,\"kept\":26,\
-        \"truncated\":false,\"hex\":\"f000204200\"}";
+        \"operation\":\"dump0\",\"sequence\":null,\"failure\":\"validation\",\
+        \"received\":26,\"kept\":26,\"truncated\":false,\
+        \"hex\":\"f0002032000e0053594e5448455449432d4944454e54495459f7\"}";
 
     fn envelope() -> serde_json::Value {
         serde_json::json!({
@@ -607,6 +610,20 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::other("closed"))
         }
+    }
+
+    #[test]
+    fn window_line_fixture_agrees_with_its_schema() {
+        let line: serde_json::Value = serde_json::from_str(WINDOW_LINE).unwrap();
+        let hex = line["hex"].as_str().unwrap();
+        assert_eq!(hex, WINDOW_HEX);
+        assert_eq!(
+            line["kept"].as_u64().unwrap() * 2,
+            u64::try_from(hex.len()).unwrap()
+        );
+        assert_eq!(line["received"], line["kept"]);
+        assert_eq!(line["truncated"], false);
+        assert_eq!(line["failure"], "validation");
     }
 
     #[test]
@@ -637,7 +654,7 @@ mod tests {
         assert_eq!(with_window, without_window);
         let text = String::from_utf8(with_window).unwrap();
         assert!(!text.contains("failure-window-bytes"), "{text}");
-        assert!(!text.contains("f000204200"), "{text}");
+        assert!(!text.contains(WINDOW_HEX), "{text}");
     }
 
     #[test]

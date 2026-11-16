@@ -5,8 +5,8 @@
 - Keep the bytes of a failed approved read window (TIN-6964). Three fault
   shapes stayed unexplained because failure records kept no bytes. When a
   `room-refresh` Search or dump exchange fails, `dcxctl` writes one
-  `dcx.failure-window-bytes/v1` line to stderr. It holds the first 128 bytes
-  read after that request, in hex, and the total count. The helper keeps
+  `dcx.failure-window-bytes/v1` line to stderr. It holds the failure kind,
+  the first 128 bytes read after that request, in hex, and the total count. The helper keeps
   that stderr in its private failure record. The stdout envelope, the room
   receipt and helper status carry no bytes. A success writes no line. The
   helper now also removes private records older than seven days before it

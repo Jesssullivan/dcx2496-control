@@ -160,7 +160,37 @@ impl fmt::Debug for WindowBytes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureWindow {
     operation: SnapshotOperationKind,
+    failure: WindowFailure,
     bytes: WindowBytes,
+}
+
+/// How the exchange that kept a [`FailureWindow`] failed.
+///
+/// A transport failure can come before the first read, as with a short write
+/// or input that needs recovery, so its window may be empty. The record names
+/// the kind so such a window is not read as an empty timeout. TIN-6964.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFailure {
+    /// The carrier returned an error.
+    Transport,
+    /// The deadline passed without a complete response.
+    Timeout,
+    /// The response passed its byte limit.
+    ResponseLimit,
+    /// A complete response failed validation.
+    Validation,
+}
+
+impl WindowFailure {
+    /// The fixed name the private record line uses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Timeout => "timeout",
+            Self::ResponseLimit => "responseLimit",
+            Self::Validation => "validation",
+        }
+    }
 }
 
 /// Schema of the one-line private failure-window record.
@@ -170,6 +200,11 @@ impl FailureWindow {
     /// The failed exchange.
     pub const fn operation(&self) -> SnapshotOperationKind {
         self.operation
+    }
+
+    /// How that exchange failed.
+    pub const fn failure(&self) -> WindowFailure {
+        self.failure
     }
 
     /// The bytes read in that exchange window.
@@ -192,7 +227,9 @@ impl FailureWindow {
         let sequence = sequence.map_or_else(|| "null".to_owned(), |value| value.to_string());
         format!(
             "{{\"schemaVersion\":\"{FAILURE_WINDOW_SCHEMA}\",\"operation\":\"{operation}\",\
-             \"sequence\":{sequence},\"received\":{},\"kept\":{},\"truncated\":{},\"hex\":\"{}\"}}",
+             \"sequence\":{sequence},\"failure\":\"{}\",\"received\":{},\"kept\":{},\
+             \"truncated\":{},\"hex\":\"{}\"}}",
+            self.failure.as_str(),
             self.bytes.received(),
             self.bytes.kept().len(),
             self.bytes.truncated(),
@@ -367,12 +404,20 @@ impl<S: PersistentSnapshotSession> PersistentSnapshotSession for CountedSnapshot
 /// `None`, so their records keep no window bytes.
 fn failed_exchange<E: StdError + Send + Sync + 'static, P: StdError + Send + Sync + 'static>(
     failure: &SnapshotCaptureError<E, P>,
-) -> Option<SnapshotOperationKind> {
+) -> Option<(SnapshotOperationKind, WindowFailure)> {
     match failure {
-        SnapshotCaptureError::Transport { operation, .. }
-        | SnapshotCaptureError::Timeout { operation, .. }
-        | SnapshotCaptureError::ResponseLimit { operation, .. }
-        | SnapshotCaptureError::Validation { operation, .. } => Some(*operation),
+        SnapshotCaptureError::Transport { operation, .. } => {
+            Some((*operation, WindowFailure::Transport))
+        }
+        SnapshotCaptureError::Timeout { operation, .. } => {
+            Some((*operation, WindowFailure::Timeout))
+        }
+        SnapshotCaptureError::ResponseLimit { operation, .. } => {
+            Some((*operation, WindowFailure::ResponseLimit))
+        }
+        SnapshotCaptureError::Validation { operation, .. } => {
+            Some((*operation, WindowFailure::Validation))
+        }
         SnapshotCaptureError::Pacing { .. }
         | SnapshotCaptureError::BudgetExceeded { .. }
         | SnapshotCaptureError::SearchQualificationIncomplete { .. }
@@ -446,9 +491,16 @@ fn approved_target_snapshot<S: PersistentSnapshotSession, P: RepeatPacer>(
         .map_err(|failure| {
             // Keep the window only when the failure names the exchange that
             // read it.
-            let failure_window = window
-                .filter(|(operation, _)| failed_exchange(&failure) == Some(*operation))
-                .map(|(operation, bytes)| Box::new(FailureWindow { operation, bytes }));
+            let failure_window = window.and_then(|(operation, bytes)| {
+                let (failed, kind) = failed_exchange(&failure)?;
+                (failed == operation).then(|| {
+                    Box::new(FailureWindow {
+                        operation,
+                        failure: kind,
+                        bytes,
+                    })
+                })
+            });
             ApprovedTargetCaptureError {
                 failure,
                 search_attempts: attempts,
@@ -2529,7 +2581,8 @@ mod tests {
             window.private_record_line(),
             format!(
                 "{{\"schemaVersion\":\"dcx.failure-window-bytes/v1\",\"operation\":\"dump0\",\
-                 \"sequence\":null,\"received\":26,\"kept\":26,\"truncated\":false,\"hex\":\"{hex}\"}}"
+                 \"sequence\":null,\"failure\":\"validation\",\"received\":26,\"kept\":26,\
+                 \"truncated\":false,\"hex\":\"{hex}\"}}"
             )
         );
         // The error's Debug text, which dcxctl prints, carries no window bytes.
@@ -2579,7 +2632,7 @@ mod tests {
             assert!(
                 window
                     .private_record_line()
-                    .ends_with("\"received\":0,\"kept\":0,\"truncated\":false,\"hex\":\"\"}")
+                    .ends_with("\"failure\":\"timeout\",\"received\":0,\"kept\":0,\"truncated\":false,\"hex\":\"\"}")
             );
         }
     }
@@ -2614,8 +2667,48 @@ mod tests {
         assert!(
             window
                 .private_record_line()
-                .contains("\"operation\":\"search\",\"sequence\":1,\"received\":10,\"kept\":10")
+                .contains("\"operation\":\"search\",\"sequence\":1,\"failure\":\"timeout\",\"received\":10,\"kept\":10")
         );
+    }
+
+    /// A transport failure before any read, such as a short write, keeps an
+    /// empty window too. The record names the failure, so it does not read
+    /// as an empty timeout.
+    #[test]
+    fn an_empty_transport_window_is_named_apart_from_an_empty_timeout() {
+        let cases = [
+            // The carrier fails Search 1 before it reads a byte.
+            (vec![Step::Fail], WindowFailure::Transport, "transport"),
+            // Dump0 times out with no byte.
+            (
+                vec![
+                    Step::Read(SnapshotRead::complete(&identity(0)).unwrap()),
+                    Step::Read(SnapshotRead::timed_out(&[]).unwrap()),
+                ],
+                WindowFailure::Timeout,
+                "timeout",
+            ),
+        ];
+        for (steps, failure, name) in cases {
+            let (mut session, _log) = FakeSession::new(steps);
+            session.window = Some(WindowBytes::default());
+            let error = approved_target_snapshot(
+                session,
+                &mut FakePacer::default(),
+                DeviceId::new(0).unwrap(),
+            )
+            .unwrap_err();
+            let window = error.failure_window().unwrap();
+            assert_eq!(window.failure(), failure);
+            assert_eq!(window.bytes().received(), 0);
+            assert!(
+                window
+                    .private_record_line()
+                    .contains(&format!("\"failure\":\"{name}\",\"received\":0,")),
+                "{}",
+                window.private_record_line()
+            );
+        }
     }
 
     #[test]

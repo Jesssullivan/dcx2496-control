@@ -234,7 +234,7 @@ final class RoomFailureDiagnosticsTests: XCTestCase {
     /// They stay in the private record and never reach status metadata.
     func testFailedWindowBytesStayInThePrivateRecordOnly() throws {
         let hex = "f0002032000e0053594e5448455449432d4944454e54495459f7"
-        let line = #"{"schemaVersion":"dcx.failure-window-bytes/v1","operation":"dump0","sequence":null,"received":26,"kept":26,"truncated":false,"hex":"\#(hex)"}"#
+        let line = #"{"schemaVersion":"dcx.failure-window-bytes/v1","operation":"dump0","sequence":null,"failure":"validation","received":26,"kept":26,"truncated":false,"hex":"\#(hex)"}"#
         let stderr = Data((line + "\nError: ApprovedTargetCaptureError { SYNTHETIC }\n").utf8)
         let stdout = try JSONSerialization.data(withJSONObject: failedEnvelope())
         let (value, root) = try exercise(.init(refresh: .success(result(exit: 1, stdout: stdout, stderr: stderr))))
