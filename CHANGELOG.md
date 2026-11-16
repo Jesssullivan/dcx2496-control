@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Allow the device to set Dump0 byte 101 from 0 to 1 in a typed write.
+  TIN-6805 tracks it. Legalab ruling 69, Linear TIN-5385 comment `50be9d3b`:
+  "Yes, value 1 only (Recommended)". `ALLOWED_DEVICE_MOVES` holds that one move
+  with its exact before and after values. It counts only when the Dump0
+  trailer keeps its modulo-128 balance and the plan holds a
+  typed-write-lane address. Containment, `write verify`, the apply readback
+  and the rollback readback then pass, and each receipt lists the move
+  under `device_moves`. Value 2 or any value but 1, a move from 1 to 0, an
+  unbalanced trailer, carrier 108 bit 0 set or moved in either snapshot and
+  any other unplanned byte still fail. PEQ, O4 mute and routing plans keep
+  exact equality.
+  `readback_matches_desired` and `equals_baseline` stay exact digest
+  equality. A rollback readback that keeps the byte at 1 now ends
+  `rolled_back` with `equals_baseline: false` and the move listed. Legalab
+  ruling 89, Linear TIN-5385 comment `38e47c36`: "Yes, and the receipt says
+  so (Recommended)". The `post_apply_state_uncertain` and
+  `post_rollback_state_uncertain` receipts print `device_moves: null`.
+  `pa_leg_replay_compliant_write_is_contained_and_verified`
+  runs by default and passes.
 - Pin the PA-leg write containment gap with tests. TIN-6805 tracks it. The
   tests replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame
   addresses only the five planned fields. The linked O3 low-pass move at

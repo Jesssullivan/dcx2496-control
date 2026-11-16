@@ -1398,7 +1398,9 @@ pub(crate) fn with_finish<
 /// Exact result of typed apply plus complete readback.
 #[derive(Debug)]
 pub enum ApplyReadbackOutcome {
-    /// Complete readback exactly matched desired state.
+    /// Complete readback matched desired state exactly, or once the allowed
+    /// device moves of a typed write are put back
+    /// (`dcx_core::ALLOWED_DEVICE_MOVES`).
     Verified(CapturedSnapshotV1),
     /// Complete readback differed and rollback is now required.
     RollbackRequired(CapturedSnapshotV1),
@@ -1407,7 +1409,8 @@ pub enum ApplyReadbackOutcome {
 /// Exact result of typed rollback plus complete readback.
 #[derive(Debug)]
 pub enum RollbackReadbackOutcome {
-    /// Complete readback restored exact immutable baseline equality.
+    /// Complete readback restored the immutable baseline exactly, or up to
+    /// the allowed device moves of a typed write.
     RolledBack(CapturedSnapshotV1),
     /// Complete readback still differed from baseline.
     Faulted(CapturedSnapshotV1),
@@ -1846,8 +1849,8 @@ fn settle_apply_readback<
             return Err(error.into());
         }
     };
-    let exact = match transaction.verify_apply_readback(captured.snapshot()) {
-        Ok(receipt) => receipt.is_exact(),
+    let verified = match transaction.verify_apply_readback(captured.snapshot()) {
+        Ok(receipt) => receipt.is_verified(),
         Err(source) => {
             transaction.require_rollback_after_error()?;
             return Err(TransactionExecutionError::Transaction {
@@ -1856,7 +1859,7 @@ fn settle_apply_readback<
             });
         }
     };
-    if exact {
+    if verified {
         Ok(ApplyReadbackOutcome::Verified(captured))
     } else {
         Ok(ApplyReadbackOutcome::RollbackRequired(captured))
@@ -1944,8 +1947,8 @@ pub fn execute_rollback_readback<S: PersistentApplySession, P: RepeatPacer>(
             return Err(error.into());
         }
     };
-    let exact = match transaction.verify_rollback_readback(captured.snapshot()) {
-        Ok(receipt) => receipt.is_exact(),
+    let verified = match transaction.verify_rollback_readback(captured.snapshot()) {
+        Ok(receipt) => receipt.is_verified(),
         Err(source) => {
             transaction.fault_rollback_after_error()?;
             return Err(TransactionExecutionError::Transaction {
@@ -1954,7 +1957,7 @@ pub fn execute_rollback_readback<S: PersistentApplySession, P: RepeatPacer>(
             });
         }
     };
-    if exact {
+    if verified {
         Ok(RollbackReadbackOutcome::RolledBack(captured))
     } else {
         Ok(RollbackReadbackOutcome::Faulted(captured))
@@ -3020,6 +3023,105 @@ mod tests {
                 RemoteMode::ReceiveDirect,
             ]
         );
+    }
+
+    /// The snapshot with Dump0 101 set to `value` and the Dump0 trailer kept
+    /// in balance, as the device did on 2026-10-20.
+    fn with_dump0_101(snapshot: &SnapshotV1, value: u8) -> SnapshotV1 {
+        let mut dump0 = snapshot.frame(SnapshotSection::Dump0).to_vec();
+        let trailer = dump0.len() - 2;
+        dump0[trailer] = dump0[trailer].wrapping_add(dump0[101]).wrapping_sub(value) & 0x7f;
+        dump0[101] = value;
+        SnapshotV1::from_frames(
+            snapshot.frame(SnapshotSection::Identity),
+            &dump0,
+            snapshot.frame(SnapshotSection::Dump1),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn typed_write_device_move_of_dump0_101_verifies_apply_and_rollback() {
+        // Ruling 69: in a typed write the device may set Dump0 101 from 0 to
+        // 1. The O1 mute is a typed-write-lane address. Typed writes need
+        // O5 and O6 muted (Dump1 392 and 561).
+        let mut dump1 = dump(0, 1, 0);
+        dump1[392] = 1;
+        dump1[561] = 1;
+        let baseline = SnapshotV1::from_frames(&identity(0), &dump(0, 0, 0), &dump1).unwrap();
+        let mute = DirectParameterAction::new(5, 0x03, 1).unwrap();
+        let mut transaction =
+            ApplyTransactionV1::stage_projected(baseline.clone(), vec![mute]).unwrap();
+        assert!(transaction.apply_plan().admits_device_moves());
+        let desired = transaction.apply_plan().desired().clone();
+
+        let mut apply_steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        apply_steps.extend(snapshot_steps(
+            &with_dump0_101(&desired, 1),
+            READBACK_SEARCH_COUNT,
+        ));
+        let (session, _) = FakeSession::new(apply_steps);
+        assert!(matches!(
+            execute_apply_readback(session, &mut FakePacer::default(), &mut transaction).unwrap(),
+            ApplyReadbackOutcome::Verified(_)
+        ));
+        assert_eq!(transaction.state(), ApplyTransactionState::Verified);
+
+        // A later rollback whose readback keeps the byte at 1 restores the
+        // baseline: no inverse can reach the byte.
+        let mut rollback =
+            ApplyTransactionV1::resume_rollback(transaction.rollback_plan()).unwrap();
+        let mut rollback_steps = vec![Step::Read(
+            SnapshotRead::complete(baseline.frame(SnapshotSection::Identity)).unwrap(),
+        )];
+        rollback_steps.extend(snapshot_steps(
+            &with_dump0_101(&baseline, 1),
+            READBACK_SEARCH_COUNT,
+        ));
+        let (session, _) = FakeSession::new(rollback_steps);
+        assert!(matches!(
+            execute_rollback_readback(session, &mut FakePacer::default(), &mut rollback).unwrap(),
+            RollbackReadbackOutcome::RolledBack(_)
+        ));
+        assert_eq!(rollback.state(), ApplyTransactionState::RolledBack);
+
+        // Value 2 is not the allowed move: the rollback faults.
+        let mut rollback =
+            ApplyTransactionV1::resume_rollback(transaction.rollback_plan()).unwrap();
+        let mut rollback_steps = vec![Step::Read(
+            SnapshotRead::complete(baseline.frame(SnapshotSection::Identity)).unwrap(),
+        )];
+        rollback_steps.extend(snapshot_steps(
+            &with_dump0_101(&baseline, 2),
+            READBACK_SEARCH_COUNT,
+        ));
+        let (session, _) = FakeSession::new(rollback_steps);
+        assert!(matches!(
+            execute_rollback_readback(session, &mut FakePacer::default(), &mut rollback).unwrap(),
+            RollbackReadbackOutcome::Faulted(_)
+        ));
+    }
+
+    #[test]
+    fn peq_write_device_move_of_dump0_101_still_requires_rollback() {
+        // A PEQ-only plan is not a typed write, so exact equality stands.
+        let baseline = snapshot(0, 0, 0);
+        let apply = DirectParameterAction::new(5, 0x3c, 40).unwrap();
+        let mut transaction =
+            ApplyTransactionV1::stage_projected(baseline.clone(), vec![apply]).unwrap();
+        assert!(!transaction.apply_plan().admits_device_moves());
+        let desired = transaction.apply_plan().desired().clone();
+        let mut apply_steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        apply_steps.extend(snapshot_steps(
+            &with_dump0_101(&desired, 1),
+            READBACK_SEARCH_COUNT,
+        ));
+        let (session, _) = FakeSession::new(apply_steps);
+        assert!(matches!(
+            execute_apply_readback(session, &mut FakePacer::default(), &mut transaction).unwrap(),
+            ApplyReadbackOutcome::RollbackRequired(_)
+        ));
+        assert_eq!(transaction.state(), ApplyTransactionState::RollbackRequired);
     }
 
     #[test]

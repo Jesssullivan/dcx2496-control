@@ -28,17 +28,16 @@ is the check a readback must pass before an address can be called observed.
 Observed 2026-10-20 (PA leg): a separate snapshot after the apply read back
 all five written values (O1-O3 mutes, O4 high-pass type LR24 and frequency
 code 74, 99.35 Hz) at their transcribed offsets, but containment also flagged
-Dump0 byte 101 (`0 -> 1`, unexplained, out of scope here) and the linked O3
-low-pass move described below, so that readback did not pass `write verify`
-and no address is promoted by it.
+Dump0 byte 101 moving from 0 to 1 and the linked O3 low-pass move described
+below, so that readback did not pass `write verify` and no address is
+promoted by it. "Device-set status byte at Dump0 101" below covers that move.
 
-Today the linked O3 low-pass move is contained, and Dump0 101 is the one
-byte containment still flags. TIN-6805 tracks that gap. The
-`pa_leg_replay_*` tests in `crates/dcx-core/src/typed_write/tests.rs` replay
-that write. The ignored
-`pa_leg_replay_compliant_write_is_contained_and_verified` fails until Dump0
-101 has a containment rule. Run it with
-`nix develop -c cargo test --locked -p dcx-core --lib -- --ignored pa_leg_replay_compliant`.
+Today the linked O3 low-pass move is contained, and the Dump0 101 move is
+an allowed device move under Legalab ruling 69. TIN-6805 tracks it, and
+"Device-set status byte at Dump0 101" states the rule. The
+`pa_leg_replay_*` tests in `crates/dcx-core/src/typed_write/tests.rs`
+replay that write.
+`pa_leg_replay_compliant_write_is_contained_and_verified` passes.
 
 ## Flow
 
@@ -399,6 +398,74 @@ not equal the desired state, and the apply fails safe into its exact
 rollback; a plan writing both fields is refused. The way out is to write
 the O3 low-pass frequency first, in its own plan, so the codes differ.
 
+## Device-set status byte at Dump0 101
+
+Observed 2026-10-20 on the PA leg: the device set Dump0 frame byte 101
+from 0 to 1 and lowered the Dump0 trailer by 1, so the dump kept its
+modulo-128 balance. No planned action owns the byte and no public table
+maps it. It sits in the `XCUR` setup header, decoded offset 77, and its
+high bit is carrier 108 bit 0.
+
+Legalab ruling 69, Linear TIN-5385 comment `50be9d3b`. The question was:
+"May the device set that byte to 1 without failing containment?" The
+answer, verbatim: "Yes, value 1 only (Recommended)".
+
+The rule is one entry in `ALLOWED_DEVICE_MOVES`, named
+`dump0_101_set_by_device`. It lives in `crates/dcx-core/src/snapshot.rs`.
+
+| Case | Result |
+| --- | --- |
+| Expected 0, readback 1, Dump0 balance kept | Allowed, listed under `device_moves` |
+| Expected 0, readback 2 or any value but 1 | Uncontained |
+| Expected 1, readback 0 | Uncontained |
+| Readback 1 with the Dump0 trailer not moved to match | Uncontained |
+| Carrier 108 bit 0 set or moved, in the expected snapshot or the readback | Uncontained |
+| A plan with no typed-write-lane address | Uncontained, exact equality as before |
+
+It applies only to a typed write, a plan with at least one
+typed-write-lane address. PEQ, O4 mute and routing carriers keep exact
+equality. When the move matches, the byte is put back to 0 and the trailer
+moved by the same step, and every other byte must then still pass the
+ordinary checks. The rule also requires carrier 108 bit 0 clear in both
+snapshots, so the logical value is exactly 0 before and exactly 1 after. A
+baseline that already holds that bit holds 128 at the byte, and a move to
+129 is refused. The move counts against the plan's baseline for
+containment, the desired snapshot for the apply readback, and the baseline
+for the rollback readback.
+
+Receipts list each move under its own `device_moves` field, with
+`classification`, `rule`, `section`, `offset`, `before` and `after`. `write verify` carries it in
+`dcx.write-verification/v1`. `control verify-containment`, `write apply`
+and `write rollback` print it beside `readback_matches_desired` or
+`equals_baseline`. Those two fields stay exact digest equality, so after an
+allowed move `write apply` prints `status: verified` with
+`readback_matches_desired: false`.
+
+Every `write apply`, `control apply`, `write rollback` and `control
+rollback` receipt carries the `device_moves` key. It is an empty list when
+the readback shows no move. In a `post_apply_state_uncertain` or
+`post_rollback_state_uncertain` receipt no readback was captured, so
+`device_moves` is `null` beside `readback: null` or `restored: null`. The
+`receipt_tests` in `crates/dcxctl/src/live_control.rs` pin all four shapes.
+
+Rollback: no inverse can reach Dump0 101. Legalab ruling 89, Linear
+TIN-5385 comment `38e47c36`, covers this case. The question was: "May a
+rollback count as clean when the only difference from the original is byte
+101 reading 1?" The answer, verbatim: "Yes, and the receipt says so
+(Recommended)". The option text: a rollback ends 'rolled back' when every
+byte matches except byte 101 at 1, and the receipt records that it does
+not equal the baseline exactly. Any other difference still ends faulted.
+
+So a rollback readback that differs from the baseline only by the allowed
+move ends `rolled_back`. Its receipt prints `equals_baseline: false` and
+lists the move under `device_moves`. Any other difference still ends
+`state_unresolved`, the CLI form of `Faulted`.
+
+A later plan bound to a snapshot that holds 1 sees no move. A chain step
+planned from a predicted snapshot still expects 0 there, so `profile apply`
+refuses the next step as a stale baseline after a step in which the device
+moved the byte.
+
 ## Offline consistency check
 
 `write verify --plan apply-plan.json --readback readback.json` exits non-zero
@@ -406,8 +473,10 @@ unless all three of these hold:
 
 - every written code decodes from the readback at its transcribed location;
 - no bit changed outside the plan's projected bits, the touched dump
-  trailer and a matched linked-crossover follower field;
-- the readback equals the desired snapshot.
+  trailer and a matched linked-crossover follower field, once an allowed
+  device move is put back;
+- the readback equals the desired snapshot, exactly or once an allowed
+  device move is put back.
 
 A unit test runs this over all 55 typed addresses (13 on each of O1-O4, plus
 inputs A-C). Each value projected into a snapshot decodes from the named frame
