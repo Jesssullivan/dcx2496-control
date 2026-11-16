@@ -551,8 +551,11 @@ fn require_device(expected: DeviceId, actual: DeviceId) -> Result<(), io::Error>
 ///
 /// The window bytes go to stderr only. The helper keeps child stderr in its
 /// private failure record, and the envelope that it parses from stdout never
-/// carries them. A failed stderr write is ignored so it cannot change the
-/// result. Only the failure path calls this, so a success writes no line.
+/// carries them. The envelope is one line of compact JSON, the same bytes
+/// that `println!("{}", envelope)` wrote before, because the helper parses
+/// this stdout and records its digest and byte count. A failed stderr write is
+/// ignored so it cannot change the result. Only the failure path calls this,
+/// so a success writes no line.
 #[cfg_attr(
     not(all(feature = "live-control", target_os = "macos")),
     allow(dead_code)
@@ -563,7 +566,7 @@ fn write_approved_failure(
     envelope: &serde_json::Value,
     window_line: Option<&str>,
 ) -> io::Result<()> {
-    writeln!(stdout, "{}", serde_json::to_string_pretty(envelope)?)?;
+    writeln!(stdout, "{}", serde_json::to_string(envelope)?)?;
     if let Some(line) = window_line {
         let _ = writeln!(stderr, "{line}");
     }
@@ -611,7 +614,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         write_approved_failure(&mut stdout, &mut stderr, &envelope(), Some(WINDOW_LINE)).unwrap();
-        let expected = format!("{}\n", serde_json::to_string_pretty(&envelope()).unwrap());
+        let expected = format!("{}\n", serde_json::to_string(&envelope()).unwrap());
         assert_eq!(String::from_utf8(stdout).unwrap(), expected);
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
@@ -635,6 +638,23 @@ mod tests {
         let text = String::from_utf8(with_window).unwrap();
         assert!(!text.contains("failure-window-bytes"), "{text}");
         assert!(!text.contains("f000204200"), "{text}");
+    }
+
+    #[test]
+    fn stdout_envelope_matches_the_compact_println_form() {
+        // Before this writer, capture_approved printed the envelope with
+        // `println!("{}", value)`. The helper parses that stdout, so its
+        // bytes stay the same: one compact line and one newline.
+        let mut stdout = Vec::new();
+        write_approved_failure(&mut stdout, &mut Vec::new(), &envelope(), Some(WINDOW_LINE))
+            .unwrap();
+        let text = String::from_utf8(stdout).unwrap();
+        assert_eq!(text, format!("{}\n", envelope()));
+        assert_eq!(text.matches('\n').count(), 1, "{text}");
+        assert!(text.ends_with("}\n"), "{text}");
+        assert!(!text.contains(": "), "{text}");
+        let parsed: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(parsed, envelope());
     }
 
     #[test]

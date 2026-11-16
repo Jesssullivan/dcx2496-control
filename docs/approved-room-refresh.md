@@ -70,7 +70,7 @@ When a Search, Dump0 or Dump1 exchange fails in transport, times out, hits its l
 
 The window holds every byte the carrier read after the write: a request echo, a discarded Search reply, the frame that failed and any trailing frame. The carrier records each byte as it reads it. It adds no read, no wait and no write, and it changes no deadline or retry.
 
-The line goes to stderr only. The helper keeps child stderr in its private record under `RoomDiagnostics`, which has mode `0700` with records at `0600`. The stdout envelope, the room receipt, helper status and the unified log never carry the bytes. The error text on the last stderr line keeps its earlier form and names no byte.
+The line goes to stderr only. The helper keeps child stderr in its private record under `RoomDiagnostics`, which has mode `0700` with records at `0600`. The stdout envelope, the room receipt, helper status and the unified log never carry the bytes. The stdout envelope stays one line of compact JSON, byte for byte the form it had before this line was added. The error text on the last stderr line keeps its earlier form and names no byte.
 
 Two caps bound how many records hold bytes. The store keeps at most eight records. Before it writes a record, it removes any record older than seven days. A record older than that stays only until the next failure is recorded.
 
