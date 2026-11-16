@@ -30,12 +30,13 @@ all five written values (O1-O3 mutes, O4 high-pass type LR24 and frequency
 code 74, 99.35 Hz) at their transcribed offsets, but containment also flagged
 Dump0 byte 101 moving from 0 to 1 and the linked O3 low-pass move described
 below, so that readback did not pass `write verify` and no address is
-promoted by it. "Device-set status byte" below now covers the byte 101 move.
+promoted by it. "Device-set status byte at Dump0 101" below covers that move.
 
 Today the linked O3 low-pass move is contained, and the Dump0 101 move is
-an allowed device move under Legalab ruling 69 (TIN-6805, see "Device-set
-status byte" below). The `pa_leg_replay_*` tests in
-`crates/dcx-core/src/typed_write/tests.rs` replay that write, and
+an allowed device move under Legalab ruling 69. TIN-6805 tracks it, and
+"Device-set status byte at Dump0 101" states the rule. The
+`pa_leg_replay_*` tests in `crates/dcx-core/src/typed_write/tests.rs`
+replay that write.
 `pa_leg_replay_compliant_write_is_contained_and_verified` passes.
 
 ## Flow
@@ -397,20 +398,20 @@ not equal the desired state, and the apply fails safe into its exact
 rollback; a plan writing both fields is refused. The way out is to write
 the O3 low-pass frequency first, in its own plan, so the codes differ.
 
-## Device-set status byte (Dump0 101)
+## Device-set status byte at Dump0 101
 
-Observed 2026-10-20 (PA leg): the device set Dump0 frame byte 101 from 0 to
-1 and lowered the Dump0 trailer by 1, so the dump kept its modulo-128
-balance. No planned action owns the byte and no public table maps it. It
-sits in the `XCUR` setup header, decoded offset 77, and its high bit is
-carrier 108 bit 0.
+Observed 2026-10-20 on the PA leg: the device set Dump0 frame byte 101
+from 0 to 1 and lowered the Dump0 trailer by 1, so the dump kept its
+modulo-128 balance. No planned action owns the byte and no public table
+maps it. It sits in the `XCUR` setup header, decoded offset 77, and its
+high bit is carrier 108 bit 0.
 
 Legalab ruling 69, Linear TIN-5385 comment `50be9d3b`. The question was:
 "May the device set that byte to 1 without failing containment?" The
 answer, verbatim: "Yes, value 1 only (Recommended)".
 
-The rule is one entry in `ALLOWED_DEVICE_MOVES`
-(`crates/dcx-core/src/snapshot.rs`), named `dump0_101_set_by_device`:
+The rule is one entry in `ALLOWED_DEVICE_MOVES`, named
+`dump0_101_set_by_device`. It lives in `crates/dcx-core/src/snapshot.rs`.
 
 | Case | Result |
 | --- | --- |
