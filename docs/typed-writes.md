@@ -433,17 +433,33 @@ baseline that already holds that bit holds 128 at the byte, and a move to
 containment, the desired snapshot for the apply readback, and the baseline
 for the rollback readback.
 
-Receipts list each move under its own `device_moves` field, with `rule`,
-`section`, `offset`, `before` and `after`. `write verify` carries it in
+Receipts list each move under its own `device_moves` field, with
+`classification`, `rule`, `section`, `offset`, `before` and `after`. `write verify` carries it in
 `dcx.write-verification/v1`. `control verify-containment`, `write apply`
 and `write rollback` print it beside `readback_matches_desired` or
 `equals_baseline`. Those two fields stay exact digest equality, so after an
 allowed move `write apply` prints `status: verified` with
 `readback_matches_desired: false`.
 
-Rollback: no inverse can reach Dump0 101. A rollback readback that differs
-from the baseline only by the allowed move ends `rolled_back`, and the
-receipt lists the move. Any other difference still ends `state_unresolved`.
+Every `write apply`, `control apply`, `write rollback` and `control
+rollback` receipt carries the `device_moves` key. It is an empty list when
+the readback shows no move. In a `post_apply_state_uncertain` or
+`post_rollback_state_uncertain` receipt no readback was captured, so
+`device_moves` is `null` beside `readback: null` or `restored: null`. The
+`receipt_tests` in `crates/dcxctl/src/live_control.rs` pin all four shapes.
+
+Rollback: no inverse can reach Dump0 101. Legalab ruling 89, Linear
+TIN-5385 comment `38e47c36`, covers this case. The question was: "May a
+rollback count as clean when the only difference from the original is byte
+101 reading 1?" The answer, verbatim: "Yes, and the receipt says so
+(Recommended)". The option text: a rollback ends 'rolled back' when every
+byte matches except byte 101 at 1, and the receipt records that it does
+not equal the baseline exactly. Any other difference still ends faulted.
+
+So a rollback readback that differs from the baseline only by the allowed
+move ends `rolled_back`. Its receipt prints `equals_baseline: false` and
+lists the move under `device_moves`. Any other difference still ends
+`state_unresolved`, the CLI form of `Faulted`.
 
 A later plan bound to a snapshot that holds 1 sees no move. A chain step
 planned from a predicted snapshot still expects 0 there, so `profile apply`

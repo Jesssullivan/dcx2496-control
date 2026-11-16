@@ -15,7 +15,11 @@
   exact equality.
   `readback_matches_desired` and `equals_baseline` stay exact digest
   equality. A rollback readback that keeps the byte at 1 now ends
-  `rolled_back`. `pa_leg_replay_compliant_write_is_contained_and_verified`
+  `rolled_back` with `equals_baseline: false` and the move listed. Legalab
+  ruling 89, Linear TIN-5385 comment `38e47c36`: "Yes, and the receipt says
+  so (Recommended)". The `post_apply_state_uncertain` and
+  `post_rollback_state_uncertain` receipts print `device_moves: null`.
+  `pa_leg_replay_compliant_write_is_contained_and_verified`
   runs by default and passes.
 - Pin the PA-leg write containment gap with tests. TIN-6805 tracks it. The
   tests replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame

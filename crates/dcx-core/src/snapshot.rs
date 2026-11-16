@@ -2439,7 +2439,7 @@ pub enum ApplyTransactionState {
     /// The caller reports rollback steps are being executed.
     RollingBack,
     /// Complete rollback readback matched the baseline exactly, or once the
-    /// allowed device moves of a typed write are put back.
+    /// allowed device moves of a typed write are put back (Legalab ruling 89).
     RolledBack,
     /// Rollback readback did not restore exact baseline equality.
     Faulted,
@@ -2656,9 +2656,11 @@ impl ApplyTransactionV1 {
     ///
     /// In a typed write a readback that differs from the baseline only by
     /// allowed device moves restores it: the device moved the byte, no write
-    /// can put it back, and the receipt lists it. Any other same-device
-    /// mismatch is terminal `Faulted`; wrong-device evidence is rejected
-    /// without changing state.
+    /// can put it back, and the receipt lists it with `is_exact` false.
+    /// Legalab ruling 89 (Linear TIN-5385 comment `38e47c36`, "Yes, and the
+    /// receipt says so") allows this for Dump0 101 at 1. Any other
+    /// same-device mismatch is terminal `Faulted`; wrong-device evidence is
+    /// rejected without changing state.
     ///
     /// # Errors
     ///

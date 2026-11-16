@@ -106,7 +106,10 @@ runtime. Legalab owns the cross-repository studio ontology and PZM activation.
   stays uncontained. In a typed write the device may set Dump0 byte 101
   from 0 to 1 with a balanced trailer and carrier 108 bit 0 clear. Legalab
   ruling 69, TIN-5385 `50be9d3b`, allows it. Apply, rollback and containment
-  report it under `device_moves` and refuse every other value. An apply readback
+  report it under `device_moves` and refuse every other value. A rollback
+  that leaves only that move ends `rolled_back` with `equals_baseline:
+  false`, under Legalab ruling 89, TIN-5385 `38e47c36`. An uncertain apply
+  or rollback receipt prints `device_moves: null`. An apply readback
   that fails in transport is repeated only as a fresh read-only G1
   snapshot, 20 s later and only while it fits the 150 s apply envelope
   (fixed constants, no write re-sent). Missing post-write capture remains

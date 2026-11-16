@@ -2320,6 +2320,71 @@ fn device_move_in_a_dump1_only_typed_write_needs_a_balanced_trailer() {
     );
 }
 
+/// A typed write that touches Dump0 puts the whole Dump0 trailer inside the
+/// plan, so the trailer is never reported on its own. The balance check in
+/// the rule still holds there: Dump0 101 at 1 with the trailer not moved,
+/// moved by the wrong step or moved the wrong way is no device move. The byte
+/// is uncontained, and apply, `write verify` and rollback all refuse it.
+#[test]
+fn device_move_in_a_dump0_typed_write_needs_a_balanced_trailer() {
+    let base = linked_baseline();
+    let transaction = pa_leg_transaction(&base);
+    let plan = &transaction.apply_plan;
+    assert!(plan.admits_device_moves());
+    let trailer = DUMP0_RESPONSE_LEN - 2;
+    assert_eq!(
+        plan.projected_masks()
+            .get(&(crate::SnapshotSection::Dump0, trailer)),
+        Some(&0xff)
+    );
+    // The device step is 101 up by 1 and the trailer down by 1. Each case
+    // sets 101 to 1 and moves the trailer by another amount.
+    for (name, trailer_step) in [
+        ("trailer not moved", 0u8),
+        ("trailer down by 2", 0x7e),
+        ("trailer up by 1", 0x01),
+    ] {
+        let unbalanced = |snapshot: &SnapshotV1| {
+            with_dump0(snapshot, |frame| {
+                frame[DUMP0_XCUR_FLAG] = 1;
+                frame[trailer] = frame[trailer].wrapping_add(trailer_step) & 0x7f;
+            })
+        };
+        let readback = unbalanced(plan.desired());
+        assert_eq!(
+            uncontained_offsets(plan, &readback),
+            [(crate::SnapshotSection::Dump0, DUMP0_XCUR_FLAG, 0, 1)],
+            "{name}"
+        );
+        assert!(plan.device_moves(&readback).unwrap().is_empty(), "{name}");
+        let verification = verify_written_values(plan, &readback).unwrap();
+        assert_eq!(verification.status, "inconsistent", "{name}");
+        assert!(verification.device_moves.is_empty(), "{name}");
+        let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+        apply.begin_apply().unwrap();
+        let receipt = apply.verify_apply_readback(&readback).unwrap();
+        assert!(!receipt.is_verified(), "{name}");
+        assert!(receipt.device_moves().is_empty(), "{name}");
+        assert_eq!(
+            apply.state(),
+            crate::ApplyTransactionState::RollbackRequired,
+            "{name}"
+        );
+        let mut rollback = ApplyTransactionV1::resume_rollback(&transaction.rollback_plan).unwrap();
+        rollback.begin_rollback().unwrap();
+        let receipt = rollback
+            .verify_rollback_readback(&unbalanced(&base))
+            .unwrap();
+        assert!(!receipt.is_verified(), "{name}");
+        assert!(receipt.device_moves().is_empty(), "{name}");
+        assert_eq!(
+            rollback.state(),
+            crate::ApplyTransactionState::Faulted,
+            "{name}"
+        );
+    }
+}
+
 /// The rule covers typed writes only. A plan without a typed-write-lane
 /// address, here the O4 mute, keeps exact equality.
 #[test]
