@@ -170,7 +170,9 @@ invalid comparison and drift latch periodic reads off. An explicit successful
 verification or a changed approved configuration resets that latch.
 
 A Dump0 or Dump1 timeout after some bytes, with a verified close, retries on
-the next thirty-second period. A Dump0 or Dump1 read whose complete frame fails
+the next thirty-second period. While a kept receipt holds it retries at once.
+See [Keeping the receipt after a clean read
+failure](#keeping-the-receipt-after-a-clean-read-failure). A Dump0 or Dump1 read whose complete frame fails
 validation, with a verified close, also retries on the next period. It keeps
 its own count. Three partial dumps, or three validation failures, with no
 successful capture between them stop periodic reads. The reason names the cap
@@ -181,8 +183,8 @@ close or byte count still latches at once. A validation failure with an
 unknown close, a byte count, or a Search or meter operation also latches.
 
 A Search that times out, with or without bytes, or fails in transport, with a
-verified close, also retries on the next period with its own count. Three in a
-row stop periodic reads with `periodic-search-read-cap-reached`. Search is a
+verified close, also retries on the next period with its own count. While a
+kept receipt holds it retries at once. Three in a row stop periodic reads with `periodic-search-read-cap-reached`. Search is a
 read, and each retry opens a new session. A Search validation failure, such as
 a wrong device, and a Search failure with an unknown close still latch.
 
@@ -224,10 +226,19 @@ time. The heartbeat renews `expiresAt` from that capture only, so the receipt
 ends sixty seconds after its capture with `expired-or-disconnected`, as any
 receipt does. A failed read never extends it. The next periodic read is due at
 once. The runtime brings its five-second check forward, and that read passes
-every binding, recovery and serial admission guard again. The existing counts
-and caps still apply. The empty dump timeout has no stop cap, so its immediate
-retries last only while the kept receipt is under its limit. After that it
-backs off as before.
+every binding, recovery and serial admission guard again.
+
+The existing caps still apply, and the retries change when they are spent:
+
+| Kind | Under a kept receipt | Effect |
+|---|---|---|
+| Empty Dump0 or Dump1 timeout | Retries at once and leaves the backoff count alone | It has no stop cap. The sixty-second limit bounds the retries. After that, the backoff starts from the count it had before the kept receipt |
+| Partial Dump0 or Dump1 timeout | Retries at once and counts toward its cap of three | Three failures inside one receipt lifetime stop reads for the five-minute cooldown. Build 14 spread the same three over about sixty seconds |
+| Search timeout or transport failure | Retries at once and counts toward its cap of three | The same as the partial dump |
+
+A short burst of three partial or Search failures can therefore stop periodic
+reads where build 14 would have recovered on its third period. A longer fault
+reaches the cooldown sooner than in build 14. Neither rate is measured yet.
 
 The receipt is invalidated at once in these cases:
 
@@ -240,7 +251,16 @@ The receipt is invalidated at once in these cases:
 | Any bridge device operation | `device-operation` |
 | Drift | the drift receipt replaces it |
 
-Explicit button, startup and URL reads never keep a receipt.
+The coordinator keeps the receipt before the periodic schedule rules on it.
+For a stale attempt or a spent cap, the receipt stays live from the end of the
+read until the schedule ends it. That window covers the diagnostic write and
+one schedule call. The receipt is a real capture under sixty seconds old in
+that window, and every device operation invalidates it before it starts.
+
+An explicit button read never keeps a receipt. A startup or URL read that
+starts its own flight never keeps one either. A startup or URL read that joins
+an in-flight periodic read gets that read's outcome. When the periodic read
+keeps the receipt, the joined request still gets the capture failure.
 
 Saved helper configuration, target, callout and exact expectation bytes must
 match before capture and publication. Foreground exit or a changed binding

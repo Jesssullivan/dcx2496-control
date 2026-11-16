@@ -702,6 +702,77 @@ final class ApprovedRoomRefreshTests: XCTestCase {
         }
     }
 
+    /// The runtime glue: `completePeriodicRead` keeps the receipt and asks for
+    /// a read now, ends a refused keep for a stale attempt, ends it with the
+    /// stop reason when the cap is spent, and restates a stop it did not cause.
+    func testCompletePeriodicReadActsOnTheScheduleRuling() throws {
+        let sent = ReceiptLog()
+        try exerciseRetention(submit: { sent.append($0) }) { coordinator, publisher, _, backend, manifest, configuration, first in
+            let firstCapture = try XCTUnwrap(self.date(first.verifiedAt))
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            _ = schedule.poll(binding: manifest, capturedAt: firstCapture, now: firstCapture)
+            var now = firstCapture.addingTimeInterval(PeriodicRoomVerification.successDelay)
+            backend.refreshOverride = try self.failedRefresh(["category": "timeout", "operation": "search", "received": 10])
+
+            // Kept: the receipt stays and the next read starts now.
+            var attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: firstCapture, now: now).attempt)
+            var failure = try self.captureFailure(coordinator, manifest, configuration)
+            XCTAssertTrue(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
+                keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: now))
+            XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, first.verifiedAt)
+
+            // Spent cap: the second and third failures. The third ends the
+            // kept receipt with the stop reason, once, with no restatement.
+            now = now.addingTimeInterval(1)
+            attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: firstCapture, now: now).attempt)
+            failure = try self.captureFailure(coordinator, manifest, configuration)
+            XCTAssertTrue(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
+                keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: now))
+            now = now.addingTimeInterval(1)
+            attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: firstCapture, now: now).attempt)
+            failure = try self.captureFailure(coordinator, manifest, configuration)
+            XCTAssertNotNil(failure.keptReceiptCapturedAt)
+            let before = sent.values.count
+            XCTAssertFalse(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
+                keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: now))
+            XCTAssertNil(publisher.current(expectation: manifest), "a spent cap ends the kept receipt")
+            let stopped = Array(sent.values.dropFirst(before))
+            XCTAssertEqual(stopped.count, 1, "the stop reason is sent once")
+            XCTAssertEqual(stopped.first?.status, "invalidated")
+            XCTAssertTrue(try XCTUnwrap(stopped.first?.invalidationReason)
+                .hasPrefix("periodic-reads-stopped: periodic-search-read-cap-reached"))
+        }
+        try exerciseRetention(submit: { sent.append($0) }) { coordinator, publisher, _, backend, manifest, configuration, first in
+            // Stale attempt: the binding changed in the schedule after the
+            // coordinator kept the receipt. The receipt ends at once.
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: Date()).attempt)
+            backend.refreshOverride = try self.failedRefresh(["category": "transport", "operation": "search"])
+            let failure = try self.captureFailure(coordinator, manifest, configuration)
+            XCTAssertEqual(publisher.current(expectation: manifest)?.verifiedAt, first.verifiedAt)
+            _ = schedule.poll(binding: Data("SYNTHETIC changed binding".utf8), capturedAt: nil, now: Date())
+            XCTAssertFalse(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
+                keptReceiptCapturedAt: failure.keptReceiptCapturedAt, schedule: schedule, now: Date()))
+            XCTAssertNil(publisher.current(expectation: manifest), "a stale attempt ends the kept receipt")
+            XCTAssertEqual(sent.values.last?.invalidationReason, PeriodicRoomVerification.keptReceiptRefusedReason)
+        }
+        try exerciseRetention(submit: { sent.append($0) }) { coordinator, publisher, _, backend, manifest, configuration, _ in
+            // No kept receipt: a latching failure was invalidated by the
+            // coordinator, and the stop reason is restated after it.
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let attempt = try XCTUnwrap(schedule.poll(binding: manifest, capturedAt: nil, now: Date()).attempt)
+            backend.refreshOverride = try self.failedRefresh(["category": "timeout", "operation": "search", "received": 10,
+                "sessionClosedVerified": false, "closeFailure": "cleanup"])
+            let failure = try self.captureFailure(coordinator, manifest, configuration)
+            XCTAssertNil(failure.keptReceiptCapturedAt)
+            XCTAssertFalse(coordinator.completePeriodicRead(attempt, outcome: failure.periodicOutcome(current: true),
+                keptReceiptCapturedAt: nil, schedule: schedule, now: Date()))
+            XCTAssertNil(publisher.current(expectation: manifest))
+            XCTAssertEqual(sent.values.last?.invalidationReason,
+                RoomVerificationPublisher.periodicStopReason(PeriodicRoomVerification.failedReason))
+        }
+    }
+
     func testInvalidateKeptNeverTouchesANewerCapture() throws {
         let publisher = RoomVerificationPublisher(startHeartbeats: false, submit: { _ in }, ttyPresent: { _ in true })
         let manifest = Data("SYNTHETIC newer capture".utf8)

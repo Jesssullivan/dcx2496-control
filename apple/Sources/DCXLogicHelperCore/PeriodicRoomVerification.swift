@@ -98,13 +98,15 @@ final class PeriodicRoomVerification: @unchecked Sendable {
     static let keptReceiptRefusedReason = "room-verification-failed"
     static let successDelay: TimeInterval = 30
     /// Partial dumps in a row, with no successful capture between them, that
-    /// stop the periodic reader. The first two retry on the next period.
+    /// stop the periodic reader. The first two retry on the next period, or
+    /// at once while a kept receipt holds under ruling 70.
     static let partialReadCap = 3
     /// Validation failures in a row, with no successful capture between them,
     /// that stop the periodic reader. The first two retry on the next period.
     static let validationReadCap = 3
     /// Search failures in a row, with no successful capture between them, that
-    /// stop the periodic reader. The first two retry on the next period.
+    /// stop the periodic reader. The first two retry on the next period, or
+    /// at once while a kept receipt holds under ruling 70.
     static let searchReadCap = 3
     /// TIN-6964: a stop at a verified-close cap lifts by itself after this
     /// cooldown. Each further cap stop doubles it, up to `maximumCapCooldown`.
@@ -268,8 +270,16 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             due = now.addingTimeInterval(min(300, 15 * pow(2, Double(busyCount - 1))))
         case .retryableReadFailure:
             // A fresh read still passes every binding, recovery and serial guard.
-            readFailureCount = min(readFailureCount + 1, 6)
-            due = retryAtOnce ? now : now.addingTimeInterval(min(300, 15 * pow(2, Double(readFailureCount - 1))))
+            // TIN-6964, ruling 70: an at-once retry under a kept receipt leaves
+            // the backoff count alone. This kind has no stop cap, and the kept
+            // receipt's sixty-second limit bounds those retries. Once it ends,
+            // the backoff starts from the count it had before, as in build 14.
+            if retryAtOnce {
+                due = now
+            } else {
+                readFailureCount = min(readFailureCount + 1, 6)
+                due = now.addingTimeInterval(min(300, 15 * pow(2, Double(readFailureCount - 1))))
+            }
         case let .partialReadFailure(received):
             // Busy and empty timeouts do not reset this count. Only a
             // successful capture or a changed binding does.

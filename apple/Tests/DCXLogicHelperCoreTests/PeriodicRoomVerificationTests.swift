@@ -521,6 +521,40 @@ final class PeriodicRoomVerificationTests: XCTestCase {
             .invalidate(RoomVerificationPublisher.periodicStopReason(try XCTUnwrap(schedule.blockReason))))
     }
 
+    /// An at-once retry of an empty dump timeout leaves the backoff count
+    /// alone, so the first backoff after the kept receipt ends is the one
+    /// build 14 used for a first failure.
+    func testKeptEmptyDumpRetriesDoNotInflateTheLaterBackoff() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        var now = at
+        for _ in 0..<6 {
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            XCTAssertEqual(schedule.complete(attempt, outcome: .retryableReadFailure, now: now, receiptKept: true), .keep)
+            now = now.addingTimeInterval(10)
+        }
+        let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+        XCTAssertEqual(schedule.complete(attempt, outcome: .retryableReadFailure, now: now), .none)
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(14.999)).attempt)
+        XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(15)).attempt)
+    }
+
+    /// Partial and Search retries under a kept receipt still count toward
+    /// their caps, so the third in a row stops the reader as in build 14.
+    func testKeptPartialAndSearchRetriesStillCountTowardTheirCaps() throws {
+        for outcome: PeriodicRoomVerification.Outcome in [.partialReadFailure(received: 491), .searchReadFailure] {
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            var now = at
+            for _ in 0..<2 {
+                let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+                XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: now, receiptKept: true), .keep)
+                now = now.addingTimeInterval(10)
+            }
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: now), .none)
+            XCTAssertNotNil(schedule.blockReason, "the third failure spends the cap with or without a kept receipt")
+        }
+    }
+
     func testOnlyOnePeriodicReaderOwnerPerProcessClaim() {
         let claim = PeriodicRoomReaderClaim()
         let firstOwner = NSObject(), secondOwner = NSObject()

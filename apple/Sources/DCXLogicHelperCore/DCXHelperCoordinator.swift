@@ -416,6 +416,23 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
         roomVerification.invalidateKept(capturedAt: capturedAt, reason: reason)
     }
 
+    /// TIN-6964, ruling 70: records a finished periodic read in `schedule` and
+    /// acts on its ruling about a kept receipt. A refused keep ends the
+    /// receipt with the schedule's reason. When the reader stopped and this
+    /// call ended nothing, the stop reason is restated, so an agent sees the
+    /// reader stopped. True when the next periodic read should start now.
+    func completePeriodicRead(_ attempt: PeriodicRoomVerification.Attempt, outcome: PeriodicRoomVerification.Outcome,
+                              keptReceiptCapturedAt kept: Date?, schedule: PeriodicRoomVerification,
+                              now: Date) -> Bool {
+        let disposition = schedule.complete(attempt, outcome: outcome, now: now, receiptKept: kept != nil)
+        var ended = false
+        if case let .invalidate(reason) = disposition, let kept {
+            ended = invalidateKeptRoomReceipt(capturedAt: kept, reason: reason)
+        }
+        if let reason = schedule.blockReason, !ended { reportPeriodicReadsStopped(reason) }
+        return disposition == .keep
+    }
+
     /// Offline preflight for persisting an independently approved expectation.
     public func validateApprovedRoomExpectation(_ expectation: Data) throws {
         invalidateRoomVerification("approved-expectation-replaced")
