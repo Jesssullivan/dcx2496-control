@@ -85,6 +85,17 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         /// or failed in transport, such as an unexpected trailing frame.
         case searchReadFailure
     }
+    /// TIN-6964, ruling 70: what the runtime does with a receipt the
+    /// coordinator kept after a failed periodic read.
+    enum KeptReceipt: Equatable {
+        /// No receipt was kept.
+        case none
+        /// Keep it until its own capture limit and read again at once.
+        case keep
+        /// End it now, with this reason.
+        case invalidate(String)
+    }
+    static let keptReceiptRefusedReason = "room-verification-failed"
     static let successDelay: TimeInterval = 30
     /// Partial dumps in a row, with no successful capture between them, that
     /// stop the periodic reader. The first two retry on the next period.
@@ -220,11 +231,33 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         return running && generation == attempt.generation && binding == attempt.binding
     }
 
-    func complete(_ attempt: Attempt, outcome: Outcome, now: Date) {
+    /// Records the outcome and schedules the next read. `receiptKept` says
+    /// the coordinator kept the last good receipt after this failure. The
+    /// result says whether the runtime keeps it or ends it now. A kept receipt
+    /// survives only an empty, partial or Search read failure of the current
+    /// attempt that stops no reader. Its next read is due at once.
+    @discardableResult
+    func complete(_ attempt: Attempt, outcome: Outcome, now: Date, receiptKept: Bool = false) -> KeptReceipt {
         lock.lock(); defer { lock.unlock() }
-        guard active?.id == attempt.id else { return }
+        let refused: KeptReceipt = receiptKept ? .invalidate(Self.keptReceiptRefusedReason) : .none
+        guard active?.id == attempt.id else { return refused }
         active = nil
-        guard running, attempt.generation == generation, attempt.binding == binding else { return }
+        guard running, attempt.generation == generation, attempt.binding == binding else { return refused }
+        let keeps: Bool
+        switch outcome {
+        case .retryableReadFailure, .partialReadFailure, .searchReadFailure: keeps = receiptKept
+        case .success, .busy, .failed, .validationReadFailure: keeps = false
+        }
+        record(outcome, now: now, retryAtOnce: keeps)
+        guard receiptKept else { return .none }
+        if blocked, let blockedReason {
+            // The retry cap is spent. The kept receipt ends with the stop reason.
+            return .invalidate(RoomVerificationPublisher.periodicStopReason(blockedReason))
+        }
+        return keeps ? .keep : refused
+    }
+
+    private func record(_ outcome: Outcome, now: Date, retryAtOnce: Bool) {
         switch outcome {
         case let .success(capturedAt):
             observedCapture = capturedAt
@@ -236,7 +269,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
         case .retryableReadFailure:
             // A fresh read still passes every binding, recovery and serial guard.
             readFailureCount = min(readFailureCount + 1, 6)
-            due = now.addingTimeInterval(min(300, 15 * pow(2, Double(readFailureCount - 1))))
+            due = retryAtOnce ? now : now.addingTimeInterval(min(300, 15 * pow(2, Double(readFailureCount - 1))))
         case let .partialReadFailure(received):
             // Busy and empty timeouts do not reset this count. Only a
             // successful capture or a changed binding does.
@@ -244,7 +277,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             if partialReadCount >= Self.partialReadCap {
                 stopAtCap(Self.partialCapReason(received: received), now: now)
             } else {
-                due = now.addingTimeInterval(Self.successDelay)
+                due = retryAtOnce ? now : now.addingTimeInterval(Self.successDelay)
             }
         case .validationReadFailure:
             // Its own count. Empty timeouts, partial dumps and busy admission
@@ -264,7 +297,7 @@ final class PeriodicRoomVerification: @unchecked Sendable {
             if searchReadCount >= Self.searchReadCap {
                 stopAtCap(Self.searchCapReason, now: now)
             } else {
-                due = now.addingTimeInterval(Self.successDelay)
+                due = retryAtOnce ? now : now.addingTimeInterval(Self.successDelay)
             }
         case .failed:
             // Unknown or failed transport retirement is never retried by a timer.

@@ -427,6 +427,100 @@ final class PeriodicRoomVerificationTests: XCTestCase {
         XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now.addingTimeInterval(86_400)).attempt)
     }
 
+    // MARK: TIN-6964, ruling 70
+
+    func testKeptReceiptRetriesAtOnceForEachCleanReadKind() throws {
+        let kinds: [PeriodicRoomVerification.Outcome] = [
+            .retryableReadFailure, .partialReadFailure(received: 491), .searchReadFailure,
+        ]
+        for outcome in kinds {
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: at, receiptKept: true), .keep)
+            XCTAssertNil(schedule.blockReason)
+            XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at).attempt, "due at once")
+        }
+    }
+
+    func testWithoutAKeptReceiptTheOldScheduleStands() throws {
+        let cases: [(PeriodicRoomVerification.Outcome, TimeInterval)] = [
+            (.retryableReadFailure, 15), (.partialReadFailure(received: 491), 30), (.searchReadFailure, 30),
+        ]
+        for (outcome, delay) in cases {
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: at), .none)
+            XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(delay - 0.01)).attempt)
+            XCTAssertNotNil(schedule.poll(binding: first, capturedAt: nil, now: at.addingTimeInterval(delay)).attempt)
+        }
+    }
+
+    func testKeptReceiptEndsOnValidationFailedLatchBusyAndSuccessOutcomes() throws {
+        let refused = PeriodicRoomVerification.KeptReceipt.invalidate(PeriodicRoomVerification.keptReceiptRefusedReason)
+        let cases: [(PeriodicRoomVerification.Outcome, PeriodicRoomVerification.KeptReceipt)] = [
+            (.validationReadFailure, refused),
+            (.busy, refused),
+            (.success(capturedAt: at), refused),
+            (.failed, .invalidate(RoomVerificationPublisher.periodicStopReason(PeriodicRoomVerification.failedReason))),
+        ]
+        for (outcome, expected) in cases {
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+            XCTAssertEqual(schedule.complete(attempt, outcome: outcome, now: at, receiptKept: true), expected)
+        }
+    }
+
+    func testKeptReceiptEndsWhenTheRetryCapIsSpent() throws {
+        let caps: [(PeriodicRoomVerification.Outcome, Int)] = [
+            (.partialReadFailure(received: 10), PeriodicRoomVerification.partialReadCap),
+            (.searchReadFailure, PeriodicRoomVerification.searchReadCap),
+        ]
+        for (outcome, cap) in caps {
+            let schedule = PeriodicRoomVerification(); schedule.start()
+            var now = at
+            for index in 1...cap {
+                let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+                let disposition = schedule.complete(attempt, outcome: outcome, now: now, receiptKept: true)
+                if index < cap {
+                    XCTAssertEqual(disposition, .keep)
+                } else {
+                    let reason = try XCTUnwrap(schedule.blockReason)
+                    XCTAssertEqual(disposition, .invalidate(RoomVerificationPublisher.periodicStopReason(reason)))
+                    XCTAssertNil(schedule.poll(binding: first, capturedAt: nil, now: now).attempt)
+                }
+                now = now.addingTimeInterval(1)
+            }
+        }
+    }
+
+    func testKeptReceiptEndsForAStaleOrUnknownAttempt() throws {
+        let refused = PeriodicRoomVerification.KeptReceipt.invalidate(PeriodicRoomVerification.keptReceiptRefusedReason)
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let attempt = try XCTUnwrap(schedule.poll(binding: first, capturedAt: nil, now: at).attempt)
+        _ = schedule.poll(binding: Data("SYNTHETIC changed binding".utf8), capturedAt: nil, now: at)
+        XCTAssertEqual(schedule.complete(attempt, outcome: .searchReadFailure, now: at, receiptKept: true), refused)
+        XCTAssertEqual(schedule.complete(attempt, outcome: .searchReadFailure, now: at, receiptKept: true), refused,
+            "a completion repeated for an attempt no longer active")
+        let stopped = PeriodicRoomVerification(); stopped.start()
+        let old = try XCTUnwrap(stopped.poll(binding: first, capturedAt: nil, now: at).attempt)
+        stopped.stop()
+        XCTAssertEqual(stopped.complete(old, outcome: .searchReadFailure, now: at, receiptKept: true), refused)
+    }
+
+    func testAKeptFailureNeitherResetsCountsNorMovesTheCapture() throws {
+        let schedule = PeriodicRoomVerification(); schedule.start()
+        let capture = at.addingTimeInterval(-30)
+        XCTAssertNil(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(-30)).attempt)
+        let one = try XCTUnwrap(schedule.poll(binding: first, capturedAt: capture, now: at).attempt)
+        XCTAssertEqual(schedule.complete(one, outcome: .searchReadFailure, now: at, receiptKept: true), .keep)
+        // The heartbeat keeps reporting the same capture. It never defers or resets anything.
+        let two = try XCTUnwrap(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(5)).attempt)
+        XCTAssertEqual(schedule.complete(two, outcome: .searchReadFailure, now: at.addingTimeInterval(5), receiptKept: true), .keep)
+        let three = try XCTUnwrap(schedule.poll(binding: first, capturedAt: capture, now: at.addingTimeInterval(10)).attempt)
+        XCTAssertEqual(schedule.complete(three, outcome: .searchReadFailure, now: at.addingTimeInterval(10), receiptKept: true),
+            .invalidate(RoomVerificationPublisher.periodicStopReason(try XCTUnwrap(schedule.blockReason))))
+    }
+
     func testOnlyOnePeriodicReaderOwnerPerProcessClaim() {
         let claim = PeriodicRoomReaderClaim()
         let firstOwner = NSObject(), secondOwner = NSObject()

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Keep the room receipt after a clean periodic read failure in helper build
+  15 (TIN-6964). Ruling 70 of TIN-5385 comment 50be9d3b asks for it. Before, every failed
+  periodic read invalidated the receipt at once, so about 2 agent passes in
+  280 were refused on November 16. Now an empty or partial Dump0 or Dump1
+  timeout, or a Search timeout or transport failure, with a verified close
+  keeps the last good receipt. The next read is due at once, within the
+  existing caps. The receipt keeps its capture time, and the heartbeat still
+  ends it sixty seconds after that capture. An unknown or failed close, a
+  validation failure, any other failure, a device operation or a spent retry
+  cap still invalidates it at once. Helper build 15 is version 0.1.14. It
+  also carries the failed window bytes below.
 - Pin the PA-leg write containment gap with tests. TIN-6805 tracks it. The
   tests replay the 2026-10-20 PA-leg plan on a synthetic baseline. The apply frame
   addresses only the five planned fields. The linked O3 low-pass move at
@@ -20,7 +31,7 @@
   seven days before it writes the next one, beside its cap of eight. The age
   cap trusts each record's modification time, so the count cap of eight is
   the hard bound. The read path is unchanged. Apply and rollback emit no
-  bytes. Helper build 14 is unchanged.
+  bytes. Helper build 14 is unchanged. Helper build 15 carries it.
 - Discard one stale Search reply ahead of a dump (TIN-6964). On November 15,
   2026, at 22:32:59Z, a 26-byte frame arrived where the 1015-byte Dump0
   belongs. In a Dump0 or Dump1 window the carrier now discards one complete

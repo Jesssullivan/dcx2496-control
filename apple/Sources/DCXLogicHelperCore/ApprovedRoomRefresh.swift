@@ -137,6 +137,23 @@ struct ApprovedRoomFailureEnvelope: Decodable {
 
 struct ApprovedRoomCaptureFailed: Error {
     let failure: RoomCaptureFailureV1
+    /// TIN-6964, ruling 70: the capture time of the receipt the coordinator
+    /// kept after this failure, or nil when it invalidated the receipt. Only a
+    /// periodic read sets it, and only when `keepsPriorReceipt` holds.
+    var keptReceiptCapturedAt: Date? = nil
+
+    /// TIN-6964, ruling 70: a periodic read that failed this way may keep the
+    /// last good receipt until its own sixty-second capture limit. It covers
+    /// the three kinds the periodic reader retries without a write: an empty
+    /// or partial Dump0 or Dump1 timeout and a Search timeout or transport
+    /// failure, each with a verified close. A validation failure is left out,
+    /// because the record does not say whether the frame named another device
+    /// or another state. An unknown or failed close is left out too. The
+    /// protected `room-refresh` child writes no parameter, and every bridge
+    /// device operation invalidates the receipt before it starts.
+    var keepsPriorReceipt: Bool {
+        permitsPeriodicRetry || permitsBoundedPartialRetry || permitsBoundedSearchRetry
+    }
     /// TIN-6964: a completed, verified-close empty Dump0 or Dump1 timeout rearms with backoff.
     var permitsPeriodicRetry: Bool {
         isVerifiedClosedDumpTimeout && failure.received == 0

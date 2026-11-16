@@ -216,6 +216,9 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
                 return try captureRoom(expectation: expectation, expectedConfiguration: configuration, attempt: attempt,
                     approvedTargetRefresh: approvedTargetRefresh,
                     retainFreshDuringRead: retainFreshDuringRead && forceFresh && approvedTargetRefresh)
+            } catch let failed as ApprovedRoomCaptureFailed where failed.keptReceiptCapturedAt != nil {
+                // TIN-6964, ruling 70: captureRoom kept the last good receipt.
+                throw failed
             } catch {
                 roomVerification.invalidate("room-verification-failed")
                 throw error
@@ -381,13 +384,36 @@ public final class DCXHelperCoordinator: @unchecked Sendable {
             )
         }
         } catch {
-            roomVerification.invalidate("room-verification-failed")
+            let kept = keptReceiptCaptureDate(after: error, retainFreshDuringRead: retainFreshDuringRead, attempt: attempt)
+            if kept == nil { roomVerification.invalidate("room-verification-failed") }
             let metadata = roomFailureDiagnostics.record(diagnostic, error: error)
             stateLock.lock()
             lastRoomFailure = metadata
             stateLock.unlock()
+            if let kept, var failed = error as? ApprovedRoomCaptureFailed {
+                failed.keptReceiptCapturedAt = kept
+                throw failed
+            }
             throw error
         }
+    }
+
+    /// TIN-6964, ruling 70: a periodic read that failed with a verified close
+    /// and no write keeps the last good receipt. The receipt keeps its own
+    /// capture time, so it still expires sixty seconds after that capture.
+    /// Every other failure, and any changed binding, returns nil.
+    private func keptReceiptCaptureDate(after error: Error, retainFreshDuringRead: Bool,
+                                        attempt: RoomVerificationPreparation.Attempt) -> Date? {
+        guard retainFreshDuringRead, let failed = error as? ApprovedRoomCaptureFailed,
+              failed.keepsPriorReceipt, attempt.bindingChecks.isValid() else { return nil }
+        return roomVerification.retainedCaptureDate(binding: attempt.key)
+    }
+
+    /// TIN-6964, ruling 70: ends a kept receipt when the periodic reader says
+    /// so. It touches no newer capture. True when it invalidated the receipt.
+    @discardableResult
+    func invalidateKeptRoomReceipt(capturedAt: Date, reason: String) -> Bool {
+        roomVerification.invalidateKept(capturedAt: capturedAt, reason: reason)
     }
 
     /// Offline preflight for persisting an independently approved expectation.

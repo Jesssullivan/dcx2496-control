@@ -186,10 +186,30 @@ final class RoomVerificationPublisher: @unchecked Sendable {
     /// Only the admitted periodic read may retain a matching, unexpired proof.
     /// The existing heartbeat retains its original capture timestamp and binding.
     func canRetainDuringRead(binding: Data, now: Date = Date()) -> Bool {
+        retainedCaptureDate(binding: binding, now: now) != nil
+    }
+
+    /// TIN-6964, ruling 70: the capture time of the live matching receipt that
+    /// the periodic read with `binding` may keep, or nil. The same checks as
+    /// `canRetainDuringRead` apply, so a kept receipt is never past its own
+    /// sixty-second capture limit. Keeping it changes no field.
+    func retainedCaptureDate(binding: Data, now: Date = Date()) -> Date? {
         lock.lock(); defer { lock.unlock() }
         guard captureBinding == binding, bindingIsCurrent(), let receipt,
-              receipt.matches, let capturedAt, let ttyPath else { return false }
-        return receipt.renewed(at: now, capturedAt: capturedAt, ttyPresent: ttyPresent(ttyPath)) != nil
+              receipt.matches, let capturedAt, let ttyPath,
+              receipt.renewed(at: now, capturedAt: capturedAt, ttyPresent: ttyPresent(ttyPath)) != nil else { return nil }
+        return capturedAt
+    }
+
+    /// TIN-6964, ruling 70: invalidates the kept receipt only while the live
+    /// receipt still carries `capturedAt`. A newer capture is never touched.
+    /// True when this call invalidated it.
+    @discardableResult
+    func invalidateKept(capturedAt kept: Date, reason: String) -> Bool {
+        lock.lock()
+        guard receipt != nil, capturedAt == kept else { lock.unlock(); return false }
+        invalidateHoldingLock(reason)
+        return true
     }
 
     func captureDate(expectation: Data) -> Date? {
@@ -201,6 +221,11 @@ final class RoomVerificationPublisher: @unchecked Sendable {
 
     func invalidate(_ reason: String) {
         lock.lock()
+        invalidateHoldingLock(reason)
+    }
+
+    /// Called with `lock` held. It releases the lock before submission.
+    private func invalidateHoldingLock(_ reason: String) {
         timer?.cancel()
         timer = nil
         let invalidated = receipt
@@ -231,14 +256,15 @@ final class RoomVerificationPublisher: @unchecked Sendable {
         submit(value)
     }
 
-    private func publish() {
+    /// One heartbeat. It renews `expiresAt` from the original capture time
+    /// only, so a kept receipt after a failed read expires at that capture
+    /// plus sixty seconds, the same as any other receipt.
+    func publish(now: Date = Date()) {
         lock.lock()
         guard var value = receipt, let capturedAt, let ttyPath else { lock.unlock(); return }
-        let now = Date()
         guard bindingIsCurrent(), let renewed = value.renewed(at: now, capturedAt: capturedAt,
                                         ttyPresent: ttyPresent(ttyPath)) else {
-            lock.unlock()
-            invalidate("expired-or-disconnected")
+            invalidateHoldingLock("expired-or-disconnected")
             return
         }
         value = renewed

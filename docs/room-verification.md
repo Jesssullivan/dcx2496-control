@@ -200,6 +200,48 @@ foreground or stopping the reader clears the counts and the stop, so the caps
 count within one foreground session. No timer performs parameter repair,
 rollback or unknown-child recovery.
 
+### Keeping the receipt after a clean read failure
+
+Helper build 15 implements ruling 70 of TIN-5385 comment 50be9d3b. Before
+build 15, every failed periodic read invalidated the room receipt at once. On
+November 16 about 2 agent passes in 280 were refused that way. Now a periodic
+read keeps the last good receipt when all of these hold:
+
+| Condition | Where it is checked |
+|---|---|
+| The read is a periodic `profile room-refresh` read that retains its prior proof | `DCXHelperCoordinator.captureRoom` |
+| The failure is an empty or partial Dump0 or Dump1 timeout, or a Search timeout or transport failure | `ApprovedRoomCaptureFailed.keepsPriorReceipt` |
+| The session close is verified and no close failure is named | the same property |
+| The saved binding still matches and the receipt still matches and is under sixty seconds old | `RoomVerificationPublisher.retainedCaptureDate` |
+| The attempt is current and its failure stops no reader | `PeriodicRoomVerification.complete` |
+
+The `room-refresh` child sends Search, Dump0, Dump1 and remote-mode requests.
+It writes no parameter. Every bridge device operation invalidates the receipt
+before it starts, so no session that wrote can keep it.
+
+A kept receipt changes no field. Its `verifiedAt` stays the original capture
+time. The heartbeat renews `expiresAt` from that capture only, so the receipt
+ends sixty seconds after its capture with `expired-or-disconnected`, as any
+receipt does. A failed read never extends it. The next periodic read is due at
+once. The runtime brings its five-second check forward, and that read passes
+every binding, recovery and serial admission guard again. The existing counts
+and caps still apply. The empty dump timeout has no stop cap, so its immediate
+retries last only while the kept receipt is under its limit. After that it
+backs off as before.
+
+The receipt is invalidated at once in these cases:
+
+| Case | Reason sent |
+|---|---|
+| Unknown or failed close | `room-verification-failed` |
+| A validation failure. The record does not say whether the frame named another device or state | `room-verification-failed` |
+| Any other failure kind, a child that left no failure envelope, or a stale attempt | `room-verification-failed` |
+| The failure spends a retry cap or latches the reader | `periodic-reads-stopped:` and the stop reason |
+| Any bridge device operation | `device-operation` |
+| Drift | the drift receipt replaces it |
+
+Explicit button, startup and URL reads never keep a receipt.
+
 Saved helper configuration, target, callout and exact expectation bytes must
 match before capture and publication. Foreground exit or a changed binding
 invalidates pending work. Joined requests add their binding checks to the shared
@@ -212,7 +254,8 @@ full configuration, callout, expectation and identity-policy key must match.
 Admission reloads recovery authority first. Heartbeats retain the original
 capture time, so expiration still blocks readiness during an unfinished read.
 The new result replaces the old proof atomically. Drift, failed capture,
-foreground exit or changed authority invalidate the prior proof. Mutating
+foreground exit or changed authority invalidate the prior proof. The clean read
+failures listed above are the one exception to failed capture. Mutating
 operations and explicit fresh reads still invalidate before capture.
 `helper.status.activeTransactionID` remains `room-verification` during a read.
 A fresh prior proof means the earlier capture remains valid, not that the
@@ -318,6 +361,8 @@ remain separate qualification steps.
 ## Failure diagnostics
 
 A failed room capture invalidates readiness before any diagnostic storage work.
+A clean periodic read failure that keeps its receipt under ruling 70 still
+writes its diagnostic record.
 The helper keeps the original failure and automatic-retry latch. Optional
 `helper.status` metadata identifies the attempt, phase, typed failure, completed
 child exit code and duration, output digests and whether close was verified.
