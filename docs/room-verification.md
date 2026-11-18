@@ -467,7 +467,7 @@ mixes the two forms, or names an unapproved preset, publishes nothing.
 | File | Preset | Snapshot | Approved |
 |---|---|---|---|
 | `fixtures/room-expectations/LEGALAB-practice-room.json` | practice-room | `20a5b485` | Yes, by expectation `c49d97c0` and receipt `e3facafc` |
-| `fixtures/room-expectations/LEGALAB-jbl-protected.json` | jbl-protected | `0b1f125a`, the final image of the JBL protection plan | No |
+| `fixtures/room-expectations/LEGALAB-jbl-protected.json` | jbl-protected | `dffe9c61`, the final image of the JBL protection plan with the linked O1 low-pass move | No |
 
 Legalab owns these files and their approval. The copies here carry the
 `LEGALAB-` prefix like the profile fixtures, and tests pin them. A file moves

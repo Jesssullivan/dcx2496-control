@@ -39,13 +39,13 @@ use crate::{
         BandField, DELAY_ENABLED_PARAMETER, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER,
         GAIN_INPUT_COUNT, GAIN_PARAMETER, HIGH_PASS_FREQUENCY_PARAMETER, HIGH_PASS_TYPE_PARAMETER,
         LIMITER_ENABLED_PARAMETER, LIMITER_RELEASE_PARAMETER, LIMITER_THRESHOLD_PARAMETER,
-        LINKED_LIMITER_OUTPUTS, LONG_DELAY_PARAMETER, LOW_PASS_FREQUENCY_PARAMETER,
-        LOW_PASS_TYPE_PARAMETER, LinkEvidence, MAX_ACTIVE_PEQ_BANDS, MAX_FREQUENCY_CODE,
-        MAX_LEVEL_STEP_CODES, MAX_LIMITER_RELEASE_CODE, MAX_LIMITER_THRESHOLD_CODE,
-        MAX_LONG_DELAY_CODE, MAX_SHORT_DELAY_CODE, MUTE_PARAMETER, OUTPUT_COUNT, OutputField,
-        PEQ_BANDS, POLARITY_PARAMETER, ReviewedAddress, SHORT_DELAY_PARAMETER, SOURCE_PARAMETER,
-        TYPED_WRITE_OUTPUTS, UNITY_GAIN_CODE, band_parameter, output_channel, reviewed_address,
-        routing_rank,
+        LINKED_CROSSOVERS, LINKED_LIMITER_OUTPUTS, LONG_DELAY_PARAMETER,
+        LOW_PASS_FREQUENCY_PARAMETER, LOW_PASS_TYPE_PARAMETER, LinkEvidence, MAX_ACTIVE_PEQ_BANDS,
+        MAX_FREQUENCY_CODE, MAX_LEVEL_STEP_CODES, MAX_LIMITER_RELEASE_CODE,
+        MAX_LIMITER_THRESHOLD_CODE, MAX_LONG_DELAY_CODE, MAX_SHORT_DELAY_CODE, MUTE_PARAMETER,
+        OUTPUT_COUNT, OutputField, PEQ_BANDS, POLARITY_PARAMETER, ReviewedAddress,
+        SHORT_DELAY_PARAMETER, SOURCE_PARAMETER, TYPED_WRITE_OUTPUTS, UNITY_GAIN_CODE,
+        band_parameter, output_channel, reviewed_address, routing_rank,
     },
     peq_bank::{self, PeqBankError, decode_peq_bank, frequency_hz, gain_db, q_value},
     protocol::{DeviceId, DirectParameterAction, DirectParameterCommand, ProtocolError},
@@ -1033,6 +1033,33 @@ pub struct LinkedEffectV1 {
     pub dump_offsets: DumpOffsetsV1,
 }
 
+/// One linked-crossover pair the plan writes on both sides at one corner.
+///
+/// The device keeps a linked pair at one code, so the plan names both sides
+/// and writes both. The result is the same whether or not the device links
+/// the pair and in either write order, and the exact rollback writes both
+/// back to the one baseline code.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkedWriteV1 {
+    /// Output whose high-pass frequency the plan writes.
+    pub high_pass_output: u8,
+    /// Output whose low-pass frequency the plan writes, one below.
+    pub low_pass_output: u8,
+    /// Shared baseline code of both sides.
+    pub before_code: u16,
+    /// Code the plan writes to both sides.
+    pub after_code: u16,
+    /// Human value of the baseline code.
+    pub before: serde_json::Value,
+    /// Human value of the written code.
+    pub after: serde_json::Value,
+    /// Evidence class of the high-pass to low-pass direction.
+    pub evidence: &'static str,
+    /// Plain statement of the change for the operator.
+    pub notice: String,
+}
+
 /// Human value of one reviewed field code.
 pub fn describe(field: OutputField, code: u16) -> serde_json::Value {
     use serde_json::json;
@@ -1117,6 +1144,8 @@ pub struct WriteTransactionV1 {
     /// Predicted linked-crossover side effects (O4 high-pass frequency and
     /// O3 low-pass frequency); no frame byte is added for them.
     pub linked_effects: Vec<LinkedEffectV1>,
+    /// Linked pairs the plan writes on both sides at one corner.
+    pub linked_writes: Vec<LinkedWriteV1>,
     /// Limiter switches the plan changes, each with a plain notice.
     pub limiter_switches: Vec<LimiterSwitchV1>,
     /// Exact apply frame, uppercase hexadecimal, or `None` for a no-op plan.
@@ -1265,6 +1294,7 @@ pub fn plan_writes(
             dump_offsets: DumpOffsetsV1::of(prediction.follower),
         })
         .collect();
+    let linked_writes = linked_writes(baseline, &actions);
     let apply_plan = transaction.apply_plan().clone();
     let rollback_plan = transaction.rollback_plan().clone();
     check_rollback(&rollback_plan)?;
@@ -1315,10 +1345,55 @@ pub fn plan_writes(
         writes,
         unchanged_changes,
         linked_effects,
+        linked_writes,
         limiter_switches,
         apply_plan,
         rollback_plan,
     })
+}
+
+/// Linked pairs the baseline shows linked whose both sides `actions` write,
+/// necessarily at one code (see `SnapshotV1::project_linked_actions`).
+fn linked_writes(baseline: &SnapshotV1, actions: &[DirectParameterAction]) -> Vec<LinkedWriteV1> {
+    let written = |(channel, parameter): (u8, u8)| {
+        actions
+            .iter()
+            .find(|action| action.channel() == channel && action.parameter() == parameter)
+            .map(|action| action.value())
+    };
+    LINKED_CROSSOVERS
+        .iter()
+        .filter(|link| link.driver.1 == HIGH_PASS_FREQUENCY_PARAMETER)
+        .filter_map(|link| {
+            let high = reviewed_address(link.driver.0, link.driver.1)?;
+            let low = reviewed_address(link.follower.0, link.follower.1)?;
+            let after = written(link.driver)?;
+            if written(link.follower)? != after {
+                return None;
+            }
+            let before = baseline.read_reviewed(high);
+            if baseline.read_reviewed(low) != before {
+                return None;
+            }
+            let hz = |code: u16| round3(frequency_hz(code));
+            Some(LinkedWriteV1 {
+                high_pass_output: high.output,
+                low_pass_output: low.output,
+                before_code: before,
+                after_code: after,
+                before: describe(high.field, before),
+                after: describe(high.field, after),
+                evidence: link.evidence.label(),
+                notice: format!(
+                    "O{} low-pass and O{} high-pass are linked. Both move from {} Hz to {} Hz in this one frame.",
+                    low.output,
+                    high.output,
+                    hz(before),
+                    hz(after)
+                ),
+            })
+        })
+        .collect()
 }
 
 fn limiter_switch(write: &PlannedWriteV1, link_partners: &BTreeSet<u8>) -> LimiterSwitchV1 {
@@ -1583,9 +1658,11 @@ fn check_linked_followers(
         if active && !policy.allow_protection_change {
             return Err(TypedWriteError::LinkedProtectionChange {
                 driver_output: prediction.driver.output,
+                driver_field: prediction.driver.field.label(),
                 follower_output: prediction.follower.output,
                 field: prediction.follower.field.label(),
                 evidence: prediction.link.evidence.label(),
+                follower_hz: round3(frequency_hz(prediction.before)),
             });
         }
     }
@@ -2018,15 +2095,18 @@ pub enum TypedWriteError {
         "O{output} {field}: loosening an active high-pass needs allow_protection_change in the plan and --allow-protection-change"
     )]
     ProtectionChange { output: u8, field: String },
-    /// A predicted linked-crossover follower move on an active filter.
+    /// A predicted linked-crossover follower move on an active filter the
+    /// plan does not address.
     #[error(
-        "the O{driver_output} write is predicted ({evidence}) to move O{follower_output} {field} on an active filter (linked crossover); it needs allow_protection_change in the plan and --allow-protection-change"
+        "O{driver_output} {driver_field} is linked to O{follower_output} {field} at {follower_hz} Hz, an active filter this plan does not address. The device would move it with no write of its own ({evidence}). Add an O{follower_output} change at the same corner so the plan writes both sides, or keep the corner. Moving it alone needs allow_protection_change in the plan and --allow-protection-change"
     )]
     LinkedProtectionChange {
         driver_output: u8,
+        driver_field: String,
         follower_output: u8,
         field: String,
         evidence: &'static str,
+        follower_hz: f64,
     },
     /// The encoded one-action frame had an unexpected layout.
     #[error("one-action direct frame has unexpected length {0}")]

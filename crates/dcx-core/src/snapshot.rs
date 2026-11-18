@@ -503,17 +503,25 @@ impl SnapshotV1 {
         predictions
     }
 
-    /// Refuse an action list that writes both fields of a linked pair while
-    /// this snapshot shows the pair linked: the device's result for that
-    /// frame is unknown.
+    /// Refuse an action list that writes both fields of a linked pair at two
+    /// different codes while this snapshot shows the pair linked: the device
+    /// result for that frame depends on the write order and the unknown
+    /// adjust mode.
+    ///
+    /// Both fields written at one code is a linked change named on both
+    /// sides. Its result is the same in linked and FREE mode and in either
+    /// order: each write leaves both fields at that code, or leaves the other
+    /// field for its own write. Its exact inverse writes both back to the one
+    /// baseline code they share.
     fn require_no_linked_conflict(
         &self,
         actions: &[DirectParameterAction],
     ) -> Result<(), SnapshotProjectionError> {
-        let writes = |(channel, parameter): (u8, u8)| {
+        let written = |(channel, parameter): (u8, u8)| {
             actions
                 .iter()
-                .any(|action| action.channel() == channel && action.parameter() == parameter)
+                .find(|action| action.channel() == channel && action.parameter() == parameter)
+                .map(|action| action.value())
         };
         for link in LINKED_CROSSOVERS {
             let (Some(driver), Some(follower)) = (
@@ -522,8 +530,9 @@ impl SnapshotV1 {
             ) else {
                 continue;
             };
-            if writes(link.driver)
-                && writes(link.follower)
+            if let (Some(driver_code), Some(follower_code)) =
+                (written(link.driver), written(link.follower))
+                && driver_code != follower_code
                 && self.read_reviewed(driver) == self.read_reviewed(follower)
             {
                 return Err(SnapshotProjectionError::LinkedCrossoverConflict {
@@ -959,9 +968,10 @@ pub enum SnapshotProjectionError {
         parameter: u8,
         value: u16,
     },
-    /// One action list writes both fields of a pair the baseline shows linked.
+    /// One action list writes both fields of a pair the baseline shows
+    /// linked, at two different codes.
     #[error(
-        "channel {driver_channel} parameter {driver_parameter:#04x} and channel {follower_channel} parameter {follower_parameter:#04x} are a linked crossover pair; write them in separate plans"
+        "channel {driver_channel} parameter {driver_parameter:#04x} and channel {follower_channel} parameter {follower_parameter:#04x} are a linked crossover pair; write both at one corner"
     )]
     LinkedCrossoverConflict {
         driver_channel: u8,

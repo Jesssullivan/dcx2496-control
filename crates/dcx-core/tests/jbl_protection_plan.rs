@@ -176,9 +176,17 @@ fn committed_plan_chains_to_the_proposed_jbl_protection() {
             })
             .collect();
         assert_eq!(Value::Array(writes), want["writes"], "{name} writes");
-        assert!(
-            tx.linked_effects.is_empty(),
-            "{name} predicts a linked move"
+        // Apply 4 moves the O2 high-pass, and the device moves the linked
+        // O1 low-pass with it, as it did on 2026-11-16.
+        assert_eq!(
+            serde_json::to_value(&tx.linked_effects).unwrap(),
+            want["linked_effects"],
+            "{name} linked effects"
+        );
+        assert_eq!(
+            tx.linked_effects.len(),
+            usize::from(*name == "apply-4-high-pass-corner.write-plan.json"),
+            "{name} linked effects"
         );
         assert!(
             tx.unchanged_changes.is_empty(),

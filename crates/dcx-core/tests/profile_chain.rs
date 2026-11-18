@@ -901,7 +901,7 @@ fn declared_preset_files_bind_the_approved_and_planned_images() {
     );
     assert_eq!(
         jbl.snapshot_digest,
-        "sha256/0b1f125af34b24cb9224d8e83565902d72cbb2b06d0124c77353b4d8076bfe35"
+        "sha256/dffe9c614bcbf363613a76b91baf17366717b36311c53e58d43d9461466d3ddf"
     );
     // The plan writes no mute, so the planned image keeps the baseline mutes.
     assert_eq!(jbl.output_mutes, room.output_mutes);

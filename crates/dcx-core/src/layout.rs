@@ -702,12 +702,11 @@ pub fn routing_rank(address: ReviewedAddress) -> Option<u8> {
 /// Evidence class of one modelled linked-crossover direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkEvidence {
-    /// Seen on the named device: the 2026-10-20 PA-leg `write apply` of O4
-    /// high-pass LR24 100 Hz (code 74) moved the O3 low-pass frequency from
-    /// code 180 (equal to the O4 high-pass code before the write) to 74
-    /// (Dump1 205 `52 -> 74`, carrier 212 bit 0 `1 -> 0`).
+    /// Seen on the named device: a write of the driver moved the follower,
+    /// which held the driver's code before the write, to the written code.
+    /// Each observed entry of [`LINKED_CROSSOVERS`] cites its event.
     Observed,
-    /// Inferred from the observed direction only; never seen on a device.
+    /// The reverse of an observed direction; never seen on a device.
     Inferred,
 }
 
@@ -734,14 +733,30 @@ pub struct LinkedCrossover {
     pub evidence: LinkEvidence,
 }
 
-/// The only modelled linked-crossover pair: O4 high-pass frequency and O3
-/// low-pass frequency. The O1/O2 and O2/O3 pairs, and the crossover types,
-/// are deliberately not modelled.
+/// The modelled linked-crossover pairs, each a high-pass frequency of one
+/// output and the low-pass frequency of the output below it.
+///
+/// - O4 high-pass drives O3 low-pass, observed on 2026-10-20: the PA-leg
+///   `write apply` of O4 high-pass code 74 moved the O3 low-pass from code
+///   180, equal to the O4 code before the write, to 74 (Dump1 205
+///   `52 -> 74`, carrier 212 bit 0 `1 -> 0`).
+/// - O2 high-pass drives O1 low-pass, observed on 2026-11-16: apply 4 of the
+///   JBL protection plan wrote O1 and O2 high-pass code 37 from baseline
+///   `b31a7e38`, where O1 low-pass and O2 high-pass both held code 180. The
+///   readback `e2088871` held O1 low-pass at 37 (Dump0 866 `52 -> 37`,
+///   carrier 868 bit 5 `1 -> 0`). The rollback wrote O2 back to 180 and the
+///   snapshot after it read `b31a7e38` again, O1 low-pass at 180.
+/// - The two reverse directions, a low-pass write moving the high-pass of
+///   the output above, are inferred and have never been seen.
+///
+/// The O2/O3, O4/O5 and O5/O6 pairs and the crossover types are not
+/// modelled: no device event shows them. `docs/typed-writes.md` lists them
+/// as not yet read.
 ///
 /// The device's crossover adjust mode has no reviewed address, so a link is
 /// treated as active only while the pre-write snapshot holds the follower at
 /// the driver's code (see `SnapshotV1::linked_predictions`).
-pub const LINKED_CROSSOVERS: [LinkedCrossover; 2] = [
+pub const LINKED_CROSSOVERS: [LinkedCrossover; 4] = [
     LinkedCrossover {
         driver: (8, HIGH_PASS_FREQUENCY_PARAMETER),
         follower: (7, LOW_PASS_FREQUENCY_PARAMETER),
@@ -752,11 +767,24 @@ pub const LINKED_CROSSOVERS: [LinkedCrossover; 2] = [
         follower: (8, HIGH_PASS_FREQUENCY_PARAMETER),
         evidence: LinkEvidence::Inferred,
     },
+    LinkedCrossover {
+        driver: (6, HIGH_PASS_FREQUENCY_PARAMETER),
+        follower: (5, LOW_PASS_FREQUENCY_PARAMETER),
+        evidence: LinkEvidence::Observed,
+    },
+    LinkedCrossover {
+        driver: (5, LOW_PASS_FREQUENCY_PARAMETER),
+        follower: (6, HIGH_PASS_FREQUENCY_PARAMETER),
+        evidence: LinkEvidence::Inferred,
+    },
 ];
 
 /// Output pair whose limiter switches the device may link: O1 at Dump0 869
-/// (carrier 876 bit 0) and O2 at Dump1 38 (carrier 44 bit 1). Untested on
-/// the named device, so a partner move is admitted, never predicted.
+/// (carrier 876 bit 0) and O2 at Dump1 38 (carrier 44 bit 1). A partner
+/// move is admitted, never predicted. On 2026-11-18 the O1 switch-off from
+/// image `f20fddae` read back `004c8252` with O2 still on, so the O1 write
+/// did not move O2. The O2 write that followed found O1 already off, so the
+/// O2 to O1 direction is still unread.
 pub const LINKED_LIMITER_OUTPUTS: (u8, u8) = (1, 2);
 
 /// Dump layout failures.
@@ -1542,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_crossover_pair_is_o4_high_pass_and_o3_low_pass_frequency_only() {
+    fn linked_crossover_pairs_are_o4_o3_and_o2_o1_frequency_only() {
         // DuinoDCX 00b9d70 outputLocations: O3 low-pass frequency is Dump1
         // 205 with carrier 212 bit 0 and high byte 206 (212 bits 4 and 6
         // carry the O3 limiter threshold and release); O4 high-pass frequency
@@ -1566,20 +1594,49 @@ mod tests {
         assert_eq!(o4_high_pass.output, 4);
         assert_eq!(o4_high_pass.location, split(1, 369, 372, 4, 370));
 
+        // O1 low-pass frequency is Dump0 866 with carrier 868 bit 5 and high
+        // byte 867; O2 high-pass frequency is Dump1 31 with carrier 36 bit 2
+        // and high byte 32.
+        let o1_low_pass = reviewed_address(5, LOW_PASS_FREQUENCY_PARAMETER).unwrap();
+        assert_eq!(o1_low_pass.location, split(0, 866, 868, 5, 867));
+        let o2_high_pass = reviewed_address(6, HIGH_PASS_FREQUENCY_PARAMETER).unwrap();
+        assert_eq!(o2_high_pass.location, split(1, 31, 36, 2, 32));
+
         assert_eq!(
             LINKED_CROSSOVERS
                 .iter()
                 .filter(|link| link.evidence == LinkEvidence::Observed)
                 .map(|link| (link.driver, link.follower))
                 .collect::<Vec<_>>(),
-            [(
-                (8, HIGH_PASS_FREQUENCY_PARAMETER),
-                (7, LOW_PASS_FREQUENCY_PARAMETER)
-            )]
+            [
+                (
+                    (8, HIGH_PASS_FREQUENCY_PARAMETER),
+                    (7, LOW_PASS_FREQUENCY_PARAMETER)
+                ),
+                (
+                    (6, HIGH_PASS_FREQUENCY_PARAMETER),
+                    (5, LOW_PASS_FREQUENCY_PARAMETER)
+                )
+            ]
         );
         for link in LINKED_CROSSOVERS {
+            // Every direction pairs one output's high-pass with the low-pass
+            // of the output below it, and only O1/O2 and O3/O4 are linked.
+            let (high, low) = if link.driver.1 == HIGH_PASS_FREQUENCY_PARAMETER {
+                (link.driver, link.follower)
+            } else {
+                (link.follower, link.driver)
+            };
+            assert_eq!(high.1, HIGH_PASS_FREQUENCY_PARAMETER);
+            assert_eq!(low.1, LOW_PASS_FREQUENCY_PARAMETER);
+            assert_eq!(high.0, low.0 + 1);
+            assert!(matches!(low.0, 5 | 7), "only O1/O2 and O3/O4 are linked");
+            assert_eq!(
+                link.evidence == LinkEvidence::Observed,
+                link.driver == high,
+                "only the high-pass to low-pass direction is observed"
+            );
             for (channel, parameter) in [link.driver, link.follower] {
-                assert!(matches!(channel, 7 | 8), "only the O3/O4 pair is linked");
                 let address = reviewed_address(channel, parameter).unwrap();
                 assert!(matches!(
                     address.field,

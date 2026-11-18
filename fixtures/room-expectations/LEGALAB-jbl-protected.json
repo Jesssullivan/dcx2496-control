@@ -3,9 +3,9 @@
   "presetId": "jbl-protected",
   "presetDigest": null,
   "dcxBlockDigest": null,
-  "snapshotDigest": "sha256/0b1f125af34b24cb9224d8e83565902d72cbb2b06d0124c77353b4d8076bfe35",
+  "snapshotDigest": "sha256/dffe9c614bcbf363613a76b91baf17366717b36311c53e58d43d9461466d3ddf",
   "approved": false,
-  "basis": "Expected final image of the five applies in docs/plans/jbl-protection-20a5b485/expected.json. No device readback yet. The plan keeps O4 open, as the 20a5b485 baseline has it, and the Legalab jbl-protected preset declares O4 muted, trim 0 dB and no limiter threshold. Legalab must name the preset of this image and declare its digests before approval.",
+  "basis": "Expected final image of the five applies in docs/plans/jbl-protection-20a5b485/expected.json. The digest includes the linked O1 low-pass move that apply 4 showed on 2026-11-16. No device readback of the final image yet. The plan keeps O4 open, as the 20a5b485 baseline has it, and the Legalab jbl-protected preset declares O4 muted, trim 0 dB and no limiter threshold. Legalab must name the preset of this image and declare its digests before approval.",
   "outputMutes": [
     false,
     false,

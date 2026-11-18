@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Model the linked O1 low-pass and O2 high-pass crossover corners
+  (TIN-5385). On November 16 apply 4 wrote the O2 high-pass and the device
+  moved the O1 low-pass with it, so the readback failed containment. The
+  planner now predicts that move, and the same plan from `b31a7e38`
+  expects `e2088871`, the image the device returned. A plan may write both
+  sides of a linked pair at one corner, listed under `linked_writes`, so
+  the sub low-pass on O3 can move with the O4 Alto high-pass when the plan
+  names both. A predicted move of an active partner the plan does not
+  address is refused with a message that names the partner and its corner.
+  Two sides at two corners stay refused. The plans are in
+  `docs/plans/linked-corners-fa3b05b4`, and pairs no device event shows are
+  listed as not yet read in `docs/typed-writes.md`.
 - Let a typed write switch one output's limiter off and back on (TIN-5385).
   Legalab ruling 105: "Remove it today". Ruling 108, Linear TIN-5385
   comment `15475103`, asks for the software to do it. The plan addresses
