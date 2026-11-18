@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Let a typed write switch one output's limiter off and back on (TIN-5385).
+  Legalab ruling 105: "Remove it today". Ruling 108, Linear TIN-5385
+  comment `15475103`, asks for the software to do it. The plan addresses
+  only that output. The switch is not counted in the gain step, and
+  `write plan` states it under `limiter_switches`. Whether the device links
+  the O1 and O2 switches is untested. The apply readback admits the
+  partner unchanged or at the written value, and names the second under
+  `device_moves` as `o1_o2_limiter_link_untested`. The rollback readback
+  does not admit it.
 - Keep the room receipt after a clean periodic read failure in helper build
   15 (TIN-6964). Ruling 70 of TIN-5385 comment 50be9d3b asks for it. Before, every failed
   periodic read invalidated the receipt at once, so about 2 agent passes in
