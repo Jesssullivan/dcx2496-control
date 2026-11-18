@@ -348,56 +348,101 @@ failure class; never bytes or paths), and `readback_retry_stop`
 `open_failed`, or null). `session_closed_verified: false` on the first
 failure means the retry was not eligible.
 
-## Linked O3/O4 crossover
+## Linked crossover corners
 
-Observed 2026-10-20 (PA leg): writing O4 high-pass frequency code 74 also
-moved the O3 low-pass frequency, which had equalled the O4 high-pass code
-(180) before the write, to 74: Dump1 205 `52 -> 74` (low seven bits) and
-carrier 212 `81 -> 80` (bit 0 is the field's bit 7; bits 4 and 6 are the O3
-limiter threshold and release and did not change). The O3 low-pass type did
-not change. Inferred: the device links adjacent outputs' crossover points
-(its linked, not FREE, crossover adjust mode); that mode has no reviewed
-address.
+The device links the high-pass corner of one output to the low-pass corner
+of the output below it. Writing the high-pass frequency moves the low-pass
+frequency to the same code. The crossover types do not follow. The link is
+the device's linked, not FREE, crossover adjust mode, which has no reviewed
+address (DCX-7).
 
-The model is deliberately narrow:
+| Driver | Follower | Evidence | Event |
+| --- | --- | --- | --- |
+| O4 high-pass, channel 8 `0x43` | O3 low-pass, channel 7 `0x45` | observed | 2026-10-20 PA leg. O4 code 74 moved O3 from 180, Dump1 205 `52 -> 74`, carrier 212 bit 0 `1 -> 0`. The O3 low-pass type did not change |
+| O2 high-pass, channel 6 `0x43` | O1 low-pass, channel 5 `0x45` | observed | 2026-11-16 visit 1 apply 4 from `b31a7e38`. O2 code 37 moved O1 from 180, Dump0 866 `52 -> 37`, carrier 868 bit 5 `1 -> 0`, readback `e2088871`. The rollback wrote O2 back to 180 and the next snapshot read `b31a7e38`, O1 at 180 again |
+| O3 low-pass | O4 high-pass | inferred | Reverse of an observed direction. Never seen |
+| O1 low-pass | O2 high-pass | inferred | Reverse of an observed direction. Never seen |
 
-- only O4 high-pass frequency (channel 8, `0x43`; Dump1 369, carrier 372
-  bit 4, high 370) driving O3 low-pass frequency (channel 7, `0x45`; Dump1
-  205, carrier 212 bit 0, high 206). No O1/O2 or O2/O3 pair and no crossover
-  type is modelled;
-- a link is predicted only when the baseline holds the follower at the
-  driver's code (the only available sign the pair is linked) and the plan
-  does not also write the follower. A plan writing both fields of a pair the
-  baseline shows linked is refused;
-- a predicted follower move on an active filter (type not off in the
-  baseline, or switched on by the plan) needs `allow_protection_change` in
-  the plan and `--allow-protection-change`, whichever direction it moves and
-  whether the direction is observed or inferred, because the device moves it
-  without a frame byte of its own;
-- `write plan` lists the prediction in `linked_effects` and adds no frame
-  byte. The desired snapshot, and so `write verify` and the live readback
-  check, expect the follower at the written code. The rollback, which
-  rewrites only the driver, expects the follower back at its baseline code;
+Apply 4 wrote O1 and O2 high-pass code 37 in one frame. O1 high-pass was 0
+and O1 low-pass was 180 before it, so only the O2 write held the O1 low-pass
+code. The planner did not model that pair, so the apply ended
+`rollback_required` with Dump0 866 and 868 uncontained. With this model the
+same plan from `b31a7e38` predicts the move. Its desired snapshot is
+`e2088871`, the image the device returned.
+
+The planner rules:
+
+- a link is active only while the baseline holds the follower at the
+  driver's code. That is the only sign the pair is linked;
+- a plan that writes one side predicts the other. The prediction is listed
+  in `linked_effects` and adds no frame byte. An observed direction is in
+  the desired snapshot, so `write verify` and the live readback expect it.
+  The rollback rewrites the driver, and the link brings the follower back.
+  An inferred direction is never in the desired snapshot, and if the device
+  moves it, containment fails;
+- a predicted follower on an active filter, its type not off in the
+  baseline or switched on by the plan, is a protection the plan does not
+  address. The plan is refused with `LinkedProtectionChange`. The message
+  names the partner and its corner, and says to add the partner's change at
+  the same corner. Consent through `allow_protection_change` and
+  `--allow-protection-change` still admits the move as before;
+- a plan may write both sides at one code. That is one transaction that
+  names both sides. Each write leaves both fields at that code, in linked
+  or FREE mode and in either order, so the readback is exact either way.
+  The rollback writes both back to the one baseline code. `write plan`
+  lists the pair in `linked_writes` with a notice. Each side keeps its own
+  policy: lowering an active high-pass needs the protection consent, as any
+  direct write does;
+- a plan that writes both sides at two different codes is refused with
+  `LinkedCrossoverConflict`. The device result would depend on the write
+  order and the mode;
 - `control verify-containment` and `write verify` list a follower move
-  under `linked_changes` (never dropped) only when the follower reads
-  exactly the written driver code and the readback driver holds it too. Only
-  an observed direction counts as contained (`contained: true`). Any other
-  bit of those bytes (such as the limiter threshold or release high bits in
-  212) or any other code stays uncontained.
+  under `linked_changes` only when the follower reads exactly the written
+  driver code and the readback driver holds it too. Only an observed
+  direction is contained. Any other bit of those bytes, such as the O3
+  limiter bits in Dump1 212, stays uncontained.
 
-The reverse direction (an O3 low-pass frequency write moving O4 high-pass
-frequency) is inferred and unverified. `linked_effects` and `linked_changes`
-report it as `inferred_unverified` with `contained: false`; its bits stay in
-`uncontained_changes`, so both gates exit non-zero, and the desired snapshot
-never expects it, so a live apply reports `rollback_required`.
+The equal-codes gate has a false-positive mode. On a device in FREE mode,
+any state where the two corners share a code predicts a link. The device
+then moves only the driver, the readback differs from the desired state,
+and the apply fails safe into its exact rollback. Writing both sides at one
+corner avoids it.
 
-The equal-codes gate is a heuristic with a false-positive mode: on a device
-in FREE mode, any state where O4 high-pass and O3 low-pass share a code
-(after an aligning write, or at a shared default) predicts a link on every
-later O4 high-pass write. The device then moves only O4, the readback does
-not equal the desired state, and the apply fails safe into its exact
-rollback; a plan writing both fields is refused. The way out is to write
-the O3 low-pass frequency first, in its own plan, so the codes differ.
+### Use cases
+
+`docs/plans/linked-corners-fa3b05b4` holds the plans. The test
+`crates/dcx-core/tests/linked_corners.rs` replays each one on a fake DCX
+that honours the observed links, with and without the reverse links. Every
+apply verifies exactly, and every rollback returns the exact baseline.
+
+| Plan | Writes | Linked side | Consent |
+| --- | --- | --- | --- |
+| `jbl-1-high-pass-corner` | O1 and O2 high-pass corner 45 Hz, type off | O1 low-pass follows O2 to 44.575 Hz, type off. Predicted, observed | None |
+| `jbl-2-high-pass-on` | O1 and O2 high-pass type LR24 | None | None |
+| `sub-o3-low-pass-80hz-alone` | O3 low-pass LR24 80 Hz | O4 high-pass, the Alto protection at 99.35 Hz | Refused, `LinkedProtectionChange` |
+| `sub-o3-low-pass-80hz-with-o4` | O3 low-pass LR24 80 Hz and O4 high-pass 80 Hz | Both sides written at code 64 | `allow_protection_change`, because the Alto high-pass goes down |
+| `sub-o3-low-pass-120hz-with-o4` | O3 low-pass LR24 and O4 high-pass at code 83, 120.733 Hz | Both sides written | None. The Alto high-pass goes up |
+
+The two JBL plans are ruling 54's high-pass, one frame of two actions each.
+Every plan here holds at most 3 actions, inside the 5 remote-mode writes per
+apply and 3 per rollback of `dec-dcx-attended-software-writes-20261019`.
+
+### Not yet read
+
+No device event shows these. The planner does not model them. Each is a
+read for a later rack visit.
+
+| Item | What is known | Effect today |
+| --- | --- | --- |
+| O3 low-pass driving O4 high-pass | Inferred only | Predicted, never expected. A plan that names both sides needs no answer |
+| O1 low-pass driving O2 high-pass | Inferred only | Same as above |
+| O2 low-pass and O3 high-pass | Codes 319 and 0 in `fa3b05b4`, never equal in any saved image | Not modelled. An unplanned move fails containment |
+| O4 low-pass and O5 high-pass | O5 has no typed address | Not modelled |
+| O5 low-pass and O6 high-pass | Both code 180 in every saved image, no write | Not modelled. O5 and O6 are never addressed |
+| A high-pass type write moving the linked low-pass type | The O4 type write of 2026-10-20 left the O3 type unchanged. O1/O2 types never written | Not modelled. An unplanned move fails containment |
+| A low-pass type write moving the linked high-pass type | Never written | Same as above |
+| The crossover adjust mode, linked or FREE | No reviewed address | The equal-codes gate stands in for it |
+| O2 limiter switch moving O1 | On 2026-11-18 O1 was already off when O2 went off | Admitted, never predicted, `o1_o2_limiter_link_untested` |
 
 ## Limiter off and the O1/O2 limiter link
 
@@ -415,10 +460,10 @@ and O6 muted and never addressed.
 
 The O1 switch is Dump0 869, carrier 876 bit 0. The O2 switch is Dump1 38,
 carrier 44 bit 1. Each is a low-only location, so its carrier bit is never
-written. Whether the device links the O1 and O2 switches is untested.
-`LINKED_CROSSOVERS` models crossover corners only. On November 16 apply 4
-showed that the device links the O1 low-pass and O2 high-pass corners, which
-the planner did not model, so that apply ended `rollback_required`.
+written. `LINKED_CROSSOVERS` models crossover corners only. On November 18
+the O1 switch-off from `f20fddae` read back verified as `004c8252`, O2
+still on. So the O1 write does not move O2. The O2 switch-off that followed
+found O1 already off, so the O2 to O1 direction is still unread.
 
 So the planner admits both outcomes and predicts neither. When a plan writes
 one switch of the pair, and the baseline holds both switches at the same

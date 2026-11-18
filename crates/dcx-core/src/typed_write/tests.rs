@@ -2348,19 +2348,27 @@ fn the_reverse_link_is_reported_as_inferred_and_never_contained() {
 
 #[test]
 fn no_other_output_pair_is_linked() {
-    // O2 low-pass equal to O3 high-pass, and O1 low-pass equal to O2
-    // high-pass: writing either high-pass predicts nothing.
+    // O2 low-pass equal to O3 high-pass: no device event shows that pair
+    // linked, so writing either side predicts nothing. O1/O2 is linked.
     let mut builder = Builder::new();
     builder.set(6, LOW_PASS_FREQUENCY_PARAMETER, 100);
     builder.set(7, HIGH_PASS_FREQUENCY_PARAMETER, 100);
     builder.set(5, LOW_PASS_FREQUENCY_PARAMETER, 90);
     builder.set(6, HIGH_PASS_FREQUENCY_PARAMETER, 90);
     let base = builder.snapshot();
-    for channel in [6, 7] {
-        let action =
-            DirectParameterAction::new(channel, HIGH_PASS_FREQUENCY_PARAMETER, 120).unwrap();
+    for (channel, parameter) in [
+        (7, HIGH_PASS_FREQUENCY_PARAMETER),
+        (6, LOW_PASS_FREQUENCY_PARAMETER),
+    ] {
+        let action = DirectParameterAction::new(channel, parameter, 120).unwrap();
         assert!(base.linked_predictions(&[action]).is_empty());
     }
+    let action = DirectParameterAction::new(6, HIGH_PASS_FREQUENCY_PARAMETER, 120).unwrap();
+    let [prediction] = base.linked_predictions(&[action])[..] else {
+        panic!("the O2 high-pass write moves the O1 low-pass")
+    };
+    assert_eq!(prediction.link.evidence, LinkEvidence::Observed);
+    assert_eq!((prediction.follower.output, prediction.before), (1, 90));
 }
 
 // TIN-6805 replays the 2026-10-20 PA-leg write. Its receipt is

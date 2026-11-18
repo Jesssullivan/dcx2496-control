@@ -42,8 +42,8 @@ within 5 per apply and 3 per rollback. No apply addresses O3 to O6.
 | 1 | `apply-1-trim` | O1 and O2 gain 0.0 to -15.0 dB, code 150 to 0 | `e10681a8` |
 | 2 | `apply-2-limiter-threshold` | O1 threshold -0.5 to -13.8 dB, code 235 to 102. O2 0.0 to -13.8 dB, code 240 to 102 | `852b277a` |
 | 3 | `apply-3-limiter-on` | O1 and O2 limiter off to on | `b31a7e38` |
-| 4 | `apply-4-high-pass-corner` | O1 high-pass corner code 0 to 37. O2 code 180 to 37. 44.575 Hz, type still off | `01d57878` |
-| 5 | `apply-5-high-pass-on` | O1 and O2 high-pass type off to LR24 | `0b1f125a` |
+| 4 | `apply-4-high-pass-corner` | O1 high-pass corner code 0 to 37. O2 code 180 to 37. 44.575 Hz, type still off. The linked O1 low-pass follows O2 from 180 to 37 | `e2088871` |
+| 5 | `apply-5-high-pass-on` | O1 and O2 high-pass type off to LR24 | `dffe9c61` |
 
 Baseline: `sha256/20a5b485a4b4053b4b7026b9fb53517d210cbb3b456aa7f135b578c9b728b5e7`.
 Full digests, frames and rollback frames are in `expected.json`.
@@ -64,7 +64,7 @@ release.
 
 The planner puts 45 Hz on code 37, 44.575 Hz, the nearest step on its
 logarithmic grid. The same ten writes in one plan reach the same final digest
-`0b1f125a`. That single transaction also sends 5 remote-mode writes, but its
+`dffe9c61`. That single transaction also sends 5 remote-mode writes, but its
 rollback carries 10 parameter actions.
 
 ## Numbers
@@ -160,7 +160,7 @@ is therefore UNKNOWN. The O4 ceiling range is the same -2.0 to +22.0 dBu.
 |---|---|---|
 | The `jbl-protected` preset declares O3 and O4 muted | `20a5b485` has O4 unmuted, and ruling 54 puts the Alto in the target. This plan leaves O4 as it is. Muting O4 would take a separate mute write | Legalab `profiles/dcx-scene-map.json`, `decisions.jsonl:262` |
 | Legalab files hold gain 0 and a null threshold | This plan proposes -15.0 and -13.8. A Legalab change must declare them, with a basis, before the plan is applied | Legalab `profiles/levels.json`, `profiles/dcx-scene-map.json` |
-| O1 low-pass and O2 high-pass share code 180 in `20a5b485` | The planner models only the O4 high-pass to O3 low-pass link. If the device links O1 and O2 the same way, apply 4 also moves the O1 low-pass corner to 37 with its type off. The readback then differs from the desired state and the apply returns `rollback_required`. Both filters are off in apply 4, so nothing audible changes | `docs/typed-writes.md`, Linked O3/O4 crossover |
+| O1 low-pass and O2 high-pass share code 180 in `20a5b485` | On 2026-11-16 apply 4 moved the O1 low-pass corner to 37 with its type off, and the apply returned `rollback_required`. The planner now models the O2 high-pass to O1 low-pass link. Apply 4 predicts that move, and its desired snapshot and the later digests changed. Both filters are off in apply 4, so nothing audible changes | `docs/typed-writes.md`, Linked crossover corners |
 | Write containment | An earlier apply moved bytes outside its plan. `write verify` checks every readback | TIN-6805 |
 | Limiter and high-pass addresses have no named-device readback | The first readback that passes `write verify` promotes them | `docs/typed-writes.md`, evidence class |
 | Dump0 byte 101 | Already 1 in `20a5b485`, so the modified flag does not move | Device capture |

@@ -56,6 +56,12 @@ filegroup(
     srcs = glob(["docs/plans/jbl-protection-20a5b485/*.json"]),
 )
 
+# Typed write plans for the linked O1/O2 and O3/O4 crossover corners.
+filegroup(
+    name = "linked_corners_plan",
+    srcs = glob(["docs/plans/linked-corners-fa3b05b4/*.json"]),
+)
+
 filegroup(
     name = "synthetic_search_fixture",
     srcs = ["fixtures/protocol/SYNTHETIC-search-response-26.hex"],
@@ -110,6 +116,7 @@ test_suite(
     tests = [
         ":toolchain_pin_parity",
         "//crates/dcx-core:jbl_protection_plan",
+        "//crates/dcx-core:linked_corners",
         "//crates/dcx-core:profile_chain",
         "//crates/dcx-core:robustness",
         "//crates/dcx-core:unit_tests",

@@ -134,7 +134,7 @@
       "apply": 4,
       "plan": "apply-4-high-pass-corner.write-plan.json",
       "baseline_snapshot_digest": "sha256/b31a7e38bbe4fd13b23c72dc0d4c360afdae58bb90e56ee34d8d8fa99d3089a2",
-      "desired_snapshot_digest": "sha256/01d578783be2b084c318fb1bd5ff12c0d00f6506c9560fc8c58600e6ea3b7e32",
+      "desired_snapshot_digest": "sha256/e2088871bc05259b5ae59ed611cf440331f7ed9e9389acd3d50566e194e43356",
       "writes": [
         {
           "output": 1,
@@ -155,11 +155,37 @@
           }
         }
       ],
-      "linked_effects": [],
+      "linked_effects": [
+        {
+          "evidence": "observed",
+          "driver_output": 2,
+          "driver_field": "high_pass.frequency",
+          "follower_output": 1,
+          "follower_field": "low_pass.frequency",
+          "before_code": 180,
+          "after_code": 37,
+          "before": {
+            "frequency_hz": 987.015
+          },
+          "after": {
+            "frequency_hz": 44.575
+          },
+          "in_desired_snapshot": true,
+          "dump_offsets": {
+            "part": 0,
+            "low": 866,
+            "carrier": [
+              868,
+              5
+            ],
+            "high": 867
+          }
+        }
+      ],
       "apply_frame_hex": "F0002032000E20020543002506430025F7",
       "rollback_frame_hex": "F0002032000E20020643013405430000F7",
-      "apply_plan_digest": "sha256/f1be2a5413105993c9cdf85031e3406d6f859ea38e4356fd98cb4a698957b542",
-      "rollback_plan_digest": "sha256/1506c64931e25293dc9bb2a77b5c7ab1c4e65de105fd5710e3d5ff1599aa4cfd",
+      "apply_plan_digest": "sha256/3a655d785a1d6086a65b7fa16ab9bfa37c2e58d6587a1f750bcb76a274000d9e",
+      "rollback_plan_digest": "sha256/31182952fe82cdfa2a9393818bb6c82b0199cb716fa76ab5a8b9f9ce4248e042",
       "wire_budget": {
         "apply_actions": 2,
         "apply_frame_bytes": 17,
@@ -172,8 +198,8 @@
     {
       "apply": 5,
       "plan": "apply-5-high-pass-on.write-plan.json",
-      "baseline_snapshot_digest": "sha256/01d578783be2b084c318fb1bd5ff12c0d00f6506c9560fc8c58600e6ea3b7e32",
-      "desired_snapshot_digest": "sha256/0b1f125af34b24cb9224d8e83565902d72cbb2b06d0124c77353b4d8076bfe35",
+      "baseline_snapshot_digest": "sha256/e2088871bc05259b5ae59ed611cf440331f7ed9e9389acd3d50566e194e43356",
+      "desired_snapshot_digest": "sha256/dffe9c614bcbf363613a76b91baf17366717b36311c53e58d43d9461466d3ddf",
       "writes": [
         {
           "output": 1,
@@ -197,8 +223,8 @@
       "linked_effects": [],
       "apply_frame_hex": "F0002032000E20020542000806420008F7",
       "rollback_frame_hex": "F0002032000E20020642000005420000F7",
-      "apply_plan_digest": "sha256/9ee9581f53277c3b65f2ad84fee8d5be59e0d15de0159f0aa99a0259a7d71b58",
-      "rollback_plan_digest": "sha256/f529ec519d7c5a06c3a6c53f0faa030aebc634f4b83b7e1a71e8833a66552613",
+      "apply_plan_digest": "sha256/c9b84ee5c70acd1e43c0dc7845f0f07acc2dbe02d0b6cc7aa0adccf4bd603ad4",
+      "rollback_plan_digest": "sha256/b6ae31e28ec149b4608f093e864efc9cd795c2bb946128e03229d5e3ad5e6d9c",
       "wire_budget": {
         "apply_actions": 2,
         "apply_frame_bytes": 17,
@@ -210,7 +236,7 @@
     }
   ],
   "final": {
-    "snapshot_digest": "sha256/0b1f125af34b24cb9224d8e83565902d72cbb2b06d0124c77353b4d8076bfe35",
+    "snapshot_digest": "sha256/dffe9c614bcbf363613a76b91baf17366717b36311c53e58d43d9461466d3ddf",
     "outputs": {
       "1": {
         "gain_code": 0,

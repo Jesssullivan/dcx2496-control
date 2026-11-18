@@ -52,10 +52,21 @@ rust_test(
     deps = [":dcx_core"] + all_crate_deps(normal = True),
 )
 
+# The linked-corner plans, replayed on a fake DCX from synthetic images.
+rust_test(
+    name = "linked_corners",
+    size = "small",
+    srcs = ["tests/linked_corners.rs"],
+    compile_data = ["//:linked_corners_plan"],
+    edition = "2024",
+    deps = [":dcx_core"] + all_crate_deps(normal = True),
+)
+
 test_suite(
     name = "all_tests",
     tests = [
         ":jbl_protection_plan",
+        ":linked_corners",
         ":profile_chain",
         ":robustness",
         ":unit_tests",
