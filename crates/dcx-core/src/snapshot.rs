@@ -27,9 +27,10 @@ use thiserror::Error;
 
 use crate::{
     layout::{
-        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, LINKED_CROSSOVERS, LinkEvidence,
-        LinkedCrossover, MAX_LEVEL_STEP_CODES, OUTPUT_COUNT, OutputField, PACKED_PAYLOAD_START,
-        PEQ_BANDS, ReviewedAddress, UNITY_GAIN_CODE, band_parameter, output_channel,
+        BandField, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER, LIMITER_ENABLED_PARAMETER,
+        LINKED_CROSSOVERS, LINKED_LIMITER_OUTPUTS, LinkEvidence, LinkedCrossover,
+        MAX_LEVEL_STEP_CODES, OUTPUT_COUNT, OutputField, PACKED_PAYLOAD_START, PEQ_BANDS,
+        ReviewedAddress, UNITY_GAIN_CODE, band_parameter, output_channel, packing_carrier,
         reviewed_address, routing_rank,
     },
     protocol::{
@@ -1076,6 +1077,12 @@ pub const ALLOWED_DEVICE_MOVES: [AllowedDeviceMove; 1] = [AllowedDeviceMove {
     after: 1,
 }];
 
+/// Rule label of the plan-bound O1/O2 limiter link partner move; see
+/// [`ApplyPlanV1::limiter_link_moves`]. Legalab ruling 105, and ruling 108 in
+/// Linear TIN-5385 comment `15475103`, ask for the limiter to come off by
+/// software.
+pub const LIMITER_LINK_RULE: &str = "o1_o2_limiter_link_untested";
+
 /// One allowed device move seen in a readback; see [`ALLOWED_DEVICE_MOVES`].
 ///
 /// The dump trailer moved with it so the dump kept its modulo-128 balance.
@@ -1106,11 +1113,19 @@ impl SnapshotV1 {
     /// balance of `expected`. Putting it back
     /// restores the byte and moves the trailer by the same amount, so the
     /// balance holds. Every other byte is left as read.
-    fn without_device_moves(&self, expected: &Self) -> (Self, Vec<DeviceMoveV1>) {
+    ///
+    /// `extra` holds plan-bound rules, such as the O1/O2 limiter link
+    /// partner (see [`ApplyPlanV1::limiter_link_moves`]), checked the same
+    /// way after the fixed [`ALLOWED_DEVICE_MOVES`].
+    fn without_device_moves(
+        &self,
+        expected: &Self,
+        extra: &[AllowedDeviceMove],
+    ) -> (Self, Vec<DeviceMoveV1>) {
         let mut dump0 = self.dump0.frame.clone();
         let mut dump1 = self.dump1.frame.clone();
         let mut moves = Vec::new();
-        for rule in ALLOWED_DEVICE_MOVES {
+        for rule in ALLOWED_DEVICE_MOVES.iter().chain(extra).copied() {
             let (frame, wanted) = match rule.section {
                 SnapshotSection::Dump0 => (&mut dump0, &expected.dump0.frame),
                 SnapshotSection::Dump1 => (&mut dump1, &expected.dump1.frame),
@@ -1191,8 +1206,8 @@ impl ApplyPlanV1 {
     ///
     /// Level gains (output gain on O1-O4 and the input A-C gains) may fall
     /// freely but may rise by at most 30 codes (+3 dB) per plan and never to
-    /// above unity (0 dB); a limiter threshold may rise by at most 30 codes;
-    /// and an enabled limiter may never be switched off. These hold for the
+    /// above unity (0 dB); and a limiter threshold may rise by at most 30
+    /// codes. A limiter switch may go on or off. These hold for the
     /// apply direction only: a rollback restores the verified baseline. Any
     /// typed-write-lane action also requires O5 and O6 to read muted.
     ///
@@ -1379,7 +1394,9 @@ impl ApplyPlanV1 {
         self.require_readback_device(readback)?;
         let normalized;
         let readback = if self.admits_device_moves() {
-            normalized = readback.without_device_moves(&self.baseline).0;
+            normalized = readback
+                .without_device_moves(&self.baseline, &self.limiter_link_moves())
+                .0;
             &normalized
         } else {
             readback
@@ -1462,7 +1479,91 @@ impl ApplyPlanV1 {
         if !self.admits_device_moves() {
             return Ok(Vec::new());
         }
-        Ok(readback.without_device_moves(&self.baseline).1)
+        Ok(readback
+            .without_device_moves(&self.baseline, &self.limiter_link_moves())
+            .1)
+    }
+
+    /// Allowed device moves a rollback readback shows against the bound
+    /// baseline: the fixed [`ALLOWED_DEVICE_MOVES`] only. A limiter link
+    /// partner left at the applied value is not a clean rollback.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a readback from another device.
+    pub fn rollback_device_moves(
+        &self,
+        readback: &SnapshotV1,
+    ) -> Result<Vec<DeviceMoveV1>, SnapshotDiffError> {
+        self.require_readback_device(readback)?;
+        if !self.admits_device_moves() {
+            return Ok(Vec::new());
+        }
+        Ok(readback.without_device_moves(&self.baseline, &[]).1)
+    }
+
+    /// Plan-bound device moves for the O1/O2 limiter switch pair
+    /// ([`LINKED_LIMITER_OUTPUTS`]).
+    ///
+    /// Whether the device links the O1 and O2 limiter switches is untested.
+    /// When this plan writes one switch of the pair and not the other, and
+    /// the baseline holds both switches at the same value, the partner may
+    /// read either its baseline value or the written value. The second is
+    /// an allowed move named [`LIMITER_LINK_RULE`], so it is contained and
+    /// listed under `device_moves`. It applies to the apply readback only.
+    /// The partner byte's carrier bit must be clear in both snapshots, as
+    /// for Dump0 101.
+    pub fn limiter_link_moves(&self) -> Vec<AllowedDeviceMove> {
+        let Some(command) = &self.command else {
+            return Vec::new();
+        };
+        let switch =
+            |output: u8| reviewed_address(output_channel(output), LIMITER_ENABLED_PARAMETER);
+        let written = |output: u8| {
+            command
+                .actions()
+                .iter()
+                .find(|action| {
+                    action.channel() == output_channel(output)
+                        && action.parameter() == LIMITER_ENABLED_PARAMETER
+                })
+                .map(|action| action.value())
+        };
+        let (first, second) = LINKED_LIMITER_OUTPUTS;
+        let mut moves = Vec::new();
+        for (driver, partner) in [(first, second), (second, first)] {
+            let (Some(code), None) = (written(driver), written(partner)) else {
+                continue;
+            };
+            let (Some(driver_address), Some(partner_address)) = (switch(driver), switch(partner))
+            else {
+                continue;
+            };
+            let before = self.baseline.read_reviewed(partner_address);
+            if before != self.baseline.read_reviewed(driver_address) || before == code {
+                continue;
+            }
+            let location = partner_address.location;
+            let (Some(carrier), Ok(before), Ok(after)) = (
+                packing_carrier(location.low_offset()),
+                u8::try_from(before),
+                u8::try_from(code),
+            ) else {
+                continue;
+            };
+            moves.push(AllowedDeviceMove {
+                rule: LIMITER_LINK_RULE,
+                section: match location.part() {
+                    DumpPart::Part0 => SnapshotSection::Dump0,
+                    DumpPart::Part1 => SnapshotSection::Dump1,
+                },
+                offset: location.low_offset(),
+                carrier,
+                before,
+                after,
+            });
+        }
+        moves
     }
 
     /// Compare a complete post-apply readback to the desired snapshot, the
@@ -1475,7 +1576,12 @@ impl ApplyPlanV1 {
         &self,
         readback: &SnapshotV1,
     ) -> Result<ReadbackVerificationV1, SnapshotDiffError> {
-        ReadbackVerificationV1::compare(&self.desired, readback, self.admits_device_moves())
+        ReadbackVerificationV1::compare(
+            &self.desired,
+            readback,
+            self.admits_device_moves(),
+            &self.limiter_link_moves(),
+        )
     }
 
     fn require_readback_device(&self, readback: &SnapshotV1) -> Result<(), SnapshotDiffError> {
@@ -1665,13 +1771,14 @@ fn require_cut_only(actions: &[DirectParameterAction]) -> Result<(), ApplyPlanEr
     Ok(())
 }
 
-/// Refuse an apply that raises a level too far or switches a limiter off.
+/// Refuse an apply that raises a level too far.
 ///
 /// Compared against the immutable baseline (each address is written at most
 /// once per command): a level gain may rise by at most
-/// [`MAX_LEVEL_STEP_CODES`] and never to above unity, a limiter threshold may
-/// rise by at most [`MAX_LEVEL_STEP_CODES`], and an enabled limiter may not be
-/// disabled. Decreases are always admitted.
+/// [`MAX_LEVEL_STEP_CODES`] and never to above unity, and a limiter threshold
+/// may rise by at most [`MAX_LEVEL_STEP_CODES`]. Decreases are always
+/// admitted. A limiter switch is not a level and may go off: Legalab ruling
+/// 105, and ruling 108 in Linear TIN-5385 comment `15475103`.
 fn require_protective_levels(
     baseline: &SnapshotV1,
     actions: &[DirectParameterAction],
@@ -1699,11 +1806,6 @@ fn require_protective_levels(
                 parameter: action.parameter(),
                 before,
                 after,
-            });
-        }
-        if address.field == OutputField::LimiterEnabled && before != 0 && after == 0 {
-            return Err(ApplyPlanError::LimiterDisable {
-                channel: action.channel(),
             });
         }
     }
@@ -2074,9 +2176,6 @@ pub enum ApplyPlanError {
         "channel {channel} PEQ band count {count} is above 8; the DCX2496 refused a count of 9 on 2026-10-21"
     )]
     DeviceBandCount { channel: u8, count: u16 },
-    /// An enabled limiter would be switched off.
-    #[error("channel {channel} limiter is enabled; apply never disables a limiter")]
-    LimiterDisable { channel: u8 },
     /// Routing fields were not in mutes, input sum, sources apply order.
     #[error(
         "channel {channel} parameter {parameter:#04x} breaks the routing apply order \
@@ -2370,6 +2469,7 @@ impl ReadbackVerificationV1 {
         expected: &SnapshotV1,
         observed: &SnapshotV1,
         admit_device_moves: bool,
+        extra_moves: &[AllowedDeviceMove],
     ) -> Result<Self, SnapshotDiffError> {
         if expected.device_id != observed.device_id {
             return Err(SnapshotDiffError::DeviceMismatch {
@@ -2381,7 +2481,7 @@ impl ReadbackVerificationV1 {
         let (device_moves, verified) = if exact || !admit_device_moves {
             (Vec::new(), exact)
         } else {
-            let (restored, moves) = observed.without_device_moves(expected);
+            let (restored, moves) = observed.without_device_moves(expected, extra_moves);
             let verified = !moves.is_empty() && restored == *expected;
             (moves, verified)
         };
@@ -2621,6 +2721,7 @@ impl ApplyTransactionV1 {
             &self.desired,
             observed,
             self.apply_plan.admits_device_moves(),
+            &self.apply_plan.limiter_link_moves(),
         )?;
         self.state = if receipt.is_verified() {
             ApplyTransactionState::Verified
@@ -2674,6 +2775,7 @@ impl ApplyTransactionV1 {
             &self.baseline,
             observed,
             self.apply_plan.admits_device_moves(),
+            &[],
         )?;
         self.state = if receipt.is_verified() {
             ApplyTransactionState::RolledBack

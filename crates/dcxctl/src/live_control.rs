@@ -381,7 +381,7 @@ fn rollback_receipt(
             "status": if rolled_back { "rolled_back" } else { "state_unresolved" },
             "restored": snapshot,
             "equals_baseline": snapshot.digest() == plan.baseline().digest(),
-            "device_moves": plan.apply_plan().device_moves(snapshot)?,
+            "device_moves": plan.apply_plan().rollback_device_moves(snapshot)?,
         }),
         None => serde_json::json!({
             "status": "state_unresolved",

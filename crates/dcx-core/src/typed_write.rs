@@ -39,12 +39,13 @@ use crate::{
         BandField, DELAY_ENABLED_PARAMETER, EQ_COUNT_PARAMETER, EQ_ENABLED_PARAMETER,
         GAIN_INPUT_COUNT, GAIN_PARAMETER, HIGH_PASS_FREQUENCY_PARAMETER, HIGH_PASS_TYPE_PARAMETER,
         LIMITER_ENABLED_PARAMETER, LIMITER_RELEASE_PARAMETER, LIMITER_THRESHOLD_PARAMETER,
-        LONG_DELAY_PARAMETER, LOW_PASS_FREQUENCY_PARAMETER, LOW_PASS_TYPE_PARAMETER, LinkEvidence,
-        MAX_ACTIVE_PEQ_BANDS, MAX_FREQUENCY_CODE, MAX_LEVEL_STEP_CODES, MAX_LIMITER_RELEASE_CODE,
-        MAX_LIMITER_THRESHOLD_CODE, MAX_LONG_DELAY_CODE, MAX_SHORT_DELAY_CODE, MUTE_PARAMETER,
-        OUTPUT_COUNT, OutputField, PEQ_BANDS, POLARITY_PARAMETER, ReviewedAddress,
-        SHORT_DELAY_PARAMETER, SOURCE_PARAMETER, TYPED_WRITE_OUTPUTS, UNITY_GAIN_CODE,
-        band_parameter, output_channel, reviewed_address, routing_rank,
+        LINKED_LIMITER_OUTPUTS, LONG_DELAY_PARAMETER, LOW_PASS_FREQUENCY_PARAMETER,
+        LOW_PASS_TYPE_PARAMETER, LinkEvidence, MAX_ACTIVE_PEQ_BANDS, MAX_FREQUENCY_CODE,
+        MAX_LEVEL_STEP_CODES, MAX_LIMITER_RELEASE_CODE, MAX_LIMITER_THRESHOLD_CODE,
+        MAX_LONG_DELAY_CODE, MAX_SHORT_DELAY_CODE, MUTE_PARAMETER, OUTPUT_COUNT, OutputField,
+        PEQ_BANDS, POLARITY_PARAMETER, ReviewedAddress, SHORT_DELAY_PARAMETER, SOURCE_PARAMETER,
+        TYPED_WRITE_OUTPUTS, UNITY_GAIN_CODE, band_parameter, output_channel, reviewed_address,
+        routing_rank,
     },
     peq_bank::{self, PeqBankError, decode_peq_bank, frequency_hz, gain_db, q_value},
     protocol::{DeviceId, DirectParameterAction, DirectParameterCommand, ProtocolError},
@@ -338,7 +339,8 @@ pub enum TypedChange {
     Limiter {
         /// Output, 1 through 4.
         output: u8,
-        /// Limiter switch; switching an enabled limiter off is refused.
+        /// Limiter switch. Switching it off must be the only output the plan
+        /// touches.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enabled: Option<bool>,
         /// Threshold, -24 through 0 dB in 0.1 dB steps.
@@ -913,7 +915,8 @@ pub fn encode_change(
 /// PEQ band fields (a band's gain first when its cut deepens, last when it
 /// gets shallower, so the moving band is never louder than either end
 /// state); 4 PEQ activation (more bands, then on); 5 level and threshold
-/// rises; 6 sources in routing rank (O4 before O3); 7 unmutes.
+/// rises, then limiter off; 6 sources in routing rank (O4 before O3); 7
+/// unmutes.
 fn phase(address: ReviewedAddress, before: u16, after: u16) -> (u8, u8) {
     let rising = after > before;
     match address.field {
@@ -926,6 +929,7 @@ fn phase(address: ReviewedAddress, before: u16, after: u16) -> (u8, u8) {
                 (1, 0)
             }
         }
+        OutputField::LimiterEnabled if before != 0 && after == 0 => (5, 1),
         OutputField::LimiterEnabled | OutputField::LimiterRelease => (1, 1),
         OutputField::EqEnabled if !rising => (2, 0),
         OutputField::EqCount if !rising => (2, 1),
@@ -1072,6 +1076,26 @@ fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
 }
 
+/// One limiter switch a typed write plan changes, stated in the plan output.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimiterSwitchV1 {
+    /// Output whose limiter switch the plan writes.
+    pub output: u8,
+    /// Baseline switch.
+    pub enabled_before: bool,
+    /// Written switch.
+    pub enabled_after: bool,
+    /// Always false: a switch is not a level, so the summed gain rise does
+    /// not count it.
+    pub counted_in_gain_step: bool,
+    /// O1/O2 partner whose switch the device may move to the same value
+    /// (the link is untested), or `None`.
+    pub link_partner: Option<u8>,
+    /// Plain statement of the change for the operator.
+    pub notice: String,
+}
+
 /// Complete dry-run receipt of one typed write plan.
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1093,6 +1117,8 @@ pub struct WriteTransactionV1 {
     /// Predicted linked-crossover side effects (O4 high-pass frequency and
     /// O3 low-pass frequency); no frame byte is added for them.
     pub linked_effects: Vec<LinkedEffectV1>,
+    /// Limiter switches the plan changes, each with a plain notice.
+    pub limiter_switches: Vec<LimiterSwitchV1>,
     /// Exact apply frame, uppercase hexadecimal, or `None` for a no-op plan.
     pub apply_frame_hex: Option<String>,
     /// Exact rollback frame, uppercase hexadecimal, or `None`.
@@ -1135,7 +1161,8 @@ pub struct WireBudgetV1 {
 /// EQ boosts, duplicate addresses, an unmute or source change without both
 /// consents, an unmute together with a source change, a loosened active
 /// high-pass without consent, a summed level rise past the policy step, a
-/// level rise past the ceiling, a limiter switch-off, too many actions, a
+/// level rise past the ceiling, a limiter switch-off that shares the plan
+/// with another output, too many actions, a
 /// baseline value outside its documented domain, and every core carrier
 /// refusal.
 #[allow(clippy::too_many_lines)]
@@ -1241,6 +1268,21 @@ pub fn plan_writes(
     let apply_plan = transaction.apply_plan().clone();
     let rollback_plan = transaction.rollback_plan().clone();
     check_rollback(&rollback_plan)?;
+    let link_partners: BTreeSet<u8> = apply_plan
+        .limiter_link_moves()
+        .iter()
+        .filter_map(|rule| {
+            (1..=OUTPUT_COUNT).find(|output| {
+                reviewed_address(output_channel(*output), LIMITER_ENABLED_PARAMETER)
+                    .is_some_and(|address| address.location.low_offset() == rule.offset)
+            })
+        })
+        .collect();
+    let limiter_switches = writes
+        .iter()
+        .filter(|write: &&PlannedWriteV1| write.parameter == LIMITER_ENABLED_PARAMETER)
+        .map(|write| limiter_switch(write, &link_partners))
+        .collect();
     let apply_frame = apply_plan
         .command()
         .map(DirectParameterCommand::encode)
@@ -1273,9 +1315,41 @@ pub fn plan_writes(
         writes,
         unchanged_changes,
         linked_effects,
+        limiter_switches,
         apply_plan,
         rollback_plan,
     })
+}
+
+fn limiter_switch(write: &PlannedWriteV1, link_partners: &BTreeSet<u8>) -> LimiterSwitchV1 {
+    let (first, second) = LINKED_LIMITER_OUTPUTS;
+    let partner = match write.output {
+        output if output == first => Some(second),
+        output if output == second => Some(first),
+        _ => None,
+    }
+    .filter(|partner| link_partners.contains(partner));
+    let enabled_after = write.after_code != 0;
+    let state = if enabled_after { "on" } else { "off" };
+    let mut notice = format!(
+        "O{} limiter goes {state}. A limiter switch is not a level and is not counted in the gain step.",
+        write.output
+    );
+    if let Some(partner) = partner {
+        use std::fmt::Write as _;
+        let _ = write!(
+            notice,
+            " The O1/O2 limiter link is untested: O{partner} limiter may also go {state}. The readback admits O{partner} unchanged or {state} and names a move under device_moves."
+        );
+    }
+    LimiterSwitchV1 {
+        output: write.output,
+        enabled_before: write.before_code != 0,
+        enabled_after,
+        counted_in_gain_step: false,
+        link_partner: partner,
+        notice,
+    }
 }
 
 fn require_reviewed(action: DirectParameterAction) -> Result<ReviewedAddress, TypedWriteError> {
@@ -1355,7 +1429,10 @@ fn check_high_pass_protection(
 ///   may not share a plan with an unmute;
 /// - changing the type of an active high-pass, switching it off, or lowering
 ///   its corner needs `allow_protection_change`;
-/// - an enabled limiter stays on;
+/// - a limiter switch-off is the only output in the frame, so a plan turns
+///   one limiter off at a time (Legalab ruling 105, and ruling 108 in Linear
+///   TIN-5385 comment `15475103`). The switch is not a level and is not
+///   counted in the step budget;
 /// - the summed rise of every level gain, limiter threshold, and effective
 ///   PEQ band gain (a band's gain while active, unity while inactive) is at
 ///   most the policy step, so rises on one path cannot add up past it;
@@ -1390,6 +1467,8 @@ pub fn check_policy(
     let mut rise: u32 = 0;
     let mut peq_outputs = BTreeSet::new();
     let mut previous_phase = None;
+    let mut limiter_off = None;
+    let mut outputs = BTreeSet::new();
     for action in actions {
         let address = require_reviewed(*action)?;
         if (5..=OUTPUT_COUNT).contains(&address.output) {
@@ -1397,6 +1476,7 @@ pub fn check_policy(
                 output: address.output,
             });
         }
+        outputs.insert(address.output);
         let before = baseline.read_reviewed(address);
         let after = action.value();
         let key = phase(address, before, after);
@@ -1426,9 +1506,7 @@ pub fn check_policy(
                 sources = true;
             }
             OutputField::LimiterEnabled if before != 0 && after == 0 => {
-                return Err(TypedWriteError::LimiterDisable {
-                    output: address.output,
-                });
+                limiter_off.get_or_insert(address.output);
             }
             OutputField::HighPassType | OutputField::HighPassFrequency => {
                 check_high_pass_protection(baseline, address, before, after, policy)?;
@@ -1454,6 +1532,11 @@ pub fn check_policy(
     }
     if unmutes && sources {
         return Err(TypedWriteError::UnmuteWithRouting);
+    }
+    if let Some(output) = limiter_off
+        && let Some(&other) = outputs.iter().find(|other| **other != output)
+    {
+        return Err(TypedWriteError::LimiterOffWithOtherOutput { output, other });
     }
     check_linked_followers(baseline, actions, policy)?;
     if !peq_outputs.is_empty() {
@@ -1920,9 +2003,11 @@ pub enum TypedWriteError {
     /// Unmute and routing in one plan.
     #[error("a plan may not both unmute an output and change a source; split it")]
     UnmuteWithRouting,
-    /// Limiter switch-off.
-    #[error("O{output} limiter is enabled; typed writes never disable a limiter")]
-    LimiterDisable { output: u8 },
+    /// A limiter switch-off shares the plan with another output.
+    #[error(
+        "O{output} limiter goes off in a plan that also addresses O{other}; switch one output's limiter off per plan"
+    )]
+    LimiterOffWithOtherOutput { output: u8, other: u8 },
     /// The plan's summed level rise exceeds the policy step.
     #[error(
         "plan raises levels by {rise_db} dB in total (level gains, limiter thresholds, effective PEQ band gains); the policy step is {maximum_step_db} dB"

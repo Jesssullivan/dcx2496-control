@@ -754,6 +754,11 @@ pub const LINKED_CROSSOVERS: [LinkedCrossover; 2] = [
     },
 ];
 
+/// Output pair whose limiter switches the device may link: O1 at Dump0 869
+/// (carrier 876 bit 0) and O2 at Dump1 38 (carrier 44 bit 1). Untested on
+/// the named device, so a partner move is admitted, never predicted.
+pub const LINKED_LIMITER_OUTPUTS: (u8, u8) = (1, 2);
+
 /// Dump layout failures.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum LayoutError {

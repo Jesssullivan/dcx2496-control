@@ -209,7 +209,9 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
     therefore share one budget;
   - a rising output or input gain above `--gain-ceiling-db` (default and
     maximum 0 dB). A cut from above the ceiling is admitted;
-  - switching an enabled limiter off;
+  - switching a limiter off in a plan that addresses any other output.
+    One plan turns one output's limiter off. See "Limiter off and the O1/O2
+    limiter link" below;
   - more than `--max-actions` actions (default 16, maximum 32);
   - a carrier whose actions are not in the safe in-frame order below.
 
@@ -232,8 +234,7 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
   2026-10-09, so this costs nothing operationally. `dcxctl routing
   desired-profile` accepts `--o5-mute on` and `--o6-mute on` only.
   `ApplyPlanV1` also refuses a level gain rise above unity or of more than
-  +3 dB, a limiter-threshold rise of more than +3 dB, a limiter switch-off,
-  and any typed-write-lane action (O1-O3 mute or a typed field) while O5 or
+  +3 dB, a limiter-threshold rise of more than +3 dB, and any typed-write-lane action (O1-O3 mute or a typed field) while O5 or
   O6 reads unmuted. Rollback is exempt from the level rules because it
   restores a verified baseline. `control apply` and `control rollback` refuse
   any carrier that holds a typed-write-lane address (the typed fields and the
@@ -254,7 +255,7 @@ Golden vectors in `crates/dcx-core/src/typed_write/tests.rs`:
      is never louder than either end state. A filter being switched off goes
      off before its corner moves;
   5. PEQ activation (more bands, then on);
-  6. level rises;
+  6. level rises, then a limiter switching off;
   7. sources, O4 before O3 (the routing rank);
   8. unmutes.
 
@@ -397,6 +398,43 @@ later O4 high-pass write. The device then moves only O4, the readback does
 not equal the desired state, and the apply fails safe into its exact
 rollback; a plan writing both fields is refused. The way out is to write
 the O3 low-pass frequency first, in its own plan, so the codes differ.
+
+## Limiter off and the O1/O2 limiter link
+
+Legalab ruling 105 says "Remove it today". Ruling 108, Linear TIN-5385
+comment `15475103`, asks for the software to do it. A typed write may now
+switch a limiter off. The other guards stand: a fresh baseline, one frame
+with five remote-mode writes, the exact rollback, readback containment, O5
+and O6 muted and never addressed.
+
+- The plan may address only the output whose limiter goes off.
+- The switch is not a level. The summed gain rise does not count it.
+- `write plan` lists each switch under `limiter_switches`. Each entry has a
+  `notice` such as "O1 limiter goes off."
+- The switch-off goes after level rises and before unmutes in the frame.
+
+The O1 switch is Dump0 869, carrier 876 bit 0. The O2 switch is Dump1 38,
+carrier 44 bit 1. Each is a low-only location, so its carrier bit is never
+written. Whether the device links the O1 and O2 switches is untested.
+`LINKED_CROSSOVERS` models crossover corners only. On November 16 apply 4
+showed that the device links the O1 low-pass and O2 high-pass corners, which
+the planner did not model, so that apply ended `rollback_required`.
+
+So the planner admits both outcomes and predicts neither. When a plan writes
+one switch of the pair, and the baseline holds both switches at the same
+value, the rule `o1_o2_limiter_link_untested` applies:
+
+| Partner readback | Result |
+| --- | --- |
+| Unchanged | Verified exactly |
+| The written value, its dump trailer kept in balance | Verified, listed under `device_moves` |
+| Any other value, its carrier bit set, or an unbalanced trailer | Uncontained, `rollback_required` |
+
+The desired snapshot expects the partner unchanged. The rule applies to the
+apply readback, containment and `write verify`. It does not apply to the
+rollback readback. The rollback rewrites only the planned switch, so a
+partner left at the applied value ends `state_unresolved`. If the partner
+followed, the next plan for it is a no-op.
 
 ## Device-set status byte at Dump0 101
 

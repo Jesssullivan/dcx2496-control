@@ -3102,6 +3102,122 @@ mod tests {
         ));
     }
 
+    /// The snapshot with one Dump1 byte set and the Dump1 trailer kept in
+    /// balance, as a device that links the O1 and O2 limiters would leave it.
+    fn with_dump1_byte(snapshot: &SnapshotV1, offset: usize, value: u8) -> SnapshotV1 {
+        let mut dump1 = snapshot.frame(SnapshotSection::Dump1).to_vec();
+        let trailer = dump1.len() - 2;
+        dump1[trailer] = dump1[trailer]
+            .wrapping_add(dump1[offset])
+            .wrapping_sub(value)
+            & 0x7f;
+        dump1[offset] = value;
+        SnapshotV1::from_frames(
+            snapshot.frame(SnapshotSection::Identity),
+            snapshot.frame(SnapshotSection::Dump0),
+            &dump1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn limiter_off_apply_and_rollback_against_the_fake_device() {
+        // Rulings 105 and 108: switch the O1 limiter off (channel 5,
+        // parameter 0x46, Dump0 869) with O2 on (Dump1 38). O5 and O6 read
+        // muted (Dump1 392 and 561).
+        let mut dump0 = dump(0, 0, 0);
+        dump0[869] = 1;
+        let mut dump1 = dump(0, 1, 0);
+        dump1[38] = 1;
+        dump1[392] = 1;
+        dump1[561] = 1;
+        let baseline = SnapshotV1::from_frames(&identity(0), &dump0, &dump1).unwrap();
+        let off = DirectParameterAction::new(5, 0x46, 0).unwrap();
+        let on = DirectParameterAction::new(5, 0x46, 1).unwrap();
+        let staged = || ApplyTransactionV1::stage_projected(baseline.clone(), vec![off]).unwrap();
+        let mut transaction = staged();
+        let desired = transaction.apply_plan().desired().clone();
+        assert_eq!(desired.frame(SnapshotSection::Dump0)[869], 0);
+
+        // The device moves O2 with O1: verified, and the move is named.
+        let mut apply_steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        apply_steps.extend(snapshot_steps(
+            &with_dump1_byte(&desired, 38, 0),
+            READBACK_SEARCH_COUNT,
+        ));
+        let (session, log) = FakeSession::new(apply_steps);
+        let outcome =
+            execute_apply_readback(session, &mut FakePacer::default(), &mut transaction).unwrap();
+        assert!(matches!(outcome, ApplyReadbackOutcome::Verified(_)));
+        let moves = transaction
+            .apply_plan()
+            .device_moves(&with_dump1_byte(&desired, 38, 0))
+            .unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].rule, dcx_core::LIMITER_LINK_RULE);
+        assert_eq!(
+            (moves[0].offset, moves[0].before, moves[0].after),
+            (38, 1, 0)
+        );
+        assert_eq!(log.borrow().writes.len(), 1);
+        assert_eq!(log.borrow().writes[0].actions(), [off]);
+        assert_eq!(log.borrow().modes.len(), 5);
+
+        // The device leaves O2 alone: verified exactly.
+        let mut transaction = staged();
+        let mut apply_steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        apply_steps.extend(snapshot_steps(&desired, READBACK_SEARCH_COUNT));
+        let (session, _) = FakeSession::new(apply_steps);
+        assert!(matches!(
+            execute_apply_readback(session, &mut FakePacer::default(), &mut transaction).unwrap(),
+            ApplyReadbackOutcome::Verified(_)
+        ));
+
+        // Rollback writes O1 on. A readback with O2 back on is clean.
+        let mut rollback =
+            ApplyTransactionV1::resume_rollback(transaction.rollback_plan()).unwrap();
+        let mut rollback_steps = vec![Step::Read(
+            SnapshotRead::complete(baseline.frame(SnapshotSection::Identity)).unwrap(),
+        )];
+        rollback_steps.extend(snapshot_steps(&baseline, READBACK_SEARCH_COUNT));
+        let (session, rollback_log) = FakeSession::new(rollback_steps);
+        assert!(matches!(
+            execute_rollback_readback(session, &mut FakePacer::default(), &mut rollback).unwrap(),
+            RollbackReadbackOutcome::RolledBack(_)
+        ));
+        assert_eq!(rollback_log.borrow().writes[0].actions(), [on]);
+        assert_eq!(rollback_log.borrow().modes.len(), 3);
+
+        // A rollback that leaves O2 off faults.
+        let mut rollback =
+            ApplyTransactionV1::resume_rollback(transaction.rollback_plan()).unwrap();
+        let mut rollback_steps = vec![Step::Read(
+            SnapshotRead::complete(baseline.frame(SnapshotSection::Identity)).unwrap(),
+        )];
+        rollback_steps.extend(snapshot_steps(
+            &with_dump1_byte(&baseline, 38, 0),
+            READBACK_SEARCH_COUNT,
+        ));
+        let (session, _) = FakeSession::new(rollback_steps);
+        assert!(matches!(
+            execute_rollback_readback(session, &mut FakePacer::default(), &mut rollback).unwrap(),
+            RollbackReadbackOutcome::Faulted(_)
+        ));
+
+        // O2 at any other value needs rollback.
+        let mut transaction = staged();
+        let mut apply_steps = snapshot_steps(&baseline, PERSISTENT_SEARCH_COUNT);
+        apply_steps.extend(snapshot_steps(
+            &with_dump1_byte(&desired, 38, 2),
+            READBACK_SEARCH_COUNT,
+        ));
+        let (session, _) = FakeSession::new(apply_steps);
+        assert!(matches!(
+            execute_apply_readback(session, &mut FakePacer::default(), &mut transaction).unwrap(),
+            ApplyReadbackOutcome::RollbackRequired(_)
+        ));
+    }
+
     #[test]
     fn peq_write_device_move_of_dump0_101_still_requires_rollback() {
         // A PEQ-only plan is not a typed write, so exact equality stands.

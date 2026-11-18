@@ -804,30 +804,491 @@ fn level_rises_are_bounded_by_step_and_ceiling() {
 }
 
 #[test]
-fn limiter_switch_off_is_refused_by_policy_and_core() {
+fn limiter_switch_off_is_admitted_by_policy_and_core() {
+    // Legalab ruling 105, and ruling 108 in TIN-5385 comment 15475103.
     let mut builder = Builder::new();
     builder.set(8, LIMITER_ENABLED_PARAMETER, 1);
     let base = builder.snapshot();
+    let transaction = plan_writes(
+        &base,
+        &plan(vec![limiter_switch(4, false)]),
+        &WritePolicyV1::default(),
+    )
+    .unwrap();
+    assert_eq!(wires(&transaction), [[8, LIMITER_ENABLED_PARAMETER, 0, 0]]);
+    let off = DirectParameterAction::new(8, LIMITER_ENABLED_PARAMETER, 0).unwrap();
+    let staged = ApplyTransactionV1::stage_projected(base, vec![off]).unwrap();
+    assert_eq!(
+        staged.rollback_plan().command().unwrap().actions(),
+        [DirectParameterAction::new(8, LIMITER_ENABLED_PARAMETER, 1).unwrap()]
+    );
+}
+
+// Limiter off by software, TIN-5385 rulings 105 and 108. The bound image
+// `f20fddae` holds the O1 and O2 limiters on at -13.8 dB (threshold code
+// 102). Whether the device links the O1 and O2 switches is untested, so a
+// plan for one output admits the partner either unchanged or at the written
+// value, and names the second under `device_moves`.
+
+const O1_LIMITER_SWITCH: usize = 869;
+const O1_LIMITER_CARRIER: (usize, u8) = (876, 0);
+const O2_LIMITER_SWITCH: usize = 38;
+const O2_LIMITER_CARRIER: (usize, u8) = (44, 1);
+
+fn limiter_switch(output: u8, enabled: bool) -> TypedChange {
+    TypedChange::Limiter {
+        output,
+        enabled: Some(enabled),
+        threshold_db: None,
+        release_ms: None,
+    }
+}
+
+/// O1 and O2 at 0 dB trim with their limiters at -13.8 dB, switched as given.
+fn jbl_baseline(o1: bool, o2: bool) -> SnapshotV1 {
+    let mut builder = Builder::new();
+    for (output, enabled) in [(1, o1), (2, o2)] {
+        let channel = output_channel(output);
+        builder.set(channel, LIMITER_THRESHOLD_PARAMETER, 102);
+        builder.set(channel, LIMITER_ENABLED_PARAMETER, u16::from(enabled));
+    }
+    builder.snapshot()
+}
+
+fn limiter_transaction(base: &SnapshotV1, output: u8, enabled: bool) -> WriteTransactionV1 {
+    plan_writes(
+        base,
+        &plan(vec![limiter_switch(output, enabled)]),
+        &WritePolicyV1::default(),
+    )
+    .unwrap()
+}
+
+/// A readback shaped as a linked device would leave it: `snapshot` with one
+/// byte set and that dump's trailer moved to keep its modulo-128 balance.
+fn device_sets(
+    snapshot: &SnapshotV1,
+    section: crate::SnapshotSection,
+    offset: usize,
+    value: u8,
+) -> SnapshotV1 {
+    let mut dump0 = snapshot.frame(crate::SnapshotSection::Dump0).to_vec();
+    let mut dump1 = snapshot.frame(crate::SnapshotSection::Dump1).to_vec();
+    let frame = if section == crate::SnapshotSection::Dump0 {
+        &mut dump0
+    } else {
+        &mut dump1
+    };
+    let before = frame[offset];
+    frame[offset] = value;
+    let trailer = frame.len() - 2;
+    frame[trailer] = frame[trailer].wrapping_add(before).wrapping_sub(value) & 0x7f;
+    SnapshotV1::from_frames(
+        snapshot.frame(crate::SnapshotSection::Identity),
+        &dump0,
+        &dump1,
+    )
+    .unwrap()
+}
+
+#[test]
+fn limiter_layout_matches_the_reviewed_bytes() {
+    let o1 = reviewed_address(output_channel(1), LIMITER_ENABLED_PARAMETER).unwrap();
+    let o2 = reviewed_address(output_channel(2), LIMITER_ENABLED_PARAMETER).unwrap();
+    assert_eq!(
+        (o1.location.part(), o1.location.low_offset()),
+        (DumpPart::Part0, O1_LIMITER_SWITCH)
+    );
+    assert_eq!(
+        (o2.location.part(), o2.location.low_offset()),
+        (DumpPart::Part1, O2_LIMITER_SWITCH)
+    );
+    assert_eq!(
+        crate::layout::packing_carrier(O1_LIMITER_SWITCH),
+        Some(O1_LIMITER_CARRIER)
+    );
+    assert_eq!(
+        crate::layout::packing_carrier(O2_LIMITER_SWITCH),
+        Some(O2_LIMITER_CARRIER)
+    );
+    // Dump0 101 keeps its own rule: carrier 108 bit 0.
+    assert_eq!(crate::layout::packing_carrier(101), Some((108, 0)));
+}
+
+#[test]
+fn limiter_off_plan_states_the_switch_and_keeps_the_wire_budget() {
+    let base = jbl_baseline(true, true);
+    let transaction = limiter_transaction(&base, 1, false);
+    assert_eq!(wires(&transaction), [[5, LIMITER_ENABLED_PARAMETER, 0, 0]]);
+    assert_eq!(
+        transaction.rollback_frame_hex.as_deref(),
+        Some(frame(&[[5, LIMITER_ENABLED_PARAMETER, 0, 1]]).as_str())
+    );
+    assert_eq!(transaction.wire_budget.apply_remote_mode_writes, 5);
+    assert_eq!(transaction.wire_budget.apply_direct_frames, 1);
+    assert_eq!(transaction.wire_budget.rollback_remote_mode_writes, 3);
+    assert!(transaction.linked_effects.is_empty());
+    let [switch] = transaction.limiter_switches.as_slice() else {
+        panic!("one limiter switch expected")
+    };
+    assert_eq!(
+        (
+            switch.output,
+            switch.enabled_before,
+            switch.enabled_after,
+            switch.counted_in_gain_step,
+            switch.link_partner
+        ),
+        (1, true, false, false, Some(2))
+    );
+    assert!(switch.notice.starts_with("O1 limiter goes off."));
+    assert!(switch.notice.contains("O2 limiter may also go off"));
+    // The desired snapshot expects only O1 to move.
+    let desired = transaction.apply_plan.desired();
+    assert_eq!(
+        desired.frame(crate::SnapshotSection::Dump1)[O2_LIMITER_SWITCH],
+        1
+    );
+    assert_eq!(
+        transaction.apply_plan.limiter_link_moves(),
+        [crate::AllowedDeviceMove {
+            rule: crate::LIMITER_LINK_RULE,
+            section: crate::SnapshotSection::Dump1,
+            offset: O2_LIMITER_SWITCH,
+            carrier: O2_LIMITER_CARRIER,
+            before: 1,
+            after: 0,
+        }]
+    );
+}
+
+#[test]
+fn limiter_switch_is_not_counted_in_the_gain_step() {
+    let base = jbl_baseline(true, true);
+    // A full +3 dB threshold rise still fits beside the switch.
+    let transaction = plan_writes(
+        &base,
+        &plan(vec![TypedChange::Limiter {
+            output: 1,
+            enabled: Some(false),
+            threshold_db: Some(-10.8),
+            release_ms: None,
+        }]),
+        &WritePolicyV1::default(),
+    )
+    .unwrap();
+    // The threshold rise goes first, the switch-off after it.
+    assert_eq!(
+        transaction
+            .writes
+            .iter()
+            .map(|write| write.parameter)
+            .collect::<Vec<_>>(),
+        [LIMITER_THRESHOLD_PARAMETER, LIMITER_ENABLED_PARAMETER]
+    );
     assert!(matches!(
         plan_writes(
             &base,
             &plan(vec![TypedChange::Limiter {
-                output: 4,
+                output: 1,
                 enabled: Some(false),
-                threshold_db: None,
+                threshold_db: Some(-10.7),
                 release_ms: None,
             }]),
             &WritePolicyV1::default(),
         ),
-        Err(TypedWriteError::LimiterDisable { output: 4 })
+        Err(TypedWriteError::GainStep { .. })
     ));
-    let off = DirectParameterAction::new(8, LIMITER_ENABLED_PARAMETER, 0).unwrap();
+}
+
+#[test]
+fn limiter_off_refuses_a_second_output_and_o5_o6() {
+    let base = jbl_baseline(true, true);
+    for changes in [
+        vec![limiter_switch(1, false), limiter_switch(2, false)],
+        vec![
+            limiter_switch(1, false),
+            TypedChange::OutputGain {
+                output: 3,
+                gain_db: -1.0,
+            },
+        ],
+    ] {
+        assert!(matches!(
+            plan_writes(&base, &plan(changes), &WritePolicyV1::default()),
+            Err(TypedWriteError::LimiterOffWithOtherOutput { output: 1, .. })
+        ));
+    }
+    for output in [5, 6] {
+        assert!(matches!(
+            plan_writes(
+                &base,
+                &plan(vec![limiter_switch(output, false)]),
+                &WritePolicyV1::default()
+            ),
+            Err(TypedWriteError::ReservedOutput { output: o, .. }) if o == output
+        ));
+    }
+    // An unmuted O5 refuses the O1 switch-off too.
+    let mut builder = Builder::new();
+    builder.set(output_channel(1), LIMITER_ENABLED_PARAMETER, 1);
+    builder.set(output_channel(5), MUTE_PARAMETER, 0);
     assert!(matches!(
-        ApplyTransactionV1::stage_projected(base, vec![off]),
-        Err(ApplyTransactionError::Plan(
-            ApplyPlanError::LimiterDisable { channel: 8 }
-        ))
+        plan_writes(
+            &builder.snapshot(),
+            &plan(vec![limiter_switch(1, false)]),
+            &WritePolicyV1::default()
+        ),
+        Err(TypedWriteError::ReservedOutputUnmuted { output: 5, .. })
     ));
+}
+
+#[test]
+fn limiter_off_replay_unlinked_readback_verifies_and_rolls_back() {
+    let base = jbl_baseline(true, true);
+    let transaction = limiter_transaction(&base, 1, false);
+    let plan = &transaction.apply_plan;
+    let readback = plan.desired().clone();
+    let verification = verify_written_values(plan, &readback).unwrap();
+    assert_eq!(verification.status, "consistent");
+    assert!(verification.readback_matches_desired);
+    assert!(verification.device_moves.is_empty());
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    assert!(apply.verify_apply_readback(&readback).unwrap().is_exact());
+    assert_eq!(apply.state(), crate::ApplyTransactionState::Verified);
+    let mut rollback = ApplyTransactionV1::resume_rollback(&transaction.rollback_plan).unwrap();
+    rollback.begin_rollback().unwrap();
+    let receipt = rollback.verify_rollback_readback(&base).unwrap();
+    assert!(receipt.is_exact());
+    assert_eq!(rollback.state(), crate::ApplyTransactionState::RolledBack);
+}
+
+#[test]
+fn limiter_off_replay_linked_partner_is_contained_and_named() {
+    let base = jbl_baseline(true, true);
+    let transaction = limiter_transaction(&base, 1, false);
+    let plan = &transaction.apply_plan;
+    let readback = device_sets(
+        plan.desired(),
+        crate::SnapshotSection::Dump1,
+        O2_LIMITER_SWITCH,
+        0,
+    );
+    let expected_move = crate::DeviceMoveV1 {
+        classification: "device",
+        rule: crate::LIMITER_LINK_RULE,
+        section: crate::SnapshotSection::Dump1,
+        offset: O2_LIMITER_SWITCH,
+        before: 1,
+        after: 0,
+    };
+    assert!(uncontained_offsets(plan, &readback).is_empty());
+    assert_eq!(
+        plan.device_moves(&readback).unwrap(),
+        std::slice::from_ref(&expected_move)
+    );
+    let verification = verify_written_values(plan, &readback).unwrap();
+    assert_eq!(verification.status, "consistent");
+    assert!(!verification.readback_matches_desired);
+    assert_eq!(
+        verification.device_moves,
+        std::slice::from_ref(&expected_move)
+    );
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    let receipt = apply.verify_apply_readback(&readback).unwrap();
+    assert!(!receipt.is_exact() && receipt.is_verified());
+    assert_eq!(receipt.device_moves(), [expected_move]);
+    assert_eq!(apply.state(), crate::ApplyTransactionState::Verified);
+    // The O2 plan then sees O2 already off and sends nothing.
+    let follow_up = limiter_transaction(&readback, 2, false);
+    assert!(follow_up.writes.is_empty());
+    assert_eq!(follow_up.unchanged_changes, [0]);
+    assert!(follow_up.apply_frame_hex.is_none());
+}
+
+#[test]
+fn limiter_off_replay_rollback_must_bring_the_partner_back() {
+    let base = jbl_baseline(true, true);
+    let transaction = limiter_transaction(&base, 1, false);
+    // A linked device moves O2 back on with O1: exact baseline.
+    let mut rollback = ApplyTransactionV1::resume_rollback(&transaction.rollback_plan).unwrap();
+    rollback.begin_rollback().unwrap();
+    assert!(
+        rollback
+            .verify_rollback_readback(&base)
+            .unwrap()
+            .is_verified()
+    );
+    // O2 left off after the rollback is not a clean rollback.
+    let partner_off = device_sets(&base, crate::SnapshotSection::Dump1, O2_LIMITER_SWITCH, 0);
+    let mut rollback = ApplyTransactionV1::resume_rollback(&transaction.rollback_plan).unwrap();
+    rollback.begin_rollback().unwrap();
+    let receipt = rollback.verify_rollback_readback(&partner_off).unwrap();
+    assert!(!receipt.is_verified());
+    assert!(receipt.device_moves().is_empty());
+    assert_eq!(rollback.state(), crate::ApplyTransactionState::Faulted);
+    assert!(
+        transaction
+            .apply_plan
+            .rollback_device_moves(&partner_off)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn limiter_off_replay_refuses_any_other_partner_move() {
+    let base = jbl_baseline(true, true);
+    let transaction = limiter_transaction(&base, 1, false);
+    let plan = &transaction.apply_plan;
+    let desired = plan.desired();
+    let refused = |readback: &SnapshotV1| {
+        let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+        apply.begin_apply().unwrap();
+        assert!(!apply.verify_apply_readback(readback).unwrap().is_verified());
+        assert_eq!(
+            apply.state(),
+            crate::ApplyTransactionState::RollbackRequired
+        );
+        assert_eq!(
+            verify_written_values(plan, readback).unwrap().status,
+            "inconsistent"
+        );
+    };
+    // Another value at the partner switch.
+    let other = device_sets(desired, crate::SnapshotSection::Dump1, O2_LIMITER_SWITCH, 2);
+    refused(&other);
+    assert!(!uncontained_offsets(plan, &other).is_empty());
+    // The partner moved with its carrier bit set.
+    let mut carried = device_sets(desired, crate::SnapshotSection::Dump1, O2_LIMITER_SWITCH, 0);
+    carried = device_sets(
+        &carried,
+        crate::SnapshotSection::Dump1,
+        O2_LIMITER_CARRIER.0,
+        carried.frame(crate::SnapshotSection::Dump1)[O2_LIMITER_CARRIER.0] | 0x02,
+    );
+    refused(&carried);
+    // The partner moved without the Dump1 trailer moving to match.
+    let mut dump1 = desired.frame(crate::SnapshotSection::Dump1).to_vec();
+    dump1[O2_LIMITER_SWITCH] = 0;
+    let unbalanced = SnapshotV1::from_frames(
+        desired.frame(crate::SnapshotSection::Identity),
+        desired.frame(crate::SnapshotSection::Dump0),
+        &dump1,
+    )
+    .unwrap();
+    refused(&unbalanced);
+    // The O2 threshold moved: not the switch.
+    let threshold = device_sets(
+        desired,
+        crate::SnapshotSection::Dump1,
+        40,
+        desired.frame(crate::SnapshotSection::Dump1)[40] ^ 0x01,
+    );
+    refused(&threshold);
+}
+
+#[test]
+fn limiter_off_partner_rule_needs_an_agreeing_pair_and_one_side_written() {
+    // O2 already off: no partner rule for the O1 switch-off.
+    let base = jbl_baseline(true, false);
+    let transaction = limiter_transaction(&base, 1, false);
+    assert!(transaction.apply_plan.limiter_link_moves().is_empty());
+    assert_eq!(transaction.limiter_switches[0].link_partner, None);
+    // O3 and O4 have no limiter partner rule.
+    let mut builder = Builder::new();
+    builder.set(output_channel(3), LIMITER_ENABLED_PARAMETER, 1);
+    builder.set(output_channel(4), LIMITER_ENABLED_PARAMETER, 1);
+    let transaction = limiter_transaction(&builder.snapshot(), 3, false);
+    assert!(transaction.apply_plan.limiter_link_moves().is_empty());
+    // A plan that turns both O1 and O2 on writes both and predicts nothing.
+    let base = jbl_baseline(false, false);
+    let both = plan_writes(
+        &base,
+        &plan(vec![limiter_switch(1, true), limiter_switch(2, true)]),
+        &WritePolicyV1::default(),
+    )
+    .unwrap();
+    assert!(both.apply_plan.limiter_link_moves().is_empty());
+}
+
+#[test]
+fn limiter_on_replay_admits_the_partner_following_and_rolls_back() {
+    // Back on after both went off: the O1 plan may bring O2 on too.
+    let base = jbl_baseline(false, false);
+    let transaction = limiter_transaction(&base, 1, true);
+    assert_eq!(wires(&transaction), [[5, LIMITER_ENABLED_PARAMETER, 0, 1]]);
+    assert!(
+        transaction.limiter_switches[0]
+            .notice
+            .starts_with("O1 limiter goes on.")
+    );
+    let plan = &transaction.apply_plan;
+    let readback = device_sets(
+        plan.desired(),
+        crate::SnapshotSection::Dump1,
+        O2_LIMITER_SWITCH,
+        1,
+    );
+    let mut apply = ApplyTransactionV1::from_apply_plan(plan).unwrap();
+    apply.begin_apply().unwrap();
+    assert!(
+        apply
+            .verify_apply_readback(&readback)
+            .unwrap()
+            .is_verified()
+    );
+    // The rollback switches O1 off again under the same guards.
+    assert_eq!(
+        transaction.rollback_frame_hex.as_deref(),
+        Some(frame(&[[5, LIMITER_ENABLED_PARAMETER, 0, 0]]).as_str())
+    );
+    let mut rollback = ApplyTransactionV1::resume_rollback(&transaction.rollback_plan).unwrap();
+    rollback.begin_rollback().unwrap();
+    assert!(
+        rollback
+            .verify_rollback_readback(&base)
+            .unwrap()
+            .is_verified()
+    );
+}
+
+#[test]
+fn limiter_off_replay_from_o2_admits_o1_and_dump0_101() {
+    // The O2 plan writes Dump1 only. The O1 partner sits in Dump0 next to
+    // the Dump0 101 rule, and both moves are named.
+    let base = jbl_baseline(true, true);
+    let transaction = limiter_transaction(&base, 2, false);
+    let plan = &transaction.apply_plan;
+    let readback = device_sets(
+        &device_sets(
+            plan.desired(),
+            crate::SnapshotSection::Dump0,
+            O1_LIMITER_SWITCH,
+            0,
+        ),
+        crate::SnapshotSection::Dump0,
+        DUMP0_XCUR_FLAG,
+        1,
+    );
+    let moves = plan.device_moves(&readback).unwrap();
+    assert_eq!(
+        moves
+            .iter()
+            .map(|change| (change.rule, change.offset))
+            .collect::<Vec<_>>(),
+        [
+            ("dump0_101_set_by_device", DUMP0_XCUR_FLAG),
+            (crate::LIMITER_LINK_RULE, O1_LIMITER_SWITCH)
+        ]
+    );
+    assert!(uncontained_offsets(plan, &readback).is_empty());
+    assert_eq!(
+        verify_written_values(plan, &readback).unwrap().status,
+        "consistent"
+    );
 }
 
 #[test]
